@@ -1,0 +1,7 @@
+node_modules/
+.secrets/
+.logs/
+controller/playground/*
+!controller/playground/.gitkeep
+controller/.claude/settings.local.json
+.DS_Store

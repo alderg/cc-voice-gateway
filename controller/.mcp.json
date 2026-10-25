@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "voice": {
+      "command": "node",
+      "args": ["../src/gateway.mjs"]
+    }
+  }
+}
