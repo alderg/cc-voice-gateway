@@ -1,180 +1,178 @@
 # cc-voice-gateway
 
-Machbarkeitstest: Claude-Code-Sessions per Sprache aus dem Auto steuern. Eine Sprach-KI auf CarPlay
-(Claude Voice oder Grok) ruft einen eigenen MCP-Connector auf. Dieser leitet die Anliegen an eine
-laufende Claude-Code-Session weiter, die als Controller antwortet, nachfragt und Freigaben einholt.
+Feasibility test: drive Claude Code sessions by voice from the car. A voice assistant on CarPlay
+(Claude voice mode or Grok) calls a custom MCP connector. The connector hands the request to a
+running Claude Code session, which acts as a controller: it answers, asks back and gets approvals.
 
-Reines JavaScript (ESM), kein Build-Schritt. Einzige Abhängigkeiten: `@modelcontextprotocol/sdk` und `zod`.
+Plain JavaScript (ESM), no build step. The only dependencies are `@modelcontextprotocol/sdk` and `zod`.
 
-> **Status:** Testaufbau, kein Dauerbetrieb. Zustand liegt nur im Speicher, Claude-Code-Channels
-> sind eine Research Preview.
+> **Status:** test setup, not for continuous use. State lives in memory only, and Claude Code
+> channels are a research preview.
 
-## Was der Test klären soll
+## What the test is meant to answer
 
-1. Ruft die Sprach-KI auf CarPlay einen eigenen MCP-Connector überhaupt auf? Das ist die Frage, an der
-   alles hängt.
-2. Hält sie bei Aufgaben über 60 Sekunden durch, indem sie wiederholt nachfragt (Polling)?
-3. Funktionieren Rückfragen und Freigaben (Bash, Write, Edit) per Stimme?
+1. Does the voice assistant on CarPlay call a custom MCP connector at all? Everything else depends
+   on this.
+2. Does it keep polling through tasks that take longer than 60 seconds?
+3. Do questions and approvals (Bash, Write, Edit) work by voice?
 
-![Architektur](docs/architektur.drawio.svg)
+![Architecture](docs/architecture.drawio.svg)
 
-## Wie es funktioniert
+## How it works
 
-**Ein Prozess, zwei Seiten.** Claude Code startet `src/gateway.mjs` selbst, weil der Server in
-`controller/.mcp.json` eingetragen ist, und spricht mit ihm über stdio. Das Gateway meldet die
-Fähigkeit `claude/channel` an. Dadurch landet jede Sprachanfrage als
-`<channel source="voice" request_id="…">Text</channel>` direkt in der laufenden Controller-Session.
-Derselbe Prozess lauscht auf `127.0.0.1:8787` und bietet dort der Sprach-KI MCP-Tools an.
-Tailscale Funnel macht diesen Port per HTTPS erreichbar, denn Claude und Grok rufen Connectors aus
-ihrer eigenen Cloud auf.
+**One process, two sides.** Claude Code starts `src/gateway.mjs` itself, because the server is
+listed in `controller/.mcp.json`, and talks to it over stdio. The gateway declares the
+`claude/channel` capability, so every voice request lands in the running controller session as
+`<channel source="voice" request_id="…">text</channel>`. The same process listens on
+`127.0.0.1:8787` and offers MCP tools to the voice assistant there. Tailscale Funnel makes this
+port reachable over HTTPS, because Claude and Grok call connectors from their own cloud.
 
-**Wer denkt:** Das Gateway ist bewusst keine KI. Es hält Zustand und leitet weiter. Die
-Controller-Session (Claude Code) versteht, antwortet, fasst zusammen und fragt nach. Die Sprach-KI
-führt das Gespräch im Auto.
+**Who thinks:** the gateway is deliberately not an AI. It keeps state and relays. The controller
+session (Claude Code) understands, answers, summarises and asks back. The voice assistant runs the
+conversation in the car.
 
-| Seite | Tool | Zweck |
+| Side | Tool | Purpose |
 |---|---|---|
-| Sprach-KI | `status` | Erreichbarkeit, offene Aufträge und Freigaben |
-| Sprach-KI | `send` | Auftrag übergeben, kehrt sofort mit `id` zurück |
-| Sprach-KI | `ask` | Auftrag übergeben und bis 40 s auf die Antwort warten |
-| Sprach-KI | `get_reply` | Neues zu einer `id` abholen, wartet bis 40 s |
-| Sprach-KI | `approve` | Freigabe mit fünfstelligem Code erlauben oder ablehnen |
-| Controller | `reply` | Antwort mit `state` `working`, `question` oder `done` |
+| Voice assistant | `status` | Reachability, open requests and approvals |
+| Voice assistant | `send` | Hand over a request, returns at once with an `id` |
+| Voice assistant | `ask` | Hand over a request and wait up to 40 s for the answer |
+| Voice assistant | `get_reply` | Fetch news for an `id`, waits up to 40 s |
+| Voice assistant | `approve` | Allow or deny an approval with its five-letter code |
+| Controller | `reply` | Answer with `state` `working`, `question` or `done` |
 
-![Ablauf](docs/ablauf.drawio.svg)
+![Request flow](docs/request-flow.drawio.svg)
 
-**Warum Polling:** Ein einzelner Toolaufruf darf nicht lange blockieren. MCP-Clients brechen
-Anfragen häufig nach 60 Sekunden ab ([talk-to-claude-code][t2cc]). `get_reply` wartet darum höchstens
-40 Sekunden und kehrt sofort zurück, sobald es Neues gibt. Die erste Zeile jeder Antwort ist
-maschinenlesbar, etwa `[state=working id=k7f3 elapsed=34s]`, damit die Sprach-KI weiss, ob sie
-weiter nachfragen muss.
+**Why polling:** a single tool call must not block for long. MCP clients often abort requests
+after 60 seconds ([talk-to-claude-code][t2cc]). `get_reply` therefore waits at most 40 seconds and
+returns as soon as there is news. The first line of every result is machine-readable, for example
+`[state=working id=k7f3 elapsed=34s]`, so the voice assistant knows whether to poll again.
 
-**Freigaben:** Weil das Gateway zusätzlich `claude/channel/permission` anmeldet, schickt Claude Code
-jede Freigabe-Anfrage parallel zum Terminal-Dialog an den Channel. Die erste Antwort gilt, egal ob
-sie aus dem Auto oder aus dem Terminal kommt ([Channels-Referenz][ref]). Vertrauens- und
-MCP-Consent-Dialoge laufen nicht darüber.
+**Approvals:** because the gateway also declares `claude/channel/permission`, Claude Code sends
+every approval prompt to the channel in parallel with the terminal dialog. The first answer wins,
+whether it comes from the car or from the terminal ([channels reference][ref]). Workspace trust
+and MCP consent dialogs are not relayed.
 
-**Rückfragen:** Formulare (`AskUserQuestion`) kann im Auto niemand anklicken. Die
-`controller/CLAUDE.md` verlangt deshalb Rückfragen als normalen Text mit `state: "question"`. Die
-Antwort des Fahrers kommt als neuer Auftrag mit Verweis auf die ursprüngliche `id`.
+**Questions:** nobody can click a form (`AskUserQuestion`) in the car. `controller/CLAUDE.md`
+therefore asks for questions as plain text with `state: "question"`. The driver's answer arrives as
+a new request that refers to the original `id`.
 
-![Zustände](docs/zustaende.drawio.svg)
+![States](docs/states.drawio.svg)
 
-## Voraussetzungen
+## Requirements
 
-- Node.js 20 oder neuer (getestet mit 22) und npm
-- Claude Code mit claude.ai-Login, Channels ab v2.1.80. Bei Team- und Enterprise-Organisationen muss
-  ein Admin Channels freischalten; Pro und Max brauchen das nicht ([Channels][channels]).
-- Tailscale mit Funnel, alternativ ein anderer HTTPS-Tunnel
-- Sprach-KI mit eigenem Connector: Claude-App (eigene Connectors nur in bezahlten Plänen) oder Grok
-  ([grok.com/connectors][grok])
+- Node.js 20 or newer (tested with 22) and npm
+- Claude Code with a claude.ai login, channels need v2.1.80 or later. Team and Enterprise
+  organisations need an admin to enable channels; Pro and Max do not ([channels][channels]).
+- Tailscale with Funnel, or another HTTPS tunnel
+- A voice assistant with custom connectors: the Claude app (custom connectors on paid plans only)
+  or Grok ([grok.com/connectors][grok])
 
 ## Installation
 
 ```bash
-tar xzf cc-voice-gateway.tar.gz   # oder: git clone <repo>
+git clone git@github.com:alderg/cc-voice-gateway.git
 cd cc-voice-gateway
 npm install
-npm test          # 12 Tests, ohne Claude Code und ohne Auto
+npm test          # 12 tests, no Claude Code and no car needed
 ```
 
-`npm test` startet das Gateway über stdio und spielt beide Enden: Claude Code (Channel-Events,
-`reply`, Freigabe-Anfragen) und die Sprach-KI (HTTP-Tools).
+`npm test` starts the gateway over stdio and plays both ends: Claude Code (channel events,
+`reply`, approval prompts) and the voice assistant (HTTP tools).
 
-## Testplan
+## Test plan
 
-Stufen der Reihe nach durchgehen. Jede Stufe prüft genau eine neue Strecke.
+Go through the stages in order. Each stage adds exactly one new link.
 
-### Stufe 0: Schreibtisch, ohne Tunnel
+### Stage 0: desk, no tunnel
 
 ```bash
-scripts/start-controller.sh        # Terminal 1: Controller mit Channel
-node scripts/fake-voice.mjs        # Terminal 2: spielt die Sprach-KI
+scripts/start-controller.sh        # terminal 1: controller with the channel
+node scripts/fake-voice.mjs        # terminal 2: plays the voice assistant
 ```
 
-Beim ersten Start fragt Claude Code im Terminal nach: Vertrauen für den Ordner, Warnung zum
-Development-Channel und Zustimmung zum neuen MCP-Server aus `.mcp.json`. Alles bestätigen; die
-Erlaubnis für `mcp__voice__reply` aus `controller/.claude/settings.json` gilt erst nach dem
-Vertrauen in den Ordner. Die Session im normalen Modus mit
-Rückfragen laufen lassen, nicht im Auto-Modus, sonst entscheidet ein Klassifikator statt dir und es
-gibt keine Freigabe weiterzuleiten.
+On the first start Claude Code asks in the terminal: trust for the folder, a warning about the
+development channel, and consent for the new MCP server from `.mcp.json`. Confirm all of them; the
+permission for `mcp__voice__reply` in `controller/.claude/settings.json` only applies once the
+folder is trusted. Run the session in the normal mode with prompts, not in auto mode, otherwise a
+classifier decides instead of you and there is no approval to relay.
 
-Im zweiten Terminal:
+In the second terminal:
 
 ```text
 > status
-> ask Wie viele Dateien liegen im playground?
-> send Leg im playground die Datei hallo.txt mit dem Text Grüezi an
+> ask How many files are in the playground?
+> send Create the file hello.txt in the playground with the text Grüezi
   … [state=working … approval=abcde] Freigabe nötig (code=abcde): Write …
 > allow abcde
 > follow
 ```
 
-Das Protokoll steht in `.logs/gateway.log`.
+The gateway's tool results are in German for now; the voice assistant speaks in your language
+either way. The log is in `.logs/gateway.log`.
 
-### Stufe 1: Tunnel
+### Stage 1: tunnel
 
 ```bash
-scripts/funnel.sh start            # gibt die Connector-URL aus
+scripts/funnel.sh start            # prints the connector URL
 node scripts/fake-voice.mjs "https://<host>.ts.net:8443/mcp/<token>"
 ```
 
-Am besten von einem anderen Netz aus prüfen, zum Beispiel über den Hotspot des Handys.
+Best checked from another network, for example the phone's hotspot.
 
-### Stufe 2: Connector im Text-Chat
+### Stage 2: connector in text chat
 
-Connector mit der URL aus Stufe 1 anlegen, **ohne Authentifizierung**, denn das Secret steckt im Pfad:
+Add a connector with the URL from stage 1, **without authentication**, because the secret is in the
+path:
 
-- **Claude:** Customize → Connectors → eigenen Connector hinzufügen. Die Bezeichnungen variieren je
-  nach App-Version.
-- **Grok:** grok.com/connectors → New Connector → Custom ([xAI-Doku][grok]).
+- **Claude:** Customize → Connectors → add a custom connector. Labels vary between app versions.
+- **Grok:** grok.com/connectors → New Connector → Custom ([xAI docs][grok]).
 
-Im Text-Chat am Handy: „Frag Claude Code nach dem Gateway-Status.“
+In text chat on the phone: "Ask Claude Code for the gateway status."
 
-### Stufe 3: Voice-Modus am Handy, stehend
+### Stage 3: voice mode on the phone, standing still
 
-Gleiche Frage im Voice-Modus. **Das ist der entscheidende Test.** Ruft die Sprach-KI hier das Tool
-nicht auf, ist diese App für das Auto ungeeignet, egal wie der Server aufgebaut ist.
+Same question in voice mode. **This is the decisive test.** If the voice assistant does not call
+the tool here, that app is unsuitable for the car, however the server is built.
 
-### Stufe 4: CarPlay, parkiert
+### Stage 4: CarPlay, parked
 
-1. „Frag Claude Code nach dem Status.“
-2. „Frag Claude Code, wie viele Dateien im playground liegen.“
-3. Lange Aufgabe mit Freigabe: „Sag Claude Code, es soll 90 Sekunden warten und dann im playground
-   die Datei fertig.txt anlegen.“ Erwartet: Zwischenstände über gut 90 Sekunden und eine
-   Freigabe-Frage, je nach Vorgehen von Claude Code am Anfang oder am Ende, dann „fertig“.
-4. Rückfrage: „Sag Claude Code, es soll das playground aufräumen und vorher fragen, was weg darf.“
+1. "Ask Claude Code for the status."
+2. "Ask Claude Code how many files are in the playground."
+3. Long task with approval: "Tell Claude Code to wait 90 seconds and then create the file
+   done.txt in the playground." Expected: progress updates over a good 90 seconds and an approval
+   question, at the start or at the end depending on how Claude Code goes about it, then "done".
+4. Question: "Tell Claude Code to clean up the playground and to ask first what may go."
 
-### Ergebnisse
+### Results
 
-| Prüfpunkt | Claude Voice | Grok |
+| Check | Claude voice | Grok |
 |---|---|---|
-| Tool im Text-Chat aufgerufen | | |
-| Tool im Voice-Modus am Handy aufgerufen | | |
-| Tool auf CarPlay aufgerufen | | |
-| Polling über 60 s ohne Abbruch | | |
-| Freigabe per Stimme | | |
-| Rückfrage beantwortet | | |
-| Antworten kurz und brauchbar vorgelesen | | |
+| Tool called in text chat | | |
+| Tool called in voice mode on the phone | | |
+| Tool called on CarPlay | | |
+| Polling beyond 60 s without dropping out | | |
+| Approval by voice | | |
+| Question answered | | |
+| Answers read out short and usable | | |
 
-## Sicherheit
+## Security
 
-- **Wer die URL kennt, lässt Claude Code auf deinem Rechner arbeiten.** Das gilt auch für eine
-  Sprach-KI, die per Prompt-Injection manipuliert wurde. URL geheim halten, Tunnel nach dem Test
-  schliessen (`scripts/funnel.sh stop`).
-- Neues Secret: `.secrets/token` löschen, Controller neu starten, Connector-URL anpassen.
-- Das Gateway bindet nur an `127.0.0.1`. Anfragen ohne gültiges Secret erhalten ein nacktes 404, damit
-  Clients keinen OAuth-Ablauf starten.
-- Freigabe per Stimme bedeutet: Wer `approve` aufrufen kann, kann Tools freigeben. Die Sprach-KI wird
-  angewiesen, nur nach ausdrücklichem Ja freizugeben; das ist eine Anweisung, keine Durchsetzung.
-  Abschalten mit `VOICE_GW_PERMISSION_RELAY=0`.
-- Claude Code maskiert erkennbare Zugangsdaten in weitergeleiteten Freigabe-Texten, aber nicht jedes
-  Geheimnis ([Channels-Referenz][ref]).
-- Nicht mit `--dangerously-skip-permissions` starten und nur im Testordner `controller/` arbeiten.
+- **Whoever knows the URL can make Claude Code work on your computer.** That includes a voice
+  assistant that has been manipulated by prompt injection. Keep the URL secret and close the
+  tunnel after testing (`scripts/funnel.sh stop`).
+- New secret: delete `.secrets/token`, restart the controller, update the connector URL.
+- The gateway binds to `127.0.0.1` only. Requests without a valid secret get a bare 404, so
+  clients do not start an OAuth flow.
+- Approval by voice means: whoever can call `approve` can approve tools. The voice assistant is
+  told to approve only after an explicit yes; that is an instruction, not enforcement. Turn it off
+  with `VOICE_GW_PERMISSION_RELAY=0`.
+- Claude Code masks recognisable credentials in relayed approval texts, but not every secret
+  ([channels reference][ref]).
+- Do not start with `--dangerously-skip-permissions`, and work only in the test folder `controller/`.
 
-## Konfiguration
+## Configuration
 
-Claude Code startet das Gateway. Umgebungsvariablen gehören deshalb in `controller/.mcp.json`:
+Claude Code starts the gateway, so environment variables go into `controller/.mcp.json`:
 
 ```json
 {
@@ -188,76 +186,76 @@ Claude Code startet das Gateway. Umgebungsvariablen gehören deshalb in `control
 }
 ```
 
-| Variable | Standard | Bedeutung |
+| Variable | Default | Meaning |
 |---|---|---|
-| `VOICE_GW_PORT` | `8787` | lokaler HTTP-Port |
-| `VOICE_GW_HOST` | `127.0.0.1` | Bind-Adresse, nur ändern, wenn du weisst warum |
-| `VOICE_GW_TOKEN` | – | Secret direkt setzen, sonst `.secrets/token` |
-| `VOICE_GW_TOKEN_FILE` | `.secrets/token` | Ort der Secret-Datei |
-| `VOICE_GW_PERMISSION_RELAY` | an | `0` schaltet Freigaben per Stimme ab |
-| `VOICE_GW_DEFAULT_WAIT` | `25` | Wartezeit von `get_reply` in Sekunden |
-| `VOICE_GW_MAX_WAIT` | `40` | Obergrenze für `get_reply` und `ask` |
-| `VOICE_GW_HINT_AFTER` | `20` | ab wann ein Diagnosehinweis kommt |
-| `VOICE_GW_PERMISSION_TTL` | `900` | offene Freigaben verfallen nach Sekunden |
-| `VOICE_GW_LOG_FILE` | `.logs/gateway.log` | leer setzen für nur stderr |
-| `FUNNEL_PORT` | `8443` | für `scripts/funnel.sh`, erlaubt sind 443, 8443, 10000 |
+| `VOICE_GW_PORT` | `8787` | local HTTP port |
+| `VOICE_GW_HOST` | `127.0.0.1` | bind address, only change it if you know why |
+| `VOICE_GW_TOKEN` | – | set the secret directly, otherwise `.secrets/token` |
+| `VOICE_GW_TOKEN_FILE` | `.secrets/token` | location of the secret file |
+| `VOICE_GW_PERMISSION_RELAY` | on | `0` turns approval by voice off |
+| `VOICE_GW_DEFAULT_WAIT` | `25` | wait time of `get_reply` in seconds |
+| `VOICE_GW_MAX_WAIT` | `40` | upper limit for `get_reply` and `ask` |
+| `VOICE_GW_HINT_AFTER` | `20` | when a diagnostic hint appears |
+| `VOICE_GW_PERMISSION_TTL` | `900` | open approvals expire after this many seconds |
+| `VOICE_GW_LOG_FILE` | `.logs/gateway.log` | set empty for stderr only |
+| `FUNNEL_PORT` | `8443` | for `scripts/funnel.sh`; allowed are 443, 8443, 10000 |
 
-## Fehlersuche
+## Troubleshooting
 
-| Symptom | Ursache und Abhilfe |
+| Symptom | Cause and fix |
 |---|---|
-| `status` meldet `controller=unconfirmed`, `get_reply` gibt einen Hinweis | Session ohne `--dangerously-load-development-channels server:voice` gestartet, oder die Organisation blockiert Channels. In der Session `/mcp` prüfen; Claude Code verwirft Ereignisse sonst stillschweigend. |
-| Connector verlangt OAuth | URL ohne Secret im Pfad. Es muss `…/mcp/<token>` sein. |
-| `EADDRINUSE` im Log | Eine zweite Controller-Session läuft im selben Ordner. Nur eine starten. |
-| Sprach-KI antwortet selbst statt zu fragen | Ausdrücklich „frag Claude Code …“ sagen. |
-| Sprach-KI hört nach dem ersten `working` auf | Bekanntes Risiko mancher Clients. Genau das prüft Stufe 4. |
-| Keine Freigabe im Auto | Session im Auto-Modus, oder es ist ein Vertrauens- bzw. Consent-Dialog, die nicht weitergeleitet werden. |
+| `status` reports `controller=unconfirmed`, `get_reply` shows a hint | Session started without `--dangerously-load-development-channels server:voice`, or the organisation blocks channels. Check `/mcp` in the session; otherwise Claude Code drops events silently. |
+| Connector asks for OAuth | URL without the secret in the path. It must be `…/mcp/<token>`. |
+| `EADDRINUSE` in the log | A second controller session is running. Start only one. |
+| Voice assistant answers itself instead of asking | Say "ask Claude Code …" explicitly. |
+| Voice assistant stops after the first `working` | Known risk with some clients. Stage 4 tests exactly this. |
+| No approval in the car | Session in auto mode, or it is a trust or consent dialog, which is not relayed. |
 
-Das Debug-Log von Claude Code liegt unter `~/.claude/debug/<session-id>.txt`.
+Claude Code's debug log is at `~/.claude/debug/<session-id>.txt`.
 
-## Aufbau
+## Layout
 
 ```text
 src/
-  gateway.mjs        Einstieg: verbindet beide Seiten, beendet sich mit der Session
-  channel.mjs        stdio-Seite: Channel, reply-Tool, Permission-Relay
-  voice.mjs          HTTP-Seite: MCP-Tools für die Sprach-KI, Secret-Prüfung
-  store.mjs          Aufträge, Freigaben, Warten auf Änderungen
-  config.mjs         Umgebungsvariablen, Secret
-  log.mjs            Log nach stderr und Datei, nie nach stdout
+  gateway.mjs        entry point: wires both sides, exits with the session
+  channel.mjs        stdio side: channel, reply tool, permission relay
+  voice.mjs          HTTP side: MCP tools for the voice assistant, secret check
+  store.mjs          requests, approvals, waiting for changes
+  config.mjs         environment variables, secret
+  log.mjs            log to stderr and file, never to stdout
 controller/
-  .mcp.json          startet das Gateway als Server "voice"
-  .claude/settings.json   erlaubt mcp__voice__reply ohne Rückfrage
-  CLAUDE.md          Regeln für die Controller-Session
-  playground/        Arbeitsordner für Testaufträge
+  .mcp.json          starts the gateway as server "voice"
+  .claude/settings.json   allows mcp__voice__reply without a prompt
+  CLAUDE.md          rules for the controller session
+  playground/        working folder for test requests
 scripts/
-  start-controller.sh   Controller mit Development-Channel starten
-  funnel.sh          Tailscale Funnel starten, stoppen, URL ausgeben
-  fake-voice.mjs     Sprach-KI am Schreibtisch nachspielen
-  token.mjs          Secret anzeigen oder erzeugen
-test/e2e.test.mjs    Ende-zu-Ende-Test ohne Claude Code
-docs/*.drawio.svg    Diagramme: in GitHub als Bild, in draw.io bearbeitbar
+  start-controller.sh   start the controller with the development channel
+  funnel.sh          start or stop Tailscale Funnel, print the URL
+  fake-voice.mjs     play the voice assistant at the desk
+  token.mjs          show or create the secret
+test/e2e.test.mjs    end-to-end test without Claude Code
+docs/*.drawio.svg    diagrams: an image on GitHub, editable in draw.io
 ```
 
-## Grenzen und nächste Schritte
+## Limits and next steps
 
-- Nur eine Controller-Session, noch keine Worker. Nächster Schritt: pro Worker ein eigener kleiner
-  Channel mit eigenem Port, dazu Controller-Tools wie `list_workers`, `dispatch` und `worker_status`.
-- Ist der Controller beschäftigt, kommen neue Ereignisse gesammelt im nächsten Turn an. Für echte
-  Parallelität braucht es getrennte Sessions ([Channels-Referenz][ref]).
-- Zustand nur im Speicher; ein Neustart vergisst offene Aufträge.
-- Eigene Channels laufen während der Research Preview nur mit dem Development-Flag. Flag-Syntax und
-  Protokoll können sich ändern ([Channels][channels]).
+- One controller session only, no workers yet. Next step: a small channel with its own port per
+  worker, plus controller tools such as `list_workers`, `dispatch` and `worker_status`.
+- While the controller is busy, new events arrive together in its next turn. Real parallelism
+  needs separate sessions ([channels reference][ref]).
+- State lives in memory only; a restart forgets open requests.
+- During the research preview, custom channels only run with the development flag. Flag syntax and
+  protocol may change ([channels][channels]).
 
-## Quellen
+## Sources
 
-- [Claude Code: Channels][channels]
-- [Claude Code: Channels-Referenz][ref]
-- [Claude Code: Berechtigungen, Regeln für MCP-Tools][perm]
+- [Claude Code: channels][channels]
+- [Claude Code: channels reference][ref]
+- [Claude Code: permissions, rules for MCP tools][perm]
 - [Tailscale: `tailscale funnel`][funnel]
-- [xAI: Grok Connectors][grok]
-- [Claude: Voice-Modus mit verbundenen Tools][voice]
-- [talk-to-claude-code][t2cc]: Vorbild für Polling, Secret im Pfad und Voice-Tauglichkeit der Tool-Antworten
+- [xAI: Grok connectors][grok]
+- [Claude: voice mode with connected tools][voice]
+- [talk-to-claude-code][t2cc]: model for polling, the secret in the path and voice-friendly tool results
 
 [channels]: https://code.claude.com/docs/en/channels
 [ref]: https://code.claude.com/docs/en/channels-reference
