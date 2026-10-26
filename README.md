@@ -73,7 +73,7 @@ a new request that refers to the original `id`.
 git clone git@github.com:alderg/cc-voice-gateway.git
 cd cc-voice-gateway
 npm install
-npm test          # 12 tests, no Claude Code and no car needed
+npm test          # 14 tests, no Claude Code and no car needed
 ```
 
 `npm test` starts the gateway over stdio and plays both ends: Claude Code (channel events,
@@ -93,8 +93,13 @@ node scripts/fake-voice.mjs        # terminal 2: plays the voice assistant
 On the first start Claude Code asks in the terminal: trust for the folder, a warning about the
 development channel, and consent for the new MCP server from `.mcp.json`. Confirm all of them; the
 permission for `mcp__voice__reply` in `controller/.claude/settings.json` only applies once the
-folder is trusted. Run the session in the normal mode with prompts, not in auto mode, otherwise a
-classifier decides instead of you and there is no approval to relay.
+folder is trusted.
+
+The script starts the session in manual mode (`--permission-mode manual`), and
+`controller/.claude/settings.json` has ask rules for Bash, Write and Edit. Ask rules win over
+allow rules, so a user-wide `bypassPermissions` default or allow rules like `Bash(*)` in
+`~/.claude/settings.json` cannot approve these calls silently; otherwise there would be no
+approval to relay. Stay in manual mode: in auto mode a classifier decides instead of you.
 
 In the second terminal:
 
@@ -204,12 +209,14 @@ Claude Code starts the gateway, so environment variables go into `controller/.mc
 
 | Symptom | Cause and fix |
 |---|---|
+| Startup warning that channels are not enabled for the organisation | Team and Enterprise, including a Max seat in a Team organisation: an Owner enables Organization settings → Claude Code → Channels. `claude --debug` logs "the organization is team" in that case. In our test channels still worked without it until the session was started with `--setting-sources project,local`; do not rely on that. |
+| Channel event arrives, but no answer | The controller's turn failed, for example "Login expired". Look at the controller terminal; `/login` there. |
 | `status` reports `controller=unconfirmed`, `get_reply` shows a hint | Session started without `--dangerously-load-development-channels server:voice`, or the organisation blocks channels. Check `/mcp` in the session; otherwise Claude Code drops events silently. |
 | Connector asks for OAuth | URL without the secret in the path. It must be `…/mcp/<token>`. |
 | `EADDRINUSE` in the log | A second controller session is running. Start only one. |
 | Voice assistant answers itself instead of asking | Say "ask Claude Code …" explicitly. |
 | Voice assistant stops after the first `working` | Known risk with some clients. Stage 4 tests exactly this. |
-| No approval in the car | Session in auto mode, or it is a trust or consent dialog, which is not relayed. |
+| No approval in the car | Session in auto or bypass mode, an allow rule covers the tool, or it is a trust or consent dialog, which is not relayed. Start the session with `scripts/start-controller.sh`. |
 
 Claude Code's debug log is at `~/.claude/debug/<session-id>.txt`.
 
@@ -225,7 +232,7 @@ src/
   log.mjs            log to stderr and file, never to stdout
 controller/
   .mcp.json          starts the gateway as server "voice"
-  .claude/settings.json   allows mcp__voice__reply without a prompt
+  .claude/settings.json   allows mcp__voice__reply, always asks for Bash, Write, Edit
   CLAUDE.md          rules for the controller session
   playground/        working folder for test requests
 scripts/
@@ -233,7 +240,9 @@ scripts/
   funnel.sh          start or stop Tailscale Funnel, print the URL
   fake-voice.mjs     play the voice assistant at the desk
   token.mjs          show or create the secret
-test/e2e.test.mjs    end-to-end test without Claude Code
+test/
+  e2e.test.mjs       end-to-end test without Claude Code
+  start-controller.test.mjs   launcher flags and controller approval rules
 docs/*.drawio.svg    diagrams: an image on GitHub, editable in draw.io
 ```
 

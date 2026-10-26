@@ -3,5 +3,6 @@ node_modules/
 .logs/
 controller/playground/*
 !controller/playground/.gitkeep
+.claude/settings.local.json
 controller/.claude/settings.local.json
 .DS_Store

@@ -8,7 +8,7 @@
     "node": ">=20"
   },
   "scripts": {
-    "test": "node --test test/e2e.test.mjs",
+    "test": "node --test test/*.test.mjs",
     "token": "node scripts/token.mjs",
     "fake-voice": "node scripts/fake-voice.mjs"
   },

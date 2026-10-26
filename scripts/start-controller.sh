@@ -7,9 +7,20 @@
 # terminal: the development-channel warning and the consent for the new MCP
 # server from .mcp.json.
 #
+# The session runs in manual mode, whatever defaultMode the user settings set,
+# and controller/.claude/settings.json has ask rules for Bash, Write and Edit,
+# which win over allow rules such as Bash(*) in ~/.claude/settings.json.
+# Otherwise every tool call could be approved silently: nothing would be
+# relayed to the car, and whoever knows the connector URL could run commands
+# unasked. (Do not drop the user settings with --setting-sources instead: then
+# Claude Code reports channels as not enabled for the organisation.)
+#
 # For an always-on setup run it inside tmux:
 #   tmux new -s voice scripts/start-controller.sh
 
 set -euo pipefail
 cd "$(dirname "$0")/../controller"
-exec claude --dangerously-load-development-channels server:voice "$@"
+exec claude \
+  --permission-mode manual \
+  --dangerously-load-development-channels server:voice \
+  "$@"

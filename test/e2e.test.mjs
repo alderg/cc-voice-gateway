@@ -163,9 +163,18 @@ test('rejects requests without the secret with a bare 404', async () => {
   assert.equal(get.status, 405)
 })
 
-test('status works before the controller ever answered', async () => {
+test('status and the hint work before the controller ever answered', async () => {
   const out = await voiceCall('status')
   assert.match(out, /^\[gateway=ok controller=unconfirmed/)
+
+  // Seen with a real session: the event arrived, but the turn failed with
+  // "Login expired", so the hint must not only blame the channel flag.
+  const id = idOf(await voiceCall('send', { message: 'Hört mich jemand?' }))
+  const hint = await voiceCall('get_reply', { id, wait_seconds: 2 })
+  assert.match(hint, /^\[state=sent /)
+  assert.match(hint, /noch nie geantwortet/)
+  assert.match(hint, /--dangerously-load-development-channels server:voice/)
+  assert.match(hint, /Login abgelaufen/)
 })
 
 test('send -> channel event -> reply(working, done) -> get_reply', async () => {
@@ -233,6 +242,12 @@ test('permission relay: prompt -> get_reply -> approve -> verdict to Claude Code
 
   const out = await voiceCall('get_reply', { id, wait_seconds: 3 })
   assert.match(out, /approval=abcde/)
+  // Seen with a real session: Claude Code waits for the driver here, so the
+  // "nothing happens" hint (hint after 1 s in this test) must stay out.
+  await new Promise(r => setTimeout(r, 1100))
+  const waiting = await voiceCall('get_reply', { id, wait_seconds: 1 })
+  assert.match(waiting, /approval=abcde/)
+  assert.doesNotMatch(waiting, /Hinweis:/)
   assert.match(out, /Freigabe nötig \(code=abcde\): Write – Create playground\/hallo\.txt/)
   assert.match(out, /Ohne ausdrückliches Ja/)
 
@@ -284,5 +299,6 @@ test('get_reply on an unknown id and the hint when nothing happens', async () =>
   const out = await voiceCall('get_reply', { id, wait_seconds: 2 })
   assert.match(out, /^\[state=sent /)
   assert.match(out, /Hinweis: Claude Code hat den Auftrag noch nicht aufgenommen/)
+  assert.match(out, /Login abgelaufen/)
   assert.match(await voiceCall('status'), /controller=confirmed/)
 })

@@ -44,17 +44,23 @@ const call = async (name, args = {}) => {
 
 const stateOf = text => /^\[state=([a-z]+)/.exec(text)?.[1]
 
+// Returns true if the caller should keep polling: still running and no approval waiting.
+function keepPolling(id, text) {
+  const state = stateOf(text)
+  if (state === 'question') lastQuestionId = id
+  if (state !== 'working' && state !== 'sent') return false
+  if (/approval=/.test(text)) {
+    console.log('(Freigabe offen: mit allow/deny <code> beantworten, danach "follow")')
+    return false
+  }
+  return true
+}
+
 async function follow(id) {
   for (;;) {
     const { text } = await call('get_reply', { id })
     console.log(text + '\n')
-    const state = stateOf(text)
-    if (state === 'question') lastQuestionId = id
-    if (state !== 'working' && state !== 'sent') return
-    if (/approval=/.test(text)) {
-      console.log('(Freigabe offen: mit allow/deny <code> beantworten, danach "send" oder "follow")')
-      return
-    }
+    if (!keepPolling(id, text)) return
   }
 }
 
@@ -79,7 +85,7 @@ for await (const raw of rl) {
         const { text } = await call('ask', { message: arg })
         console.log(text + '\n')
         lastId = /id=([a-z0-9]+)/.exec(text)?.[1] ?? lastId
-        if (['working', 'sent'].includes(stateOf(text))) await follow(lastId)
+        if (keepPolling(lastId, text)) await follow(lastId)
         break
       }
       case 'send':

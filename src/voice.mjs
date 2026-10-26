@@ -84,12 +84,15 @@ function report(store, request, settings) {
       )
       break
     default: {
-      if (request.state === 'sent' && elapsed >= settings.hintAfterSeconds) {
+      // While an approval is open, Claude Code is waiting for the driver, not stuck.
+      if (request.state === 'sent' && !permissions.length && elapsed >= settings.hintAfterSeconds) {
         lines.push(
           store.controllerLastReplyAt === null
-            ? 'Hinweis: Claude Code hat seit dem Start des Gateways noch nie geantwortet. Läuft die Controller-Session ' +
-                'mit --dangerously-load-development-channels server:voice?'
-            : 'Hinweis: Claude Code hat den Auftrag noch nicht aufgenommen, vermutlich ist die Session noch beschäftigt.',
+            ? 'Hinweis: Claude Code hat seit dem Start des Gateways noch nie geantwortet. Im Terminal der ' +
+                'Controller-Session nachsehen: fehlt --dangerously-load-development-channels server:voice, ist das ' +
+                'Login abgelaufen oder ist der Turn mit einem Fehler abgebrochen?'
+            : 'Hinweis: Claude Code hat den Auftrag noch nicht aufgenommen. Vermutlich ist die Session noch ' +
+                'beschäftigt, oder ihr Turn ist mit einem Fehler abgebrochen, etwa weil das Login abgelaufen ist.',
         )
       }
       lines.push(`Noch in Arbeit. Sag dem Nutzer kurz Bescheid und ruf get_reply erneut mit id=${request.id} auf.`)
