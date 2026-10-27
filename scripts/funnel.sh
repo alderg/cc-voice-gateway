@@ -39,7 +39,20 @@ connector_url() {
 
 case "${1:-start}" in
   start)
-    tailscale funnel --bg --https="$FUNNEL_PORT" "http://127.0.0.1:${PORT}"
+    if ! out="$(tailscale funnel --bg --https="$FUNNEL_PORT" "http://127.0.0.1:${PORT}" 2>&1)"; then
+      echo "$out" >&2
+      if grep -q 'Access denied' <<<"$out"; then
+        echo "Einmalig 'sudo tailscale set --operator=\$USER' ausführen, dann geht es ohne sudo." >&2
+      fi
+      exit 1
+    fi
+    echo "$out"
+    # The first HTTPS request makes Tailscale fetch the certificate, which can
+    # take a while; do it now instead of during the first connector call.
+    host="$(dns_name)"
+    if ! curl -fsS -o /dev/null --max-time 90 "https://${host}:${FUNNEL_PORT}/healthz"; then
+      echo "Hinweis: https://${host}:${FUNNEL_PORT}/healthz antwortet noch nicht (Zertifikat oder Controller?)." >&2
+    fi
     echo
     echo "Connector-URL (geheim halten, enthält das Secret):"
     connector_url

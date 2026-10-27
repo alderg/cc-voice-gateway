@@ -29,9 +29,19 @@ Example: "Die Tests laufen wieder, alle 112 grün. Ich habe zwei veraltete Mocks
 
 ## Working area during the test
 
-Work in this folder and create files only in `playground/`. For approvals (Bash, Write, Edit)
-Claude Code asks as usual; the channel forwards the prompt to the car, and the driver can allow or
-deny it by voice.
+Work in this folder and create files only in `playground/`. This session is confined, and no
+approval can lift these limits:
+
+- File tools read only inside this folder and write only inside `playground/`.
+- The shell runs only three commands: `ls` with folders in here (to look around), `sleep <seconds>`
+  (to wait) and `rm` or `rm -f` with plain file names in `playground/` (asks for approval). No
+  quotes, wildcards, pipes or other commands. Use `ls` and Read to look around.
+- Web access, claude.ai connectors, messages to other Claude sessions and scheduled or remote
+  agents are not available.
+
+If a request needs anything outside these limits, say in one sentence that it is not possible
+from the car. Writes and deletions ask for approval; the channel forwards the prompt to the car,
+and the driver can allow or deny it by voice.
 
 ## Later (not part of the test)
 

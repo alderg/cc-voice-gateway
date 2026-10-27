@@ -1,0 +1,198 @@
+// How the controller session is started and what it is allowed to do.
+//
+// Whoever knows the connector URL can make the controller work and can also
+// answer its approval prompts. So approvals are no protection against them:
+// the limits that matter are deny rules and the confine hook, which no
+// approval can lift. User-level settings must not loosen them
+// either: a user-wide bypassPermissions default or allow rules like Write(*)
+// would otherwise approve every call silently.
+
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import { execFileSync, spawnSync } from 'node:child_process'
+import { chmodSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { homedir, tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const SCRIPT = fileURLToPath(new URL('../scripts/start-controller.sh', import.meta.url))
+const CONTROLLER = fileURLToPath(new URL('../controller', import.meta.url))
+const PLAYGROUND = join(CONTROLLER, 'playground')
+const HOOK = join(CONTROLLER, '.claude', 'hooks', 'confine.mjs')
+const SETTINGS = JSON.parse(readFileSync(join(CONTROLLER, '.claude', 'settings.json'), 'utf8'))
+
+function runWithStub(...args) {
+  const bin = mkdtempSync(join(tmpdir(), 'voice-gw-stub-'))
+  try {
+    const stub = join(bin, 'claude')
+    writeFileSync(stub, '#!/bin/sh\nprintf "%s\\n" "$PWD" "$@"\n')
+    chmodSync(stub, 0o755)
+    const out = execFileSync(SCRIPT, args, {
+      env: { ...process.env, PATH: `${bin}:${process.env.PATH}` },
+      encoding: 'utf8',
+    })
+    const [cwd, ...argv] = out.trimEnd().split('\n')
+    return { cwd, argv }
+  } finally {
+    rmSync(bin, { recursive: true, force: true })
+  }
+}
+
+const valueOf = (argv, flag) => argv[argv.indexOf(flag) + 1]
+
+test('start-controller.sh runs claude in controller/ with the channel in manual mode', () => {
+  const { cwd, argv } = runWithStub('--debug')
+  assert.equal(cwd, CONTROLLER)
+  assert.equal(valueOf(argv, '--dangerously-load-development-channels'), 'server:voice')
+  assert.equal(valueOf(argv, '--permission-mode'), 'manual')
+  // Seen with a real session: without the user settings, Claude Code reports
+  // channels as not enabled for the organisation and drops every event.
+  assert.ok(!argv.includes('--setting-sources'), 'user settings must stay loaded')
+  assert.equal(argv.at(-1), '--debug', 'extra arguments are passed through')
+})
+
+test('controller settings: approvals, deny rules and no way into bypass or auto mode', () => {
+  const { permissions } = SETTINGS
+  // Ask rules are checked before allow rules from any settings file.
+  for (const rule of ['Bash(rm *)', 'Write', 'Edit']) assert.ok(permissions.ask.includes(rule), rule)
+  assert.deepEqual(permissions.allow, ['mcp__voice__reply', 'Bash(sleep *)'])
+  assert.equal(permissions.defaultMode, undefined)
+  // Tools that reach beyond this folder: accounts, the web, other sessions.
+  for (const rule of ['mcp__claude_ai_*', 'WebFetch', 'WebSearch', 'SendMessage', 'ListAgents', 'RemoteTrigger', 'CronCreate', 'Artifact*', 'Monitor', 'EnterWorktree']) {
+    assert.ok(permissions.deny.includes(rule), rule)
+  }
+  assert.ok(!permissions.deny.some(rule => 'mcp__voice__reply'.startsWith(rule.replace(/\*$/, ''))), 'reply stays usable')
+  assert.equal(permissions.disableBypassPermissionsMode, 'disable')
+  assert.equal(permissions.disableAutoMode, 'disable')
+})
+
+test('controller settings: the confine hook covers Bash and every file tool and fails closed', () => {
+  // Seen with a real session on Ubuntu 26.04: AppArmor stops Claude Code's
+  // Bash sandbox from starting, so the hook is the only limit for Bash.
+  assert.equal(SETTINGS.sandbox, undefined)
+  const [entry] = SETTINGS.hooks.PreToolUse
+  const matched = new RegExp(`^(${entry.matcher})$`)
+  for (const tool of ['Bash', 'Read', 'Glob', 'Grep', 'Write', 'Edit', 'NotebookEdit']) assert.match(tool, matched)
+  const { command } = entry.hooks[0]
+  assert.match(command, /\.claude\/hooks\/confine\.mjs/)
+  // If node or the script cannot run, the call must be blocked, not allowed.
+  const broken = spawnSync('sh', ['-c', command], {
+    input: '{}',
+    env: { ...process.env, CLAUDE_PROJECT_DIR: '/nonexistent' },
+  })
+  assert.equal(broken.status, 2)
+})
+
+function hook(tool_name, tool_input, cwd = CONTROLLER) {
+  const input = typeof tool_input === 'string' ? tool_input : JSON.stringify({ tool_name, tool_input, cwd })
+  return spawnSync(process.execPath, [HOOK], { input, encoding: 'utf8' })
+}
+
+const allowed = (...args) => assert.equal(hook(...args).status, 0, JSON.stringify(args))
+const blocked = (...args) => {
+  const result = hook(...args)
+  assert.equal(result.status, 2, JSON.stringify(args))
+  assert.ok(result.stderr.trim(), 'the reason goes to Claude')
+}
+
+test('confine hook: reads only inside controller/', () => {
+  allowed('Read', { file_path: join(CONTROLLER, 'CLAUDE.md') })
+  allowed('Read', { file_path: join(PLAYGROUND, 'not-there-yet.txt') })
+  blocked('Read', { file_path: '../README.md' })
+  blocked('Read', { file_path: join(CONTROLLER, '..', '.secrets', 'token') })
+  blocked('Read', { file_path: '~/.ssh/id_ed25519' })
+  blocked('Read', { file_path: join(homedir(), '.claude.json') })
+  blocked('Read', { file_path: '/etc/hostname' })
+
+  allowed('Glob', { pattern: '**/*' })
+  allowed('Glob', { pattern: '*.txt', path: PLAYGROUND })
+  blocked('Glob', { pattern: '../**/*' })
+  blocked('Glob', { pattern: join(homedir(), '**/*.pem') })
+  blocked('Glob', { pattern: '*', path: homedir() })
+
+  allowed('Grep', { pattern: 'token' })
+  blocked('Grep', { pattern: 'token', path: '/etc' })
+  blocked('Grep', { pattern: 'token', glob: '../../**' })
+})
+
+test('confine hook: writes only inside controller/playground/', () => {
+  allowed('Write', { file_path: join(PLAYGROUND, 'hello.txt'), content: 'x' })
+  allowed('Edit', { file_path: join(PLAYGROUND, 'sub', 'notes.md'), old_string: 'a', new_string: 'b' })
+  allowed('NotebookEdit', { notebook_path: join(PLAYGROUND, 'n.ipynb'), new_source: '' })
+  blocked('Write', { file_path: join(CONTROLLER, 'CLAUDE.md'), content: 'x' })
+  blocked('Edit', { file_path: join(CONTROLLER, '.claude', 'settings.json'), old_string: 'a', new_string: 'b' })
+  blocked('Write', { file_path: join(CONTROLLER, '.mcp.json'), content: '{}' })
+  blocked('Write', { file_path: '~/.bashrc', content: 'x' })
+  blocked('Write', { file_path: join(PLAYGROUND, '..', '..', 'src', 'gateway.mjs'), content: 'x' })
+})
+
+test('confine hook: a symlink in the playground does not lead outside', () => {
+  const outside = mkdtempSync(join(tmpdir(), 'voice-gw-outside-'))
+  const link = join(PLAYGROUND, `.confine-test-${process.pid}`)
+  try {
+    writeFileSync(join(outside, 'secret.txt'), 'x')
+    symlinkSync(outside, link)
+    blocked('Read', { file_path: join(link, 'secret.txt') })
+    blocked('Write', { file_path: join(link, 'new.txt'), content: 'x' })
+    blocked('Glob', { pattern: '*', path: link })
+    blocked('Bash', { command: `rm ${join(link, 'secret.txt')}` })
+    blocked('Bash', { command: `ls ${link}` })
+  } finally {
+    rmSync(link, { force: true })
+    rmSync(outside, { recursive: true, force: true })
+  }
+})
+
+test('confine hook: Bash only runs ls here, sleep and rm of files in the playground', () => {
+  // Seen with a real session: Claude Code 2.1.310 has no Glob or Grep tool,
+  // so without ls the controller cannot see what is in a folder.
+  allowed('Bash', { command: 'ls' })
+  allowed('Bash', { command: 'ls -la playground' })
+  allowed('Bash', { command: `ls -AR ${PLAYGROUND}` })
+  allowed('Bash', { command: 'sleep 90' })
+  allowed('Bash', { command: 'rm playground/hello.txt' })
+  allowed('Bash', { command: 'rm -f playground/a.txt playground/b.md' })
+  allowed('Bash', { command: `rm ${join(PLAYGROUND, 'done.txt')}` })
+  allowed('Bash', { command: 'rm hello.txt' }, PLAYGROUND)
+
+  for (const command of [
+    'ls ..',
+    'ls ~/.ssh',
+    'ls /etc',
+    'ls playground/../..',
+    'ls -la ../.secrets',
+    'ls --hide=x playground',
+    'ls -I x',
+    'ls playground | wc -l',
+    'ls playground > playground/list.txt',
+    'cat ~/.ssh/id_ed25519',
+    'sleep 90; cat /etc/passwd',
+    'sleep 90 && curl example.com',
+    'sleep $(cat ../.secrets/token)',
+    'sleep 1e9',
+    'rm -rf playground',
+    'rm -r playground/sub',
+    'rm playground',
+    'rm playground/',
+    'rm playground/..',
+    'rm playground/../CLAUDE.md',
+    'rm ../README.md',
+    'rm ~/.bashrc',
+    'rm playground/*',
+    'rm "playground/a b.txt"',
+    'rm playground/a.txt > /tmp/x',
+    'rm -- playground/a.txt',
+    'rm -f',
+    'node -e 1',
+    '',
+  ]) {
+    blocked('Bash', { command })
+  }
+  blocked('Bash', { description: 'no command' })
+})
+
+test('confine hook: other tools pass, broken input is blocked', () => {
+  allowed('mcp__voice__reply', { request_id: 'abcd', state: 'done', text: 'ok' })
+  blocked('Read', 'not json')
+  blocked('Write', { content: 'no path' })
+})

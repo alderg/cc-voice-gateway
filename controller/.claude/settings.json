@@ -1,7 +1,35 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
   "permissions": {
-    "allow": ["mcp__voice__reply"],
-    "ask": ["Bash", "Write", "Edit", "NotebookEdit"]
+    "allow": ["mcp__voice__reply", "Bash(sleep *)"],
+    "ask": ["Bash(rm *)", "Write", "Edit", "NotebookEdit"],
+    "deny": [
+      "mcp__claude_ai_*",
+      "WebFetch",
+      "WebSearch",
+      "SendMessage",
+      "ListAgents",
+      "RemoteTrigger",
+      "CronCreate",
+      "Artifact*",
+      "Monitor",
+      "Workflow",
+      "EnterWorktree"
+    ],
+    "disableBypassPermissionsMode": "disable",
+    "disableAutoMode": "disable"
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Read|Glob|Grep|Write|Edit|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$CLAUDE_PROJECT_DIR/.claude/hooks/confine.mjs\" || exit 2"
+          }
+        ]
+      }
+    ]
   }
 }

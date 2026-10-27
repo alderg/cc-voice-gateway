@@ -63,7 +63,8 @@ a new request that refers to the original `id`.
 - Node.js 20 or newer (tested with 22) and npm
 - Claude Code with a claude.ai login, channels need v2.1.80 or later. Team and Enterprise
   organisations need an admin to enable channels; Pro and Max do not ([channels][channels]).
-- Tailscale with Funnel, or another HTTPS tunnel
+- Tailscale with Funnel, or another HTTPS tunnel. On Linux, run `sudo tailscale set --operator=$USER`
+  once so `scripts/funnel.sh` works without root.
 - A voice assistant with custom connectors: the Claude app (custom connectors on paid plans only)
   or Grok ([grok.com/connectors][grok])
 
@@ -73,7 +74,7 @@ a new request that refers to the original `id`.
 git clone git@github.com:alderg/cc-voice-gateway.git
 cd cc-voice-gateway
 npm install
-npm test          # 14 tests, no Claude Code and no car needed
+npm test          # 20 tests, no Claude Code and no car needed
 ```
 
 `npm test` starts the gateway over stdio and plays both ends: Claude Code (channel events,
@@ -122,6 +123,10 @@ scripts/funnel.sh start            # prints the connector URL
 node scripts/fake-voice.mjs "https://<host>.ts.net:8443/mcp/<token>"
 ```
 
+The first start fetches a certificate (the script triggers that with one request), and the public
+DNS name can take up to about ten minutes to appear. From inside the tailnet the name resolves to
+the machine's Tailscale address, so that test skips the public path.
+
 Best checked from another network, for example the phone's hotspot.
 
 ### Stage 2: connector in text chat
@@ -165,6 +170,22 @@ the tool here, that app is unsuitable for the car, however the server is built.
 - **Whoever knows the URL can make Claude Code work on your computer.** That includes a voice
   assistant that has been manipulated by prompt injection. Keep the URL secret and close the
   tunnel after testing (`scripts/funnel.sh stop`).
+- **Tailscale Funnel is public.** It needs no open port on your router, but anyone on the
+  internet can reach the mapped port, and the host name is published in the certificate
+  transparency logs. Funnel has no authentication of its own; the secret in the path is the only
+  key.
+- **The controller session is confined**, because whoever has the URL can also answer approval
+  prompts (see below). These limits hold whatever is approved:
+  - File tools read only inside `controller/` and write only inside `controller/playground/`
+    (PreToolUse hook `controller/.claude/hooks/confine.mjs`, resolves symlinks, fails closed).
+  - Bash runs only `ls` inside `controller/`, `sleep <seconds>` and `rm [-f]` with plain file
+    names in `playground/` (same hook). Claude Code's own Bash sandbox would allow more, but on Ubuntu 24.04 and later
+    AppArmor's `bwrap-userns-restrict` profile stops it from starting ([sandboxing][sandbox]).
+  - Denied: claude.ai connectors (Gmail, Slack, Drive, …), web fetch and search, messages to
+    other Claude sessions, remote and scheduled agents, artifacts, Monitor, workflows and
+    worktrees. Bypass and auto mode cannot be switched on.
+  - What is left: reading `controller/`, and writing or deleting in the playground with an
+    approval. The answers go back to the voice assistant.
 - New secret: delete `.secrets/token`, restart the controller, update the connector URL.
 - The gateway binds to `127.0.0.1` only. Requests without a valid secret get a bare 404, so
   clients do not start an OAuth flow.
@@ -173,7 +194,8 @@ the tool here, that app is unsuitable for the car, however the server is built.
   with `VOICE_GW_PERMISSION_RELAY=0`.
 - Claude Code masks recognisable credentials in relayed approval texts, but not every secret
   ([channels reference][ref]).
-- Do not start with `--dangerously-skip-permissions`, and work only in the test folder `controller/`.
+- Start the controller only with `scripts/start-controller.sh`, never with
+  `--dangerously-skip-permissions`.
 
 ## Configuration
 
@@ -232,7 +254,8 @@ src/
   log.mjs            log to stderr and file, never to stdout
 controller/
   .mcp.json          starts the gateway as server "voice"
-  .claude/settings.json   allows mcp__voice__reply, always asks for Bash, Write, Edit
+  .claude/settings.json   approvals, deny rules, confine hook
+  .claude/hooks/confine.mjs   file tools inside controller/ (writes: playground/), Bash allowlist
   CLAUDE.md          rules for the controller session
   playground/        working folder for test requests
 scripts/
@@ -242,7 +265,7 @@ scripts/
   token.mjs          show or create the secret
 test/
   e2e.test.mjs       end-to-end test without Claude Code
-  start-controller.test.mjs   launcher flags and controller approval rules
+  controller.test.mjs   launcher flags, controller settings, confine hook
 docs/*.drawio.svg    diagrams: an image on GitHub, editable in draw.io
 ```
 
@@ -261,6 +284,7 @@ docs/*.drawio.svg    diagrams: an image on GitHub, editable in draw.io
 - [Claude Code: channels][channels]
 - [Claude Code: channels reference][ref]
 - [Claude Code: permissions, rules for MCP tools][perm]
+- [Claude Code: sandboxing][sandbox]
 - [Tailscale: `tailscale funnel`][funnel]
 - [xAI: Grok connectors][grok]
 - [Claude: voice mode with connected tools][voice]
@@ -269,6 +293,7 @@ docs/*.drawio.svg    diagrams: an image on GitHub, editable in draw.io
 [channels]: https://code.claude.com/docs/en/channels
 [ref]: https://code.claude.com/docs/en/channels-reference
 [perm]: https://code.claude.com/docs/en/permissions
+[sandbox]: https://code.claude.com/docs/en/sandboxing
 [funnel]: https://tailscale.com/docs/reference/tailscale-cli/funnel
 [grok]: https://docs.x.ai/grok/connectors
 [voice]: https://support.claude.com/en/articles/11101966-use-voice-mode
