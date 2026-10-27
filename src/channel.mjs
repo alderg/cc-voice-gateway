@@ -32,7 +32,7 @@ They were spoken in a car and relayed by a voice assistant. Every one of them ne
   click a form in the car. The driver's answer arrives as a new channel message.
 - state "done": the final answer for this request_id.
 
-The text is read aloud while driving: answer in the driver's language (German unless they speak another),
+The text is read aloud while driving: answer in the language of the request,
 at most three short sentences, no code, no file paths, no URLs, no markdown, no lists. Lead with the result.
 Round numbers. If the driver asks for details, give them in a follow-up, still short.
 `.trim()

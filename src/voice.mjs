@@ -34,18 +34,22 @@ const text = (body, isError = false) => ({ content: [{ type: 'text', text: body 
 
 const clamp = (value, min, max) => Math.min(Math.max(value, min), max)
 
+const plural = (n, unit) => `${n} ${unit}${n === 1 ? '' : 's'}`
+
 function ago(timestamp) {
   const seconds = Math.round((Date.now() - timestamp) / 1000)
-  if (seconds < 90) return `vor ${seconds} Sekunden`
+  if (seconds < 90) return `${plural(seconds, 'second')} ago`
   const minutes = Math.round(seconds / 60)
-  if (minutes < 90) return `vor ${minutes} Minuten`
-  return `vor ${Math.round(minutes / 60)} Stunden`
+  if (minutes < 90) return `${plural(minutes, 'minute')} ago`
+  return `${plural(Math.round(minutes / 60), 'hour')} ago`
 }
 
 function describePermission(permission) {
   const details = preview(permission.inputPreview || '', 200)
+  // Claude Code's descriptions often end with a full stop already.
+  const description = String(permission.description).replace(/[\s.]+$/, '')
   return (
-    `Freigabe nötig (code=${permission.code}): ${permission.toolName} – ${permission.description}` +
+    `Approval needed (code=${permission.code}): ${permission.toolName} – ${description}` +
     (details ? `. Details: ${details}` : '')
   )
 }
@@ -68,18 +72,18 @@ function report(store, request, settings) {
 
   if (permissions.length) {
     lines.push(
-      'Lies dem Nutzer die Freigabe vor und frag: erlauben oder ablehnen? Ruf danach approve mit dem code auf. ' +
-        'Ohne ausdrückliches Ja nichts freigeben.',
+      'Read the approval to the user and ask: allow or deny? Then call approve with the code. ' +
+        'Approve nothing without an explicit yes.',
     )
   }
 
   switch (request.state) {
     case 'done':
-      lines.push(fresh.length ? 'Fertig. Lies die Antwort vor.' : 'Fertig, keine neuen Nachrichten.')
+      lines.push(fresh.length ? 'Done. Read the answer to the user.' : 'Done, no new messages.')
       break
     case 'question':
       lines.push(
-        `Claude Code wartet auf eine Entscheidung. Lies die Frage vor und schick die Antwort des Nutzers mit send ` +
+        `Claude Code is waiting for a decision. Read the question to the user and send their answer with send ` +
           `(in_reply_to=${request.id}).`,
       )
       break
@@ -88,14 +92,14 @@ function report(store, request, settings) {
       if (request.state === 'sent' && !permissions.length && elapsed >= settings.hintAfterSeconds) {
         lines.push(
           store.controllerLastReplyAt === null
-            ? 'Hinweis: Claude Code hat seit dem Start des Gateways noch nie geantwortet. Im Terminal der ' +
-                'Controller-Session nachsehen: fehlt --dangerously-load-development-channels server:voice, ist das ' +
-                'Login abgelaufen oder ist der Turn mit einem Fehler abgebrochen?'
-            : 'Hinweis: Claude Code hat den Auftrag noch nicht aufgenommen. Vermutlich ist die Session noch ' +
-                'beschäftigt, oder ihr Turn ist mit einem Fehler abgebrochen, etwa weil das Login abgelaufen ist.',
+            ? 'Hint: Claude Code has not answered once since the gateway started. Check the terminal of the ' +
+                'controller session: is --dangerously-load-development-channels server:voice missing, has the ' +
+                'login expired, or did the turn fail with an error?'
+            : 'Hint: Claude Code has not picked up the request yet. The session is probably still busy, or its ' +
+                'turn failed with an error, for example because the login expired.',
         )
       }
-      lines.push(`Noch in Arbeit. Sag dem Nutzer kurz Bescheid und ruf get_reply erneut mit id=${request.id} auf.`)
+      lines.push(`Still working. Tell the user briefly and call get_reply again with id=${request.id}.`)
     }
   }
   return lines.join('\n')
@@ -123,16 +127,17 @@ function statusText(store, settings) {
     `[gateway=ok controller=${confirmed ? 'confirmed' : 'unconfirmed'} open=${open.length} ` +
       `approvals=${permissions.length} relay=${settings.permissionRelay ? 'on' : 'off'} uptime=${uptime}m]`,
     confirmed
-      ? `Gateway erreichbar. Claude Code hat zuletzt ${ago(store.controllerLastReplyAt)} geantwortet.`
-      : 'Gateway erreichbar. Claude Code hat seit dem Start noch nie geantwortet; ein kurzer Auftrag mit ask zeigt, ob der Kanal funktioniert.',
+      ? `Gateway reachable. Claude Code last answered ${ago(store.controllerLastReplyAt)}.`
+      : 'Gateway reachable. Claude Code has not answered since the gateway started; a short request with ask ' +
+        'shows whether the channel works.',
   ]
   if (open.length) {
     lines.push(
-      'Offene Aufträge: ' + open.map(r => `${r.id} (${r.state}, „${preview(r.text, 40)}“)`).join('; '),
+      'Open requests: ' + open.map(r => `${r.id} (${r.state}, "${preview(r.text, 40)}")`).join('; '),
     )
   }
   if (permissions.length) {
-    lines.push('Offene Freigaben: ' + permissions.map(p => `${p.code} (${p.toolName})`).join('; '))
+    lines.push('Pending approvals: ' + permissions.map(p => `${p.code} (${p.toolName})`).join('; '))
   }
   return lines.join('\n')
 }
@@ -142,7 +147,7 @@ function buildVoiceServer(store, channel, settings) {
   const mcp = new McpServer({ name: 'claude-code-voice', version: VERSION }, { instructions: VOICE_INSTRUCTIONS })
 
   const enqueue = async (message, inReplyTo) => {
-    const textForController = inReplyTo ? `(Antwort auf ${inReplyTo}) ${message}` : message
+    const textForController = inReplyTo ? `(Answer to ${inReplyTo}) ${message}` : message
     const request = store.createRequest(textForController)
     await channel.push(request)
     return request
@@ -163,7 +168,7 @@ function buildVoiceServer(store, channel, settings) {
   mcp.registerTool(
     'send',
     {
-      title: 'An Claude Code senden',
+      title: 'Send to Claude Code',
       description:
         'Send the user\'s request to Claude Code on their computer. ' +
         RELAY_RULE +
@@ -179,14 +184,14 @@ function buildVoiceServer(store, channel, settings) {
     },
     async ({ message, in_reply_to }) => {
       const request = await enqueue(message, in_reply_to)
-      return text(`[state=sent id=${request.id}] Übergeben. Ruf jetzt get_reply mit id=${request.id} auf.`)
+      return text(`[state=sent id=${request.id}] Handed over. Now call get_reply with id=${request.id}.`)
     },
   )
 
   mcp.registerTool(
     'ask',
     {
-      title: 'Claude Code fragen',
+      title: 'Ask Claude Code',
       description:
         'Send a short question to Claude Code and wait up to about 40 seconds for the answer in one call. ' +
         RELAY_RULE +
@@ -205,7 +210,7 @@ function buildVoiceServer(store, channel, settings) {
   mcp.registerTool(
     'get_reply',
     {
-      title: 'Antwort abholen',
+      title: 'Get reply',
       description:
         'Wait for news on a request sent with send or ask, then return what Claude Code said since the last call. ' +
         'The first line is machine-readable: [state=... id=...]. state=sent or working: tell the user briefly ' +
@@ -227,7 +232,7 @@ function buildVoiceServer(store, channel, settings) {
     async ({ id, wait_seconds }, extra) => {
       const request = store.getRequest(id)
       if (!request) {
-        return text(`[state=unknown id=${id}] Diesen Auftrag kenne ich nicht. Mit send einen neuen starten.`)
+        return text(`[state=unknown id=${id}] Unknown request. Start a new one with send.`)
       }
       const wait = clamp(wait_seconds ?? settings.defaultWaitSeconds, 1, settings.maxWaitSeconds)
       return waitAndReport(store, request, wait, extra.signal, settings)
@@ -238,7 +243,7 @@ function buildVoiceServer(store, channel, settings) {
     mcp.registerTool(
       'approve',
       {
-        title: 'Freigabe beantworten',
+        title: 'Answer approval',
         description:
           'Answer a permission prompt from Claude Code, for example running a shell command or writing a file. ' +
           'Only call this after you read the request to the user and they explicitly said yes (allow) or no ' +
@@ -255,13 +260,13 @@ function buildVoiceServer(store, channel, settings) {
       async ({ code, decision }) => {
         const permission = store.resolvePermission(code, decision)
         if (!permission) {
-          return text(`[approval=unknown code=${code}] Diese Freigabe ist unbekannt oder schon erledigt.`)
+          return text(`[approval=unknown code=${code}] This approval is unknown or already answered.`)
         }
         await channel.sendVerdict(permission.code, decision)
         return text(
           decision === 'allow'
-            ? `[approval=allow code=${permission.code}] Erlaubt. Claude Code arbeitet weiter; ruf get_reply auf.`
-            : `[approval=deny code=${permission.code}] Abgelehnt.`,
+            ? `[approval=allow code=${permission.code}] Allowed. Claude Code continues; call get_reply.`
+            : `[approval=deny code=${permission.code}] Denied.`,
         )
       },
     )
@@ -282,6 +287,50 @@ function authenticate(req, url, token) {
   return tokenMatches(token, bearer) || tokenMatches(token, url.searchParams.get('token') || '')
 }
 
+const MAX_BODY_BYTES = 1024 * 1024
+
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = []
+    let size = 0
+    req.on('data', chunk => {
+      size += chunk.length
+      if (size > MAX_BODY_BYTES) {
+        reject(Object.assign(new Error('body too large'), { status: 413 }))
+        req.destroy()
+        return
+      }
+      chunks.push(chunk)
+    })
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')))
+    req.on('error', reject)
+  })
+}
+
+// One log line per JSON-RPC message, so a test in the car can tell whether the
+// voice assistant called the connector at all, and which tool. Message texts are
+// logged by the channel side (push) only when a request reaches the controller.
+function logCall(req, body) {
+  for (const message of Array.isArray(body) ? body : [body]) {
+    const method = message?.method
+    if (!method || method.startsWith('notifications/')) continue
+    if (method === 'initialize') {
+      const client = message.params?.clientInfo ?? {}
+      log(
+        'voice initialize',
+        `client=${client.name ?? '?'}/${client.version ?? '?'}`,
+        `protocol=${message.params?.protocolVersion ?? '?'}`,
+        `ua=${JSON.stringify(preview(req.headers['user-agent'] ?? '', 60))}`,
+        `from=${req.headers['x-forwarded-for'] ?? req.socket.remoteAddress}`,
+      )
+    } else if (method === 'tools/call') {
+      log('voice tools/call', message.params?.name ?? '?')
+    } else {
+      log('voice', method)
+    }
+  }
+}
+
 export function startVoiceHttp(store, channel, settings) {
   const server = createServer(async (req, res) => {
     const url = new URL(req.url || '/', 'http://localhost')
@@ -297,9 +346,22 @@ export function startVoiceHttp(store, channel, settings) {
     }
     if (req.method !== 'POST') {
       // Stateless server: no standalone SSE stream (GET) and no sessions (DELETE).
+      log('voice', req.method, '-> 405, POST only')
       res.writeHead(405, { allow: 'POST' }).end()
       return
     }
+
+    let body
+    try {
+      body = JSON.parse(await readBody(req))
+    } catch (error) {
+      log('voice request unreadable:', error.message)
+      const status = error.status ?? 400
+      res.writeHead(status, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32700, message: 'Parse error' }, id: null }))
+      return
+    }
+    logCall(req, body)
 
     const mcp = buildVoiceServer(store, channel, settings)
     const transport = new StreamableHTTPServerTransport({
@@ -312,7 +374,7 @@ export function startVoiceHttp(store, channel, settings) {
     })
     try {
       await mcp.connect(transport)
-      await transport.handleRequest(req, res)
+      await transport.handleRequest(req, res, body)
     } catch (error) {
       log('voice request failed', error?.message || String(error))
       if (!res.headersSent) res.writeHead(500).end()

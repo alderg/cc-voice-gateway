@@ -13,7 +13,7 @@ Every request needs an answer through the `reply` tool with the same `request_id
   right away, then roughly one per minute.
 - `state: "question"`: you need a decision. Ask in plain text, name the options in one sentence,
   then end your turn. No AskUserQuestion, no plan mode: nobody can click a form in the car. The
-  answer arrives as a new channel message starting with "(Antwort auf <id>)".
+  answer arrives as a new channel message starting with "(Answer to <id>)".
 - `state: "done"`: the final answer.
 
 ## What a good answer sounds like
@@ -23,9 +23,9 @@ The text is read aloud while driving:
 - at most three short sentences, result first
 - no code, no file paths, no URLs, no markdown, no lists
 - round numbers ("about 40 files"), technical terms only when needed
-- the driver's language, German by default
+- the language of the request
 
-Example: "Die Tests laufen wieder, alle 112 grün. Ich habe zwei veraltete Mocks ersetzt."
+Example: "The tests pass again, all 112 green. I replaced two outdated mocks."
 
 ## Working area during the test
 

@@ -30,7 +30,7 @@ connector_url() {
   host="$(dns_name)"
   token="$(node "$ROOT/scripts/token.mjs" --quiet)"
   if [ -z "$host" ]; then
-    echo "Tailscale-Hostname nicht gefunden. Ist 'tailscale up' gelaufen?" >&2
+    echo "Tailscale host name not found. Has 'tailscale up' run?" >&2
     exit 1
   fi
   [ "$FUNNEL_PORT" != "443" ] && suffix=":$FUNNEL_PORT"
@@ -42,7 +42,7 @@ case "${1:-start}" in
     if ! out="$(tailscale funnel --bg --https="$FUNNEL_PORT" "http://127.0.0.1:${PORT}" 2>&1)"; then
       echo "$out" >&2
       if grep -q 'Access denied' <<<"$out"; then
-        echo "Einmalig 'sudo tailscale set --operator=\$USER' ausführen, dann geht es ohne sudo." >&2
+        echo "Run 'sudo tailscale set --operator=\$USER' once, then this works without sudo." >&2
       fi
       exit 1
     fi
@@ -51,10 +51,10 @@ case "${1:-start}" in
     # take a while; do it now instead of during the first connector call.
     host="$(dns_name)"
     if ! curl -fsS -o /dev/null --max-time 90 "https://${host}:${FUNNEL_PORT}/healthz"; then
-      echo "Hinweis: https://${host}:${FUNNEL_PORT}/healthz antwortet noch nicht (Zertifikat oder Controller?)." >&2
+      echo "Note: https://${host}:${FUNNEL_PORT}/healthz does not answer yet (certificate or controller?)." >&2
     fi
     echo
-    echo "Connector-URL (geheim halten, enthält das Secret):"
+    echo "Connector URL (keep it private, it contains the secret):"
     connector_url
     ;;
   stop)

@@ -74,7 +74,7 @@ a new request that refers to the original `id`.
 git clone git@github.com:alderg/cc-voice-gateway.git
 cd cc-voice-gateway
 npm install
-npm test          # 20 tests, no Claude Code and no car needed
+npm test          # 22 tests, no Claude Code and no car needed
 ```
 
 `npm test` starts the gateway over stdio and plays both ends: Claude Code (channel events,
@@ -108,13 +108,15 @@ In the second terminal:
 > status
 > ask How many files are in the playground?
 > send Create the file hello.txt in the playground with the text Grüezi
-  … [state=working … approval=abcde] Freigabe nötig (code=abcde): Write …
+  … [state=sent … approval=abcde] Approval needed (code=abcde): Write – …
 > allow abcde
 > follow
 ```
 
-The gateway's tool results are in German for now; the voice assistant speaks in your language
-either way. The log is in `.logs/gateway.log`.
+The gateway's tool results are in English; the voice assistant speaks in your language either
+way, and the controller answers in the language of the request. The log is in `.logs/gateway.log`;
+it has one line per connector call (`voice initialize client=…`, `voice tools/list`,
+`voice tools/call ask`), so you can see whether a voice assistant called the connector at all.
 
 ### Stage 1: tunnel
 
@@ -237,6 +239,7 @@ Claude Code starts the gateway, so environment variables go into `controller/.mc
 | Connector asks for OAuth | URL without the secret in the path. It must be `…/mcp/<token>`. |
 | `EADDRINUSE` in the log | A second controller session is running. Start only one. |
 | Voice assistant answers itself instead of asking | Say "ask Claude Code …" explicitly. |
+| Voice assistant says the connector does not work | Look at `.logs/gateway.log`. No `voice initialize`: the request never arrived (URL, Funnel, DNS). `initialize` and `tools/list` but no `tools/call`: the assistant chose not to call a tool. `rejected`: wrong URL or token. |
 | Voice assistant stops after the first `working` | Known risk with some clients. Stage 4 tests exactly this. |
 | No approval in the car | Session in auto or bypass mode, an allow rule covers the tool, or it is a trust or consent dialog, which is not relayed. Start the session with `scripts/start-controller.sh`. |
 

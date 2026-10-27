@@ -24,6 +24,7 @@ let claudeCode // MCP client on the stdio side, standing in for Claude Code
 let voice // MCP client on the HTTP side, standing in for the voice assistant
 const channelEvents = []
 const verdicts = []
+let gatewayLog = '' // the gateway's stderr
 const waiters = new Set()
 
 function freePort() {
@@ -97,22 +98,25 @@ before(async () => {
       notify()
     },
   )
-  await claudeCode.connect(
-    new StdioClientTransport({
-      command: process.execPath,
-      args: [GATEWAY],
-      env: {
-        ...process.env,
-        VOICE_GW_TOKEN: TOKEN,
-        VOICE_GW_PORT: String(port),
-        VOICE_GW_MAX_WAIT: '3',
-        VOICE_GW_DEFAULT_WAIT: '2',
-        VOICE_GW_HINT_AFTER: '1',
-        VOICE_GW_LOG_FILE: '',
-      },
-      stderr: 'ignore',
-    }),
-  )
+  const stdio = new StdioClientTransport({
+    command: process.execPath,
+    args: [GATEWAY],
+    env: {
+      ...process.env,
+      VOICE_GW_TOKEN: TOKEN,
+      VOICE_GW_PORT: String(port),
+      VOICE_GW_MAX_WAIT: '3',
+      VOICE_GW_DEFAULT_WAIT: '2',
+      VOICE_GW_HINT_AFTER: '1',
+      VOICE_GW_LOG_FILE: '',
+    },
+    stderr: 'pipe',
+  })
+  stdio.stderr.on('data', chunk => {
+    gatewayLog += chunk
+    notify()
+  })
+  await claudeCode.connect(stdio)
 
   // The HTTP side starts right after the stdio handshake.
   for (let i = 0; i < 50; i++) {
@@ -146,6 +150,29 @@ test('voice endpoint exposes the voice tools', async () => {
   assert.deepEqual(tools.map(t => t.name).sort(), ['approve', 'ask', 'get_reply', 'send', 'status'])
 })
 
+test('logs every voice call with client, method and tool, never the secret', async () => {
+  // In the car the question is whether the assistant called the connector at
+  // all; these lines answer it even when no request reaches the controller.
+  await voiceCall('status')
+  const logged = await waitUntil(() => gatewayLog.includes('voice tools/call status') && gatewayLog)
+  assert.match(logged, /voice initialize client=fake-voice\/0\.0\.0 protocol=\S+ ua="[^"]*" from=/)
+  assert.match(logged, /voice tools\/list/)
+  assert.ok(!logged.includes(TOKEN), 'the secret never reaches the log')
+})
+
+test('answers unreadable and oversized bodies with a JSON-RPC parse error', async () => {
+  const headers = { 'content-type': 'application/json', accept: 'application/json, text/event-stream' }
+  const bad = await fetch(`http://127.0.0.1:${port}/mcp/${TOKEN}`, { method: 'POST', headers, body: '{nope' })
+  assert.equal(bad.status, 400)
+  assert.equal((await bad.json()).error.code, -32700)
+  const big = await fetch(`http://127.0.0.1:${port}/mcp/${TOKEN}`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'ping', params: { pad: 'x'.repeat(1100 * 1024) } }),
+  }).catch(error => ({ status: 'reset', error }))
+  assert.ok(big.status === 413 || big.status === 'reset', `got ${big.status}`)
+})
+
 test('rejects requests without the secret with a bare 404', async () => {
   const body = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'ping' })
   const headers = { 'content-type': 'application/json', accept: 'application/json, text/event-stream' }
@@ -169,65 +196,65 @@ test('status and the hint work before the controller ever answered', async () =>
 
   // Seen with a real session: the event arrived, but the turn failed with
   // "Login expired", so the hint must not only blame the channel flag.
-  const id = idOf(await voiceCall('send', { message: 'Hört mich jemand?' }))
+  const id = idOf(await voiceCall('send', { message: 'Can anyone hear me?' }))
   const hint = await voiceCall('get_reply', { id, wait_seconds: 2 })
   assert.match(hint, /^\[state=sent /)
-  assert.match(hint, /noch nie geantwortet/)
+  assert.match(hint, /has not answered once/)
   assert.match(hint, /--dangerously-load-development-channels server:voice/)
-  assert.match(hint, /Login abgelaufen/)
+  assert.match(hint, /login expired/)
 })
 
 test('send -> channel event -> reply(working, done) -> get_reply', async () => {
-  const sent = await voiceCall('send', { message: 'Wie viele Dateien liegen im playground?' })
+  const sent = await voiceCall('send', { message: 'How many files are in the playground?' })
   const id = idOf(sent)
   assert.match(sent, /^\[state=sent id=[a-z0-9]{4}\]/)
 
   const event = await waitUntil(() => channelEvents.find(e => e.meta?.request_id === id))
-  assert.equal(event.content, 'Wie viele Dateien liegen im playground?')
+  assert.equal(event.content, 'How many files are in the playground?')
 
-  await controllerReply(id, 'working', 'Ich schaue nach.')
+  await controllerReply(id, 'working', 'Looking.')
   const first = await voiceCall('get_reply', { id })
   assert.match(first, new RegExp(`^\\[state=working id=${id} `))
-  assert.match(first, /Claude Code: Ich schaue nach\./)
-  assert.match(first, /get_reply erneut/)
+  assert.match(first, /Claude Code: Looking\./)
+  assert.match(first, /call get_reply again/)
 
   // The long poll returns as soon as the answer arrives, not after the full wait.
   const started = Date.now()
-  setTimeout(() => controllerReply(id, 'done', 'Es sind drei Dateien.'), 300)
+  setTimeout(() => controllerReply(id, 'done', 'There are three files.'), 300)
   const second = await voiceCall('get_reply', { id, wait_seconds: 3 })
   assert.ok(Date.now() - started < 2500, 'get_reply should return early')
   assert.match(second, /^\[state=done /)
-  assert.match(second, /Es sind drei Dateien\./)
-  assert.doesNotMatch(second, /Ich schaue nach/, 'already delivered updates are not repeated')
+  assert.match(second, /There are three files\./)
+  assert.doesNotMatch(second, /Looking/, 'already delivered updates are not repeated')
 
   const third = await voiceCall('get_reply', { id })
-  assert.match(third, /Fertig, keine neuen Nachrichten/)
+  assert.match(third, /Done, no new messages/)
 })
 
 test('ask waits in one call', async () => {
-  const pending = voiceCall('ask', { message: 'Läuft der Build?' })
-  const event = await waitUntil(() => channelEvents.find(e => e.content === 'Läuft der Build?'))
-  await controllerReply(event.meta.request_id, 'done', 'Ja, grün.')
+  const pending = voiceCall('ask', { message: 'Is the build green?' })
+  const event = await waitUntil(() => channelEvents.find(e => e.content === 'Is the build green?'))
+  await controllerReply(event.meta.request_id, 'done', 'Yes, green.')
   const out = await pending
   assert.match(out, /^\[state=done /)
-  assert.match(out, /Ja, grün\./)
+  assert.match(out, /Yes, green\./)
 })
 
 test('a question round-trip carries in_reply_to', async () => {
-  const id = idOf(await voiceCall('send', { message: 'Räum das Repo auf.' }))
+  const id = idOf(await voiceCall('send', { message: 'Clean up the repo.' }))
   await waitUntil(() => channelEvents.find(e => e.meta?.request_id === id))
-  await controllerReply(id, 'question', 'Soll ich auch die Branches löschen, ja oder nein?')
+  await controllerReply(id, 'question', 'Should I delete the branches too, yes or no?')
   const out = await voiceCall('get_reply', { id })
   assert.match(out, /^\[state=question /)
   assert.match(out, new RegExp(`in_reply_to=${id}`))
 
-  const answerId = idOf(await voiceCall('send', { message: 'Nein, nur die Dateien.', in_reply_to: id }))
+  const answerId = idOf(await voiceCall('send', { message: 'No, only the files.', in_reply_to: id }))
   const event = await waitUntil(() => channelEvents.find(e => e.meta?.request_id === answerId))
-  assert.equal(event.content, `(Antwort auf ${id}) Nein, nur die Dateien.`)
+  assert.equal(event.content, `(Answer to ${id}) No, only the files.`)
 })
 
 test('permission relay: prompt -> get_reply -> approve -> verdict to Claude Code', async () => {
-  const id = idOf(await voiceCall('send', { message: 'Leg die Datei hallo.txt an.' }))
+  const id = idOf(await voiceCall('send', { message: 'Create the file hello.txt.' }))
   await waitUntil(() => channelEvents.find(e => e.meta?.request_id === id))
 
   await claudeCode.notification({
@@ -235,8 +262,9 @@ test('permission relay: prompt -> get_reply -> approve -> verdict to Claude Code
     params: {
       request_id: 'abcde',
       tool_name: 'Write',
-      description: 'Create playground/hallo.txt',
-      input_preview: '{"file_path": "playground/hallo.txt", "content": "Grüezi"}',
+      // Claude Code's descriptions often end with a full stop.
+      description: 'Create playground/hello.txt.',
+      input_preview: '{"file_path": "playground/hello.txt", "content": "Grüezi"}',
     },
   })
 
@@ -247,11 +275,12 @@ test('permission relay: prompt -> get_reply -> approve -> verdict to Claude Code
   await new Promise(r => setTimeout(r, 1100))
   const waiting = await voiceCall('get_reply', { id, wait_seconds: 1 })
   assert.match(waiting, /approval=abcde/)
-  assert.doesNotMatch(waiting, /Hinweis:/)
-  assert.match(out, /Freigabe nötig \(code=abcde\): Write – Create playground\/hallo\.txt/)
-  assert.match(out, /Ohne ausdrückliches Ja/)
+  assert.doesNotMatch(waiting, /Hint:/)
+  assert.match(out, /Approval needed \(code=abcde\): Write – Create playground\/hello\.txt\. Details: /)
+  assert.match(out, /"content": "Grüezi"/)
+  assert.match(out, /without an explicit yes/)
 
-  assert.match(await voiceCall('status'), /Offene Freigaben: abcde \(Write\)/)
+  assert.match(await voiceCall('status'), /Pending approvals: abcde \(Write\)/)
 
   const approved = await voiceCall('approve', { code: 'ABCDE', decision: 'allow' })
   assert.match(approved, /^\[approval=allow code=abcde\]/)
@@ -259,7 +288,7 @@ test('permission relay: prompt -> get_reply -> approve -> verdict to Claude Code
   assert.equal(verdict.behavior, 'allow')
 
   const again = await voiceCall('approve', { code: 'abcde', decision: 'deny' })
-  assert.match(again, /unbekannt oder schon erledigt/)
+  assert.match(again, /unknown or already answered/)
   assert.equal(verdicts.filter(v => v.request_id === 'abcde').length, 1)
 })
 
@@ -275,7 +304,7 @@ test('reply rejects unknown request ids and bad states', async () => {
   })
   assert.equal(unknown.isError, true)
   const id = idOf(await voiceCall('send', { message: 'Test' }))
-  const badState = await claudeCode.callTool({ name: 'reply', arguments: { request_id: id, state: 'fertig', text: 'x' } })
+  const badState = await claudeCode.callTool({ name: 'reply', arguments: { request_id: id, state: 'finished', text: 'x' } })
   assert.equal(badState.isError, true)
 })
 
@@ -295,10 +324,10 @@ test('a gateway whose Claude Code session dies exits instead of holding the port
 
 test('get_reply on an unknown id and the hint when nothing happens', async () => {
   assert.match(await voiceCall('get_reply', { id: 'qqqq' }), /^\[state=unknown id=qqqq\]/)
-  const id = idOf(await voiceCall('send', { message: 'Niemand antwortet darauf.' }))
+  const id = idOf(await voiceCall('send', { message: 'Nobody answers this.' }))
   const out = await voiceCall('get_reply', { id, wait_seconds: 2 })
   assert.match(out, /^\[state=sent /)
-  assert.match(out, /Hinweis: Claude Code hat den Auftrag noch nicht aufgenommen/)
-  assert.match(out, /Login abgelaufen/)
+  assert.match(out, /Hint: Claude Code has not picked up the request yet/)
+  assert.match(out, /login expired/)
   assert.match(await voiceCall('status'), /controller=confirmed/)
 })

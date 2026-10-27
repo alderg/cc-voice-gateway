@@ -11,7 +11,7 @@ if (process.argv.includes('--quiet')) {
   process.stdout.write(token + '\n')
 } else {
   console.log(`Token:      ${token}`)
-  console.log(`Datei:      ${config.tokenFile}`)
-  console.log(`Lokal:      http://${config.host}:${config.port}/mcp/${token}`)
-  console.log('Öffentlich: scripts/funnel.sh url')
+  console.log(`File:       ${config.tokenFile}`)
+  console.log(`Local:      http://${config.host}:${config.port}/mcp/${token}`)
+  console.log('Public:     scripts/funnel.sh url')
 }

@@ -27,11 +27,11 @@ const client = new Client({ name: 'fake-voice', version: '0.1.0' })
 try {
   await client.connect(new StreamableHTTPClientTransport(url))
 } catch (error) {
-  console.error(`Keine Verbindung zu ${shownUrl}: ${error.message}`)
-  console.error('Läuft die Controller-Session (scripts/start-controller.sh)? Stimmt das Token?')
+  console.error(`Cannot connect to ${shownUrl}: ${error.message}`)
+  console.error('Is the controller session running (scripts/start-controller.sh)? Is the token right?')
   process.exit(1)
 }
-console.log(`Verbunden mit ${shownUrl}. Befehle: status, ask, send, answer, allow, deny, quit`)
+console.log(`Connected to ${shownUrl}. Commands: status, ask, send, answer, follow, allow, deny, quit`)
 
 let lastId = null
 let lastQuestionId = null
@@ -50,7 +50,7 @@ function keepPolling(id, text) {
   if (state === 'question') lastQuestionId = id
   if (state !== 'working' && state !== 'sent') return false
   if (/approval=/.test(text)) {
-    console.log('(Freigabe offen: mit allow/deny <code> beantworten, danach "follow")')
+    console.log('(Approval pending: answer with allow/deny <code>, then "follow")')
     return false
   }
   return true
@@ -106,10 +106,10 @@ for await (const raw of rl) {
         console.log((await call('approve', { code: arg, decision: command })).text + '\n')
         break
       default:
-        console.log('Befehle: status, ask <text>, send <text>, answer <text>, follow [id], allow <code>, deny <code>, quit')
+        console.log('Commands: status, ask <text>, send <text>, answer <text>, follow [id], allow <code>, deny <code>, quit')
     }
   } catch (error) {
-    console.error(`Fehler: ${error.message}`)
+    console.error(`Error: ${error.message}`)
   }
   rl.prompt()
 }
