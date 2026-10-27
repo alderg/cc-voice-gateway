@@ -96,11 +96,11 @@ development channel, and consent for the new MCP server from `.mcp.json`. Confir
 permission for `mcp__voice__reply` in `controller/.claude/settings.json` only applies once the
 folder is trusted.
 
-The script starts the session in manual mode (`--permission-mode manual`), and
-`controller/.claude/settings.json` has ask rules for Bash, Write and Edit. Ask rules win over
-allow rules, so a user-wide `bypassPermissions` default or allow rules like `Bash(*)` in
-`~/.claude/settings.json` cannot approve these calls silently; otherwise there would be no
-approval to relay. Stay in manual mode: in auto mode a classifier decides instead of you.
+The script starts the session in manual mode (`--permission-mode manual`), whatever default
+`~/.claude/settings.json` sets. `controller/.claude/settings.json` lets Bash, Write and Edit run
+without asking, because the confine hook limits them (see [Security](#security)), and denies tools
+that reach beyond the folder. Anything else that needs an approval is relayed to the voice
+assistant. Stay in manual mode: in auto mode a classifier decides instead of the rules.
 
 In the second terminal:
 
@@ -108,10 +108,11 @@ In the second terminal:
 > status
 > ask How many files are in the playground?
 > send Create the file hello.txt in the playground with the text Grüezi
-  … [state=sent … approval=abcde] Approval needed (code=abcde): Write – …
-> allow abcde
 > follow
 ```
+
+If Claude Code asks for an approval, fake-voice shows `Approval needed (code=abcde)`; answer with
+`allow abcde` or `deny abcde`, then `follow`.
 
 The gateway's tool results are in English; the voice assistant speaks in your language either
 way, and the controller answers in the language of the request. The log is in `.logs/gateway.log`;
@@ -150,9 +151,9 @@ the tool here, that app is unsuitable for the car, however the server is built.
 
 1. "Ask Claude Code for the status."
 2. "Ask Claude Code how many files are in the playground."
-3. Long task with approval: "Tell Claude Code to wait 90 seconds and then create the file
-   done.txt in the playground." Expected: progress updates over a good 90 seconds and an approval
-   question, at the start or at the end depending on how Claude Code goes about it, then "done".
+3. Long task: "Tell Claude Code to wait 90 seconds and then create the file done.txt in the
+   playground." Expected: progress updates over a good 90 seconds, then "done". Writing in the
+   playground needs no approval.
 4. Question: "Tell Claude Code to clean up the playground and to ask first what may go."
 
 ### Results
@@ -176,8 +177,8 @@ the tool here, that app is unsuitable for the car, however the server is built.
   internet can reach the mapped port, and the host name is published in the certificate
   transparency logs. Funnel has no authentication of its own; the secret in the path is the only
   key.
-- **The controller session is confined**, because whoever has the URL can also answer approval
-  prompts (see below). These limits hold whatever is approved:
+- **The controller session is confined.** It works without approvals, because whoever has the
+  URL could answer them anyway (see below). These limits hold regardless:
   - File tools read only inside `controller/` and write only inside `controller/playground/`
     (PreToolUse hook `controller/.claude/hooks/confine.mjs`, resolves symlinks, fails closed).
   - Bash runs only `ls` inside `controller/`, `sleep <seconds>` and `rm [-f]` with plain file
@@ -186,8 +187,10 @@ the tool here, that app is unsuitable for the car, however the server is built.
   - Denied: claude.ai connectors (Gmail, Slack, Drive, …), web fetch and search, messages to
     other Claude sessions, remote and scheduled agents, artifacts, Monitor, workflows and
     worktrees. Bypass and auto mode cannot be switched on.
-  - What is left: reading `controller/`, and writing or deleting in the playground with an
-    approval. The answers go back to the voice assistant.
+  - What is left: reading `controller/`, and writing or deleting in the playground. The answers
+    go back to the voice assistant.
+  - Planned: run the controller in a sandboxed VM, so that nothing on this machine is reachable
+    even if the hook has a gap.
 - New secret: delete `.secrets/token`, restart the controller, update the connector URL.
 - The gateway binds to `127.0.0.1` only. Requests without a valid secret get a bare 404, so
   clients do not start an OAuth flow.
@@ -241,7 +244,7 @@ Claude Code starts the gateway, so environment variables go into `controller/.mc
 | Voice assistant answers itself instead of asking | Say "ask Claude Code …" explicitly. |
 | Voice assistant says the connector does not work | Look at `.logs/gateway.log`. No `voice initialize`: the request never arrived (URL, Funnel, DNS). `initialize` and `tools/list` but no `tools/call`: the assistant chose not to call a tool. `rejected`: wrong URL or token. |
 | Voice assistant stops after the first `working` | Known risk with some clients. Stage 4 tests exactly this. |
-| No approval in the car | Session in auto or bypass mode, an allow rule covers the tool, or it is a trust or consent dialog, which is not relayed. Start the session with `scripts/start-controller.sh`. |
+| No approval in the car | Expected for Bash, Write and Edit: they run without asking. For other tools: session in auto or bypass mode, an allow rule covers the tool, or it is a trust or consent dialog, which is not relayed. Start the session with `scripts/start-controller.sh`. |
 
 Claude Code's debug log is at `~/.claude/debug/<session-id>.txt`.
 
@@ -257,7 +260,7 @@ src/
   log.mjs            log to stderr and file, never to stdout
 controller/
   .mcp.json          starts the gateway as server "voice"
-  .claude/settings.json   approvals, deny rules, confine hook
+  .claude/settings.json   allow and deny rules, confine hook
   .claude/hooks/confine.mjs   file tools inside controller/ (writes: playground/), Bash allowlist
   CLAUDE.md          rules for the controller session
   playground/        working folder for test requests

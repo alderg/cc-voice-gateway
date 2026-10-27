@@ -1,11 +1,10 @@
 // How the controller session is started and what it is allowed to do.
 //
 // Whoever knows the connector URL can make the controller work and can also
-// answer its approval prompts. So approvals are no protection against them:
-// the limits that matter are deny rules and the confine hook, which no
-// approval can lift. User-level settings must not loosen them
-// either: a user-wide bypassPermissions default or allow rules like Write(*)
-// would otherwise approve every call silently.
+// answer its approval prompts. So approvals are no protection against them,
+// and the controller works without asking: the limits are the deny rules and
+// the confine hook, which no approval or allow rule can lift. Every tool that
+// runs without asking must therefore go through the hook.
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
@@ -51,11 +50,15 @@ test('start-controller.sh runs claude in controller/ with the channel in manual 
   assert.equal(argv.at(-1), '--debug', 'extra arguments are passed through')
 })
 
-test('controller settings: approvals, deny rules and no way into bypass or auto mode', () => {
+test('controller settings: confined tools run without asking, deny rules, no bypass or auto mode', () => {
   const { permissions } = SETTINGS
-  // Ask rules are checked before allow rules from any settings file.
-  for (const rule of ['Bash(rm *)', 'Write', 'Edit']) assert.ok(permissions.ask.includes(rule), rule)
-  assert.deepEqual(permissions.allow, ['mcp__voice__reply', 'Bash(sleep *)'])
+  // Seen in voice mode: an approval for every write is too much while driving.
+  assert.deepEqual(permissions.allow, ['mcp__voice__reply', 'Bash', 'Write', 'Edit', 'NotebookEdit'])
+  assert.equal(permissions.ask, undefined)
+  const [entry] = SETTINGS.hooks.PreToolUse
+  for (const rule of permissions.allow.filter(rule => rule !== 'mcp__voice__reply')) {
+    assert.match(rule, new RegExp(`^(${entry.matcher})$`), `${rule} runs without asking, so the hook must confine it`)
+  }
   assert.equal(permissions.defaultMode, undefined)
   // Tools that reach beyond this folder: accounts, the web, other sessions.
   for (const rule of ['mcp__claude_ai_*', 'WebFetch', 'WebSearch', 'SendMessage', 'ListAgents', 'RemoteTrigger', 'CronCreate', 'Artifact*', 'Monitor', 'EnterWorktree']) {

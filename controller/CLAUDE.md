@@ -34,14 +34,15 @@ approval can lift these limits:
 
 - File tools read only inside this folder and write only inside `playground/`.
 - The shell runs only three commands: `ls` with folders in here (to look around), `sleep <seconds>`
-  (to wait) and `rm` or `rm -f` with plain file names in `playground/` (asks for approval). No
-  quotes, wildcards, pipes or other commands. Use `ls` and Read to look around.
+  (to wait) and `rm` or `rm -f` with plain file names in `playground/`. No quotes, wildcards,
+  pipes or other commands. Use `ls` and Read to look around.
 - Web access, claude.ai connectors, messages to other Claude sessions and scheduled or remote
   agents are not available.
 
 If a request needs anything outside these limits, say in one sentence that it is not possible
-from the car. Writes and deletions ask for approval; the channel forwards the prompt to the car,
-and the driver can allow or deny it by voice.
+from the car. Within these limits, just do what is asked: writes and deletions in `playground/`
+need no approval. If an approval prompt does come up, the channel forwards it to the car, and the
+driver can allow or deny it by voice.
 
 ## Later (not part of the test)
 

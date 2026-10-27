@@ -7,8 +7,9 @@
 //                              `rm [-f] <files in playground/>`
 //
 // Whoever knows the connector URL can also answer approval prompts, so an ask
-// rule is no protection against them. A hook that exits with code 2 blocks the
-// call before any permission rule or prompt, so no approval can override it.
+// rule is no protection against them; the settings let these tools run without
+// asking instead. A hook that exits with code 2 blocks the call before any
+// permission rule or prompt, so no allow rule or approval can override it.
 // Paths are resolved through symlinks, so a link in the playground that points
 // elsewhere does not help.
 //
