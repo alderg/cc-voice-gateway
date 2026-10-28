@@ -725,7 +725,6 @@ container, not for the controller.
 git clone git@github.com:alderg/cc-voice-gateway.git
 cd cc-voice-gateway
 npm install
-npm test
 node scripts/setup.mjs
 ```
 
