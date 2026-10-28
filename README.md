@@ -881,8 +881,9 @@ On claude.ai, as Owner or Primary Owner:
    channel, and still has to opt in per session with `--channels`.
 
 Claude Code picks the setting up at its next start, or within an hour; `claude doctor` shows the
-`Managed settings (remote)` line. Nothing is left to do on the server: the next start of the
-controller uses the plugin.
+`Managed settings (remote)` line. Nothing is left to do on the server. The start script reads
+Claude Code's local copy of these settings, which Claude Code refreshes when it starts, so the
+first start after saving may still use the development flag; the one after it uses the plugin.
 
 ## 8. Operation
 
@@ -1144,6 +1145,7 @@ do not set them.
 | The connector stopped working after weeks unused | The refresh token expired after 30 days. Sign in again from the connector's settings. |
 | Claude asks before every tool call | Choose "Always allow" for the connector's tools. |
 | Startup warning that channels are not enabled for the organisation | Team and Enterprise, including a Max seat in a Team organisation: an Owner enables Organization settings → Claude Code → Channels. `claude --debug` logs "the organization is team" in that case. |
+| The start log says `the development flag, since voice@cc-voice-gateway is not on the organisation's channel allowlist` although it is | The script reads Claude Code's local copy of the managed settings (`~/.claude/remote-settings.json`), which Claude Code updates when a session starts. The first start after adding the entry still sees the old copy. Answer the warning or quit, and start again. `node scripts/channel-mode.mjs` shows what the next start will use. |
 | Channel event arrives, but no answer | The controller's turn failed, for example "Login expired". Look at the controller terminal; `/login` there. |
 | `status` reports `controller=unconfirmed`, `get_reply` shows a hint | The session runs without the channel (neither the plugin nor `--dangerously-load-development-channels server:voice`), or the organisation blocks channels. Start it with `scripts/start-controller.sh` and check `/mcp`; otherwise Claude Code drops events silently. |
 | `voice port … is in use by another process` in the log, and the same on Telegram | Another process holds `VOICE_GW_PORT`: a second controller session, or a gateway left over from an earlier session, which also answers the watchdog's `/healthz`. The new gateway ends with an error. `lsof -nP -iTCP:8787 -sTCP:LISTEN` shows the process; end it, start only one controller, then restart it. |
