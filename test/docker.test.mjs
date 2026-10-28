@@ -214,6 +214,8 @@ before(async () => {
       VOICE_GW_CLAUDE_BIN: join(BIN, 'claude'), // the command inside the container
       VOICE_GW_GH_BIN: join(BIN, 'no-gh'),
       VOICE_GW_LOG_FILE: '',
+      VOICE_GW_WORKER_MODEL: 'opus',
+      VOICE_GW_WORKER_EFFORT: 'high',
       FAKE_DOCKER_LOG: join(TMP, 'docker-calls.jsonl'),
       FAKE_DOCKER_CONTAINER: CONTAINER,
       FAKE_DOCKER_DOWN: DOWN,
@@ -365,6 +367,8 @@ test('Docker: runs go through voice-run in the container, with the rules of thei
   const exec = dockerCalls().find(c => c.includes('voice-run') && c.includes(readonly.id))
   assert.deepEqual(exec.slice(0, 8), ['exec', '-i', '-w', join(REPOS, 'readonly'), CONTAINER, 'voice-run', readonly.id, join(BIN, 'claude')])
   assert.equal(arg(call, '--permission-mode'), 'bypassPermissions')
+  assert.equal(arg(call, '--model'), 'opus', 'VOICE_GW_WORKER_MODEL reaches the run in the container')
+  assert.equal(arg(call, '--effort'), 'high', 'VOICE_GW_WORKER_EFFORT too')
   assert.match(arg(call, '--append-system-prompt'), /Publish: nothing leaves the container\. Never push and never open a pull request/)
   assert.doesNotMatch(arg(call, '--append-system-prompt'), /gh pr create/)
   assert.match(call.input, /^- Access level: read-only \(the token cannot push \(Contents is read-only\)\)\. Nothing leaves this container: no push, no pull request\.$/m)

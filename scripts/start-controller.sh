@@ -12,7 +12,10 @@
 #                controller/.mcp.json: Claude Code shows a warning at every
 #                start that must be answered at the terminal.
 #
-# Both read the gateway's settings from controller/.mcp.json.
+# Both read the gateway's settings from controller/.mcp.json and from
+# .secrets/gateway.env, which the setup assistant writes (scripts/setup.mjs).
+# From the latter this script also takes the session's model and effort:
+# VOICE_GW_CONTROLLER_MODEL and VOICE_GW_CONTROLLER_EFFORT.
 #
 # The session runs in manual mode, whatever defaultMode the user settings set.
 # controller/.claude/settings.json lets Bash, Write and Edit run without asking,
@@ -42,6 +45,7 @@
 
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd -P)
+. "$ROOT/scripts/settings.sh"
 CONTROLLER=$ROOT/controller
 STATE=${VOICE_GW_STATE_DIR:-$ROOT/.state}
 LOCK=$STATE/controller.lock # a directory, since mkdir is atomic: pid, claude.pid
@@ -173,6 +177,10 @@ choose_channel() {
     claude_args=(--permission-mode manual --dangerously-load-development-channels server:voice)
     log "channel: the development flag, since ${line#development }; the warning at the start needs Enter at the terminal"
   fi
+  # The session's model and effort from the settings; options given to this
+  # script come later and win.
+  if [ -n "${VOICE_GW_CONTROLLER_MODEL:-}" ]; then claude_args+=(--model "$VOICE_GW_CONTROLLER_MODEL"); fi
+  if [ -n "${VOICE_GW_CONTROLLER_EFFORT:-}" ]; then claude_args+=(--effort "$VOICE_GW_CONTROLLER_EFFORT"); fi
   export VOICE_GW_CHANNEL_MODE=$channel_mode # for the gateway (restart.mjs)
 }
 

@@ -12,7 +12,7 @@
 // open, for checks and reviews, and optionally Telegram, for news after the
 // voice mode ended. Over all of it, the kill switch (killswitch.mjs).
 
-import { config } from './config.mjs'
+import { EFFORTS, config } from './config.mjs'
 import { log } from './log.mjs'
 import { Store } from './store.mjs'
 import { Auth } from './oauth.mjs'
@@ -46,6 +46,12 @@ if (config.docker) {
       : 'access level per repository from the GitHub token',
   )
 }
+if (config.workerEffort && !EFFORTS.includes(config.workerEffort)) {
+  log(`VOICE_GW_WORKER_EFFORT=${config.workerEffort} is not one of ${EFFORTS.join(', ')}; workers run with the default`)
+}
+if (config.workerModel || config.workerEffort) {
+  log(`workers run with model ${config.workerModel || 'default'}, effort ${config.workerEffort || 'default'}`)
+}
 const runner = config.docker
   ? new DockerRunner({ container: config.docker, root: config.dockerRepos, dockerBin: config.dockerBin })
   : new HostRunner(config.workerRoot)
@@ -64,6 +70,8 @@ const workers = new Workers({
   stateDir: config.stateDir,
   claudeBin: config.claudeBin,
   ghBin: config.ghBin,
+  model: config.workerModel,
+  effort: EFFORTS.includes(config.workerEffort) ? config.workerEffort : '',
   maxRuns: config.maxWorkers,
   timeoutMinutes: config.workerTimeoutMinutes,
 })

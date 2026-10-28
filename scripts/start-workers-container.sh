@@ -6,7 +6,7 @@
 # that it does not come back by itself. The gateway stops a container with a
 # writable /repos while it is locked, however it was started.
 #
-# Settings, from the environment:
+# Settings, from the environment or .secrets/gateway.env (scripts/settings.sh):
 #   VOICE_GW_DOCKER         the container (voice-workers)
 #   VOICE_GW_DOCKER_FOLDER  the host folder with the repositories (~/docker-developer)
 #   VOICE_GW_DOCKER_IMAGE   the image (cc-voice-worker)
@@ -14,6 +14,7 @@
 
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd -P)
+. "$ROOT/scripts/settings.sh"
 container=${VOICE_GW_DOCKER:-voice-workers}
 folder=${VOICE_GW_DOCKER_FOLDER:-$HOME/docker-developer}
 image=${VOICE_GW_DOCKER_IMAGE:-cc-voice-worker}

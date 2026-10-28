@@ -94,6 +94,25 @@ Telegram.prototype.getUpdates = async function getUpdates({ offset, timeout = 25
   return Array.isArray(body.result) ? body.result : []
 }
 
+// The bot itself ({ id, username, first_name }), which checks the token; for
+// the setup assistant.
+Telegram.prototype.getMe = async function getMe() {
+  let response
+  try {
+    response = await fetch(`${this.apiBase}/bot${this.token}/getMe`, { signal: AbortSignal.timeout(SEND_TIMEOUT_MS) })
+  } catch (error) {
+    const cause = error.cause?.message ?? error.cause?.code
+    throw new Error(this.redact(cause ? `${error.message} (${cause})` : error.message))
+  }
+  const body = await response.json().catch(() => ({}))
+  if (!response.ok || body.ok !== true) {
+    throw Object.assign(new Error(this.redact(`${response.status} ${body.description ?? response.statusText}`)), {
+      status: response.status,
+    })
+  }
+  return body.result ?? {}
+}
+
 // The one command the gateway takes from Telegram: the kill switch.
 export const isStopCommand = text =>
   /^\/(stop|notstopp|killswitch|emergencystop)(@\w+)?$/i.test(String(text).trim()) || emergencyPhrase(text)

@@ -13,6 +13,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+. "$ROOT/scripts/settings.sh"
 PORT="${VOICE_GW_PORT:-8787}"
 FUNNEL_PORT="${FUNNEL_PORT:-443}"
 

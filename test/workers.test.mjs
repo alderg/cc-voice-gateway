@@ -171,6 +171,12 @@ before(async () => {
   repo('gamma')
   repo('dirty', { origin: 'git@github.com:acme/dirty.git', dirty: true })
   mkdirSync(join(ROOT, 'not-a-repo'))
+  // Settings as the setup assistant writes them; the environment wins.
+  mkdirSync(join(TMP, 'secrets'), { recursive: true })
+  writeFileSync(
+    join(TMP, 'secrets', 'gateway.env'),
+    '# written by the setup assistant\nVOICE_GW_WORKER_MODEL=sonnet\nVOICE_GW_WORKER_EFFORT=low\nVOICE_GW_MAX_WORKERS=9\n',
+  )
   gw = await startGateway()
 })
 
@@ -240,6 +246,8 @@ test('dispatch runs claude -p in the checkout; the result reaches the controller
   assert.equal(arg(call, '--output-format'), 'stream-json')
   assert.equal(arg(call, '--permission-mode'), 'bypassPermissions')
   assert.equal(arg(call, '--permission-prompts'), 'none')
+  assert.equal(arg(call, '--model'), 'sonnet', 'model from .secrets/gateway.env')
+  assert.equal(arg(call, '--effort'), 'low', 'effort from .secrets/gateway.env')
   const deny = JSON.parse(arg(call, '--settings')).permissions.deny
   for (const rule of ['mcp__claude_ai_*', 'SendMessage', 'AskUserQuestion']) assert.ok(deny.includes(rule), rule)
   assert.match(arg(call, '--append-system-prompt'), /voice\/<short-name>/)
