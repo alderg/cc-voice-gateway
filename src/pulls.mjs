@@ -1,0 +1,276 @@
+// Pull requests that workers open: the gateway watches them with gh for the
+// results that come without anyone asking, automatic checks and reviews, and
+// tells the controller as news. The driver is not asked anything.
+//
+// Which pull requests: those a run names by URL for its own repository, in
+// its tool output or its result, if gh shows them open on a voice/ branch.
+// Whether results will come is not guessed from the repository's settings;
+// the watcher looks: checks on the head commit (GitHub Actions and other CI),
+// requested reviewers (CODEOWNERS, required reviewers, a person the driver
+// named) or reviews and comments from others (bots such as Copilot or the
+// Claude app, people). If none of that shows up within the first polls,
+// nothing automatic runs, often because bot reviewers skip drafts, and it
+// stops quietly. A later run that names the pull request again, for example
+// one that requests a review, starts watching anew.
+//
+// News: checks finished on a head commit (once per commit), new reviews with
+// their inline comments, and new comments. Reviews and comments of the account
+// gh is logged in as are what workers post on the driver's behalf; they are
+// not news. Stops when the pull request is merged or closed, or after
+// VOICE_GW_PR_WATCH_HOURS. Without a gh login it does nothing. It only reads
+// JSON from gh; no token passes through it.
+
+import { execFile } from 'node:child_process'
+import { EventEmitter } from 'node:events'
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { dirname } from 'node:path'
+import { log as defaultLog, preview } from './log.mjs'
+
+const GRACE_POLLS = 5 // polls without checks, review requests or reviews before it gives up
+const FAST_POLLS = 15 // then every SLOW_FACTOR intervals
+const SLOW_FACTOR = 5
+const AUTH_CHECK_MS = 10 * 60 * 1000
+const KEEP_STOPPED = 50
+const FIELDS = 'number,title,state,isDraft,headRefName,headRefOid,url,statusCheckRollup,reviewRequests,reviews,comments'
+
+const REVIEW_STATE = {
+  APPROVED: 'approved',
+  CHANGES_REQUESTED: 'changes requested',
+  COMMENTED: 'commented',
+  DISMISSED: 'dismissed',
+}
+
+const plural = (n, unit) => `${n} ${unit}${n === 1 ? '' : 's'}`
+const login = name => String(name ?? '').replace(/\[bot\]$/i, '')
+const sameLogin = (a, b) => Boolean(a && b) && login(a).toLowerCase() === login(b).toLowerCase()
+
+// A check run (GitHub Actions, apps) or a commit status (other CI).
+const isStatus = check => check.__typename === 'StatusContext' || (!('status' in check) && 'state' in check)
+const complete = check => (isStatus(check) ? !['PENDING', 'EXPECTED'].includes(check.state) : check.status === 'COMPLETED')
+
+function outcome(check) {
+  if (isStatus(check)) return check.state === 'SUCCESS' ? 'passed' : 'failed'
+  if (['SUCCESS', 'NEUTRAL'].includes(check.conclusion)) return 'passed'
+  if (['SKIPPED', 'STALE'].includes(check.conclusion)) return 'skipped'
+  return 'failed'
+}
+
+function describeChecks(checks) {
+  const failed = checks.filter(c => outcome(c) === 'failed').map(c => c.name || c.context || 'unnamed')
+  const passed = checks.filter(c => outcome(c) === 'passed').length
+  const skipped = checks.filter(c => outcome(c) === 'skipped').length
+  const parts = [`${passed} passed`]
+  if (failed.length) parts.push(`${failed.length} failed (${failed.slice(0, 3).join(', ')}${failed.length > 3 ? ', …' : ''})`)
+  if (skipped) parts.push(`${skipped} skipped`)
+  return `Checks finished on the latest push: ${parts.join(', ')}.`
+}
+
+export class PullWatcher extends EventEmitter {
+  constructor({ ghBin = 'gh', stateFile, pollSeconds = 60, watchHours = 24, log = defaultLog }) {
+    super()
+    this.ghBin = ghBin
+    this.stateFile = stateFile
+    this.pollMs = pollSeconds * 1000
+    this.watchMs = watchHours * 60 * 60 * 1000
+    this.log = log
+    this.auth = null // { at, ok, me }
+    this.busy = false
+    this.watches = this.load()
+    this.timer = setInterval(() => this.tick(), Math.min(5000, Math.max(100, this.pollMs / 4)))
+    this.timer.unref()
+  }
+
+  close() {
+    clearInterval(this.timer)
+  }
+
+  // --- state --------------------------------------------------------------
+
+  load() {
+    try {
+      return JSON.parse(readFileSync(this.stateFile, 'utf8')).watches ?? []
+    } catch {
+      return []
+    }
+  }
+
+  save() {
+    const stopped = this.watches.filter(w => !w.active)
+    this.watches = this.watches.filter(w => w.active || stopped.indexOf(w) >= stopped.length - KEEP_STOPPED)
+    mkdirSync(dirname(this.stateFile), { recursive: true })
+    const tmp = `${this.stateFile}.${process.pid}.tmp`
+    writeFileSync(tmp, JSON.stringify({ watches: this.watches }, null, 2) + '\n')
+    renameSync(tmp, this.stateFile)
+  }
+
+  active() {
+    return this.watches.filter(w => w.active)
+  }
+
+  // --- gh -----------------------------------------------------------------
+
+  gh(args) {
+    return new Promise(resolve => {
+      execFile(
+        this.ghBin,
+        args,
+        { timeout: 30000, maxBuffer: 8 * 1024 * 1024, env: { ...process.env, GH_PROMPT_DISABLED: '1', NO_COLOR: '1' } },
+        (error, stdout) => resolve(error ? null : stdout),
+      )
+    })
+  }
+
+  async json(args) {
+    const out = await this.gh(args)
+    try {
+      return out === null ? null : JSON.parse(out)
+    } catch {
+      return null
+    }
+  }
+
+  // Logged in, and as whom; checked every ten minutes.
+  async ready() {
+    if (this.auth && Date.now() - this.auth.at < AUTH_CHECK_MS) return this.auth.ok
+    const me = (await this.gh(['auth', 'status'])) === null ? null : (await this.json(['api', 'user']))?.login
+    const ok = typeof me === 'string' && me.length > 0
+    if (!ok && this.auth?.ok !== false) this.log('gh is not logged in: pull requests that workers open are not watched')
+    this.auth = { at: Date.now(), ok, me: ok ? me : null }
+    return ok
+  }
+
+  view(slug, number) {
+    return this.json(['pr', 'view', String(number), '--repo', slug, '--json', FIELDS])
+  }
+
+  // --- watching -----------------------------------------------------------
+
+  // The pull requests a finished run opened or worked on, as gh shows them:
+  // [{ number, title, isDraft, url }]. Starts watching each of them.
+  async fromRun(task) {
+    if (!task.slug || !task.pulls?.length || !(await this.ready())) return []
+    const found = []
+    for (const number of task.pulls) {
+      const pr = await this.view(task.slug, number)
+      if (!pr || pr.state !== 'OPEN' || !String(pr.headRefName).startsWith('voice/')) continue
+      found.push({ number: pr.number, title: pr.title, isDraft: Boolean(pr.isDraft), url: pr.url })
+      this.watch({ worker: task.repo, slug: task.slug, number: pr.number, title: pr.title })
+    }
+    if (found.length) this.save()
+    return found
+  }
+
+  watch({ worker, slug, number, title }) {
+    const key = `${slug}#${number}`
+    let entry = this.watches.find(w => w.key === key)
+    if (!entry) {
+      entry = { key, worker, slug, number, reviews: [], comments: [], inline: [], checked: [] }
+      this.watches.push(entry)
+    }
+    const now = Date.now()
+    Object.assign(entry, { worker, title, active: true, stopped: null, until: now + this.watchMs, polls: 0, quiet: 0, nextAt: now })
+    this.log('watching pull request', key, `for ${worker}`)
+  }
+
+  stop(entry, reason) {
+    entry.active = false
+    entry.stopped = reason
+    this.log('stopped watching pull request', entry.key + ':', reason)
+  }
+
+  async tick() {
+    const due = this.active().filter(w => w.nextAt <= Date.now())
+    if (this.busy || !due.length) return
+    this.busy = true
+    try {
+      if (!(await this.ready())) {
+        for (const entry of due) entry.nextAt = Date.now() + this.pollMs
+        return
+      }
+      for (const entry of due) await this.poll(entry)
+      this.save()
+    } catch (error) {
+      this.log('pull request watch failed:', error.message)
+    } finally {
+      this.busy = false
+    }
+  }
+
+  async poll(entry) {
+    entry.polls++
+    entry.nextAt = Date.now() + this.pollMs * (entry.polls >= FAST_POLLS ? SLOW_FACTOR : 1)
+    if (Date.now() > entry.until) return this.stop(entry, 'time limit')
+    const pr = await this.view(entry.slug, entry.number)
+    if (!pr) return // gh or GitHub not reachable; again at the next poll
+    if (pr.state !== 'OPEN') return this.stop(entry, pr.state === 'MERGED' ? 'merged' : 'closed')
+
+    const own = name => sameLogin(name, this.auth.me)
+    const checks = pr.statusCheckRollup ?? []
+    const reviews = (pr.reviews ?? []).filter(r => r.state !== 'PENDING' && !own(r.author?.login))
+    const comments = (pr.comments ?? []).filter(c => !own(c.author?.login))
+    const lines = []
+    const kinds = []
+
+    if (checks.length && checks.every(complete) && pr.headRefOid && !entry.checked.includes(pr.headRefOid)) {
+      entry.checked = [...entry.checked, pr.headRefOid].slice(-20)
+      lines.push(describeChecks(checks))
+      kinds.push('checks')
+    }
+    const newReviews = reviews.filter(r => !entry.reviews.includes(r.id))
+    if (newReviews.length) {
+      kinds.push('review')
+      entry.reviews = [...entry.reviews, ...newReviews.map(r => r.id)].slice(-200)
+      for (const review of newReviews) {
+        const body = String(review.body ?? '').trim()
+        lines.push(
+          `Review from ${login(review.author?.login)}: ${REVIEW_STATE[review.state] ?? String(review.state).toLowerCase()}` +
+            (body ? `, "${preview(body, 200)}".` : '.'),
+        )
+      }
+      const inline = await this.newInline(entry, own)
+      if (inline.length) {
+        const shown = inline
+          .slice(0, 5)
+          .map(c => `${c.path}${c.line ? `:${c.line}` : ''} "${preview(c.body, 120)}"`)
+          .join('; ')
+        lines.push(`${plural(inline.length, 'inline comment')}: ${shown}${inline.length > 5 ? '; …' : ''}.`)
+      }
+    }
+    const newComments = comments.filter(c => !entry.comments.includes(c.id))
+    if (newComments.length) {
+      kinds.push('comment')
+      entry.comments = [...entry.comments, ...newComments.map(c => c.id)].slice(-200)
+      for (const comment of newComments) {
+        lines.push(`Comment from ${login(comment.author?.login)}: "${preview(comment.body, 200)}".`)
+      }
+    }
+
+    const expected = checks.length || pr.reviewRequests?.length || reviews.length || comments.length
+    if (!expected && ++entry.quiet >= GRACE_POLLS) {
+      this.stop(entry, pr.isDraft ? 'nothing automatic runs (a draft)' : 'nothing automatic runs')
+    }
+    if (lines.length) {
+      entry.title = pr.title
+      this.emit('news', {
+        worker: entry.worker,
+        slug: entry.slug,
+        number: entry.number,
+        kind: kinds.join(','),
+        text: [
+          `Pull request ${entry.number} in ${entry.slug} (worker ${entry.worker}): "${preview(pr.title, 80)}".`,
+          ...lines,
+          'Tell the driver as news in one or two sentences, without asking anything. Details: gh pr view or gh pr checks.',
+        ].join('\n'),
+      })
+    }
+  }
+
+  // Inline review comments from others that were not news yet.
+  async newInline(entry, own) {
+    const all = await this.json(['api', `repos/${entry.slug}/pulls/${entry.number}/comments?per_page=100`])
+    if (!Array.isArray(all)) return []
+    const fresh = all.filter(c => !own(c.user?.login) && !entry.inline.includes(c.id))
+    entry.inline = [...entry.inline, ...fresh.map(c => c.id)].slice(-500)
+    return fresh
+  }
+}

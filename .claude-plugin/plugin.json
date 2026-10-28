@@ -1,0 +1,21 @@
+{
+  "name": "voice",
+  "version": "0.1.0",
+  "description": "Voice gateway: Claude voice mode talks to a Claude Code session through this channel.",
+  "author": {
+    "name": "draw.io"
+  },
+  "mcpServers": {
+    "voice": {
+      "command": "node",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/src/plugin.mjs"
+      ]
+    }
+  },
+  "channels": [
+    {
+      "server": "voice"
+    }
+  ]
+}

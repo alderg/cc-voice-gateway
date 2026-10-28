@@ -1,0 +1,13 @@
+{
+  "name": "cc-voice-gateway",
+  "owner": { "name": "draw.io" },
+  "description": "The voice gateway for Claude Code, as a channel plugin for the controller session.",
+  "plugins": [
+    {
+      "name": "voice",
+      "source": "./",
+      "description": "Voice gateway: Claude voice mode talks to a Claude Code session through this channel.",
+      "defaultEnabled": false
+    }
+  ]
+}

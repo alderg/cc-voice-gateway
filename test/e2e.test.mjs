@@ -155,7 +155,15 @@ test('declares the channel and permission capabilities and the reply tool', asyn
   assert.deepEqual(caps.experimental['claude/channel'], {})
   assert.deepEqual(caps.experimental['claude/channel/permission'], {})
   const { tools } = await claudeCode.listTools()
-  assert.deepEqual(tools.map(t => t.name), ['reply', 'list_workers', 'dispatch', 'worker_status', 'stop_worker', 'raise_alarm'])
+  assert.deepEqual(tools.map(t => t.name), [
+    'reply',
+    'list_workers',
+    'dispatch',
+    'worker_status',
+    'stop_worker',
+    'restart_controller',
+    'raise_alarm',
+  ])
   assert.match(claudeCode.getInstructions(), /request_id/)
 })
 
