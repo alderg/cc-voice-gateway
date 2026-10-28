@@ -73,6 +73,11 @@ gateway starts `claude -p` in that checkout, without approvals:
   answer reaches you as news with the next call.
 - **Restarts:** runs are detached and survive a controller restart; the new gateway picks them up.
 
+**Telegram (optional):** voice assistants only poll, so once the conversation has ended, nobody
+hears a late result. If a Telegram bot is set up, the gateway notices the silence and sends
+results, questions and approval requests to your Telegram chat as well. See
+[Telegram fallback](#telegram-fallback).
+
 ![States](docs/states.drawio.svg)
 
 ## Requirements
@@ -219,6 +224,56 @@ ahead; a worker never commits, stashes or discards changes it did not make. Work
 and switch branches in your checkouts, so do not work in the same repository at the desk while a
 worker runs there.
 
+## Telegram fallback
+
+Optional, outbound only. While the voice assistant keeps calling the connector, everything goes
+through the voice conversation as usual. When no voice tool call has come for 60 seconds
+(`VOICE_GW_TELEGRAM_AFTER`), the gateway counts the voice mode as ended. From then on it sends
+what the voice assistant has not picked up to your Telegram chat:
+
+- **Results:** the controller's answers with state `done`, including its summaries of finished
+  worker runs.
+- **Questions:** answers with state `question`.
+- **Approval requests:** the code, the tool and what it wants to do.
+
+Interim `working` updates stay off Telegram. Each item goes out once. The voice path does not
+change: when you open voice mode again, the assistant still hears everything it has not picked
+up, and Telegram goes quiet as soon as it calls the connector again. Each message starts with what
+it is and what it belongs to, for example
+`Result for request k7f3 (worker cc-voice-gateway, task t3cz)`. You cannot answer by Telegram:
+answer questions and approvals in voice mode, naming the id or code, or at the terminal.
+
+The fallback is on only when `.secrets/telegram_token` and `.secrets/telegram_chat_id` both exist
+and are not empty. Without them the gateway logs one line, `telegram fallback off`, and works as
+before. To set it up:
+
+1. **Create a bot.** In Telegram, write `/newbot` to [@BotFather](https://t.me/BotFather) and copy
+   the token it gives you.
+2. **Store the token** without leaving it in the shell history:
+
+   ```bash
+   mkdir -p -m 700 .secrets
+   (umask 077; read -rsp 'Bot token: ' t; printf '%s' "$t" > .secrets/telegram_token)
+   ```
+
+3. **Write to your bot** from your own Telegram account: open it with the link from BotFather and
+   send any message, for example "Hallo".
+4. **Read your chat ID** from the bot's updates and store it:
+
+   ```bash
+   curl -s "https://api.telegram.org/bot$(cat .secrets/telegram_token)/getUpdates" \
+     | jq '.result[].message.chat | {id, type, first_name}'
+   (umask 077; printf '%s' '<id of your private chat>' > .secrets/telegram_chat_id)
+   ```
+
+   If the list is empty, send the message again. Telegram hands each update out only once, so
+   another program polling the same bot, or a webhook, takes them away.
+5. **Restart the controller.** The gateway reads both files at startup and logs
+   `telegram fallback ready: after 60 s without a voice call`.
+
+The token stays in `.secrets/` and never appears in the log; a failed message is logged with
+Telegram's error and does not affect the voice path.
+
 ## Connections
 
 ```bash
@@ -308,6 +363,8 @@ approval prompts) and the voice assistant, including the whole sign-in.
   with `VOICE_GW_PERMISSION_RELAY=0`.
 - Claude Code masks recognisable credentials in relayed approval texts, but not every secret
   ([channels reference][ref]).
+- The Telegram fallback sends results, questions and approval details through Telegram's servers.
+  Bot chats are not end-to-end encrypted. Leave the two files out if that is not acceptable.
 - Start the controller only with `scripts/start-controller.sh`, never with
   `--dangerously-skip-permissions`. It runs the session in manual mode, whatever default
   `~/.claude/settings.json` sets.
@@ -346,6 +403,8 @@ Claude Code starts the gateway, so environment variables go into `controller/.mc
 | `VOICE_GW_STATE_DIR` | `.state` | worker state and the output of every run |
 | `VOICE_GW_CLAUDE_BIN` | `claude` | the Claude Code command for workers |
 | `VOICE_GW_GH_BIN` | `gh` | the GitHub CLI, used to tell public from private repositories |
+| `VOICE_GW_TELEGRAM_AFTER` | `60` | seconds without a voice tool call after which the voice mode counts as ended and the [Telegram fallback](#telegram-fallback) sends |
+| `VOICE_GW_TELEGRAM_API` | `https://api.telegram.org` | Telegram Bot API address; the tests point it at a stand-in |
 | `FUNNEL_PORT` | `443` | for `scripts/funnel.sh` only; keep 443 for Claude |
 
 ## Troubleshooting
@@ -370,6 +429,7 @@ Claude Code starts the gateway, so environment variables go into `controller/.mc
 | A worker fails at once | `could not start claude`: Claude Code is not on the gateway's `PATH`; set `VOICE_GW_CLAUDE_BIN`. Otherwise read `.state/tasks/<task>.err`. |
 | What did a worker do? | `.state/tasks/<task>.jsonl` holds the whole run. `claude --resume <session>` in the repository opens the session; `.state/workers.json` lists the session ids. |
 | A private repository is handled like a public one | `gh` is not logged in or not on the `PATH`, so the visibility is unknown, and the worker asks before pushing to be safe. |
+| No Telegram message | Messages go out only after `VOICE_GW_TELEGRAM_AFTER` seconds without a voice call, and only for what the voice assistant has not picked up. `telegram fallback off` in the log: a file is missing or empty, or the controller was not restarted. `telegram send failed: 400 Bad Request: chat not found`: wrong chat ID, or you never wrote to the bot. `401 Unauthorized`: wrong token. |
 | No approval by voice | Expected for Bash, Write and Edit: they run without asking. For other tools: the session runs in auto or bypass mode, an allow rule covers the tool, or it is a trust or consent dialog, which is not relayed. Start the session with `scripts/start-controller.sh`. |
 
 Claude Code's debug log is at `~/.claude/debug/<session-id>.txt`.
@@ -383,6 +443,7 @@ src/
   voice.mjs          HTTP side: MCP tools for the voice assistant
   oauth.mjs          sign-in: OAuth metadata, registration, sign-in page, tokens
   workers.mjs        workers: find repositories, start and follow claude -p runs
+  telegram.mjs       Telegram fallback once the voice mode has ended
   admin.mjs          Unix socket for pair.mjs and fake-voice
   store.mjs          requests, approvals, waiting for changes
   http.mjs           small HTTP helpers
@@ -404,6 +465,7 @@ test/
   e2e.test.mjs       both sides end to end, without Claude Code
   oauth.test.mjs     the sign-in as Claude's connector goes through it
   workers.test.mjs   workers with a stand-in for claude and gh
+  telegram.test.mjs  Telegram fallback with a stand-in Bot API
   controller.test.mjs   launcher flags, controller settings, confine hook
 docs/
   *.drawio.svg       diagrams: an image on GitHub, editable in draw.io
@@ -415,7 +477,9 @@ docs/
 
 - Workers have no live view. Follow a run with `worker_status`, or read its output in `.state/tasks/`.
 - Voice assistants only poll, so you hear about a finished run with your next request, not when it
-  ends.
+  ends. With the Telegram fallback, the result also arrives as a message once the voice mode has
+  ended.
+- Telegram is outbound only: answers and approvals still go through voice mode or the terminal.
 - While the controller is busy, new events arrive together in its next turn. Real parallelism
   needs separate sessions ([channels reference][ref]).
 - Open requests live in memory only; a restart forgets them. Connections and worker runs survive
