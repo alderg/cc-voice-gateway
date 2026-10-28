@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Starts the worker container (README, "Workers in Docker"), replacing one that
-# exists; its state lives in the folder and the voice-home volume. The
-# repositories folder is mounted read-write, or read-only while the kill switch
-# is locked (.secrets/killswitch.json); then also without a restart policy, so
-# that it does not come back by itself. The gateway stops a container with a
-# writable /repos while it is locked, however it was started.
+# Starts the worker container (README, "Workers: on this computer or in
+# Docker"), replacing one that exists; its state lives in the folder and the
+# voice-home volume. The repositories folder is mounted read-write, or
+# read-only while the kill switch is locked (.secrets/killswitch.json); then
+# also without a restart policy, so that it does not come back by itself. The
+# gateway stops a container with a writable /repos while it is locked, however
+# it was started.
 #
 # Settings, from the environment or .secrets/gateway.env (scripts/settings.sh):
 #   VOICE_GW_DOCKER         the container (voice-workers)

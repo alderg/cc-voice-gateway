@@ -12,7 +12,7 @@
 #
 # Why a bundle: a fetch straight from the folder would run git's upload-pack in
 # that repository, with its config, which the container's side controls. See
-# the README, "Getting changes out of the container".
+# the README, "The mounted folder and the clean clone".
 #
 # Settings, from the environment:
 #   VOICE_GW_DOCKER        the container (voice-workers)
