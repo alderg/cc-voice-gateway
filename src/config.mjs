@@ -59,7 +59,15 @@ export const config = {
   ghBin: process.env.VOICE_GW_GH_BIN || 'gh',
   // Worker state and the output of every run.
   stateDir: process.env.VOICE_GW_STATE_DIR || join(ROOT, '.state'),
+
+  // Telegram fallback, on when both of its files in the secrets folder are set:
+  // after this many seconds without a voice tool call, the voice mode counts
+  // as ended, and results, questions and approvals also go to Telegram.
+  telegramAfterSeconds: num(process.env.VOICE_GW_TELEGRAM_AFTER, 60),
+  telegramApi: process.env.VOICE_GW_TELEGRAM_API || 'https://api.telegram.org',
 }
 
 config.oauthStateFile = join(config.secretsDir, 'oauth.json')
 config.adminSocket = join(config.secretsDir, 'admin.sock')
+config.telegramTokenFile = join(config.secretsDir, 'telegram_token')
+config.telegramChatIdFile = join(config.secretsDir, 'telegram_chat_id')
