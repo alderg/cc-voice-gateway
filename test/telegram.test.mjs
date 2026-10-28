@@ -8,6 +8,8 @@
 
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
+import { getEventListeners } from 'node:events'
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
@@ -19,7 +21,7 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 import { z } from 'zod'
 import { adminRequest } from '../src/admin.mjs'
 import { Store } from '../src/store.mjs'
-import { Telegram, TelegramFallback, loadTelegram } from '../src/telegram.mjs'
+import { Telegram, TelegramFallback, callBotApi, loadTelegram, pause } from '../src/telegram.mjs'
 
 const GATEWAY = fileURLToPath(new URL('../src/gateway.mjs', import.meta.url))
 const TMP = mkdtempSync(join(tmpdir(), 'voice-gw-telegram-'))
@@ -238,6 +240,43 @@ test('a failing Telegram call is logged and changes nothing for the voice path',
   telegram.close()
 })
 
+test('after a restart: what the voice client heard is not sent, even when it read it late', async () => {
+  const file = join(TMP, 'heard', 'requests.json')
+  const options = send => ({ afterSeconds: AFTER, log: () => {}, send: async text => send.push(text) })
+  const first = new Store({ file, log: () => {} })
+  const sentBefore = []
+  const before = new TelegramFallback(first, options(sentBefore))
+  first.voiceCallStarted()
+  const request = first.createRequest('Is the build green?')
+  first.addUpdate(request.id, 'done', 'Yes, green.')
+  await sleep(150) // the change is saved; reading it later is no change
+  first.takeUnread(request)
+  first.markClosed(request)
+  first.voiceCallEnded()
+  await sleep(150)
+  before.close()
+
+  const second = new Store({ file, log: () => {} })
+  const sentAfter = []
+  const after = new TelegramFallback(second, options(sentAfter))
+  await sleep(AFTER * 1000 + 150)
+  second.changed()
+  assert.deepEqual([...sentBefore, ...sentAfter], [], 'the voice client had it; Telegram never sends it')
+  assert.equal(second.getRequest(request.id).closed, true)
+  after.close()
+})
+
+test("the command loop's pause leaves no abort listener behind, and ends at once on abort", async () => {
+  const controller = new AbortController()
+  for (let i = 0; i < 30; i++) await pause(1, controller.signal)
+  assert.equal(getEventListeners(controller.signal, 'abort').length, 0)
+  const started = Date.now()
+  const waiting = pause(60000, controller.signal)
+  controller.abort()
+  await waiting
+  assert.ok(Date.now() - started < 1000)
+})
+
 // --- the Telegram client against the stand-in API ----------------------------
 
 test('after a restart: nothing is sent twice, and what is left waits for the voice client first', async () => {
@@ -283,6 +322,24 @@ test('Telegram.send posts to the chat; errors carry no token', async () => {
   const nowhere = new Telegram({ token: TOKEN, chatId: CHAT_ID, apiBase: 'http://127.0.0.1:1' })
   await assert.rejects(nowhere.send('Hello'), error => !error.message.includes(TOKEN))
   api.mode = 'ok'
+})
+
+test('getUpdates and getMe go through the same call: errors with the status, never the token', async () => {
+  api.mode = 'ok'
+  const telegram = new Telegram({ token: TOKEN, chatId: CHAT_ID, apiBase: `${api.url}/` })
+  for (const call of [() => telegram.getUpdates({ timeout: 0 }), () => telegram.getMe()]) {
+    await assert.rejects(call(), error => {
+      assert.equal(error.status, 400)
+      assert.equal(error.message, '400 Bad Request: chat not found')
+      return true
+    })
+  }
+  api.mode = 'drop'
+  await assert.rejects(telegram.getMe(), error => error.status === undefined && !error.message.includes(TOKEN))
+  api.mode = 'ok'
+  const result = await callBotApi({ apiBase: api.url, token: TOKEN, method: 'sendMessage', body: { chat_id: CHAT_ID, text: 'Direct' } })
+  assert.deepEqual(result, { message_id: api.messages.length })
+  assert.equal(api.messages.at(-1).text, 'Direct')
 })
 
 // --- the gateway as a whole ------------------------------------------------
@@ -410,5 +467,48 @@ test('gateway with Telegram: sends after the voice mode ended, survives a failin
   } finally {
     api.mode = 'ok'
     await gw.close()
+  }
+})
+
+test('a gateway whose port is taken ends with an error, and says so on Telegram', async () => {
+  api.mode = 'ok'
+  const blocker = createServer((req, res) => res.end('ok'))
+  await new Promise(resolve => blocker.listen(0, '127.0.0.1', resolve))
+  const port = blocker.address().port
+  const secrets = join(TMP, 'busy')
+  mkdirSync(secrets, { recursive: true, mode: 0o700 })
+  writeFileSync(join(secrets, 'telegram_token'), `${TOKEN}\n`, { mode: 0o600 })
+  writeFileSync(join(secrets, 'telegram_chat_id'), CHAT_ID, { mode: 0o600 })
+  const before = api.messages.length
+  const child = spawn(process.execPath, [GATEWAY], {
+    env: {
+      ...process.env,
+      VOICE_GW_SECRETS_DIR: secrets,
+      VOICE_GW_STATE_DIR: join(secrets, 'state'),
+      VOICE_GW_WORKER_ROOT: join(secrets, 'no-repositories'),
+      VOICE_GW_PORT: String(port),
+      VOICE_GW_LOG_FILE: '',
+      VOICE_GW_TELEGRAM_API: api.url,
+    },
+    stdio: ['pipe', 'ignore', 'pipe'], // stdin stays open, as under Claude Code
+  })
+  let log = ''
+  child.stderr.on('data', chunk => (log += chunk))
+  try {
+    const code = await Promise.race([
+      new Promise(resolve => child.on('exit', resolve)),
+      sleep(10000).then(() => 'still running'),
+    ])
+    assert.equal(code, 1)
+    assert.match(log, new RegExp(`voice port 127\\.0\\.0\\.1:${port} is in use by another process`))
+    assert.match(log, new RegExp(`shutting down: voice port ${port} in use`))
+    const alert = api.messages.slice(before).find(m => /voice port/.test(m.text))
+    assert.ok(alert, 'a Telegram message')
+    assert.equal(alert.chat_id, CHAT_ID)
+    assert.match(alert.text, new RegExp(`the voice port ${port} is in use by another process, so the gateway of the controller session ends`))
+    assert.ok(!log.includes(TOKEN))
+  } finally {
+    child.kill('SIGKILL')
+    blocker.close()
   }
 })

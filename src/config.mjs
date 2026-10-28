@@ -49,6 +49,8 @@ export const config = {
 
   // Log file; set VOICE_GW_LOG_FILE= (empty) to log to stderr only.
   logFile: env.VOICE_GW_LOG_FILE ?? join(ROOT, '.logs', 'gateway.log'),
+  // Past this size in MB the log moves to <file>.1, replacing the one before.
+  logMaxMb: num(env.VOICE_GW_LOG_MAX_MB, 10),
 
   // Sign-in state and the admin socket (mode 0700).
   secretsDir,

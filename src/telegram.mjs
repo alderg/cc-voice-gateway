@@ -14,6 +14,7 @@
 
 import { EventEmitter } from 'node:events'
 import { readFileSync } from 'node:fs'
+import { setTimeout as delay } from 'node:timers/promises'
 import { emergencyPhrase } from './killswitch.mjs'
 import { log as defaultLog, preview } from './log.mjs'
 
@@ -28,6 +29,41 @@ function readSecret(file) {
   }
 }
 
+// One call of the Bot API, for the gateway, the setup assistant and
+// scripts/telegram-notify.mjs. Resolves with the call's result. Otherwise it
+// throws an error with the HTTP status, if there was an answer; its message
+// never contains the token, which is part of every API address.
+export async function callBotApi({
+  apiBase = 'https://api.telegram.org',
+  token,
+  method,
+  body = {},
+  timeoutMs = SEND_TIMEOUT_MS,
+  signal,
+}) {
+  const redact = text => (token ? String(text).split(token).join('<token>') : String(text))
+  const limit = AbortSignal.timeout(timeoutMs)
+  let response
+  try {
+    response = await fetch(`${apiBase.replace(/\/+$/, '')}/bot${token}/${method}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: signal ? AbortSignal.any([signal, limit]) : limit,
+    })
+  } catch (error) {
+    const cause = error.cause?.message ?? error.cause?.code
+    throw new Error(redact(cause ? `${error.message} (${cause})` : error.message))
+  }
+  const data = await response.json().catch(() => ({}))
+  if (!response.ok || data.ok !== true) {
+    throw Object.assign(new Error(redact(`${response.status} ${data.description ?? response.statusText}`)), {
+      status: response.status,
+    })
+  }
+  return data.result
+}
+
 // A Telegram client, or null when the two secret files are not both set.
 export function loadTelegram({ tokenFile, chatIdFile, apiBase }) {
   const token = readSecret(tokenFile)
@@ -40,91 +76,42 @@ export class Telegram {
   constructor({ token, chatId, apiBase = 'https://api.telegram.org' }) {
     this.token = token
     this.chatId = chatId
-    this.apiBase = apiBase.replace(/\/+$/, '')
+    this.apiBase = apiBase
   }
 
-  redact(text) {
-    return String(text).split(this.token).join('<token>')
+  call(method, body, options = {}) {
+    return callBotApi({ apiBase: this.apiBase, token: this.token, method, body, ...options })
   }
 
-  // Resolves when Telegram accepted the message; otherwise throws an error
-  // whose message is safe to log.
+  // Resolves when Telegram accepted the message.
   async send(text) {
-    let response
-    try {
-      response = await fetch(`${this.apiBase}/bot${this.token}/sendMessage`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ chat_id: this.chatId, text: text.slice(0, MAX_TEXT) }),
-        signal: AbortSignal.timeout(SEND_TIMEOUT_MS),
-      })
-    } catch (error) {
-      const cause = error.cause?.message ?? error.cause?.code
-      throw new Error(this.redact(cause ? `${error.message} (${cause})` : error.message))
-    }
-    const body = await response.json().catch(() => ({}))
-    if (!response.ok || body.ok !== true) {
-      throw new Error(this.redact(`${response.status} ${body.description ?? response.statusText}`))
-    }
+    await this.call('sendMessage', { chat_id: this.chatId, text: String(text).slice(0, MAX_TEXT) })
   }
-}
 
-// Updates for the bot, waiting up to `timeout` seconds for new ones. Errors
-// carry the HTTP status and never the token.
-Telegram.prototype.getUpdates = async function getUpdates({ offset, timeout = 25, signal } = {}) {
-  const limit = AbortSignal.timeout((timeout + 15) * 1000)
-  let response
-  try {
-    response = await fetch(`${this.apiBase}/bot${this.token}/getUpdates`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ offset, timeout, allowed_updates: ['message'] }),
-      signal: signal ? AbortSignal.any([signal, limit]) : limit,
-    })
-  } catch (error) {
-    const cause = error.cause?.message ?? error.cause?.code
-    throw new Error(this.redact(cause ? `${error.message} (${cause})` : error.message))
+  // Updates for the bot, waiting up to `timeout` seconds for new ones.
+  async getUpdates({ offset, timeout = 25, signal } = {}) {
+    const result = await this.call(
+      'getUpdates',
+      { offset, timeout, allowed_updates: ['message'] },
+      { timeoutMs: (timeout + 15) * 1000, signal },
+    )
+    return Array.isArray(result) ? result : []
   }
-  const body = await response.json().catch(() => ({}))
-  if (!response.ok || body.ok !== true) {
-    throw Object.assign(new Error(this.redact(`${response.status} ${body.description ?? response.statusText}`)), {
-      status: response.status,
-    })
-  }
-  return Array.isArray(body.result) ? body.result : []
-}
 
-// The bot itself ({ id, username, first_name }), which checks the token; for
-// the setup assistant.
-Telegram.prototype.getMe = async function getMe() {
-  let response
-  try {
-    response = await fetch(`${this.apiBase}/bot${this.token}/getMe`, { signal: AbortSignal.timeout(SEND_TIMEOUT_MS) })
-  } catch (error) {
-    const cause = error.cause?.message ?? error.cause?.code
-    throw new Error(this.redact(cause ? `${error.message} (${cause})` : error.message))
+  // The bot itself ({ id, username, first_name }), which checks the token; for
+  // the setup assistant.
+  async getMe() {
+    return (await this.call('getMe')) ?? {}
   }
-  const body = await response.json().catch(() => ({}))
-  if (!response.ok || body.ok !== true) {
-    throw Object.assign(new Error(this.redact(`${response.status} ${body.description ?? response.statusText}`)), {
-      status: response.status,
-    })
-  }
-  return body.result ?? {}
 }
 
 // The one command the gateway takes from Telegram: the kill switch.
 export const isStopCommand = text =>
   /^\/(stop|notstopp|killswitch|emergencystop)(@\w+)?$/i.test(String(text).trim()) || emergencyPhrase(text)
 
-const pause = (ms, signal) =>
-  new Promise(resolve => {
-    const timer = setTimeout(resolve, ms)
-    signal.addEventListener('abort', () => {
-      clearTimeout(timer)
-      resolve()
-    })
-  })
+// Waits `ms`, or less if the signal aborts. The timer's abort listener goes
+// away with it, so a long run of backoffs leaves none behind.
+export const pause = (ms, signal) => delay(ms, undefined, { signal }).catch(() => {})
 
 // Inbound: polls the bot for messages and emits 'stop' for a stop command
 // from the configured private chat. Every other chat, and every other message,

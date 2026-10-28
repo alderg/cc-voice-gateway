@@ -251,7 +251,9 @@ to a lost phone or a leaked token.
 - **Redirect addresses** must be HTTPS on `claude.ai` or `claude.com` (`VOICE_GW_OAUTH_HOSTS`), or
   a loopback address.
 - **Sign-in needs a pairing code** from `node scripts/pair.mjs` on your computer: eight digits,
-  valid for five minutes and one sign-in, burnt after five wrong attempts.
+  valid for five minutes and one sign-in. Five wrong attempts lock out the client and the address
+  they came from (the last `X-Forwarded-For` entry, set by the tunnel), so a stranger cannot burn
+  your code; twenty wrong attempts in all burn it.
 - **Tokens.** Access tokens last one hour. The refresh token rotates on every use and expires after
   30 days. Local tokens for `scripts/fake-voice.mjs` last 12 hours.
 - **Stored as hashes only:** tokens, codes and client secrets are stored as SHA-256 hashes in
@@ -454,7 +456,7 @@ folder, `.git` included.
 - **When:** after `VOICE_GW_TELEGRAM_AFTER` seconds (60) without a voice tool call, voice mode
   counts as ended. Results, questions and approval requests then also go to the chat, each once;
   interim `working` updates do not. The kill switch alarm goes at once, whether voice mode is on
-  or not.
+  or not, and so does a note when the gateway ends because another process holds its port.
 - **Inbound:** only `/stop`, `/notstopp`, `/killswitch`, `/emergencystop` or an emergency phrase,
   only from the configured private chat, only if sent in the last two minutes. Everything else is
   ignored. You cannot answer questions or approvals by Telegram.
@@ -514,8 +516,9 @@ unlock by voice, Telegram or the controller.
 | `.secrets/telegram_token`, `.secrets/telegram_chat_id` | The Telegram bot | 0600 |
 | `.secrets/killswitch.json` | Kill switch state, present while locked | 0600 |
 | `.secrets/worker/claude_token`, `.secrets/worker/github_token` | The container's logins, mounted read-only into it | 0600, folder 0700 |
-| `.state/` | Worker state, run output, open requests, watched pull requests, the watchdog's lock | – |
-| `.logs/gateway.log` | Log, without tokens | – |
+| `.state/` | Worker state, run output, open requests, watched pull requests, the watchdog's lock | 0700 when the gateway creates it |
+| `.state/requests.json` | Voice requests and the answers, with what the voice client has read | 0600 |
+| `.logs/gateway.log`, `.logs/gateway.log.1` | Log, without tokens; rotated at `VOICE_GW_LOG_MAX_MB` | 0600, folder 0700 when the gateway creates it |
 
 `.secrets/`, `.state/` and `.logs/` are ignored by git. The controller's confinement keeps it
 away from `.secrets/`; the container sees only `.secrets/worker`.
@@ -696,8 +699,9 @@ mkdir -p -m 700 .secrets
 ```bash
 (umask 077; read -rsp 'Bot token: ' t; printf '%s' "$t" > .secrets/telegram_token)
 # write to the bot from your Telegram account, then:
-curl -s "https://api.telegram.org/bot$(cat .secrets/telegram_token)/getUpdates" \
-  | jq '.result[].message.chat | {id, type, first_name}'
+# printf is built into the shell, so the token stays off every command line (ps)
+printf 'url = "https://api.telegram.org/bot%s/getUpdates"\n' "$(cat .secrets/telegram_token)" \
+  | curl -s -K - | jq '.result[].message.chat | {id, type, first_name}'
 (umask 077; printf '%s' '<id of your private chat>' > .secrets/telegram_chat_id)
 ```
 
@@ -947,6 +951,7 @@ gateway reads them at its start: restart the controller after a change.
 | `VOICE_GW_SECRETS_DIR` | `.secrets` | Secrets, settings file, admin socket |
 | `VOICE_GW_STATE_DIR` | `.state` | Worker state, run output, requests, pull request watches |
 | `VOICE_GW_LOG_FILE` | `.logs/gateway.log` | Empty: stderr only |
+| `VOICE_GW_LOG_MAX_MB` | `10` | Past this size the log moves to `gateway.log.1`, replacing the one before |
 | `VOICE_GW_OAUTH_HOSTS` | `claude.ai,claude.com` | Hosts allowed in redirect addresses and client ID metadata documents |
 | `VOICE_GW_PERMISSION_RELAY` | on | `0`: approvals only at the terminal |
 | `VOICE_GW_PERMISSION_TTL` | `900` | Seconds before an open approval leaves the voice view |
@@ -1037,7 +1042,7 @@ do not set them.
 | Startup warning that channels are not enabled for the organisation | Team and Enterprise, including a Max seat in a Team organisation: an Owner enables Organization settings → Claude Code → Channels. `claude --debug` logs "the organization is team" in that case. |
 | Channel event arrives, but no answer | The controller's turn failed, for example "Login expired". Look at the controller terminal; `/login` there. |
 | `status` reports `controller=unconfirmed`, `get_reply` shows a hint | The session runs without the channel (neither the plugin nor `--dangerously-load-development-channels server:voice`), or the organisation blocks channels. Start it with `scripts/start-controller.sh` and check `/mcp`; otherwise Claude Code drops events silently. |
-| `EADDRINUSE` in the log | A second controller session is running. Start only one. |
+| `voice port … is in use by another process` in the log, and the same on Telegram | Another process holds `VOICE_GW_PORT`: a second controller session, or a gateway left over from an earlier session, which also answers the watchdog's `/healthz`. The new gateway ends with an error. `lsof -nP -iTCP:8787 -sTCP:LISTEN` shows the process; end it, start only one controller, then restart it. |
 | Voice assistant answers itself instead of asking | Say "Ask Claude Code …" explicitly. |
 | Voice assistant says the connector does not work | Look at `.logs/gateway.log`. No `voice initialize`: the request never arrived (URL, tunnel or proxy, DNS). `voice 401`: the client has to sign in again. `initialize` and `tools/list` but no `tools/call`: the assistant chose not to call a tool. |
 | A repository is missing from `list_workers` | Only folders directly in the worker root with a `.git` count. Check `VOICE_GW_WORKER_ROOT`. |

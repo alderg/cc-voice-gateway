@@ -31,7 +31,8 @@ const REFRESH_TTL_S = 30 * 24 * 60 * 60
 const LOCAL_TTL_S = 12 * 60 * 60
 const CODE_TTL_MS = 5 * 60 * 1000
 const PAIRING_TTL_MS = 5 * 60 * 1000
-const PAIRING_ATTEMPTS = 5
+const PAIRING_ATTEMPTS = 5 // wrong ones per client and per address
+const PAIRING_ATTEMPTS_TOTAL = 20 // wrong ones in all; then the code is burnt
 const MAX_CLIENTS = 100
 const MAX_FORM_BYTES = 64 * 1024
 const SCOPE = 'mcp'
@@ -55,6 +56,23 @@ export function publicOrigin(req) {
     // fall through
   }
   return 'http://localhost'
+}
+
+const loopback = address => /^(127\.|::1$|::ffff:127\.)/.test(address)
+
+// The address a request came from, for counting wrong pairing codes. The
+// gateway listens on loopback, and the tunnel or reverse proxy on this
+// computer connects from there: then the client's address is the last entry
+// of X-Forwarded-For, the one that proxy added. Anything else counts by the
+// address of the connection itself, which a client cannot choose.
+export function clientAddress(req) {
+  const peer = req.socket?.remoteAddress ?? '?'
+  const forwarded = String(req.headers['x-forwarded-for'] ?? '')
+    .split(',')
+    .map(entry => entry.trim())
+    .filter(Boolean)
+    .at(-1)
+  return preview(forwarded && loopback(peer) ? forwarded : peer, 64)
 }
 
 function sameResource(resource, origin) {
@@ -124,26 +142,49 @@ export class Auth {
 
   newPairingCode() {
     const code = String(randomInt(0, 1e8)).padStart(8, '0')
-    this.pairing = { hash: sha256(code), expiresAt: now() + PAIRING_TTL_MS, attemptsLeft: PAIRING_ATTEMPTS }
+    this.pairing = {
+      hash: sha256(code),
+      expiresAt: now() + PAIRING_TTL_MS,
+      wrong: { total: 0, clients: new Map(), addresses: new Map() },
+    }
     log('oauth pairing code issued')
     return { code: `${code.slice(0, 4)} ${code.slice(4)}`, expiresIn: PAIRING_TTL_MS / 1000 }
   }
 
   // One code, one sign-in, a few attempts: guessing 8 digits is hopeless.
-  checkPairingCode(input) {
+  // Wrong attempts count per client and per address, so that a stranger, who
+  // can register a client of their own, locks out only themselves; after
+  // PAIRING_ATTEMPTS_TOTAL wrong ones from anywhere the code is burnt. A client
+  // ID metadata document is public, anyone can name it, so such a client
+  // counts by address only: nobody can lock out Claude's published identity.
+  checkPairingCode(input, { clientId = null, address = '?' } = {}) {
     const pairing = this.pairing
     if (!pairing || pairing.expiresAt < now()) {
       this.pairing = null
       log('oauth sign-in without a valid pairing code')
       return false
     }
+    const { wrong } = pairing
+    const client = clientId && !/^https?:\/\//.test(clientId) ? clientId : null
+    const count = (map, key) => (key === null ? 0 : (map.get(key) ?? 0))
+    if (count(wrong.clients, client) >= PAIRING_ATTEMPTS || count(wrong.addresses, address) >= PAIRING_ATTEMPTS) {
+      log(`oauth pairing code refused for ${address}: too many wrong attempts from this client or address`)
+      return false
+    }
     if (sha256(String(input ?? '').replace(/[\s-]/g, '')) === pairing.hash) {
       this.pairing = null
       return true
     }
-    pairing.attemptsLeft -= 1
-    if (pairing.attemptsLeft <= 0) this.pairing = null
-    log(`oauth wrong pairing code, ${Math.max(pairing.attemptsLeft, 0)} attempts left`)
+    if (client !== null) wrong.clients.set(client, count(wrong.clients, client) + 1)
+    wrong.addresses.set(address, count(wrong.addresses, address) + 1)
+    wrong.total += 1
+    if (wrong.total >= PAIRING_ATTEMPTS_TOTAL) {
+      this.pairing = null
+      log(`oauth wrong pairing code from ${address}; ${wrong.total} wrong attempts in all, the code is burnt`)
+      return false
+    }
+    const left = PAIRING_ATTEMPTS - Math.max(count(wrong.clients, client), count(wrong.addresses, address))
+    log(`oauth wrong pairing code from ${address}, ${left} attempts left there`)
     return false
   }
 
@@ -398,7 +439,7 @@ export class Auth {
       redirect(res, withParams(redirectUri, { error: 'access_denied', state, iss: origin }))
       return
     }
-    if (!this.checkPairingCode(params.get('pairing_code'))) {
+    if (!this.checkPairingCode(params.get('pairing_code'), { clientId: client.clientId, address: clientAddress(req) })) {
       sendPage(res, 200, signInPage(params, client, origin, 'Wrong or expired code. Run node scripts/pair.mjs again.'))
       return
     }

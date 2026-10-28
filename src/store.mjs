@@ -13,6 +13,7 @@ import { EventEmitter } from 'node:events'
 import { randomInt } from 'node:crypto'
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
+import { log as defaultLog } from './log.mjs'
 
 // Short ids without look-alike characters (no l/1, o/0, i).
 const ID_ALPHABET = 'abcdefghjkmnpqrstuvwxyz23456789'
@@ -21,6 +22,7 @@ export const REQUEST_STATES = ['sent', 'working', 'question', 'done']
 export const CONTROLLER_STATES = ['working', 'question', 'done']
 
 const REQUEST_RETENTION_MS = 6 * 60 * 60 * 1000
+const SAVE_DELAY_MS = 100
 
 // What a request that was not finished says after a restart of the session.
 export const RESTART_NOTE =
@@ -30,9 +32,10 @@ export class Store extends EventEmitter {
   // With a file, the requests survive a restart of the gateway, which comes
   // with every restart of the controller session. Approvals do not: they
   // belong to the session that asked.
-  constructor({ permissionTtlSeconds = 900, file = null } = {}) {
+  constructor({ permissionTtlSeconds = 900, file = null, log = defaultLog } = {}) {
     super()
     this.setMaxListeners(0) // one listener per waiting long-poll
+    this.log = log
     this.permissionTtlMs = permissionTtlSeconds * 1000
     this.requests = new Map()
     this.permissions = new Map()
@@ -44,10 +47,7 @@ export class Store extends EventEmitter {
     this.saveTimer = null
     if (file) {
       this.restore()
-      this.on('change', () => {
-        clearTimeout(this.saveTimer)
-        this.saveTimer = setTimeout(() => this.save(), 100)
-      })
+      this.on('change', () => this.saveSoon())
     }
   }
 
@@ -59,11 +59,23 @@ export class Store extends EventEmitter {
     let saved
     try {
       saved = JSON.parse(readFileSync(this.file, 'utf8'))
-    } catch {
+    } catch (error) {
+      if (error.code !== 'ENOENT') {
+        this.log(`requests file ${this.file} unreadable, starting without the saved requests: ${error.message}`)
+      }
       return
     }
-    for (const request of saved.requests ?? []) {
-      if (!request?.id) continue
+    if (!Array.isArray(saved?.requests)) {
+      this.log(`requests file ${this.file} holds no list of requests, starting without the saved requests`)
+      return
+    }
+    let skipped = 0
+    for (const request of saved.requests) {
+      if (!usable(request)) {
+        skipped++
+        continue
+      }
+      request.closed = request.closed === true
       if (request.origin === 'voice' && request.state !== 'done') {
         request.updates.push({ at: Date.now(), state: 'done', text: RESTART_NOTE })
         request.state = 'done'
@@ -71,23 +83,37 @@ export class Store extends EventEmitter {
       if (request.origin === 'worker' && !request.updates.length) request.resend = true
       this.requests.set(request.id, request)
     }
+    if (skipped) {
+      this.log(`requests file ${this.file}: skipped ${skipped} unusable entr${skipped === 1 ? 'y' : 'ies'}`)
+    }
     this.prune()
     // The restart counts as a voice call, so the voice client gets the usual
     // time to pick up what is left before the Telegram fallback sends it.
     if (this.requests.size) this.voiceSeenAt = Date.now()
   }
 
+  // Requests hold what the driver said and what the controller answered:
+  // folder 0700 and file 0600 when the gateway creates them.
   save() {
     if (!this.file) return
     clearTimeout(this.saveTimer)
     try {
-      mkdirSync(dirname(this.file), { recursive: true })
+      mkdirSync(dirname(this.file), { recursive: true, mode: 0o700 })
       const tmp = `${this.file}.${process.pid}.tmp`
-      writeFileSync(tmp, JSON.stringify({ requests: [...this.requests.values()] }) + '\n')
+      writeFileSync(tmp, JSON.stringify({ requests: [...this.requests.values()] }) + '\n', { mode: 0o600 })
       renameSync(tmp, this.file)
     } catch {
       // the requests stay in memory; the next change tries again
     }
+  }
+
+  // Saves after a short delay, so that a burst of changes is written once.
+  // Without the 'change' event: what the voice client has read must reach the
+  // file too, but it must not wake the long-polls or the Telegram fallback.
+  saveSoon() {
+    if (!this.file) return
+    clearTimeout(this.saveTimer)
+    this.saveTimer = setTimeout(() => this.save(), SAVE_DELAY_MS)
   }
 
   newId(length = 4) {
@@ -144,8 +170,29 @@ export class Store extends EventEmitter {
 
   takeUnread(request) {
     const fresh = request.updates.slice(request.cursor)
-    request.cursor = request.updates.length
+    if (fresh.length) {
+      request.cursor = request.updates.length
+      this.saveSoon() // otherwise a restart would deliver it again, by Telegram
+    }
     return fresh
+  }
+
+  // The voice client has received state done: later answers are news.
+  markClosed(request) {
+    if (request.closed) return
+    request.closed = true
+    this.saveSoon()
+  }
+
+  // The driver answered a question with a new request (send with in_reply_to).
+  // The question is settled: not open any more, and nothing of it is left to
+  // deliver, by voice or by Telegram.
+  markAnswered(request, answerId) {
+    request.state = 'done'
+    request.answeredBy = answerId
+    request.cursor = request.updates.length
+    request.closed = true
+    this.changed()
   }
 
   // News: answers the voice client gets with whatever it calls next, because
@@ -169,6 +216,7 @@ export class Store extends EventEmitter {
   // --- permission prompts relayed by Claude Code --------------------------
 
   addPermission({ request_id, tool_name, description, input_preview }) {
+    this.prunePermissions()
     const code = String(request_id).toLowerCase()
     this.permissions.set(code, {
       code,
@@ -184,17 +232,18 @@ export class Store extends EventEmitter {
   }
 
   openPermissions() {
+    this.prunePermissions()
+    return [...this.permissions.values()].filter(permission => permission.status === 'open')
+  }
+
+  // Open approvals leave after the TTL; answered ones too, counted from the
+  // answer, so that a second answer still hears "already answered" for a while.
+  prunePermissions() {
     const now = Date.now()
-    const open = []
     for (const [code, permission] of this.permissions) {
-      if (permission.status !== 'open') continue
-      if (now - permission.createdAt > this.permissionTtlMs) {
-        this.permissions.delete(code)
-        continue
-      }
-      open.push(permission)
+      const since = permission.status === 'open' ? permission.createdAt : (permission.resolvedAt ?? permission.createdAt)
+      if (now - since > this.permissionTtlMs) this.permissions.delete(code)
     }
-    return open
   }
 
   hasUnannouncedPermission() {
@@ -205,6 +254,7 @@ export class Store extends EventEmitter {
     const permission = this.permissions.get(String(code).toLowerCase())
     if (!permission || permission.status !== 'open') return null
     permission.status = behavior
+    permission.resolvedAt = Date.now()
     this.changed()
     return permission
   }
@@ -266,4 +316,24 @@ export class Store extends EventEmitter {
       if (request.createdAt < cutoff) this.requests.delete(id)
     }
   }
+}
+
+// A saved request the gateway can work with. Anything else in the file, from
+// an older version or edited by hand, is skipped instead of stopping the start.
+function usable(request) {
+  return (
+    request !== null &&
+    typeof request === 'object' &&
+    typeof request.id === 'string' &&
+    request.id !== '' &&
+    typeof request.text === 'string' &&
+    typeof request.origin === 'string' &&
+    REQUEST_STATES.includes(request.state) &&
+    Number.isFinite(request.createdAt) &&
+    Array.isArray(request.updates) &&
+    request.updates.every(update => update !== null && typeof update === 'object' && typeof update.text === 'string') &&
+    Number.isInteger(request.cursor) &&
+    request.cursor >= 0 &&
+    request.cursor <= request.updates.length
+  )
 }

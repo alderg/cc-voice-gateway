@@ -238,13 +238,28 @@ const idOf = out => /id=([a-z0-9]+)/.exec(out)?.[1]
 
 test('voice requests survive a restart of the gateway; an unfinished one ends with a note', async () => {
   const first = await startGateway('survive')
-  const answered = idOf(await first.call('send', { message: 'How many files are there?' }))
-  await first.controller('reply', { request_id: answered, state: 'done', text: 'There are three files.' })
-  const unfinished = idOf(await first.call('send', { message: 'Run the long task.' }))
-  await first.controller('reply', { request_id: unfinished, state: 'working', text: 'On it.' })
-  assert.match(await first.call('get_reply', { id: unfinished }), /Claude Code: On it\./)
-  await sleep(300)
-  await first.close()
+  let answered, heard, unfinished
+  try {
+    answered = idOf(await first.call('send', { message: 'How many files are there?' }))
+    await first.controller('reply', { request_id: answered, state: 'done', text: 'There are three files.' })
+    heard = idOf(await first.call('send', { message: 'Is the build green?' }))
+    await first.controller('reply', { request_id: heard, state: 'done', text: 'Yes, green.' })
+    unfinished = idOf(await first.call('send', { message: 'Run the long task.' }))
+    await first.controller('reply', { request_id: unfinished, state: 'working', text: 'On it.' })
+    // Read well after the replies were saved: reading is saved on its own.
+    await sleep(300)
+    assert.match(await first.call('get_reply', { id: heard }), /Claude Code: Yes, green\./)
+    assert.match(await first.call('get_reply', { id: unfinished }), /Claude Code: On it\./)
+    await sleep(300)
+    const read = JSON.parse(readFileSync(join(first.state, 'requests.json'), 'utf8')).requests
+    assert.deepEqual(
+      [heard, unfinished].map(id => read.find(r => r.id === id)).map(r => [r.cursor, r.closed]),
+      [[1, true], [1, false]],
+      'saved before the session ends',
+    )
+  } finally {
+    await first.close()
+  }
   await sleep(300)
 
   // A worker result the old controller never answered.
@@ -261,11 +276,17 @@ test('voice requests survive a restart of the gateway; an unfinished one ends wi
     closed: false,
     meta: { worker: 'alpha', task: 't123', outcome: 'done' },
   })
+  // An entry the gateway cannot use, from an older version or edited by hand.
+  saved.requests.push({ id: 'bad1', origin: 'voice', state: 'sent', text: 'no updates' })
   writeFileSync(file, JSON.stringify(saved))
 
   const second = await startGateway('survive')
   try {
+    assert.match(second.log, /requests file .*requests\.json: skipped 1 unusable entry/)
     assert.match(await second.call('get_reply', { id: answered }), /^\[state=done .*\nClaude Code: There are three files\./)
+    const again = await second.call('get_reply', { id: heard })
+    assert.match(again, /Done, no new messages/)
+    assert.doesNotMatch(again, /Yes, green/, 'what the voice client heard before the restart is not repeated')
     const note = await second.call('get_reply', { id: unfinished })
     assert.match(note, /^\[state=done /)
     assert.ok(note.includes(RESTART_NOTE))

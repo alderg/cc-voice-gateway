@@ -283,7 +283,7 @@ test('sign-in page: shows who connects, needs a pairing code that works once', a
   assert.ok(!gatewayLog.includes(exchange.body.access_token), 'tokens stay out of the log')
 })
 
-test('five wrong pairing codes burn the code', async () => {
+test('five wrong pairing codes burn the code for that client', async () => {
   const { body: client } = await register()
   const params = authorizeParams(client.client_id, pkce().challenge)
   const { code } = await admin('POST', '/pairing')
@@ -293,6 +293,63 @@ test('five wrong pairing codes burn the code', async () => {
   const late = await request('/oauth/authorize', { form: { ...params, pairing_code: code, action: 'connect' } })
   assert.equal(late.status, 200)
   assert.match(await late.text(), /Wrong or expired code/)
+})
+
+// Wrong pairing codes from a stranger, who can register a client of their own,
+// lock out only that client and address; the code is burnt for everyone only
+// after 20 wrong attempts in all. The address comes from X-Forwarded-For, which
+// the tunnel sets.
+async function attempt(clientId, pairingCode, address) {
+  const res = await request('/oauth/authorize', {
+    form: { ...authorizeParams(clientId, pkce().challenge), pairing_code: pairingCode, action: 'connect' },
+    headers: address ? { 'x-forwarded-for': address } : {},
+  })
+  return res.status
+}
+
+test('wrong pairing codes from a stranger lock out only that client and address', async () => {
+  const { body: stranger } = await register({ client_name: 'Stranger' })
+  const { body: driver } = await register({ client_name: 'Claude' })
+  const { code } = await admin('POST', '/pairing')
+  for (let i = 0; i < 5; i++) assert.equal(await attempt(stranger.client_id, '99999999', '203.0.113.7'), 200)
+  assert.equal(await attempt(stranger.client_id, code, '203.0.113.7'), 200, 'locked out at its address')
+  assert.equal(await attempt(stranger.client_id, code, '203.0.113.8'), 200, 'and as a client, from anywhere')
+  const { body: fresh } = await register({ client_name: 'Stranger again' })
+  assert.equal(await attempt(fresh.client_id, code, '203.0.113.7'), 200, 'a new client from the same address neither')
+  assert.match(gatewayLog, /pairing code refused for 203\.0\.113\.7: too many wrong attempts/)
+  assert.equal(await attempt(driver.client_id, code, '198.51.100.2'), 302, 'the driver still signs in')
+})
+
+test("the address counts behind the tunnel only: the tunnel's entry is the last one", async () => {
+  const { code } = await admin('POST', '/pairing')
+  // A stranger's own X-Forwarded-For comes first; the tunnel appends the real address.
+  for (let i = 0; i < 5; i++) {
+    const { body: client } = await register()
+    assert.equal(await attempt(client.client_id, '99999999', `10.0.0.${i}, 203.0.113.9`), 200)
+  }
+  const { body: next } = await register()
+  assert.equal(await attempt(next.client_id, code, '10.0.0.99, 203.0.113.9'), 200, 'five wrong ones from that address')
+  const { body: driver } = await register()
+  assert.equal(await attempt(driver.client_id, code, '198.51.100.3'), 302)
+})
+
+test("Claude's published identity counts by address only, so a stranger cannot lock it out", async () => {
+  const clientId = `http://127.0.0.1:${documentsPort}/client.json`
+  const { code } = await admin('POST', '/pairing')
+  for (let i = 0; i < 5; i++) assert.equal(await attempt(clientId, '99999999', '203.0.113.10'), 200)
+  assert.equal(await attempt(clientId, code, '203.0.113.10'), 200)
+  assert.equal(await attempt(clientId, code, '198.51.100.4'), 302)
+})
+
+test('twenty wrong pairing codes in all burn the code for everyone', async () => {
+  const { code } = await admin('POST', '/pairing')
+  for (let i = 0; i < 20; i++) {
+    const { body: client } = await register()
+    assert.equal(await attempt(client.client_id, '99999999', `203.0.113.${20 + Math.floor(i / 5)}`), 200)
+  }
+  assert.match(gatewayLog, /20 wrong attempts in all, the code is burnt/)
+  const { body: driver } = await register()
+  assert.equal(await attempt(driver.client_id, code, '198.51.100.5'), 200)
 })
 
 test('authorization errors: a strange client stays on the page, the rest goes back to it', async () => {
