@@ -8,7 +8,7 @@
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -20,7 +20,9 @@ import { z } from 'zod'
 import { adminRequest } from '../src/admin.mjs'
 
 const GATEWAY = fileURLToPath(new URL('../src/gateway.mjs', import.meta.url))
-const TMP = mkdtempSync(join(tmpdir(), 'voice-gw-workers-'))
+// Resolved: on macOS the temporary folder is behind a symlink (/var is
+// /private/var), and the stand-in for claude reports the resolved cwd.
+const TMP = realpathSync(mkdtempSync(join(tmpdir(), 'voice-gw-workers-')))
 const ROOT = join(TMP, 'Developer')
 const BIN = join(TMP, 'bin')
 const CALLS = join(TMP, 'claude-calls.jsonl')
