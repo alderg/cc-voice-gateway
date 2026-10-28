@@ -1,0 +1,21 @@
+#!/bin/sh
+# voice-run <task> <command> [args...]
+#
+# Starts one worker run for the gateway (docker exec ... voice-run). Hands it
+# the tokens from the mounted secrets, without them ever being in the
+# container's configuration, and puts it in its own process group, whose id
+# goes to /tmp/voice-runs/<task> so that voice-stop ends the whole run.
+set -eu
+task="$1"
+shift
+secrets="${VOICE_SECRETS:-/run/secrets/voice}"
+if [ -s "$secrets/claude_token" ]; then
+  CLAUDE_CODE_OAUTH_TOKEN="$(cat "$secrets/claude_token")"
+  export CLAUDE_CODE_OAUTH_TOKEN
+fi
+if [ -s "$secrets/github_token" ]; then
+  GH_TOKEN="$(cat "$secrets/github_token")"
+  export GH_TOKEN
+fi
+mkdir -p /tmp/voice-runs
+exec setsid -w sh -c 'echo $$ > "/tmp/voice-runs/$1"; shift; exec "$@"' sh "$task" "$@"

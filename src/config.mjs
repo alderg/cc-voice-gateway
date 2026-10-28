@@ -59,9 +59,37 @@ export const config = {
   ghBin: process.env.VOICE_GW_GH_BIN || 'gh',
   // Worker state and the output of every run.
   stateDir: process.env.VOICE_GW_STATE_DIR || join(ROOT, '.state'),
+
+  // Pull requests that workers open (pulls.mjs): how often the gateway looks
+  // at their checks and reviews, in seconds, and for how many hours at most.
+  prPollSeconds: num(process.env.VOICE_GW_PR_POLL, 60),
+  prWatchHours: num(process.env.VOICE_GW_PR_WATCH_HOURS, 24),
+
+  // Telegram fallback, on when both of its files in the secrets folder are set:
+  // after this many seconds without a voice tool call, the voice mode counts
+  // as ended, and results, questions and approvals also go to Telegram.
+  telegramAfterSeconds: num(process.env.VOICE_GW_TELEGRAM_AFTER, 60),
+  telegramApi: process.env.VOICE_GW_TELEGRAM_API || 'https://api.telegram.org',
+
+  // Workers in a Docker container with its own clones (docker/): the
+  // container's name. Empty: workers run in the checkouts on this computer.
+  docker: process.env.VOICE_GW_DOCKER || '',
+  dockerBin: process.env.VOICE_GW_DOCKER_BIN || 'docker',
+  // Where the clones are inside the container.
+  dockerRepos: process.env.VOICE_GW_DOCKER_REPOS || '/repos',
+  // Access level of workers in the container (access.mjs): read-only, pr or
+  // full for every repository. Empty: detected per repository from the token.
+  access: process.env.VOICE_GW_ACCESS || '',
+  githubApi: process.env.VOICE_GW_GITHUB_API || 'https://api.github.com',
 }
 
 config.oauthStateFile = join(config.secretsDir, 'oauth.json')
 // Voice requests, so that they survive a restart of the controller session.
 config.requestsFile = join(config.stateDir, 'requests.json')
 config.adminSocket = join(config.secretsDir, 'admin.sock')
+config.pullsStateFile = join(config.stateDir, 'pulls.json')
+config.telegramTokenFile = join(config.secretsDir, 'telegram_token')
+config.telegramChatIdFile = join(config.secretsDir, 'telegram_chat_id')
+// The worker container's secrets, mounted read-only into it.
+config.workerSecretsDir = join(config.secretsDir, 'worker')
+config.githubTokenFile = join(config.workerSecretsDir, 'github_token')

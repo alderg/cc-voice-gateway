@@ -6,8 +6,11 @@
 //   stdio  -> Claude Code controller session (a channel: push events, reply tool, permission relay)
 //   HTTP   -> voice assistant in the car (MCP tools: status, send, ask, get_reply, approve),
 //             behind an OAuth sign-in
-// plus a Unix socket for scripts/pair.mjs (pairing codes, connections), and the
-// workers: headless Claude Code runs in the repositories next to this one.
+// plus a Unix socket for scripts/pair.mjs (pairing codes, connections), the
+// workers: headless Claude Code runs in the repositories next to this one, or
+// in a Docker container with its own clones, a watch on the pull requests they
+// open, for checks and reviews, and optionally Telegram, for news after the
+// voice mode ended.
 
 import { config } from './config.mjs'
 import { log } from './log.mjs'
@@ -18,16 +21,50 @@ import { startChannel } from './channel.mjs'
 import { startVoiceHttp } from './voice.mjs'
 import { Workers } from './workers.mjs'
 import { Restarter } from './restart.mjs'
+import { PullWatcher } from './pulls.mjs'
+import { TelegramFallback, loadTelegram } from './telegram.mjs'
+import { DockerRunner, HostRunner } from './runners.mjs'
+import { ACCESS_LEVELS, GitHubAccess } from './access.mjs'
 
 const store = new Store({ permissionTtlSeconds: config.permissionTtlSeconds, file: config.requestsFile })
 const auth = new Auth({ stateFile: config.oauthStateFile, allowedHosts: config.oauthHosts })
+if (config.access && !ACCESS_LEVELS.includes(config.access)) {
+  log(`VOICE_GW_ACCESS=${config.access} is not one of ${ACCESS_LEVELS.join(', ')}; detecting the level instead`)
+}
+if (config.docker) {
+  log(
+    `workers run in the Docker container ${config.docker},`,
+    ACCESS_LEVELS.includes(config.access)
+      ? `access level ${config.access} (VOICE_GW_ACCESS)`
+      : 'access level per repository from the GitHub token',
+  )
+}
+const runner = config.docker
+  ? new DockerRunner({ container: config.docker, root: config.dockerRepos, dockerBin: config.dockerBin })
+  : new HostRunner(config.workerRoot)
+if (config.docker) {
+  runner.check().then(({ folder, user, warnings }) => {
+    log(`worker container ${config.docker}: repositories from host folder ${folder ?? '?'}, running as ${user ?? '?'}`)
+    for (const warning of warnings) log(`worker container ${config.docker}: ${warning}`)
+  })
+}
 const workers = new Workers({
-  root: config.workerRoot,
+  runner,
+  access: config.docker
+    ? new GitHubAccess({ tokenFile: config.githubTokenFile, apiBase: config.githubApi, forced: config.access })
+    : null,
   stateDir: config.stateDir,
   claudeBin: config.claudeBin,
   ghBin: config.ghBin,
   maxRuns: config.maxWorkers,
   timeoutMinutes: config.workerTimeoutMinutes,
+})
+
+const pulls = new PullWatcher({
+  ghBin: config.ghBin,
+  stateFile: config.pullsStateFile,
+  pollSeconds: config.prPollSeconds,
+  watchHours: config.prWatchHours,
 })
 
 let http
@@ -40,6 +77,7 @@ function shutdown(reason) {
   http?.close()
   admin?.close()
   workers.close() // runs go on; the next gateway picks them up
+  pulls.close() // so do the watches on pull requests
   // Give pending log writes and HTTP responses a moment, then leave.
   setTimeout(() => process.exit(0), 200).unref()
 }
@@ -54,16 +92,25 @@ const channel = await startChannel(store, {
   onClose: () => shutdown('stdio closed'),
 })
 
-// When a run ends, its result goes to the controller as a channel event. The
-// controller's reply to it reaches the driver as news.
+// When a run ends, its result goes to the controller as a channel event, with
+// the pull requests it opened or worked on. The controller's reply to it
+// reaches the driver as news.
 const reporting = new Set()
 workers.on('finished', async task => {
   if (reporting.has(task.id)) return
   reporting.add(task.id)
   try {
     await channel.ready
-    const request = store.createRequest(workers.resultText(task), { origin: 'worker' })
+    const opened = await pulls.fromRun(task).catch(error => {
+      log('pull requests of', task.id, 'not checked:', error.message)
+      return []
+    })
+    const request = store.createRequest(workers.resultText(task, opened), {
+      origin: 'worker',
+      worker: { repo: task.repo, task: task.id },
+    })
     request.meta = { worker: task.repo, task: task.id, outcome: task.state } // for sending it again
+    if (opened.length) request.meta.pull_request = opened.map(pull => pull.number).join(',')
     await channel.push(request, request.meta)
     workers.markReported(task)
   } catch (error) {
@@ -72,6 +119,32 @@ workers.on('finished', async task => {
     reporting.delete(task.id)
   }
 })
+
+// Checks and reviews on those pull requests reach the controller as events
+// too, and the driver as news.
+pulls.on('news', async news => {
+  try {
+    await channel.ready
+    const request = store.createRequest(news.text, { origin: 'worker' })
+    request.meta = { worker: news.worker, repo: news.slug, pull_request: String(news.number), kind: news.kind }
+    await channel.push(request, request.meta)
+  } catch (error) {
+    log('pull request news not delivered:', error.message)
+  }
+})
+
+// Telegram, if set up, reaches the driver once the voice mode has ended.
+const telegram = loadTelegram({
+  tokenFile: config.telegramTokenFile,
+  chatIdFile: config.telegramChatIdFile,
+  apiBase: config.telegramApi,
+})
+if (telegram) {
+  new TelegramFallback(store, { send: text => telegram.send(text), afterSeconds: config.telegramAfterSeconds })
+  log(`telegram fallback ready: after ${config.telegramAfterSeconds} s without a voice call`)
+} else {
+  log('telegram fallback off: telegram_token and telegram_chat_id not both set')
+}
 
 admin = await startAdmin(auth, config.adminSocket)
 http = startVoiceHttp(store, channel, auth, config)

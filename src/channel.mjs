@@ -46,10 +46,18 @@ Workers: the driver's repositories are worked on by workers, one per repository 
 a repository, questions included, goes to its worker with dispatch; do no repository work yourself. Put the
 driver's own words in "words" and write "task" so that the worker can act without asking. dispatch returns at
 once: tell the driver it is on its way and reply with state "done".
+With workers in Docker, list_workers shows each repository's access level: read-only keeps everything in the
+container, pr and full open a draft pull request. Only at full, and only when the driver explicitly asks for
+it, pass direct=true for a push straight to the default branch.
 When a run ends, a message arrives as <channel source="${CHANNEL_SOURCE}" request_id="..." worker="..." task="..."
 outcome="done|failed|stopped">. Summarise it for the driver like any answer and reply with that request_id:
 state "done", or "question" when the worker asks something. The driver hears it as news. Their answer arrives
 as a new message "(Answer to <id>) ...": pass it to the same worker with dispatch, as a follow-up.
+When the run opened or updated a pull request, the tag also has pull_request="<number>": say only briefly
+that it is out, and which one. Never offer or suggest a review; details only when the driver asks.
+Checks and reviews that run on such a pull request by themselves arrive later as <channel source="${CHANNEL_SOURCE}"
+request_id="..." worker="..." repo="owner/name" pull_request="..." kind="checks|review|comment">: summarise them
+in one or two sentences and reply "done", without asking anything. The driver hears it as news.
 Restart: when the driver asks to restart the controller, follow restart_controller's description: what it would
 do first, then a question to the driver, and the restart only after their yes.
 `.trim()
@@ -123,8 +131,10 @@ const WORKER_TOOLS = [
     description:
       "Hand a task to a repository's worker: a headless Claude Code run in its checkout, without approvals. " +
       'For changes it commits on a voice/ branch, pushes and opens a draft pull request; on public repositories ' +
-      'it asks before pushing. Returns at once; when the run ends you get a channel event with that worker. ' +
-      'By default the worker continues its previous session there, so follow-ups keep their context.',
+      'it asks before pushing. With workers in Docker, the access level in list_workers decides: read-only ' +
+      'keeps everything in the container, pr and full open a draft pull request. Returns at once; when the run ' +
+      'ends you get a channel event with that worker. By default the worker continues its previous session ' +
+      'there, so follow-ups keep their context.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -135,6 +145,12 @@ const WORKER_TOOLS = [
         allow_dirty: {
           type: 'boolean',
           description: 'Go ahead although the checkout has uncommitted changes. Only after the driver said yes.',
+        },
+        direct: {
+          type: 'boolean',
+          description:
+            'Push straight to the default branch instead of opening a pull request. Only when the driver ' +
+            'explicitly asked for it, and only at access level full.',
         },
       },
       required: ['worker', 'task', 'words'],
@@ -156,12 +172,25 @@ const toolText = (text, isError = false) => ({ content: [{ type: 'text', text }]
 
 function dispatchText(worker, result) {
   switch (result.status) {
-    case 'started':
+    case 'started': {
+      const access = result.facts.access
       return toolText(
-        `[dispatch=started worker=${worker} task=${result.task.id} session=${result.task.resumed ? 'continued' : 'new'}] ` +
-          `Started on branch ${result.facts.branch || 'detached'}. Tell the driver it is on its way. When it ends, ` +
-          `a channel event with worker="${worker}" arrives.`,
+        `[dispatch=started worker=${worker} task=${result.task.id} session=${result.task.resumed ? 'continued' : 'new'}` +
+          `${access ? ` access=${access.level}` : ''}] Started on branch ${result.facts.branch || 'detached'}. ` +
+          `Tell the driver it is on its way. When it ends, a channel event with worker="${worker}" arrives.`,
       )
+    }
+    case 'refused': {
+      const access = result.facts.access
+      return toolText(
+        access
+          ? `[dispatch=refused worker=${worker} access=${access.level}] A direct push needs access level full; ` +
+              `this repository is at ${access.level} (${access.reason}). Nothing started. Tell the driver; ` +
+              'without direct the worker opens a pull request.'
+          : `[dispatch=refused worker=${worker}] Direct pushes need workers in Docker with access level full. ` +
+              'Nothing started. Tell the driver; without direct the worker opens a pull request.',
+      )
+    }
     case 'dirty': {
       const shown = result.files.slice(0, 5).join(', ') + (result.files.length > 5 ? ', …' : '')
       return toolText(
@@ -189,11 +218,20 @@ function dispatchText(worker, result) {
 }
 
 async function callWorkerTool(workers, name, args) {
+  try {
+    return await workerTool(workers, name, args)
+  } catch (error) {
+    return toolText(error.message, true) // for example: the worker container does not answer
+  }
+}
+
+async function workerTool(workers, name, args) {
   const worker = typeof args.worker === 'string' ? args.worker.trim() : ''
   if (name === 'list_workers') return toolText(await workers.listText())
   if (!worker) return toolText('worker is required: a repository name from list_workers.', true)
-  if (!workers.repos().includes(worker)) {
-    return toolText(`No repository "${worker}". Known: ${workers.repos().join(', ')}.`, true)
+  const names = await workers.repos()
+  if (!names.includes(worker)) {
+    return toolText(`No repository "${worker}". Known: ${names.join(', ')}.`, true)
   }
   if (name === 'worker_status') return toolText(workers.statusText(worker))
   if (name === 'stop_worker') {
@@ -210,6 +248,7 @@ async function callWorkerTool(workers, name, args) {
     words: typeof args.words === 'string' ? args.words : '',
     fresh: args.fresh === true,
     allowDirty: args.allow_dirty === true,
+    direct: args.direct === true,
   })
   return dispatchText(worker, result)
 }
