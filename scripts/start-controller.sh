@@ -10,7 +10,12 @@
 #                project's own voice server in .mcp.json stays off.
 #   development  --dangerously-load-development-channels server:voice, from
 #                controller/.mcp.json: Claude Code shows a warning at every
-#                start that must be answered at the terminal.
+#                start that must be answered at the terminal. With
+#                --strict-mcp-config --mcp-config controller/.mcp.json, so
+#                that the gateway is the only MCP server. (Not for the plugin:
+#                --strict-mcp-config also drops plugins' MCP servers, the
+#                gateway's included. There the confine hook blocks every
+#                other server's tools.)
 #
 # Both read the gateway's settings from controller/.mcp.json and from
 # .secrets/gateway.env, which the setup assistant writes (scripts/setup.mjs).
@@ -20,9 +25,11 @@
 # The session runs in manual mode, whatever defaultMode the user settings set.
 # controller/.claude/settings.json lets Bash, Write and Edit run without asking,
 # because its confine hook limits them, and denies tools that reach beyond this
-# folder. Anything else that needs an approval is relayed to the car. (Do not
-# drop the user settings with --setting-sources: then Claude Code reports
-# channels as not enabled for the organisation.)
+# folder. The hook sees every tool call and blocks whatever is not on its list,
+# also the tools of MCP servers and plugins from the user settings. Anything
+# else that needs an approval is relayed to the car. (Do not drop the user
+# settings with --setting-sources: then Claude Code reports channels as not
+# enabled for the organisation.)
 #
 # A watchdog keeps the session running: when it crashes, or its gateway stops
 # answering, it starts it again, with a growing pause in between and at most
@@ -174,7 +181,8 @@ choose_channel() {
     log "channel: the plugin $PLUGIN@$MARKETPLACE, on the organisation's channel allowlist; no confirmation at the start"
   else
     channel_mode=development
-    claude_args=(--permission-mode manual --dangerously-load-development-channels server:voice)
+    claude_args=(--permission-mode manual --strict-mcp-config --mcp-config "$CONTROLLER/.mcp.json"
+      --dangerously-load-development-channels server:voice)
     log "channel: the development flag, since ${line#development }; the warning at the start needs Enter at the terminal"
   fi
   # The session's model and effort from the settings; options given to this

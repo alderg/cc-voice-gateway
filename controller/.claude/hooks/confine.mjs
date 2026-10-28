@@ -1,12 +1,23 @@
 #!/usr/bin/env node
-// PreToolUse hook: confines the controller session's file tools and shell.
+// PreToolUse hook: confines the controller session. It sees every tool call
+// and lets through only the tools on its list; everything else is blocked.
 //
+//   the gateway's tools        mcp__voice__<tool> and mcp__plugin_voice_voice__<tool>
+//   ToolSearch, the to-do list TodoWrite, TaskCreate, TaskGet, TaskList, TaskUpdate
 //   Read, Glob, Grep           only inside controller/
 //   Write, Edit, NotebookEdit  only inside controller/playground/
 //   Bash                       only `ls` inside controller/, `sleep <seconds>`,
 //                              `rm [-f] <files in playground/>`, read-only
 //                              `gh pr` and `gh run` commands with --repo, and
 //                              `gh pr merge`, which always asks for approval
+//
+// Blocked are, among others: other MCP servers' tools (the user's settings and
+// plugins load into this session, and in plugin mode their MCP servers too),
+// subagents (Agent, Task: it is not clear that this hook sees their calls),
+// skills, web access, AskUserQuestion and plan mode. Neither the file tools
+// nor rm touch files that Claude Code reads as instructions or settings:
+// CLAUDE.md, CLAUDE.local.md, AGENTS.md, .mcp.json and anything in a .claude
+// folder.
 //
 // Whoever knows the connector URL can also answer approval prompts, so an ask
 // rule is no protection against them; the settings let these tools run without
@@ -30,7 +41,7 @@
 
 import { realpathSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path'
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const CONTROLLER = realpathSync(resolve(dirname(fileURLToPath(import.meta.url)), '..', '..'))
@@ -39,13 +50,32 @@ const PLAYGROUND = join(CONTROLLER, 'playground')
 const READ_TOOLS = new Set(['Read', 'Glob', 'Grep'])
 const WRITE_TOOLS = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit'])
 
+// The gateway's own tools, by the name of the server in .mcp.json and as the
+// plugin's server (mcp__plugin_<plugin>_<server>__<tool>). Full names, not a
+// prefix: a server called "voice__x" would also start with mcp__voice__.
+const GATEWAY_TOOLS = ['reply', 'list_workers', 'dispatch', 'worker_status', 'stop_worker', 'restart_controller', 'raise_alarm']
+const VOICE_TOOLS = new Set(GATEWAY_TOOLS.flatMap(name => [`mcp__voice__${name}`, `mcp__plugin_voice_voice__${name}`]))
+
+// Built-in tools that reach nothing outside the session: ToolSearch loads the
+// schemas of deferred tools, the gateway's among them; the rest keep the
+// session's to-do list (TodoWrite, or the Task tools in newer versions).
+const SESSION_TOOLS = new Set(['ToolSearch', 'TodoWrite', 'TaskCreate', 'TaskGet', 'TaskList', 'TaskUpdate'])
+
+// Files that Claude Code reads as instructions, MCP servers or settings when
+// it works in a folder, compared without case (macOS ignores it).
+const PLANTED_FILES = new Set(['claude.md', 'claude.local.md', 'agents.md', '.mcp.json'])
+const SETTINGS_FOLDER = '.claude'
+
 const SHELL_RULE =
   'Shell commands are limited to `ls [-aAlhR1tSr] [folders here]`, `sleep <seconds>`, ' +
-  '`rm [-f] <files in playground/>`, read-only `gh pr view|list|checks|diff|status` and ' +
+  '`rm [-f] <files in playground/>` (not CLAUDE.md, AGENTS.md, .mcp.json or .claude/), ' +
+  'read-only `gh pr view|list|checks|diff|status` and ' +
   '`gh run view|list` with `--repo owner/name`, and `gh pr merge <number> --repo owner/name ' +
   '--squash|--merge|--rebase [--delete-branch]`, without quotes, wildcards, pipes or other shell syntax. ' +
   'gh takes plain flags only: no --web, --jq or --template, and `--json` with a comma-separated field ' +
   'list. Use ls and Read to look around.'
+
+const NOT_FROM_THE_CAR = 'Tell the driver this is not possible from the car.'
 
 function block(reason) {
   process.stderr.write(`${reason}\n`)
@@ -82,6 +112,43 @@ function realResolve(path, base) {
       current = parent
     }
   }
+}
+
+// A file in the playground that Claude Code would pick up as instructions or
+// settings. Only the part below the playground counts: the checkout itself
+// may sit in a .claude folder, for example in a worktree.
+function planted(real) {
+  return (
+    PLANTED_FILES.has(basename(real).toLowerCase()) ||
+    relative(PLAYGROUND, real)
+      .split(sep)
+      .some(part => part.toLowerCase() === SETTINGS_FOLDER)
+  )
+}
+
+// Why a tool that is not on the list is blocked, in words for the controller.
+function blockedTool(tool) {
+  const prefix = 'Blocked in the voice controller session:'
+  if (typeof tool !== 'string' || !tool) return 'confine: a tool call without a tool name'
+  if (tool === 'Agent' || tool === 'Task') {
+    return (
+      `${prefix} no subagents (${tool}), since their tool calls might not pass this check. ` +
+      "Work in the driver's repositories goes to workers with dispatch."
+    )
+  }
+  if (['AskUserQuestion', 'EnterPlanMode', 'ExitPlanMode'].includes(tool)) {
+    return `${prefix} nobody can click a form in the car. Ask with the reply tool and state "question".`
+  }
+  if (tool.startsWith('mcp__')) {
+    return (
+      `${prefix} ${tool} is not one of the gateway's tools. MCP servers from the user's settings or from ` +
+      `plugins are not available here. ${NOT_FROM_THE_CAR}`
+    )
+  }
+  return (
+    `${prefix} ${tool} is not on the list of allowed tools: the gateway's tools, Read, Write, Edit, ` +
+    `the shell commands in CLAUDE.md, ToolSearch and the to-do list. ${NOT_FROM_THE_CAR}`
+  )
 }
 
 // The fixed directory part of a glob pattern, e.g. "/home/x/*.txt" -> "/home/x".
@@ -272,7 +339,7 @@ function checkLocal(words, base) {
     files.every(file => {
       if (file.startsWith('-') || ['.', '..'].includes(basename(file))) return false
       const real = realResolve(file, base)
-      return real !== PLAYGROUND && inside(real, PLAYGROUND)
+      return real !== PLAYGROUND && inside(real, PLAYGROUND) && !planted(real)
     })
   )
 }
@@ -286,16 +353,18 @@ try {
   block('confine: could not read the hook input')
 }
 
-const tool = event.tool_name
-const base = event.cwd || CONTROLLER
+const tool = event?.tool_name
+const base = event?.cwd || CONTROLLER
 
+if (VOICE_TOOLS.has(tool) || SESSION_TOOLS.has(tool)) process.exit(0)
 if (tool === 'Bash') {
   const decision = checkShell(event.tool_input?.command, base)
   if (!decision) block(`Blocked in the voice controller session. ${SHELL_RULE}`)
   if (decision !== 'allow') ask(decision)
   process.exit(0)
 }
-if (!READ_TOOLS.has(tool) && !WRITE_TOOLS.has(tool)) process.exit(0)
+// Deny by default: whatever is not on the list is blocked.
+if (!READ_TOOLS.has(tool) && !WRITE_TOOLS.has(tool)) block(blockedTool(tool))
 
 const root = WRITE_TOOLS.has(tool) ? PLAYGROUND : CONTROLLER
 for (const path of paths(tool, event.tool_input ?? {})) {
@@ -304,7 +373,13 @@ for (const path of paths(tool, event.tool_input ?? {})) {
   if (!inside(real, root)) {
     block(
       `Blocked in the voice controller session: ${tool} is only allowed inside ${root}. ` +
-        `${real} is outside. Tell the driver this is not possible from the car.`,
+        `${real} is outside. ${NOT_FROM_THE_CAR}`,
+    )
+  }
+  if (WRITE_TOOLS.has(tool) && planted(real)) {
+    block(
+      `Blocked in the voice controller session: no CLAUDE.md, CLAUDE.local.md, AGENTS.md, .mcp.json or files in a ` +
+        '.claude folder, since Claude Code would read them as instructions or settings. Choose another name.',
     )
   }
 }

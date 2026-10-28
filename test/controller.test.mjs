@@ -3,13 +3,14 @@
 // Whoever knows the connector URL can make the controller work and can also
 // answer its approval prompts. So approvals are no protection against them,
 // and the controller works without asking: the limits are the deny rules and
-// the confine hook, which no approval or allow rule can lift. Every tool that
-// runs without asking must therefore go through the hook.
+// the confine hook, which no approval or allow rule can lift. The hook sees
+// every tool call and blocks whatever is not on its list, since the user's
+// settings, MCP servers and plugins load into the controller too.
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync, spawnSync } from 'node:child_process'
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -61,6 +62,10 @@ test('start-controller.sh runs claude in controller/ with the channel in manual 
   assert.equal(cwd, CONTROLLER)
   assert.equal(valueOf(argv, '--dangerously-load-development-channels'), 'server:voice')
   assert.equal(valueOf(argv, '--permission-mode'), 'manual')
+  // The gateway from controller/.mcp.json is the only MCP server: none from
+  // the user's settings or plugins.
+  assert.ok(argv.includes('--strict-mcp-config'))
+  assert.equal(valueOf(argv, '--mcp-config'), join(CONTROLLER, '.mcp.json'))
   // Seen with a real session: without the user settings, Claude Code reports
   // channels as not enabled for the organisation and drops every event.
   assert.ok(!argv.includes('--setting-sources'), 'user settings must stay loaded')
@@ -114,7 +119,12 @@ test('start-controller.sh loads the channel as the allowlisted plugin, without t
     enabledPlugins: { 'voice@cc-voice-gateway': true },
     disabledMcpjsonServers: ['voice'],
   })
-  assert.match(log, /channel: the plugin voice@cc-voice-gateway, on the organisation's channel allowlist; no confirmation at the start/)
+  // Checked in Claude Code 2.1.284: --strict-mcp-config skips every MCP server
+  // that does not come from --mcp-config, plugins' servers included, so the
+  // channel would be gone. Here the confine hook blocks other servers' tools.
+  assert.ok(!argv.includes('--strict-mcp-config'))
+  assert.ok(!argv.includes('--mcp-config'))
+  assert.match(log,/channel: the plugin voice@cc-voice-gateway, on the organisation's channel allowlist; no confirmation at the start/)
   assert.equal(calls.length, 1, 'no registration needed')
 })
 
@@ -146,11 +156,10 @@ test('controller settings: confined tools run without asking, deny rules, no byp
   const voiceTools = [...names.map(t => `mcp__voice__${t}`), ...names.map(t => `mcp__plugin_voice_voice__${t}`)]
   assert.deepEqual(permissions.allow, [...voiceTools, 'Bash', 'Write', 'Edit', 'NotebookEdit'])
   assert.equal(permissions.ask, undefined)
+  // Every tool goes through the hook, these and whatever the user's settings
+  // allow, too.
   const [entry] = SETTINGS.hooks.PreToolUse
-  // The gateway's own tools are not file or shell tools; the rest is confined.
-  for (const rule of permissions.allow.filter(rule => !voiceTools.includes(rule))) {
-    assert.match(rule, new RegExp(`^(${entry.matcher})$`), `${rule} runs without asking, so the hook must confine it`)
-  }
+  assert.equal(entry.matcher, '*')
   assert.equal(permissions.defaultMode, undefined)
   // Tools that reach beyond this folder: accounts, the web, other sessions.
   for (const rule of ['mcp__claude_ai_*', 'WebFetch', 'WebSearch', 'SendMessage', 'ListAgents', 'RemoteTrigger', 'CronCreate', 'Artifact*', 'Monitor', 'EnterWorktree']) {
@@ -163,13 +172,16 @@ test('controller settings: confined tools run without asking, deny rules, no byp
   assert.equal(permissions.disableAutoMode, 'disable')
 })
 
-test('controller settings: the confine hook covers Bash and every file tool and fails closed', () => {
+test('controller settings: the confine hook covers every tool and fails closed', () => {
   // Seen with a real session on Ubuntu 26.04: AppArmor stops Claude Code's
   // Bash sandbox from starting, so the hook is the only limit for Bash.
   assert.equal(SETTINGS.sandbox, undefined)
+  // "*" matches every tool name in Claude Code, MCP tools included. The
+  // security review found that a list of tools let everything else through.
+  assert.equal(SETTINGS.hooks.PreToolUse.length, 1)
   const [entry] = SETTINGS.hooks.PreToolUse
-  const matched = new RegExp(`^(${entry.matcher})$`)
-  for (const tool of ['Bash', 'Read', 'Glob', 'Grep', 'Write', 'Edit', 'NotebookEdit']) assert.match(tool, matched)
+  assert.equal(entry.matcher, '*')
+  assert.equal(entry.hooks.length, 1)
   const { command } = entry.hooks[0]
   assert.match(command, /\.claude\/hooks\/confine\.mjs/)
   // If node or the script cannot run, the call must be blocked, not allowed.
@@ -199,10 +211,12 @@ const asked = (...args) => {
   assert.equal(hookSpecificOutput.permissionDecision, 'ask', JSON.stringify(args))
   return hookSpecificOutput.permissionDecisionReason
 }
+// Returns the reason, which goes to Claude.
 const blocked = (...args) => {
   const result = hook(...args)
   assert.equal(result.status, 2, JSON.stringify(args))
   assert.ok(result.stderr.trim(), 'the reason goes to Claude')
+  return result.stderr
 }
 
 test('confine hook: reads only inside controller/', () => {
@@ -462,8 +476,153 @@ test('confine hook: gh pr merge in one strict form, and always only after an app
   }
 })
 
-test('confine hook: other tools pass, broken input is blocked', () => {
+test('confine hook: the gateway\'s tools pass under both names, and a few harmless built-ins', () => {
   allowed('mcp__voice__reply', { request_id: 'abcd', state: 'done', text: 'ok' })
+  allowed('mcp__plugin_voice_voice__reply', { request_id: 'abcd', state: 'done', text: 'ok' })
+  // Exactly the tools the settings let run without asking.
+  const voiceTools = SETTINGS.permissions.allow.filter(rule => rule.startsWith('mcp__'))
+  assert.equal(voiceTools.length, 14)
+  for (const tool of voiceTools) allowed(tool, {})
+  // ToolSearch loads deferred tools, the gateway's among them; the others
+  // are the session's to-do list.
+  for (const tool of ['ToolSearch', 'TodoWrite', 'TaskCreate', 'TaskGet', 'TaskList', 'TaskUpdate']) allowed(tool, {})
+})
+
+test('confine hook: deny by default, MCP tools from elsewhere included', () => {
+  // Found in the security review: the user's MCP servers and plugins load into
+  // the controller, and their allow rules too. Without the hook, a GitHub or
+  // filesystem tool would run unconfined and without a prompt.
+  for (const tool of [
+    'mcp__github__create_issue',
+    'mcp__github__merge_pull_request',
+    'mcp__filesystem__write_file',
+    'mcp__plugin_github_github__add_issue_comment',
+    'mcp__claude_ai_Gmail__send_email',
+    'mcp__voice__gh__create_issue', // a server called "voice__gh"
+    'mcp__voice__unknown',
+    'mcp__voice__',
+    'mcp__plugin_voice_voice__unknown',
+    'mcp__plugin_other_voice__reply',
+  ]) {
+    assert.match(blocked(tool, {}), /not one of the gateway's tools/, tool)
+  }
+  for (const tool of [
+    'ListMcpResourcesTool',
+    'ReadMcpResourceTool',
+    'WebFetch',
+    'WebSearch',
+    'LSP',
+    'PowerShell',
+    'REPL',
+    'BashOutput',
+    'TaskOutput',
+    'TaskStop',
+    'Monitor',
+    'SendMessage',
+    'CronCreate',
+    'ScheduleWakeup',
+    'RemoteTrigger',
+    'PushNotification',
+    'EnterWorktree',
+    'Workflow',
+    'Artifact',
+    'SlashCommand',
+    'bash',
+    'read',
+    'SomeToolFromTheFuture',
+  ]) {
+    assert.match(blocked(tool, {}), /is not on the list of allowed tools/, tool)
+  }
+  // Nobody can click a form in the car.
+  for (const tool of ['AskUserQuestion', 'EnterPlanMode', 'ExitPlanMode']) {
+    assert.match(blocked(tool, {}), /reply tool and state "question"/, tool)
+  }
+  blocked(undefined, {})
+  blocked('', {})
+})
+
+test('confine hook: no subagents and no skills', () => {
+  // A subagent's tool calls might not pass the hook, so none start at all.
+  for (const tool of ['Agent', 'Task']) {
+    const reason = blocked(tool, { description: 'look around', prompt: 'Read ~/.ssh/id_ed25519', subagent_type: 'general-purpose' })
+    assert.match(reason, /no subagents/)
+  }
+  // Skills come from the user's settings and plugins.
+  blocked('Skill', { skill: 'deploy' })
+})
+
+test('confine hook: no instructions or settings planted in the playground', () => {
+  // Claude Code reads these when it works in a folder, the playground included.
+  for (const file of [
+    'CLAUDE.md',
+    'claude.md',
+    'CLAUDE.local.md',
+    'AGENTS.md',
+    '.mcp.json',
+    'sub/CLAUDE.md',
+    '.claude/settings.json',
+    '.claude/settings.local.json',
+    '.claude/commands/go.md',
+    'sub/.claude/agents/helper.md',
+    '.Claude/skills/x/SKILL.md',
+  ]) {
+    const path = join(PLAYGROUND, file)
+    assert.match(blocked('Write', { file_path: path, content: 'x' }), /Claude Code would read them as instructions or settings/, file)
+    blocked('Edit', { file_path: path, old_string: 'a', new_string: 'b' })
+    blocked('MultiEdit', { file_path: path, edits: [] })
+    blocked('Bash', { command: `rm playground/${file}` })
+    blocked('Bash', { command: `rm -f ${path}` })
+  }
+  blocked('NotebookEdit', { notebook_path: join(PLAYGROUND, '.claude', 'n.ipynb'), new_source: '' })
+  blocked('Write', { file_path: 'CLAUDE.md', content: 'x' }, PLAYGROUND)
+  blocked('Write', { file_path: 'sub/../.claude/settings.json', content: 'x' }, PLAYGROUND)
+
+  // Names that only look alike, and reading, stay allowed.
+  allowed('Write', { file_path: join(PLAYGROUND, 'CLAUDE.md.txt'), content: 'x' })
+  allowed('Write', { file_path: join(PLAYGROUND, 'claude', 'notes.md'), content: 'x' })
+  allowed('Write', { file_path: join(PLAYGROUND, '.claude-notes.md'), content: 'x' })
+  allowed('Write', { file_path: join(PLAYGROUND, 'mcp.json'), content: '{}' })
+  allowed('Bash', { command: 'rm playground/CLAUDE.md.txt' })
+  allowed('Read', { file_path: join(CONTROLLER, 'CLAUDE.md') })
+  allowed('Read', { file_path: join(CONTROLLER, '.claude', 'settings.json') })
+})
+
+test('confine hook: a symlink does not lead into a .claude folder', () => {
+  const real = join(PLAYGROUND, `.confine-test-${process.pid}-real`)
+  const link = join(PLAYGROUND, `.confine-test-${process.pid}`)
+  try {
+    mkdirSync(join(real, '.claude'), { recursive: true })
+    symlinkSync(join(real, '.claude'), link)
+    blocked('Write', { file_path: join(link, 'settings.json'), content: '{}' })
+    blocked('Bash', { command: `rm ${join(link, 'settings.json')}` })
+  } finally {
+    rmSync(link, { force: true })
+    rmSync(real, { recursive: true, force: true })
+  }
+})
+
+test('confine hook: a checkout inside a .claude folder still works', () => {
+  // For example a worktree in .claude/worktrees/: only the part below the
+  // playground counts.
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), 'voice-gw-hook-')))
+  try {
+    const controller = join(dir, '.claude', 'worktrees', 'x', 'controller')
+    const copy = join(controller, '.claude', 'hooks', 'confine.mjs')
+    mkdirSync(dirname(copy), { recursive: true })
+    mkdirSync(join(controller, 'playground'))
+    copyFileSync(HOOK, copy)
+    const run = (tool_name, tool_input) =>
+      spawnSync(process.execPath, [copy], { input: JSON.stringify({ tool_name, tool_input, cwd: controller }), encoding: 'utf8' })
+    assert.equal(run('Write', { file_path: join(controller, 'playground', 'hello.txt'), content: 'x' }).status, 0)
+    assert.equal(run('Bash', { command: 'rm playground/hello.txt' }).status, 0)
+    assert.equal(run('Write', { file_path: join(controller, 'playground', 'CLAUDE.md'), content: 'x' }).status, 2)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('confine hook: broken input is blocked', () => {
   blocked('Read', 'not json')
+  blocked('Read', 'null')
   blocked('Write', { content: 'no path' })
 })
