@@ -29,6 +29,8 @@ export class Store extends EventEmitter {
     this.permissions = new Map()
     this.controllerLastReplyAt = null
     this.startedAt = Date.now()
+    this.voiceCalls = 0 // voice tool calls in progress
+    this.voiceSeenAt = null // start or end of the last voice tool call
   }
 
   newId(length = 4) {
@@ -41,11 +43,12 @@ export class Store extends EventEmitter {
 
   // --- requests from the voice client or from workers ---------------------
 
-  createRequest(text, { origin = 'voice' } = {}) {
+  createRequest(text, { origin = 'voice', worker = null } = {}) {
     const request = {
       id: this.newId(),
       text,
       origin, // voice | worker
+      worker, // { repo, task } for a worker result
       state: 'sent',
       createdAt: Date.now(),
       updates: [], // { at, state, text } from the controller
@@ -147,6 +150,30 @@ export class Store extends EventEmitter {
     permission.status = behavior
     this.changed()
     return permission
+  }
+
+  // --- whether the voice client is still there ----------------------------
+
+  // The voice mode is on while a voice tool call runs and for `idleMs` after
+  // the last one; see telegram.mjs. A separate event, so that it does not wake
+  // the waiting long-polls.
+  voiceCallStarted() {
+    this.voiceCalls++
+    this.voiceSeen()
+  }
+
+  voiceCallEnded() {
+    this.voiceCalls = Math.max(0, this.voiceCalls - 1)
+    this.voiceSeen()
+  }
+
+  voiceSeen() {
+    this.voiceSeenAt = Date.now()
+    this.emit('voice')
+  }
+
+  voiceActive(idleMs) {
+    return this.voiceCalls > 0 || (this.voiceSeenAt !== null && Date.now() - this.voiceSeenAt < idleMs)
   }
 
   // --- waiting ------------------------------------------------------------

@@ -59,7 +59,48 @@ export const config = {
   ghBin: process.env.VOICE_GW_GH_BIN || 'gh',
   // Worker state and the output of every run.
   stateDir: process.env.VOICE_GW_STATE_DIR || join(ROOT, '.state'),
+
+  // Telegram fallback, on when both of its files in the secrets folder are set:
+  // after this many seconds without a voice tool call, the voice mode counts
+  // as ended, and results, questions and approvals also go to Telegram.
+  telegramAfterSeconds: num(process.env.VOICE_GW_TELEGRAM_AFTER, 60),
+  telegramApi: process.env.VOICE_GW_TELEGRAM_API || 'https://api.telegram.org',
+
+  // Workers in a Docker container with its own clones (docker/): the
+  // container's name. Empty: workers run in the checkouts on this computer.
+  docker: process.env.VOICE_GW_DOCKER || '',
+  dockerBin: process.env.VOICE_GW_DOCKER_BIN || 'docker',
+  // Where the clones are inside the container.
+  dockerRepos: process.env.VOICE_GW_DOCKER_REPOS || '/repos',
+  // Access level of workers in the container (access.mjs): read-only, pr or
+  // full for every repository. Empty: detected per repository from the token.
+  access: process.env.VOICE_GW_ACCESS || '',
+  githubApi: process.env.VOICE_GW_GITHUB_API || 'https://api.github.com',
+
+  // The kill switch's rules on a worker run (guard.mjs): at most this many file
+  // edits, and at the end at most this many files and lines changed.
+  killMaxEdits: num(process.env.VOICE_GW_KILL_MAX_EDITS, 500),
+  killMaxFiles: num(process.env.VOICE_GW_KILL_MAX_FILES, 300),
+  killMaxLines: num(process.env.VOICE_GW_KILL_MAX_LINES, 30000),
+  // Folders, besides the repository and the temporary ones, that workers may
+  // write to; comma-separated.
+  killAllowPaths: (process.env.VOICE_GW_KILL_ALLOW_PATHS || '')
+    .split(',')
+    .map(path => path.trim())
+    .filter(Boolean),
+  // How often the default branch on GitHub, and while locked the container,
+  // are checked, in seconds.
+  killCheckSeconds: num(process.env.VOICE_GW_KILL_CHECK, 30),
+  // How long one poll of the Telegram bot for commands waits, in seconds.
+  telegramPollSeconds: num(process.env.VOICE_GW_TELEGRAM_POLL, 25),
 }
 
 config.oauthStateFile = join(config.secretsDir, 'oauth.json')
 config.adminSocket = join(config.secretsDir, 'admin.sock')
+config.telegramTokenFile = join(config.secretsDir, 'telegram_token')
+config.telegramChatIdFile = join(config.secretsDir, 'telegram_chat_id')
+// The kill switch's state: outside controller/, and not in .secrets/worker.
+config.killSwitchFile = join(config.secretsDir, 'killswitch.json')
+// The worker container's secrets, mounted read-only into it.
+config.workerSecretsDir = join(config.secretsDir, 'worker')
+config.githubTokenFile = join(config.workerSecretsDir, 'github_token')

@@ -14,6 +14,7 @@ import { z } from 'zod'
 import { VERSION } from './config.mjs'
 import { readBody } from './http.mjs'
 import { log, preview } from './log.mjs'
+import { alarmText, emergencyPhrase } from './killswitch.mjs'
 
 const VOICE_INSTRUCTIONS = `
 This connector reaches Claude Code sessions running on the user's own computer. The user is usually
@@ -23,6 +24,8 @@ to about 40 seconds) -> read the answer. Between polls tell the user in a few wo
 running. Relay Claude Code's answers faithfully; you may shorten them but never invent results.
 Approvals: read them out and call approve only after the user explicitly said yes or no to that action.
 News: results of work Claude Code finished in the background arrive with any call. Read them out too.
+Emergency: when the user says "Notstopp", "Not-Aus", "emergency stop" or "kill switch", call emergency_stop at
+once, without asking back. An [ALARM] line in any result is read out first.
 `.trim()
 
 const RELAY_RULE =
@@ -138,14 +141,15 @@ async function waitAndReport(store, request, waitSeconds, signal, settings) {
   return text(report(store, request, settings))
 }
 
-function statusText(store, settings) {
+function statusText(store, settings, killswitch) {
   const open = store.openRequests()
   const permissions = store.openPermissions()
   const confirmed = store.controllerLastReplyAt !== null
   const uptime = Math.round((Date.now() - store.startedAt) / 60000)
   const lines = [
     `[gateway=ok controller=${confirmed ? 'confirmed' : 'unconfirmed'} open=${open.length} ` +
-      `approvals=${permissions.length} relay=${settings.permissionRelay ? 'on' : 'off'} uptime=${uptime}m]`,
+      `approvals=${permissions.length} relay=${settings.permissionRelay ? 'on' : 'off'} uptime=${uptime}m` +
+      `${killswitch ? ` locked=${killswitch.locked ? 'yes' : 'no'}` : ''}]`,
     confirmed
       ? `Gateway reachable. Claude Code last answered ${ago(store.controllerLastReplyAt)}.`
       : 'Gateway reachable. Claude Code has not answered since the gateway started; a short request with ask ' +
@@ -164,9 +168,47 @@ function statusText(store, settings) {
   return lines.join('\n')
 }
 
+// Which connected voice chats (sign-in grants) heard the alarm of a lock.
+const alarmed = new Map() // lock id -> Set of grant ids
+
 // One MCP server instance per HTTP request; cheap, and keeps the endpoint stateless.
-function buildVoiceServer(store, channel, settings) {
+function buildVoiceServer(store, channel, settings, { killswitch = null, grant = null } = {}) {
   const mcp = new McpServer({ name: 'claude-code-voice', version: VERSION }, { instructions: VOICE_INSTRUCTIONS })
+
+  const heard = state => {
+    if (!alarmed.has(state.id)) alarmed.set(state.id, new Set())
+    const seen = alarmed.get(state.id)
+    const first = !seen.has(grant?.id)
+    seen.add(grant?.id)
+    return !first
+  }
+
+  // While the kill switch is locked, each voice chat hears the alarm once,
+  // with its next call, whatever it called; after the first line, which stays
+  // machine-readable.
+  const withAlarm = handler => async (...args) => {
+    const result = await handler(...args)
+    const state = killswitch?.state
+    if (!state || heard(state)) return result
+    const [head, ...rest] = result.content[0].text.split('\n')
+    const alarm = `[ALARM] ${alarmText(state)} Read this to the user first.`
+    return { ...result, content: [{ type: 'text', text: [head, alarm, ...rest].join('\n') }, ...result.content.slice(1)] }
+  }
+
+  // An emergency phrase locks the gateway before anything reaches Claude Code;
+  // while it is locked, nothing new is handed over.
+  const refuse = message => {
+    if (killswitch && emergencyPhrase(message)) {
+      const state = killswitch.trip({ trigger: 'voice', reason: `"${preview(message, 80)}" by voice` })
+      heard(state)
+      return text(`[state=locked] Emergency stop. ${alarmText(state)} Tell the user it is done.`)
+    }
+    if (killswitch?.locked) {
+      heard(killswitch.state)
+      return text(`[state=locked] ${alarmText(killswitch.state)} Nothing was handed over. Tell the user.`)
+    }
+    return null
+  }
 
   const enqueue = async (message, inReplyTo) => {
     const textForController = inReplyTo ? `(Answer to ${inReplyTo}) ${message}` : message
@@ -184,8 +226,30 @@ function buildVoiceServer(store, channel, settings) {
         'and pending approvals. Use when the user asks if the connection works or what is going on.',
       annotations: { readOnlyHint: true },
     },
-    async () => text(statusText(store, settings)),
+    withAlarm(async () => text(statusText(store, settings, killswitch))),
   )
+
+  if (killswitch) {
+    mcp.registerTool(
+      'emergency_stop',
+      {
+        title: 'Emergency stop',
+        description:
+          'Emergency stop (kill switch). Call it at once, without asking back, when the user says "Notstopp", ' +
+          '"Not-Aus", "emergency stop" or "kill switch". Locks the gateway: no new tasks, all work on the ' +
+          "user's computer stops. Only someone at the computer can unlock it.",
+        inputSchema: {
+          words: z.string().max(400).optional().describe("The user's words, if any."),
+        },
+        annotations: { destructiveHint: true },
+      },
+      async ({ words }) => {
+        const state = killswitch.trip({ trigger: 'voice', reason: words ? `"${preview(words, 80)}" by voice` : 'emergency_stop by voice' })
+        heard(state)
+        return text(`[state=locked] Emergency stop. ${alarmText(state)} Tell the user it is done.`)
+      },
+    )
+  }
 
   mcp.registerTool(
     'send',
@@ -204,10 +268,12 @@ function buildVoiceServer(store, channel, settings) {
           .describe('If this answers a question from Claude Code (state=question), the id of that request.'),
       },
     },
-    async ({ message, in_reply_to }) => {
+    withAlarm(async ({ message, in_reply_to }) => {
+      const refused = refuse(message)
+      if (refused) return refused
       const request = await enqueue(message, in_reply_to)
       return text(`[state=sent id=${request.id}] Handed over. Now call get_reply with id=${request.id}.`)
-    },
+    }),
   )
 
   mcp.registerTool(
@@ -223,10 +289,12 @@ function buildVoiceServer(store, channel, settings) {
         message: z.string().min(1).max(4000).describe(MESSAGE_DESCRIPTION),
       },
     },
-    async ({ message }, extra) => {
+    withAlarm(async ({ message }, extra) => {
+      const refused = refuse(message)
+      if (refused) return refused
       const request = await enqueue(message)
       return waitAndReport(store, request, settings.maxWaitSeconds, extra.signal, settings)
-    },
+    }),
   )
 
   mcp.registerTool(
@@ -251,14 +319,14 @@ function buildVoiceServer(store, channel, settings) {
       },
       annotations: { readOnlyHint: true },
     },
-    async ({ id, wait_seconds }, extra) => {
+    withAlarm(async ({ id, wait_seconds }, extra) => {
       const request = store.getRequest(id)
       if (!request) {
         return text(`[state=unknown id=${id}] Unknown request. Start a new one with send.`)
       }
       const wait = clamp(wait_seconds ?? settings.defaultWaitSeconds, 1, settings.maxWaitSeconds)
       return waitAndReport(store, request, wait, extra.signal, settings)
-    },
+    }),
   )
 
   if (settings.permissionRelay) {
@@ -279,7 +347,10 @@ function buildVoiceServer(store, channel, settings) {
         },
         annotations: { destructiveHint: true },
       },
-      async ({ code, decision }) => {
+      withAlarm(async ({ code, decision }) => {
+        if (killswitch?.locked && decision === 'allow') {
+          return text(`[approval=locked code=${code}] The kill switch is locked: nothing can be allowed now.`)
+        }
         const permission = store.resolvePermission(code, decision)
         if (!permission) {
           return text(`[approval=unknown code=${code}] This approval is unknown or already answered.`)
@@ -290,7 +361,7 @@ function buildVoiceServer(store, channel, settings) {
             ? `[approval=allow code=${permission.code}] Allowed. Claude Code continues; call get_reply.`
             : `[approval=deny code=${permission.code}] Denied.`,
         )
-      },
+      }),
     )
   }
 
@@ -324,7 +395,7 @@ function logCall(req, body, grant) {
   }
 }
 
-export function startVoiceHttp(store, channel, auth, settings) {
+export function startVoiceHttp(store, channel, auth, settings, { killswitch = null } = {}) {
   const server = createServer(async (req, res) => {
     const url = new URL(req.url || '/', 'http://localhost')
 
@@ -370,7 +441,13 @@ export function startVoiceHttp(store, channel, auth, settings) {
     }
     logCall(req, body, grant)
 
-    const mcp = buildVoiceServer(store, channel, settings)
+    // Tool calls show that the voice mode is still on (Telegram fallback).
+    if ((Array.isArray(body) ? body : [body]).some(message => message?.method === 'tools/call')) {
+      store.voiceCallStarted()
+      res.on('close', () => store.voiceCallEnded())
+    }
+
+    const mcp = buildVoiceServer(store, channel, settings, { killswitch, grant })
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
       enableJsonResponse: true,
