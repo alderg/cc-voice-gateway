@@ -1,16 +1,15 @@
 #!/usr/bin/env node
 // Builds the product video from script.json and slides.html:
 //   node video/build.mjs [output.mp4]
-// One voiceover clip per line (macOS `say`), one frame per line (headless Chrome),
-// a slow zoom per scene, cross-fades between lines and scenes, captions in the
-// frames. Needs macOS, Google Chrome and ffmpeg. VOICE and RATE override the
-// voice and words per minute in script.json, for example
-//   VOICE="Ava (Premium)" node video/build.mjs
-// after adding that voice in System Settings > Accessibility > Spoken Content.
+// One voiceover clip per line (Kokoro, voice af_heart, through tts.py), one frame
+// per line (headless Chrome), a slow zoom per scene, cross-fades between lines and
+// scenes, captions in the frames. Needs Google Chrome, ffmpeg and Kokoro (see
+// video/README.md). VOICE overrides the voice in script.json. TTS=say speaks with
+// macOS `say` instead, for a quick draft: TTS=say VOICE=Samantha node video/build.mjs
 
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
 import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -19,8 +18,9 @@ const ROOT = resolve(HERE, '..')
 const OUT = resolve(process.argv[2] ?? join(ROOT, 'docs', 'assets', 'cc-voice-gateway.mp4'))
 const CHROME = process.env.CHROME ?? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
 const script = JSON.parse(readFileSync(join(HERE, 'script.json'), 'utf8'))
-const VOICE = process.env.VOICE ?? script.voice
-const RATE = process.env.RATE ?? String(script.rate)
+const TTS = process.env.TTS ?? 'kokoro'
+const VOICE = process.env.VOICE ?? (TTS === 'say' ? 'Samantha' : script.voice)
+const KOKORO_PYTHON = process.env.KOKORO_PYTHON ?? join(homedir(), '.cache', 'kokoro', 'venv', 'bin', 'python')
 
 const FPS = 30
 const LEAD = 0.5 // silence before the first line
@@ -43,14 +43,34 @@ function run(cmd, args) {
 const duration = file =>
   Number(run('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', file]).toString())
 
+// The voiceover, one clip per line: { file, seconds } by line number.
+const lines = script.scenes.flatMap(scene => scene.lines)
+function speak() {
+  if (TTS === 'say') {
+    return lines.map((line, i) => {
+      const file = join(tmp, `voice-${i}.aiff`)
+      run('say', ['-v', VOICE, '-o', file, line.say])
+      return { file, seconds: duration(file) }
+    })
+  }
+  const job = JSON.stringify({ voice: VOICE, lines: lines.map((line, i) => ({ id: `line-${i}`, say: line.say })) })
+  const result = spawnSync(KOKORO_PYTHON, [join(HERE, 'tts.py'), join(tmp, 'voice')], {
+    input: job,
+    stdio: ['pipe', 'pipe', 'inherit'],
+    maxBuffer: 16 * 1024 * 1024,
+  })
+  if (result.status !== 0) throw new Error(`tts.py failed (${result.error?.message ?? `exit ${result.status}`}); see video/README.md`)
+  return result.stdout.toString().trim().split('\n').map(row => JSON.parse(row))
+}
+const voices = speak()
+
 // The lines, each with its voice clip and its segment's length.
 const segments = []
 script.scenes.forEach((scene, si) => {
   scene.lines.forEach((line, li) => {
     const i = segments.length
-    const voice = join(tmp, `voice-${i}.aiff`)
-    run('say', ['-v', VOICE, '-r', RATE, '-o', voice, line.say])
-    const spoken = duration(voice)
+    const voice = voices[i].file
+    const spoken = voices[i].seconds
     const last = li === scene.lines.length - 1
     const final = last && si === script.scenes.length - 1
     let length = VOICE_DELAY + spoken + (final ? HOLD_END : last ? GAP_SCENE : GAP_LINE)
@@ -75,7 +95,7 @@ segments.forEach((segment, i) => {
   at += segment.length
 })
 const total = at
-console.log(`${segments.length} lines, ${total.toFixed(1)} s, voice ${VOICE} at ${RATE} words per minute`)
+console.log(`${segments.length} lines, ${total.toFixed(1)} s, voice ${VOICE} (${TTS})`)
 
 // One frame per line.
 const page = join(HERE, 'slides.html')
@@ -140,8 +160,8 @@ run('ffmpeg', [
 
 // The poster, and the thumbnail with a play button for the README.
 const assets = dirname(OUT)
-shoot(join(assets, 'video-poster.png'), { s: 'payoff', b: 1, c: '', p: 0 })
-shoot(join(assets, 'video-thumbnail.png'), { s: 'payoff', b: 1, c: '', p: 0, play: 1 })
+shoot(join(assets, 'video-poster.png'), { s: 'intro', b: 1, c: '', p: 0 })
+shoot(join(assets, 'video-thumbnail.png'), { s: 'intro', b: 1, c: '', p: 0, play: 1 })
 
 rmSync(tmp, { recursive: true, force: true })
 console.log(`${OUT}: ${duration(OUT).toFixed(1)} s`)
