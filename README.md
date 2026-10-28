@@ -4,8 +4,13 @@ Talk to Claude in the Claude app's voice mode, on the phone or in the car, and h
 session on your own computer do the work: answer questions about your repositories, change code,
 push branches, open and merge pull requests. Plain JavaScript (ESM, Node.js), no build step.
 
-> **Status:** private project. Used with Claude voice mode in the Claude app on the iPhone.
-> Claude Code channels are a research preview; their flags and protocol may change.
+> **Provided as-is, as a prototype.** This is solely a prototype of an idea: a way to use Claude
+> Code from Claude's voice mode, which cannot reach Claude Code on its own. It comes without
+> warranty and without support, and there is no communication of any kind about this project: no
+> announcements, no support, no answers to issues or messages. It is not an Anthropic product.
+>
+> Used with Claude voice mode in the Claude app on the iPhone. Claude Code channels are a research
+> preview; their flags and protocol may change.
 
 ## Contents
 
