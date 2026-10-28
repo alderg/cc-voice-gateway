@@ -72,6 +72,9 @@ export class Store extends EventEmitter {
       this.requests.set(request.id, request)
     }
     this.prune()
+    // The restart counts as a voice call, so the voice client gets the usual
+    // time to pick up what is left before the Telegram fallback sends it.
+    if (this.requests.size) this.voiceSeenAt = Date.now()
   }
 
   save() {

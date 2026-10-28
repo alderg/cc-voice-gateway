@@ -34,11 +34,14 @@ in the app, runs the conversation with you.
 | Voice assistant | `ask` | Hand over a request and wait up to 40 s for the answer |
 | Voice assistant | `get_reply` | Fetch news for an `id`, waits up to 40 s |
 | Voice assistant | `approve` | Allow or deny an approval with its five-letter code |
+| Voice assistant | `emergency_stop` | Lock the [kill switch](#kill-switch) |
 | Controller | `reply` | Answer with `state` `working`, `question` or `done` |
 | Controller | `list_workers` | The repositories: origin, public or private, branch, uncommitted files, what each worker does |
 | Controller | `dispatch` | Hand a task to a repository's worker, returns at once |
 | Controller | `worker_status` | What a worker is doing or did last |
 | Controller | `stop_worker` | Stop a worker's run |
+| Controller | `restart_controller` | [Restart its own session](#restarting-the-controller-by-voice) through the watchdog, after your yes |
+| Controller | `raise_alarm` | Lock the kill switch when something looks wrong |
 
 ![Request flow](docs/request-flow.drawio.svg)
 
@@ -1092,15 +1095,16 @@ docs/
 - Voice assistants only poll, so you hear about a finished run with your next request, not when it
   ends. With the Telegram fallback, the result also arrives as a message once the voice mode has
   ended.
-- Telegram is outbound only: answers and approvals still go through voice mode or the terminal.
+- Telegram takes only `/stop` from you: answers and approvals still go through voice mode or the
+  terminal.
 - While the controller is busy, new events arrive together in its next turn. Real parallelism
   needs separate sessions ([channels reference][ref]).
 - Open requests survive a restart of the controller (`.state/requests.json`), but a request the old
   session had not finished must be said again. Connections and worker runs survive restarts too.
-- During the research preview, custom channels only run with the development flag. Flag syntax and
-  protocol may change ([channels][channels]).
-- After a crash the watchdog starts the session again, but the development-channel warning needs
-  someone at the terminal ([Keeping the controller running](#keeping-the-controller-running)).
+- During the research preview, custom channels only run with the development flag, or as a plugin
+  on the organisation's allowlist. Flag syntax and protocol may change ([channels][channels]).
+- After a crash the watchdog starts the session again, but with the development flag its warning
+  needs someone at the terminal ([Keeping the controller running](#keeping-the-controller-running)).
 
 ## Sources
 
