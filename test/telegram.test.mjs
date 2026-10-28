@@ -240,6 +240,32 @@ test('a failing Telegram call is logged and changes nothing for the voice path',
 
 // --- the Telegram client against the stand-in API ----------------------------
 
+test('after a restart: nothing is sent twice, and what is left waits for the voice client first', async () => {
+  const file = join(TMP, 'restart', 'requests.json')
+  const options = send => ({ afterSeconds: AFTER, log: () => {}, send: async text => send.push(text) })
+  const first = new Store({ file })
+  const sentBefore = []
+  const before = new TelegramFallback(first, options(sentBefore))
+  first.voiceCallStarted()
+  const request = first.createRequest('Run the tests.')
+  first.voiceCallEnded()
+  first.addUpdate(request.id, 'done', 'All pass.')
+  await waitFor(() => sentBefore.length === 1) // sent when the voice mode ended, not on a change
+  before.close()
+
+  const second = new Store({ file })
+  second.addUpdate(request.id, 'question', 'Push it as well?')
+  const sentAfter = []
+  const after = new TelegramFallback(second, options(sentAfter))
+  await sleep(AFTER * 500)
+  assert.deepEqual(sentAfter, [], 'the voice client gets its time after the restart')
+  await waitFor(() => sentAfter.length === 1)
+  await sleep(100)
+  assert.equal(sentAfter.length, 1, 'only the new question, not the result sent before the restart')
+  assert.match(sentAfter[0], /^Question for request/)
+  after.close()
+})
+
 test('Telegram.send posts to the chat; errors carry no token', async () => {
   api.mode = 'ok'
   const telegram = new Telegram({ token: TOKEN, chatId: CHAT_ID, apiBase: api.url })

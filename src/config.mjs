@@ -101,6 +101,8 @@ export const config = {
 }
 
 config.oauthStateFile = join(config.secretsDir, 'oauth.json')
+// Voice requests, so that they survive a restart of the controller session.
+config.requestsFile = join(config.stateDir, 'requests.json')
 config.adminSocket = join(config.secretsDir, 'admin.sock')
 config.telegramTokenFile = join(config.secretsDir, 'telegram_token')
 config.telegramChatIdFile = join(config.secretsDir, 'telegram_chat_id')

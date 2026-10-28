@@ -27,8 +27,9 @@ import { hostname } from 'node:os'
 import { DockerRunner, HostRunner } from './runners.mjs'
 import { ACCESS_LEVELS, GitHubAccess } from './access.mjs'
 import { PullWatcher } from './pulls.mjs'
+import { Restarter } from './restart.mjs'
 
-const store = new Store({ permissionTtlSeconds: config.permissionTtlSeconds })
+const store = new Store({ permissionTtlSeconds: config.permissionTtlSeconds, file: config.requestsFile })
 const killswitch = new KillSwitch({ file: config.killSwitchFile })
 if (killswitch.locked) {
   log(`kill switch is locked since ${killswitch.state.at} by ${killswitch.state.trigger}: ${killswitch.state.reason}`)
@@ -101,10 +102,14 @@ function shutdown(reason) {
   setTimeout(() => process.exit(0), 200).unref()
 }
 
+// Restarting the controller by voice, through the watchdog (restart.mjs).
+const restarter = new Restarter({ store, workers, secretsDir: config.secretsDir })
+
 const channel = await startChannel(store, {
   permissionRelay: config.permissionRelay,
   workers,
   killswitch,
+  restarter,
   onClose: () => shutdown('stdio closed'),
 })
 
@@ -125,9 +130,9 @@ workers.on('finished', async task => {
       origin: 'worker',
       worker: { repo: task.repo, task: task.id },
     })
-    const meta = { worker: task.repo, task: task.id, outcome: task.state }
-    if (opened.length) meta.pull_request = opened.map(pull => pull.number).join(',')
-    await channel.push(request, meta)
+    request.meta = { worker: task.repo, task: task.id, outcome: task.state } // for sending it again
+    if (opened.length) request.meta.pull_request = opened.map(pull => pull.number).join(',')
+    await channel.push(request, request.meta)
     workers.markReported(task)
   } catch (error) {
     log('worker result not delivered:', error.message)
@@ -142,12 +147,8 @@ pulls.on('news', async news => {
   try {
     await channel.ready
     const request = store.createRequest(news.text, { origin: 'worker' })
-    await channel.push(request, {
-      worker: news.worker,
-      repo: news.slug,
-      pull_request: String(news.number),
-      kind: news.kind,
-    })
+    request.meta = { worker: news.worker, repo: news.slug, pull_request: String(news.number), kind: news.kind }
+    await channel.push(request, request.meta)
   } catch (error) {
     log('pull request news not delivered:', error.message)
   }
@@ -229,6 +230,22 @@ if (config.docker) {
 
 admin = await startAdmin(auth, config.adminSocket, { killswitch })
 http = startVoiceHttp(store, channel, auth, config, { killswitch })
+
+// Once the session is connected: worker results the previous session never
+// answered go to this one, and after a restart by the watchdog the driver
+// hears on Telegram that the controller is ready again.
+channel.ready.then(async () => {
+  for (const request of [...store.requests.values()].filter(r => r.resend)) {
+    try {
+      await channel.push(request, { ...request.meta, resent: 'yes' })
+      delete request.resend
+      store.changed()
+    } catch (error) {
+      log('worker result not sent again:', error.message)
+    }
+  }
+  restarter.announceReady()
+})
 
 // The SDK's stdio transport does not notice when Claude Code goes away (it only
 // listens for data and errors). Without this, a crashed or killed session

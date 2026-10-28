@@ -251,11 +251,13 @@ export class TelegramFallback {
 
   // Everything the voice client has not received yet, except interim updates.
   flush() {
+    let marked = false
     for (const request of this.store.requests.values()) {
       if (request.origin === 'alarm') continue // the kill switch sends its own alarm
       for (const update of request.updates.slice(request.cursor)) {
         if (update.state === 'working' || update.telegram) continue
         update.telegram = true
+        marked = true
         this.deliver(describeUpdate(request, update))
       }
     }
@@ -264,6 +266,8 @@ export class TelegramFallback {
       permission.telegram = true
       this.deliver(describePermission(permission))
     }
+    // The marks go into the saved requests, so a restart sends nothing twice.
+    if (marked) this.store.save?.()
   }
 
   deliver(text) {
