@@ -1,10 +1,8 @@
-// Configuration and the shared secret.
+// Configuration.
 //
 // Everything is read from environment variables so the gateway can be started
 // by Claude Code (from .mcp.json) without any command line arguments.
 
-import { randomBytes, timingSafeEqual } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -42,33 +40,16 @@ export const config = {
   // Log file; set VOICE_GW_LOG_FILE= (empty) to log to stderr only.
   logFile: process.env.VOICE_GW_LOG_FILE ?? join(ROOT, '.logs', 'gateway.log'),
 
-  tokenFile: process.env.VOICE_GW_TOKEN_FILE || join(ROOT, '.secrets', 'token'),
+  // Sign-in state and the admin socket (mode 0700).
+  secretsDir: process.env.VOICE_GW_SECRETS_DIR || join(ROOT, '.secrets'),
+
+  // Hosts allowed as sign-in return addresses and for client ID metadata
+  // documents: Claude's.
+  oauthHosts: (process.env.VOICE_GW_OAUTH_HOSTS || 'claude.ai,claude.com')
+    .split(',')
+    .map(host => host.trim())
+    .filter(Boolean),
 }
 
-const MIN_TOKEN_LENGTH = 24
-
-// Returns the shared secret, creating .secrets/token (mode 0600) on first use.
-export function loadToken({ create = true } = {}) {
-  let token = process.env.VOICE_GW_TOKEN?.trim()
-  if (!token && existsSync(config.tokenFile)) {
-    token = readFileSync(config.tokenFile, 'utf8').trim()
-  }
-  if (!token) {
-    if (!create) return null
-    token = randomBytes(24).toString('hex')
-    mkdirSync(dirname(config.tokenFile), { recursive: true, mode: 0o700 })
-    writeFileSync(config.tokenFile, token + '\n', { mode: 0o600 })
-  }
-  if (token.length < MIN_TOKEN_LENGTH || !/^[A-Za-z0-9_-]+$/.test(token)) {
-    throw new Error(`Token must be at least ${MIN_TOKEN_LENGTH} characters of [A-Za-z0-9_-]`)
-  }
-  return token
-}
-
-// Constant-time comparison so the secret cannot be guessed byte by byte.
-export function tokenMatches(expected, given) {
-  if (typeof given !== 'string' || given.length === 0) return false
-  const a = Buffer.from(expected)
-  const b = Buffer.from(given)
-  return a.length === b.length && timingSafeEqual(a, b)
-}
+config.oauthStateFile = join(config.secretsDir, 'oauth.json')
+config.adminSocket = join(config.secretsDir, 'admin.sock')

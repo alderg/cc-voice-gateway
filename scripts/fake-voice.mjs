@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 // Plays the voice assistant at the desk: talks to the gateway's HTTP endpoint
-// exactly like Claude voice mode or Grok would, so the whole chain can be
-// tested before sitting in the car.
+// like Claude voice mode would, so the whole chain can be tried without a
+// phone. It gets its token from the running gateway's admin socket instead of
+// the sign-in page.
 //
-//   node scripts/fake-voice.mjs                     local endpoint (127.0.0.1)
-//   node scripts/fake-voice.mjs https://…/mcp/…     through the tunnel
+//   node scripts/fake-voice.mjs                   local endpoint (127.0.0.1)
+//   node scripts/fake-voice.mjs https://…/mcp     through the tunnel
 //
 // Commands:
 //   status                 gateway and controller status
@@ -18,20 +19,22 @@
 import { createInterface } from 'node:readline/promises'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
-import { config, loadToken } from '../src/config.mjs'
+import { adminRequest } from '../src/admin.mjs'
+import { config } from '../src/config.mjs'
 
-const url = new URL(process.argv[2] || `http://${config.host}:${config.port}/mcp/${loadToken()}`)
-const shownUrl = url.href.replace(/\/mcp\/[^/?]+/, '/mcp/…')
+const url = new URL(process.argv[2] || `http://${config.host}:${config.port}/mcp`)
 
 const client = new Client({ name: 'fake-voice', version: '0.1.0' })
 try {
-  await client.connect(new StreamableHTTPClientTransport(url))
+  const { access_token } = await adminRequest(config.adminSocket, 'POST', '/token', { name: 'fake-voice' })
+  const headers = { authorization: `Bearer ${access_token}` }
+  await client.connect(new StreamableHTTPClientTransport(url, { requestInit: { headers } }))
 } catch (error) {
-  console.error(`Cannot connect to ${shownUrl}: ${error.message}`)
-  console.error('Is the controller session running (scripts/start-controller.sh)? Is the token right?')
+  console.error(`Cannot connect to ${url.href}: ${error.message}`)
+  console.error('Is the controller session running (scripts/start-controller.sh)?')
   process.exit(1)
 }
-console.log(`Connected to ${shownUrl}. Commands: status, ask, send, answer, follow, allow, deny, quit`)
+console.log(`Connected to ${url.href}. Commands: status, ask, send, answer, follow, allow, deny, quit`)
 
 let lastId = null
 let lastQuestionId = null

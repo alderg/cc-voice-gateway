@@ -1,5 +1,6 @@
 // Voice side: a Streamable HTTP MCP endpoint for the voice assistant
-// (Claude voice mode, Grok, ...), reached through a tunnel.
+// (Claude voice mode), reached through a tunnel and protected by the OAuth
+// sign-in in oauth.mjs.
 //
 // Stateless by design: every POST gets its own short-lived MCP server, all
 // state lives in the shared Store. Long tasks are followed with short polls
@@ -10,7 +11,8 @@ import { createServer } from 'node:http'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { z } from 'zod'
-import { VERSION, tokenMatches } from './config.mjs'
+import { VERSION } from './config.mjs'
+import { readBody } from './http.mjs'
 import { log, preview } from './log.mjs'
 
 const VOICE_INSTRUCTIONS = `
@@ -275,42 +277,12 @@ function buildVoiceServer(store, channel, settings) {
   return mcp
 }
 
-// Accepts the secret as path segment (/mcp/<token>), bearer header or ?token=.
-// Anything unauthenticated gets a bare 404: a 401 would make some clients
-// start an OAuth discovery flow that does not exist here.
-function authenticate(req, url, token) {
-  const parts = url.pathname.split('/').filter(Boolean)
-  if (parts[0] !== 'mcp' || parts.length > 2) return false
-  if (parts.length === 2) return tokenMatches(token, parts[1])
-  const header = req.headers.authorization || ''
-  const bearer = header.startsWith('Bearer ') ? header.slice(7).trim() : ''
-  return tokenMatches(token, bearer) || tokenMatches(token, url.searchParams.get('token') || '')
-}
-
 const MAX_BODY_BYTES = 1024 * 1024
 
-function readBody(req) {
-  return new Promise((resolve, reject) => {
-    const chunks = []
-    let size = 0
-    req.on('data', chunk => {
-      size += chunk.length
-      if (size > MAX_BODY_BYTES) {
-        reject(Object.assign(new Error('body too large'), { status: 413 }))
-        req.destroy()
-        return
-      }
-      chunks.push(chunk)
-    })
-    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')))
-    req.on('error', reject)
-  })
-}
-
-// One log line per JSON-RPC message, so a test in the car can tell whether the
+// One log line per JSON-RPC message, so the log shows whether the
 // voice assistant called the connector at all, and which tool. Message texts are
 // logged by the channel side (push) only when a request reaches the controller.
-function logCall(req, body) {
+function logCall(req, body, grant) {
   for (const message of Array.isArray(body) ? body : [body]) {
     const method = message?.method
     if (!method || method.startsWith('notifications/')) continue
@@ -322,6 +294,7 @@ function logCall(req, body) {
         `protocol=${message.params?.protocolVersion ?? '?'}`,
         `ua=${JSON.stringify(preview(req.headers['user-agent'] ?? '', 60))}`,
         `from=${req.headers['x-forwarded-for'] ?? req.socket.remoteAddress}`,
+        `grant=${grant.id}`,
       )
     } else if (method === 'tools/call') {
       log('voice tools/call', message.params?.name ?? '?')
@@ -331,7 +304,7 @@ function logCall(req, body) {
   }
 }
 
-export function startVoiceHttp(store, channel, settings) {
+export function startVoiceHttp(store, channel, auth, settings) {
   const server = createServer(async (req, res) => {
     const url = new URL(req.url || '/', 'http://localhost')
 
@@ -339,9 +312,23 @@ export function startVoiceHttp(store, channel, settings) {
       res.writeHead(200, { 'content-type': 'text/plain' }).end('ok')
       return
     }
-    if (!authenticate(req, url, settings.token)) {
-      log('rejected', req.method, url.pathname.startsWith('/mcp') ? '/mcp/…' : url.pathname)
+    try {
+      if (await auth.handle(req, res, url)) return
+    } catch (error) {
+      log('oauth request failed:', error.message)
+      if (!res.headersSent) res.writeHead(error.status ?? (error instanceof SyntaxError ? 400 : 500)).end()
+      return
+    }
+    if (url.pathname !== '/mcp') {
+      // Old connector URLs had the secret in the path; keep it out of the log.
+      log('rejected', req.method, url.pathname.startsWith('/mcp/') ? '/mcp/…' : preview(url.pathname, 60))
       res.writeHead(404).end()
+      return
+    }
+    const { grant, error } = auth.verify(req)
+    if (!grant) {
+      log('voice 401', error === 'missing' ? 'no token: the client has to sign in' : 'unknown or expired token')
+      auth.challenge(res, req, error)
       return
     }
     if (req.method !== 'POST') {
@@ -353,7 +340,7 @@ export function startVoiceHttp(store, channel, settings) {
 
     let body
     try {
-      body = JSON.parse(await readBody(req))
+      body = JSON.parse(await readBody(req, MAX_BODY_BYTES))
     } catch (error) {
       log('voice request unreadable:', error.message)
       const status = error.status ?? 400
@@ -361,7 +348,7 @@ export function startVoiceHttp(store, channel, settings) {
       res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32700, message: 'Parse error' }, id: null }))
       return
     }
-    logCall(req, body)
+    logCall(req, body, grant)
 
     const mcp = buildVoiceServer(store, channel, settings)
     const transport = new StreamableHTTPServerTransport({
@@ -389,7 +376,7 @@ export function startVoiceHttp(store, channel, settings) {
     log(`voice HTTP server error on ${settings.host}:${settings.port}: ${error.message}${hint}`)
   })
   server.listen(settings.port, settings.host, () => {
-    log(`voice endpoint listening on http://${settings.host}:${settings.port}/mcp/<token>`)
+    log(`voice endpoint listening on http://${settings.host}:${settings.port}/mcp (OAuth sign-in)`)
   })
   return server
 }

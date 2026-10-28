@@ -3,23 +3,29 @@
 // The test plays both ends:
 //   - "Claude Code": spawns src/gateway.mjs over stdio, receives channel events,
 //     calls the reply tool and sends permission requests, like Claude Code does.
-//   - "voice client": talks to the HTTP endpoint like Claude voice mode or Grok.
+//   - "voice client": talks to the HTTP endpoint like Claude voice mode, with a
+//     token from the admin socket (the sign-in itself is in oauth.test.mjs).
 //
 // Run: npm test
 
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
+import { mkdtempSync, rmSync } from 'node:fs'
 import { createServer } from 'node:net'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import { z } from 'zod'
+import { adminRequest } from '../src/admin.mjs'
 
 const GATEWAY = fileURLToPath(new URL('../src/gateway.mjs', import.meta.url))
-const TOKEN = 'test_token_0123456789abcdefghij'
+const SECRETS = mkdtempSync(join(tmpdir(), 'voice-gw-e2e-'))
 
 let port
+let token // access token for the voice client
 let claudeCode // MCP client on the stdio side, standing in for Claude Code
 let voice // MCP client on the HTTP side, standing in for the voice assistant
 const channelEvents = []
@@ -103,7 +109,7 @@ before(async () => {
     args: [GATEWAY],
     env: {
       ...process.env,
-      VOICE_GW_TOKEN: TOKEN,
+      VOICE_GW_SECRETS_DIR: SECRETS,
       VOICE_GW_PORT: String(port),
       VOICE_GW_MAX_WAIT: '3',
       VOICE_GW_DEFAULT_WAIT: '2',
@@ -127,13 +133,19 @@ before(async () => {
     }
   }
 
+  ;({ access_token: token } = await adminRequest(join(SECRETS, 'admin.sock'), 'POST', '/token', { name: 'e2e' }))
   voice = new Client({ name: 'fake-voice', version: '0.0.0' })
-  await voice.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp/${TOKEN}`)))
+  await voice.connect(
+    new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp`), {
+      requestInit: { headers: { authorization: `Bearer ${token}` } },
+    }),
+  )
 })
 
 after(async () => {
   await voice?.close()
   await claudeCode?.close()
+  rmSync(SECRETS, { recursive: true, force: true })
 })
 
 test('declares the channel and permission capabilities and the reply tool', async () => {
@@ -150,22 +162,26 @@ test('voice endpoint exposes the voice tools', async () => {
   assert.deepEqual(tools.map(t => t.name).sort(), ['approve', 'ask', 'get_reply', 'send', 'status'])
 })
 
-test('logs every voice call with client, method and tool, never the secret', async () => {
+test('logs every voice call with client, method and tool, never the token', async () => {
   // In the car the question is whether the assistant called the connector at
   // all; these lines answer it even when no request reaches the controller.
   await voiceCall('status')
   const logged = await waitUntil(() => gatewayLog.includes('voice tools/call status') && gatewayLog)
-  assert.match(logged, /voice initialize client=fake-voice\/0\.0\.0 protocol=\S+ ua="[^"]*" from=/)
+  assert.match(logged, /voice initialize client=fake-voice\/0\.0\.0 protocol=\S+ ua="[^"]*" from=\S+ grant=[0-9a-f]{6}/)
   assert.match(logged, /voice tools\/list/)
-  assert.ok(!logged.includes(TOKEN), 'the secret never reaches the log')
+  assert.ok(!logged.includes(token), 'the token never reaches the log')
 })
 
 test('answers unreadable and oversized bodies with a JSON-RPC parse error', async () => {
-  const headers = { 'content-type': 'application/json', accept: 'application/json, text/event-stream' }
-  const bad = await fetch(`http://127.0.0.1:${port}/mcp/${TOKEN}`, { method: 'POST', headers, body: '{nope' })
+  const headers = {
+    'content-type': 'application/json',
+    accept: 'application/json, text/event-stream',
+    authorization: `Bearer ${token}`,
+  }
+  const bad = await fetch(`http://127.0.0.1:${port}/mcp`, { method: 'POST', headers, body: '{nope' })
   assert.equal(bad.status, 400)
   assert.equal((await bad.json()).error.code, -32700)
-  const big = await fetch(`http://127.0.0.1:${port}/mcp/${TOKEN}`, {
+  const big = await fetch(`http://127.0.0.1:${port}/mcp`, {
     method: 'POST',
     headers,
     body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'ping', params: { pad: 'x'.repeat(1100 * 1024) } }),
@@ -173,20 +189,30 @@ test('answers unreadable and oversized bodies with a JSON-RPC parse error', asyn
   assert.ok(big.status === 413 || big.status === 'reset', `got ${big.status}`)
 })
 
-test('rejects requests without the secret with a bare 404', async () => {
+test('without a valid token: 401 pointing to the sign-in, other paths 404', async () => {
   const body = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'ping' })
   const headers = { 'content-type': 'application/json', accept: 'application/json, text/event-stream' }
-  for (const path of ['/mcp', '/mcp/wrong-token-wrong-token-wrong', '/', '/.well-known/oauth-protected-resource']) {
-    const res = await fetch(`http://127.0.0.1:${port}${path}`, { method: 'POST', headers, body })
-    assert.equal(res.status, 404, path)
-  }
-  const bearer = await fetch(`http://127.0.0.1:${port}/mcp`, {
-    method: 'POST',
-    headers: { ...headers, authorization: `Bearer ${TOKEN}` },
-    body,
-  })
-  assert.equal(bearer.status, 200)
-  const get = await fetch(`http://127.0.0.1:${port}/mcp/${TOKEN}`)
+  const post = (path, extra = {}) =>
+    fetch(`http://127.0.0.1:${port}${path}`, { method: 'POST', headers: { ...headers, ...extra }, body })
+
+  const missing = await post('/mcp')
+  assert.equal(missing.status, 401)
+  assert.match(
+    missing.headers.get('www-authenticate'),
+    /^Bearer resource_metadata="http:\/\/127\.0\.0\.1:\d+\/\.well-known\/oauth-protected-resource\/mcp"/,
+  )
+  const wrong = await post('/mcp', { authorization: 'Bearer not-a-token' })
+  assert.equal(wrong.status, 401)
+  assert.match(wrong.headers.get('www-authenticate'), /error="invalid_token"/)
+
+  // The old connector URLs carried the secret in the path; it stays out of the log.
+  const old = await post(`/mcp/${'x'.repeat(40)}`, { authorization: `Bearer ${token}` })
+  assert.equal(old.status, 404)
+  assert.ok(!gatewayLog.includes('x'.repeat(40)))
+  assert.equal((await post('/')).status, 404)
+
+  assert.equal((await post('/mcp', { authorization: `Bearer ${token}` })).status, 200)
+  const get = await fetch(`http://127.0.0.1:${port}/mcp`, { headers: { authorization: `Bearer ${token}` } })
   assert.equal(get.status, 405)
 })
 
@@ -311,7 +337,12 @@ test('reply rejects unknown request ids and bad states', async () => {
 test('a gateway whose Claude Code session dies exits instead of holding the port', async () => {
   const { spawn } = await import('node:child_process')
   const child = spawn(process.execPath, [GATEWAY], {
-    env: { ...process.env, VOICE_GW_TOKEN: TOKEN, VOICE_GW_PORT: String(await freePort()), VOICE_GW_LOG_FILE: '' },
+    env: {
+      ...process.env,
+      VOICE_GW_SECRETS_DIR: join(SECRETS, 'dying'),
+      VOICE_GW_PORT: String(await freePort()),
+      VOICE_GW_LOG_FILE: '',
+    },
     stdio: ['pipe', 'ignore', 'ignore'],
   })
   await new Promise(r => setTimeout(r, 500))

@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
 # Publishes the local voice endpoint through Tailscale Funnel and prints the
-# connector URL (the secret is part of the path, keep the URL private).
+# connector URL. The URL holds no secret: the connector signs in with OAuth.
 #
-#   scripts/funnel.sh start    expose http://127.0.0.1:$VOICE_GW_PORT on https://<host>:$FUNNEL_PORT
+#   scripts/funnel.sh start    expose http://127.0.0.1:$VOICE_GW_PORT on https://<host>
 #   scripts/funnel.sh stop     remove that funnel again
 #   scripts/funnel.sh status   show Tailscale's serve/funnel config
 #   scripts/funnel.sh url      print the connector URL only
 #
-# Funnel accepts only the HTTPS ports 443, 8443 and 10000. 8443 is the default
-# here so an existing mapping on 443 stays untouched.
+# Funnel accepts the HTTPS ports 443, 8443 and 10000, but Claude's servers only
+# reached 443 in our tests, so that is the default.
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PORT="${VOICE_GW_PORT:-8787}"
-FUNNEL_PORT="${FUNNEL_PORT:-8443}"
+FUNNEL_PORT="${FUNNEL_PORT:-443}"
 
 dns_name() {
   tailscale status --json | node -e '
@@ -26,15 +26,14 @@ dns_name() {
 }
 
 connector_url() {
-  local host token suffix=""
+  local host suffix=""
   host="$(dns_name)"
-  token="$(node "$ROOT/scripts/token.mjs" --quiet)"
   if [ -z "$host" ]; then
     echo "Tailscale host name not found. Has 'tailscale up' run?" >&2
     exit 1
   fi
   [ "$FUNNEL_PORT" != "443" ] && suffix=":$FUNNEL_PORT"
-  echo "https://${host}${suffix}/mcp/${token}"
+  echo "https://${host}${suffix}/mcp"
 }
 
 case "${1:-start}" in
@@ -49,12 +48,9 @@ case "${1:-start}" in
     echo "$out"
     # The first HTTPS request makes Tailscale fetch the certificate, which can
     # take a while; do it now instead of during the first connector call.
-    host="$(dns_name)"
-    if ! curl -fsS -o /dev/null --max-time 90 "https://${host}:${FUNNEL_PORT}/healthz"; then
-      echo "Note: https://${host}:${FUNNEL_PORT}/healthz does not answer yet (certificate or controller?)." >&2
-    fi
+    node "$ROOT/scripts/check-public.mjs" "$(dns_name)" "$FUNNEL_PORT" || true
     echo
-    echo "Connector URL (keep it private, it contains the secret):"
+    echo "Connector URL:"
     connector_url
     ;;
   stop)

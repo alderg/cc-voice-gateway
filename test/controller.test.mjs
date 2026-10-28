@@ -102,7 +102,7 @@ test('confine hook: reads only inside controller/', () => {
   allowed('Read', { file_path: join(CONTROLLER, 'CLAUDE.md') })
   allowed('Read', { file_path: join(PLAYGROUND, 'not-there-yet.txt') })
   blocked('Read', { file_path: '../README.md' })
-  blocked('Read', { file_path: join(CONTROLLER, '..', '.secrets', 'token') })
+  blocked('Read', { file_path: join(CONTROLLER, '..', '.secrets', 'oauth.json') })
   blocked('Read', { file_path: '~/.ssh/id_ed25519' })
   blocked('Read', { file_path: join(homedir(), '.claude.json') })
   blocked('Read', { file_path: '/etc/hostname' })

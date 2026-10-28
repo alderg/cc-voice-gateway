@@ -2,14 +2,14 @@
   "name": "cc-voice-gateway",
   "version": "0.1.0",
   "private": true,
-  "description": "Voice gateway: drive a Claude Code controller session from CarPlay via a custom MCP connector and a Claude Code channel.",
+  "description": "Drive Claude Code by voice from the car: a custom MCP connector for Claude voice mode, relayed into a Claude Code session through a channel.",
   "type": "module",
   "engines": {
     "node": ">=20"
   },
   "scripts": {
     "test": "node --test test/*.test.mjs",
-    "token": "node scripts/token.mjs",
+    "pair": "node scripts/pair.mjs",
     "fake-voice": "node scripts/fake-voice.mjs"
   },
   "dependencies": {
