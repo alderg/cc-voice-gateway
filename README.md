@@ -39,8 +39,22 @@ Team and Enterprise an Owner first does the [admin steps](#74-admin-steps-for-te
 
    92 packages land in `node_modules`; nothing is compiled ([what it installs](#6-prerequisites)).
 
-3. **Start the controller.** It comes before the funnel and the pairing code: Claude Code starts
-   the gateway inside it, and both need the running gateway.
+3. **Run the setup assistant,** a temporary web server on this computer that writes the
+   configuration files. Without it, the gateway runs with its defaults.
+
+   ```bash
+   node scripts/setup.mjs
+   ```
+
+   It prints a one-time link per address of this computer, `http://<address>:8790/?t=<token>`. Open
+   one in a browser on your own network, since it is plain HTTP; from elsewhere use an SSH tunnel.
+   The page writes `.secrets/gateway.env`, plus Telegram, Docker workers and the autostart if you
+   choose them, and the assistant ends ([7.1](#71-with-the-setup-assistant),
+   [files](#510-secrets-and-files)).
+
+4. **Start the controller,** unless the assistant did; then attach with `tmux attach -t voice`. It
+   comes before the funnel and the pairing code: Claude Code starts the gateway inside it, and both
+   need the running gateway.
 
    ```bash
    tmux new -s voice scripts/start-controller.sh
@@ -50,7 +64,7 @@ Team and Enterprise an Owner first does the [admin steps](#74-admin-steps-for-te
    first start, and with the development flag the channel warning at every start
    ([8.1](#81-starting-and-stopping)). Run the next steps in a second terminal.
 
-4. **Start the funnel.** On Linux, run `sudo tailscale set --operator=$USER` once before.
+5. **Start the funnel.** On Linux, run `sudo tailscale set --operator=$USER` once before.
 
    ```bash
    scripts/funnel.sh start
@@ -58,14 +72,14 @@ Team and Enterprise an Owner first does the [admin steps](#74-admin-steps-for-te
 
    It prints the connector URL `https://<host>.ts.net/mcp` and reports when all Funnel relays
    answer, which can take a few minutes the first time. The URL holds no secret; the sign-in needs
-   the pairing code from step 6 ([7.3](#73-publishing-the-endpoint)).
+   the pairing code from step 7 ([7.3](#73-publishing-the-endpoint)).
 
-5. **Add the connector in Claude Desktop:** Customize → Connectors → add a custom connector, with
-   the URL from step 4 ([7.1](#71-with-the-setup-assistant), step 3).
+6. **Add the connector in Claude Desktop:** Customize → Connectors → add a custom connector, with
+   the URL from step 5 ([7.1](#71-with-the-setup-assistant)).
 
    Claude opens the sign-in page "Connect to Claude Code", which asks for a pairing code.
 
-6. **Get the pairing code:**
+7. **Get the pairing code:**
 
    ```bash
    node scripts/pair.mjs
@@ -76,9 +90,6 @@ Team and Enterprise an Owner first does the [admin steps](#74-admin-steps-for-te
    or voice mode asks at every call.
 
 Then try it in voice mode with the same account: "Ask Claude Code whether the gateway is up."
-Telegram, workers in Docker, models and the autostart come from the setup assistant,
-`node scripts/setup.mjs`, best run between steps 2 and 3; if it starts the controller, attach with
-`tmux attach -t voice` instead of step 3 ([7.1](#71-with-the-setup-assistant)).
 
 ## Contents
 
