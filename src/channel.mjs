@@ -21,9 +21,13 @@ import { log, preview } from './log.mjs'
 // Must match the key in controller/.mcp.json: Claude Code derives the
 // <channel source="..."> attribute and the tool prefix mcp__voice__ from it.
 export const CHANNEL_NAME = 'voice'
+// The source attribute of the channel's events: the server's name when the
+// development flag loads it, plugin:voice:voice when it runs as the plugin
+// (src/plugin.mjs).
+export const CHANNEL_SOURCE = process.env.VOICE_GW_CHANNEL_SOURCE || CHANNEL_NAME
 
 const INSTRUCTIONS = `
-Messages from the driver arrive as <channel source="${CHANNEL_NAME}" request_id="...">TEXT</channel>.
+Messages from the driver arrive as <channel source="${CHANNEL_SOURCE}" request_id="...">TEXT</channel>.
 They were spoken in a car and relayed by a voice assistant. Every one of them needs an answer through the
 "reply" tool, passing the request_id from the tag:
 
@@ -45,15 +49,17 @@ once: tell the driver it is on its way and reply with state "done".
 With workers in Docker, list_workers shows each repository's access level: read-only keeps everything in the
 container, pr and full open a draft pull request. Only at full, and only when the driver explicitly asks for
 it, pass direct=true for a push straight to the default branch.
-When a run ends, a message arrives as <channel source="${CHANNEL_NAME}" request_id="..." worker="..." task="..."
+When a run ends, a message arrives as <channel source="${CHANNEL_SOURCE}" request_id="..." worker="..." task="..."
 outcome="done|failed|stopped">. Summarise it for the driver like any answer and reply with that request_id:
 state "done", or "question" when the worker asks something. The driver hears it as news. Their answer arrives
 as a new message "(Answer to <id>) ...": pass it to the same worker with dispatch, as a follow-up.
 When the run opened or updated a pull request, the tag also has pull_request="<number>": say only briefly
 that it is out, and which one. Never offer or suggest a review; details only when the driver asks.
-Checks and reviews that run on such a pull request by themselves arrive later as <channel source="${CHANNEL_NAME}"
+Checks and reviews that run on such a pull request by themselves arrive later as <channel source="${CHANNEL_SOURCE}"
 request_id="..." worker="..." repo="owner/name" pull_request="..." kind="checks|review|comment">: summarise them
 in one or two sentences and reply "done", without asking anything. The driver hears it as news.
+Restart: when the driver asks to restart the controller, follow restart_controller's description: what it would
+do first, then a question to the driver, and the restart only after their yes.
 `.trim()
 
 const REPLY_TOOL = {
@@ -94,6 +100,21 @@ const PermissionRequestSchema = z.object({
     input_preview: z.string(),
   }),
 })
+
+const RESTART_TOOL = {
+  name: 'restart_controller',
+  description:
+    'Restart this controller session through its watchdog, when the driver asks for it ("Controller neu starten"). ' +
+    'Call it first without confirm: it says what a restart would do, including worker runs that are going. Ask the ' +
+    'driver with that (state "question"). Only after their yes, reply "done" to them, then call it with confirm=true; ' +
+    'the session ends a few seconds later and starts again.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      confirm: { type: 'boolean', description: 'true only after the driver said yes to the restart.' },
+    },
+  },
+}
 
 const WORKER_PROPERTY = { type: 'string', description: 'The repository name, as list_workers shows it.' }
 
@@ -232,7 +253,7 @@ async function workerTool(workers, name, args) {
   return dispatchText(worker, result)
 }
 
-export async function startChannel(store, { permissionRelay, workers, onClose } = {}) {
+export async function startChannel(store, { permissionRelay, workers, restarter, onClose } = {}) {
   const experimental = { 'claude/channel': {} }
   if (permissionRelay) experimental['claude/channel/permission'] = {}
 
@@ -241,12 +262,16 @@ export async function startChannel(store, { permissionRelay, workers, onClose } 
     { capabilities: { experimental, tools: {} }, instructions: INSTRUCTIONS },
   )
 
-  const tools = workers ? [REPLY_TOOL, ...WORKER_TOOLS] : [REPLY_TOOL]
+  const tools = [REPLY_TOOL, ...(workers ? WORKER_TOOLS : []), ...(restarter ? [RESTART_TOOL] : [])]
   mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools }))
 
   mcp.setRequestHandler(CallToolRequestSchema, async request => {
     if (workers && WORKER_TOOLS.some(tool => tool.name === request.params.name)) {
       return callWorkerTool(workers, request.params.name, request.params.arguments ?? {})
+    }
+    if (restarter && request.params.name === RESTART_TOOL.name) {
+      const confirmed = request.params.arguments?.confirm === true
+      return toolText(confirmed ? restarter.request({ by: 'voice' }) : restarter.plan())
     }
     if (request.params.name !== REPLY_TOOL.name) {
       return toolText(`Unknown tool: ${request.params.name}`, true)
