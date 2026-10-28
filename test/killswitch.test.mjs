@@ -572,6 +572,12 @@ async function startGateway() {
     const result = await g.claudeCode.callTool({ name, arguments: args })
     return { text: result.content.map(c => c.text).join('\n'), isError: result.isError }
   }
+  // The driver says it first: dispatch starts a run only on words from a
+  // recent voice request.
+  g.dispatch = async (worker, task) => {
+    await g.voice.car('send', { message: task })
+    return g.controller('dispatch', { worker, task, words: task })
+  }
   g.close = async () => {
     await g.voice.carClient.close()
     await g.voice.phoneClient.close()
@@ -668,7 +674,7 @@ test('the lock survives a restart, and only the local script unlocks it', async 
   assert.match(unlocked.out, /Unlocked: the gateway takes tasks again\./)
   assert.equal(existsSync(LOCK), false)
   assert.equal((await killswitchState()).locked, false)
-  const again = await gw.controller('dispatch', { worker: 'alpha', task: 'Look at the README.', words: 'x' })
+  const again = await gw.dispatch('alpha', 'Look at the README.')
   assert.match(again.text, /^\[dispatch=started worker=alpha/)
   assert.match((await run([])).out, /The kill switch is not locked\./)
 })
@@ -692,11 +698,11 @@ test("the controller's alarm locks it", async () => {
 })
 
 test('a rule: a push to main in a run locks it, and every running worker stops', async () => {
-  const slow = await gw.controller('dispatch', { worker: 'beta', task: 'SLOW: a long task.', words: 'x' })
+  const slow = await gw.dispatch('beta', 'SLOW: a long task.')
   const slowId = /task=(t[a-z0-9]{3})/.exec(slow.text)[1]
   await waitUntil(() => existsSync(join(TMP, 'claude-calls.jsonl')) && readFileSync(join(TMP, 'claude-calls.jsonl'), 'utf8').includes('SLOW'))
   const slowPid = JSON.parse(readFileSync(join(TMP, 'claude-calls.jsonl'), 'utf8').trim().split('\n').findLast(l => l.includes('SLOW'))).pid
-  await gw.controller('dispatch', { worker: 'alpha', task: 'PUSHMAIN: push it.', words: 'x' })
+  await gw.dispatch('alpha', 'PUSHMAIN: push it.')
 
   const state = await waitUntil(async () => (await killswitchState()).state)
   assert.equal(state.trigger, 'rule')

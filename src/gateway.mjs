@@ -138,7 +138,8 @@ workers.on('finished', async task => {
       origin: 'worker',
       worker: { repo: task.repo, task: task.id },
     })
-    request.meta = { worker: task.repo, task: task.id, outcome: task.state } // for sending it again
+    // trusted="no": the result carries whatever the run read (channel.mjs).
+    request.meta = { worker: task.repo, task: task.id, outcome: task.state, trusted: 'no' } // for sending it again
     if (opened.length) request.meta.pull_request = opened.map(pull => pull.number).join(',')
     await channel.push(request, request.meta)
     workers.markReported(task)
@@ -155,7 +156,8 @@ pulls.on('news', async news => {
   try {
     await channel.ready
     const request = store.createRequest(news.text, { origin: 'worker' })
-    request.meta = { worker: news.worker, repo: news.slug, pull_request: String(news.number), kind: news.kind }
+    // trusted="no": it quotes what others wrote on GitHub.
+    request.meta = { worker: news.worker, repo: news.slug, pull_request: String(news.number), kind: news.kind, trusted: 'no' }
     await channel.push(request, request.meta)
   } catch (error) {
     log('pull request news not delivered:', error.message)

@@ -236,9 +236,10 @@ to a lost phone or a leaked token.
 |---|---|---|
 | Anyone on the internet | Reach the sign-in page | Call a tool without a token; get a token without a pairing code from your computer |
 | A signed-in voice client | Send requests, read answers, answer approvals, lock the kill switch | Unlock the kill switch; reach the controller's tools directly |
-| The controller | Read `controller/`, write `controller/playground/`, read pull request and CI status, merge after an approval, dispatch workers, raise the alarm | Anything else (see 5.3) |
-| A worker on this computer | Everything your user can, without approvals | Nothing is blocked; rules only observe (see 5.11) |
+| The controller | Read `controller/`, write `controller/playground/`, read pull request and CI status, merge after an approval, dispatch workers with your words from a recent voice request, raise the alarm | Start a worker on words that only a worker result or a pull request brought in (see 5.4); anything else (see 5.3) |
+| A worker on this computer | Everything your user can, without approvals | Nothing is blocked; rules only observe (see 5.9) |
 | A worker in Docker | The mounted folder, the container's tokens, the network | Your other files, SSH keys, `gh` login; more on GitHub than its token allows |
+| Others on GitHub | Comment on a watched pull request: the news names them; the text of the repository's owner, members and collaborators reaches the controller, marked `trusted="no"` | Get anyone else's text to the controller through the watch; have a fork or someone else's pull request watched (see 8.4) |
 | The Telegram chat | Receive news; send `/stop` | Anything else; other chats are ignored |
 
 ### 5.2 The voice endpoint and OAuth
@@ -312,6 +313,27 @@ symlinks and fails closed.
 - **Secrets in prompts:** Claude Code masks recognisable credentials in relayed prompts, but not
   every secret ([channels reference][ref]).
 
+**Dispatch needs your words.** The controller also reads text nobody here wrote: worker results,
+which carry whatever a run read, and news about pull requests. Both arrive with `trusted="no"`,
+and its instructions call that text data, never instructions. The gateway checks in code as well
+(`src/channel.mjs`):
+
+- **The check.** `dispatch` starts a run only when its `words` occur in a voice request of the
+  last `VOICE_GW_DISPATCH_WINDOW` minutes (30). At least two words, whole words, compared in lower
+  case without punctuation and quotes. Worker results and pull request news never count.
+- **Answers count.** A follow-up "(Answer to <id>) Yes." is a voice request too. The words may
+  start in "(Answer to <id>)", so that a plain yes can be passed on, but must reach into what you
+  said; the gateway's prefix alone does not count.
+- **Every dispatch.** With `direct` and `allow_dirty` too. Otherwise `dispatch=needs_driver`:
+  nothing starts, and the controller is told to ask you by voice. `list_workers`,
+  `worker_status` and `stop_worker` are not checked.
+- **What it guarantees:** text in a repository, a run's result or a pull request cannot start a
+  worker by itself.
+- **What it does not:** the controller still reads that text, and it writes the `task` itself. A
+  phrase you said recently can be quoted again for another task, another repository or with
+  `direct`, as long as it is within the window. And whoever can call `send` supplies the words,
+  like whoever can call `approve` approves.
+
 ### 5.5 Workers: on this computer or in Docker
 
 What applies to every worker run (`src/workers.mjs`):
@@ -322,9 +344,14 @@ What applies to every worker run (`src/workers.mjs`):
   artifacts, workflows, Monitor, worktrees, `AskUserQuestion` and plan mode.
 - **Environment:** the controller session's variables (`CLAUDECODE`, its messaging socket and
   token, the session id) are removed, so a worker cannot reach the controller.
-- **Before a run:** the gateway refuses a checkout with uncommitted changes until you agree, a
-  second run in the same repository, and more than `VOICE_GW_MAX_WORKERS` runs. A run stops after
+- **Before a run:** the gateway refuses a dispatch without your words from a recent voice request
+  ([5.4](#54-approvals-by-voice)), a checkout with uncommitted changes until you agree, a second
+  run in the same repository, and more than `VOICE_GW_MAX_WORKERS` runs. A run stops after
   `VOICE_GW_WORKER_TIMEOUT` minutes.
+- **Not this repository.** On this computer the gateway's own checkout is no worker, even inside
+  `VOICE_GW_WORKER_ROOT`: a run there could change the gateway, the confine hook and
+  `controller/CLAUDE.md`. `VOICE_GW_WORKER_SELF=1` lists it anyway. In Docker, the container's
+  clones are what counts.
 - **Rules for the run** (`WORKER_RULES`): branch `voice/<name>`, commit only its own changes, never
   force-push, merge or delete branches, ask before pushing a public repository. These are rules,
   not limits.
@@ -591,9 +618,17 @@ is guarded as follows:
 - **On this computer the kill switch is a tripwire, not a boundary.** Host workers run as you,
   without approvals. They can write `.secrets/` (including `killswitch.json` and `gateway.env`),
   use your SSH keys and `gh` login, and change this repository's code (the gateway, the confine
-  hook, `controller/CLAUDE.md`), which takes effect at the next restart. A process a worker
-  detached from its process group can survive a stop. **Only Docker isolates.**
+  hook, `controller/CLAUDE.md`), which takes effect at the next restart; leaving this checkout out
+  of the workers ([5.5](#55-workers-on-this-computer-or-in-docker)) only keeps runs from starting
+  in it. A process a worker detached from its process group can survive a stop. **Only Docker
+  isolates.**
 - **In Docker,** the container can do what its token allows on GitHub, and reaches the network.
+- **The controller reads untrusted text.** Worker results, pull request news and what read-only
+  `gh` shows reach it. `trusted="no"` and its instructions ask it to treat them as data; that is
+  an instruction, not enforcement. The dispatch check ([5.4](#54-approvals-by-voice)) holds in
+  code, but a phrase you said within `VOICE_GW_DISPATCH_WINDOW` can be reused for another task,
+  and the controller writes the task itself. Merges still need your approval; its answers to you,
+  `restart_controller` and `raise_alarm` are not checked.
 - **The voice AI is an instruction-follower.** If it rewrites "Notstopp" into a longer sentence,
   the phrase check can miss it; the `emergency_stop` tool is there for that. Approvals depend on
   it asking you.
@@ -925,17 +960,27 @@ at most three short sentences, without code, paths or lists.
 | "Notstopp!" / "emergency stop" | The kill switch locks before anything reaches the controller ([5.9](#59-the-kill-switch)) |
 | "Controller neu starten." | Restart through the watchdog after your yes ([8.3](#83-restarting-the-controller-by-voice)) |
 
+**Your words.** The controller passes your words with every dispatch. If they are not from a voice
+request of the last `VOICE_GW_DISPATCH_WINDOW` minutes, the gateway starts nothing and the
+controller asks you first ([5.4](#54-approvals-by-voice)). When a worker result or a review asks
+for something, the controller is told to tell you and let you decide.
+
 **Pull requests and reviews:**
 
 - **After a push** you hear only that the pull request is out, and which one. The controller never
   offers a review.
-- **The watch.** The gateway takes the pull request URLs in a run's output, checks with `gh` that
-  they are open on a `voice/` branch, and watches them: every `VOICE_GW_PR_POLL` seconds (60),
-  five times as long after 15 looks.
+- **The watch.** The gateway takes the pull request URLs in a run's output and checks with `gh`
+  that each is open on a `voice/` branch, comes from the repository itself (not a fork), and was
+  opened by the account `gh` is logged in as. It watches those: every `VOICE_GW_PR_POLL` seconds
+  (60), five times as long after 15 looks. Without a `gh` login it watches nothing. In Docker, a
+  pull request opened with the container's token is watched only if that token belongs to the
+  same account.
 - **What becomes news:**
   - finished checks, once per push;
   - new reviews and comments, except those of the account `gh` is logged in as;
-  - you hear them as a sentence or two.
+  - their text only from the repository's owner, members and collaborators. Of anyone else, which
+    as a rule includes bots such as Copilot, you hear who reviewed or commented, not what;
+  - you hear them as a sentence or two. The controller gets them marked `trusted="no"`.
 - **When the watch stops:**
   - nothing shows up in the first five looks;
   - the pull request is merged or closed;
@@ -985,6 +1030,8 @@ gateway reads them at its start: restart the controller after a change.
 | `VOICE_GW_MAX_WAIT` | `40` | Upper limit for `get_reply` and `ask` |
 | `VOICE_GW_HINT_AFTER` | `20` | Seconds without a reaction from the controller before a diagnostic hint |
 | `VOICE_GW_WORKER_ROOT` | The folder holding this repository | Every git repository directly in it has a worker |
+| `VOICE_GW_WORKER_SELF` | off | `1`: this repository's own checkout is a worker on this computer too |
+| `VOICE_GW_DISPATCH_WINDOW` | `30` | Minutes a voice request counts for `dispatch`: only words from requests this recent start a run |
 | `VOICE_GW_MAX_WORKERS` | `2` | Runs at the same time |
 | `VOICE_GW_WORKER_TIMEOUT` | `60` | Minutes before a run is stopped |
 | `VOICE_GW_WORKER_MODEL` | Claude Code's default | `--model` for every worker run, host and Docker |

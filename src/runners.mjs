@@ -10,8 +10,9 @@
 // clone here as a bundle (scripts/fetch-from-container.sh).
 
 import { execFile, spawn } from 'node:child_process'
-import { existsSync, readdirSync } from 'node:fs'
+import { existsSync, readdirSync, statSync } from 'node:fs'
 import { join, posix } from 'node:path'
+import { ROOT, config } from './config.mjs'
 import { log } from './log.mjs'
 
 function run(command, args, timeout) {
@@ -40,6 +41,10 @@ export class HostRunner {
     return join(this.root, name)
   }
 
+  // The gateway's own checkout is left out: a run there could change the
+  // gateway, the confine hook and controller/CLAUDE.md, which take effect at
+  // the next start. Compared by device and inode, so a symlinked or
+  // differently spelled root still finds it. VOICE_GW_WORKER_SELF=1 lists it.
   async names() {
     let entries = []
     try {
@@ -47,8 +52,14 @@ export class HostRunner {
     } catch (error) {
       log('worker root unreadable:', this.root, error.message)
     }
+    const self = config.workerSelf ? null : statSync(ROOT, { throwIfNoEntry: false })
+    const isSelf = dir => {
+      const stat = self && statSync(dir, { throwIfNoEntry: false })
+      return Boolean(stat) && stat.dev === self.dev && stat.ino === self.ino
+    }
     return entries
       .filter(e => e.isDirectory() && !e.name.startsWith('.') && existsSync(join(this.root, e.name, '.git')))
+      .filter(e => !isSelf(join(this.root, e.name)))
       .map(e => e.name)
       .sort()
   }
