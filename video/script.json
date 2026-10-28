@@ -1,35 +1,31 @@
 {
-  "voice": "Daniel",
-  "rate": 160,
+  "voice": "af_heart",
   "scenes": [
     {
-      "id": "traffic",
+      "id": "intro",
       "lines": [
-        { "say": "Hours every week, stuck in traffic.", "build": 0 },
-        { "say": "Your ideas keep coming. Your computer is back at home.", "build": 1 }
+        {
+          "say": "This is C C voice gateway, a small prototype.",
+          "caption": "This is cc-voice-gateway, a small prototype.",
+          "build": 0
+        },
+        { "say": "You talk to Claude, and Claude Code does the work.", "build": 1 }
       ]
     },
     {
       "id": "gap",
       "lines": [
-        { "say": "Claude's voice mode is great to talk to.", "build": 0 },
-        {
-          "say": "But it can't reach Claude Code, the agent that does the real work in your repositories.",
-          "build": 1
-        }
+        { "say": "In the Claude app, voice mode talks with you.", "build": 0 },
+        { "say": "But it can't reach Claude Code on your computer.", "build": 1 }
       ]
     },
     {
       "id": "bridge",
       "lines": [
+        { "say": "The gateway connects the two of them.", "build": 0 },
+        { "say": "Voice mode calls it as a custom connector.", "build": 1 },
         {
-          "say": "C C voice gateway connects the two.",
-          "caption": "cc-voice-gateway connects the two.",
-          "build": 0
-        },
-        { "say": "You talk to Claude in your car, or on your phone.", "build": 1 },
-        {
-          "say": "A Claude Code session on your own computer picks it up, and gets to work.",
+          "say": "It hands each request to a Claude Code session on your computer, and brings the answer back.",
           "build": 2
         }
       ]
@@ -37,37 +33,34 @@
     {
       "id": "dialog",
       "lines": [
-        { "say": "Ask why the build failed.", "build": 0 },
-        { "say": "Have it fixed, with the tests run.", "build": 1 },
-        { "say": "A worker creates a branch, commits, and opens a pull request.", "build": 2 },
-        { "say": "When it's done, you hear the result in a sentence or two.", "build": 3 }
+        { "say": "You can ask why a build failed.", "build": 0 },
+        { "say": "Ask for a fix, and a worker makes the change and runs the tests.", "build": 1 },
+        { "say": "It commits on a branch and opens a pull request.", "build": 2 },
+        { "say": "Then you hear the result in a sentence or two.", "build": 3 }
       ]
     },
     {
       "id": "review",
       "lines": [
-        { "say": "Nothing lands behind your back.", "build": 0 },
-        { "say": "Every change is versioned with git, and arrives as a pull request.", "build": 1 },
-        {
-          "say": "Checked on GitHub, reviewed by Claude, and merged only when you say yes.",
-          "build": 2
-        }
+        { "say": "The changes stay in git, as pull requests to review at your desk.", "build": 1 },
+        { "say": "A merge needs your yes.", "build": 2 }
       ]
     },
     {
       "id": "road",
       "lines": [
-        { "say": "It's built for the road: voice only, short answers, nothing to read.", "build": 0 },
+        { "say": "Answers are short, and there is nothing to read.", "build": 0 },
         { "say": "Approvals happen by voice.", "build": 1 },
-        { "say": "And one phrase, emergency stop, locks everything at once.", "build": 2 }
+        { "say": "And if you say emergency stop, everything locks.", "build": 2 }
       ]
     },
     {
-      "id": "payoff",
-      "captions": false,
+      "id": "away",
       "lines": [
-        { "say": "Stuck in traffic?", "build": 0 },
-        { "say": "Turn your commute into commits.", "build": 1 }
+        {
+          "say": "It is meant for time away from the desk, like a commute, with your eyes on the road.",
+          "build": 1
+        }
       ]
     },
     {
@@ -75,8 +68,7 @@
       "captions": false,
       "lines": [
         {
-          "say": "C C voice gateway. A prototype, open on GitHub, and provided as is.",
-          "caption": "cc-voice-gateway: a prototype, open on GitHub, provided as-is.",
+          "say": "C C voice gateway is a prototype, provided as is. The code is on GitHub.",
           "build": 0
         }
       ]

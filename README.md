@@ -4,10 +4,10 @@ Talk to Claude in the Claude app's voice mode, on the phone or in the car, and h
 session on your own computer do the work: answer questions about your repositories, change code,
 push branches, open and merge pull requests. Plain JavaScript (ESM, Node.js), no build step.
 
-This README is the technical documentation. The idea in 90 seconds, with a video, is on the
+This README is the technical documentation. The idea in a short video is on the
 [product page](https://alderg.github.io/cc-voice-gateway/).
 
-[![Video: Stuck in traffic? Turn your commute into commits.](docs/assets/video-thumbnail.png)](https://alderg.github.io/cc-voice-gateway/#video)
+[![Video: cc-voice-gateway, Claude Code from Claude's voice mode](docs/assets/video-thumbnail.png)](https://alderg.github.io/cc-voice-gateway/#video)
 
 > **Provided as-is, as a prototype.** This is solely a prototype of an idea: a way to use Claude
 > Code from Claude's voice mode, which cannot reach Claude Code on its own. It comes without
