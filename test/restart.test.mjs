@@ -11,7 +11,7 @@
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { createServer as createNetServer } from 'node:net'
 import { tmpdir } from 'node:os'
@@ -28,7 +28,9 @@ import { channelMode } from '../scripts/channel-mode.mjs'
 const ROOT = fileURLToPath(new URL('..', import.meta.url)).replace(/\/$/, '')
 const GATEWAY = join(ROOT, 'src', 'gateway.mjs')
 const PLUGIN = join(ROOT, 'src', 'plugin.mjs')
-const TMP = mkdtempSync(join(tmpdir(), 'voice-gw-restart-'))
+// Short and resolved: the gateways' admin sockets are in folders below it, and
+// macOS allows Unix socket paths of at most 103 bytes, however TMPDIR is spelled.
+const TMP = realpathSync(mkdtempSync(join(tmpdir(), 'vgw-')))
 const BIN = join(TMP, 'bin')
 const TOKEN = '123456789:TEST-token-never-in-a-log'
 

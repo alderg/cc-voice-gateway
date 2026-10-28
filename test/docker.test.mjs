@@ -11,7 +11,7 @@
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync, spawnSync } from 'node:child_process'
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -24,7 +24,9 @@ import { GitHubAccess } from '../src/access.mjs'
 import { DockerRunner } from '../src/runners.mjs'
 
 const GATEWAY = fileURLToPath(new URL('../src/gateway.mjs', import.meta.url))
-const TMP = mkdtempSync(join(tmpdir(), 'voice-gw-docker-'))
+// Resolved: on macOS the temporary folder is behind a symlink (/var is
+// /private/var), and the stand-ins and scripts report the resolved path.
+const TMP = realpathSync(mkdtempSync(join(tmpdir(), 'voice-gw-docker-')))
 const REPOS = join(TMP, 'container', 'repos') // /repos in the container
 const HOST = join(TMP, 'host') // the checkouts on this computer, not used in Docker mode
 const BIN = join(TMP, 'bin')
