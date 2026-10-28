@@ -17,8 +17,9 @@ import { startAdmin } from './admin.mjs'
 import { startChannel } from './channel.mjs'
 import { startVoiceHttp } from './voice.mjs'
 import { Workers } from './workers.mjs'
+import { Restarter } from './restart.mjs'
 
-const store = new Store({ permissionTtlSeconds: config.permissionTtlSeconds })
+const store = new Store({ permissionTtlSeconds: config.permissionTtlSeconds, file: config.requestsFile })
 const auth = new Auth({ stateFile: config.oauthStateFile, allowedHosts: config.oauthHosts })
 const workers = new Workers({
   root: config.workerRoot,
@@ -43,9 +44,13 @@ function shutdown(reason) {
   setTimeout(() => process.exit(0), 200).unref()
 }
 
+// Restarting the controller by voice, through the watchdog (restart.mjs).
+const restarter = new Restarter({ store, workers, secretsDir: config.secretsDir })
+
 const channel = await startChannel(store, {
   permissionRelay: config.permissionRelay,
   workers,
+  restarter,
   onClose: () => shutdown('stdio closed'),
 })
 
@@ -58,7 +63,8 @@ workers.on('finished', async task => {
   try {
     await channel.ready
     const request = store.createRequest(workers.resultText(task), { origin: 'worker' })
-    await channel.push(request, { worker: task.repo, task: task.id, outcome: task.state })
+    request.meta = { worker: task.repo, task: task.id, outcome: task.state } // for sending it again
+    await channel.push(request, request.meta)
     workers.markReported(task)
   } catch (error) {
     log('worker result not delivered:', error.message)
@@ -69,6 +75,22 @@ workers.on('finished', async task => {
 
 admin = await startAdmin(auth, config.adminSocket)
 http = startVoiceHttp(store, channel, auth, config)
+
+// Once the session is connected: worker results the previous session never
+// answered go to this one, and after a restart by the watchdog the driver
+// hears on Telegram that the controller is ready again.
+channel.ready.then(async () => {
+  for (const request of [...store.requests.values()].filter(r => r.resend)) {
+    try {
+      await channel.push(request, { ...request.meta, resent: 'yes' })
+      delete request.resend
+      store.changed()
+    } catch (error) {
+      log('worker result not sent again:', error.message)
+    }
+  }
+  restarter.announceReady()
+})
 
 // The SDK's stdio transport does not notice when Claude Code goes away (it only
 // listens for data and errors). Without this, a crashed or killed session

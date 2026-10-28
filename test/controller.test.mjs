@@ -9,7 +9,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync, spawnSync } from 'node:child_process'
-import { chmodSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -20,26 +20,35 @@ const PLAYGROUND = join(CONTROLLER, 'playground')
 const HOOK = join(CONTROLLER, '.claude', 'hooks', 'confine.mjs')
 const SETTINGS = JSON.parse(readFileSync(join(CONTROLLER, '.claude', 'settings.json'), 'utf8'))
 
-function runWithStub(...args) {
+// Runs the start script with a stub claude that prints where it ran and its
+// arguments, and notes every call. setup() prepares Claude Code's config
+// folder: managed settings, known marketplaces.
+function runWithStub(args = [], setup = () => {}) {
   const bin = mkdtempSync(join(tmpdir(), 'voice-gw-stub-'))
   try {
     const stub = join(bin, 'claude')
-    writeFileSync(stub, '#!/bin/sh\nprintf "%s\\n" "$PWD" "$@"\n')
+    writeFileSync(stub, `#!/bin/sh\necho "$*" >> "${join(bin, 'calls')}"\nprintf "%s\\n" "$PWD" "$@"\n`)
     chmodSync(stub, 0o755)
+    const config = join(bin, 'claude-config')
+    mkdirSync(join(config, 'plugins'), { recursive: true })
+    setup(config)
     const out = execFileSync(SCRIPT, args, {
       env: {
         ...process.env,
         PATH: `${bin}:${process.env.PATH}`,
-        // The watchdog's lock, log and Telegram secrets: never the real ones.
+        // The watchdog's lock, log and Telegram secrets, and Claude Code's
+        // config: never the real ones.
         VOICE_GW_STATE_DIR: join(bin, 'state'),
         VOICE_GW_LOG_FILE: join(bin, 'log'),
         VOICE_GW_SECRETS_DIR: join(bin, 'secrets'),
+        CLAUDE_CONFIG_DIR: config,
+        VOICE_GW_MANAGED_SETTINGS: join(bin, 'no-managed-settings.json'),
       },
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
     })
     const [cwd, ...argv] = out.trimEnd().split('\n')
-    return { cwd, argv }
+    return { cwd, argv, log: readFileSync(join(bin, 'log'), 'utf8'), calls: readFileSync(join(bin, 'calls'), 'utf8').trim().split('\n') }
   } finally {
     rmSync(bin, { recursive: true, force: true })
   }
@@ -48,7 +57,7 @@ function runWithStub(...args) {
 const valueOf = (argv, flag) => argv[argv.indexOf(flag) + 1]
 
 test('start-controller.sh runs claude in controller/ with the channel in manual mode', () => {
-  const { cwd, argv } = runWithStub('--debug')
+  const { cwd, argv, log } = runWithStub(['--debug'])
   assert.equal(cwd, CONTROLLER)
   assert.equal(valueOf(argv, '--dangerously-load-development-channels'), 'server:voice')
   assert.equal(valueOf(argv, '--permission-mode'), 'manual')
@@ -56,17 +65,69 @@ test('start-controller.sh runs claude in controller/ with the channel in manual 
   // channels as not enabled for the organisation and drops every event.
   assert.ok(!argv.includes('--setting-sources'), 'user settings must stay loaded')
   assert.equal(argv.at(-1), '--debug', 'extra arguments are passed through')
+  assert.match(log, /channel: the development flag, since voice@cc-voice-gateway is not on the organisation's channel allowlist \(allowedChannelPlugins\) yet; the warning at the start needs Enter at the terminal/)
+})
+
+const ROOT = fileURLToPath(new URL('..', import.meta.url)).replace(/\/$/, '')
+const allowlisted = config =>
+  writeFileSync(
+    join(config, 'remote-settings.json'),
+    JSON.stringify({ channelsEnabled: true, allowedChannelPlugins: [{ marketplace: 'cc-voice-gateway', plugin: 'voice' }] }),
+  )
+const registered = (config, path = ROOT) =>
+  writeFileSync(
+    join(config, 'plugins', 'known_marketplaces.json'),
+    JSON.stringify({ 'cc-voice-gateway': { source: { source: 'directory', path }, installLocation: path } }),
+  )
+
+test('start-controller.sh loads the channel as the allowlisted plugin, without the development flag', () => {
+  const { argv, log, calls } = runWithStub([], config => {
+    allowlisted(config)
+    registered(config)
+  })
+  assert.equal(valueOf(argv, '--channels'), 'plugin:voice@cc-voice-gateway')
+  assert.ok(!argv.includes('--dangerously-load-development-channels'))
+  assert.equal(valueOf(argv, '--permission-mode'), 'manual')
+  // The plugin, for this session only; the project's own voice server stays off.
+  assert.deepEqual(JSON.parse(valueOf(argv, '--settings')), {
+    enabledPlugins: { 'voice@cc-voice-gateway': true },
+    disabledMcpjsonServers: ['voice'],
+  })
+  assert.match(log, /channel: the plugin voice@cc-voice-gateway, on the organisation's channel allowlist; no confirmation at the start/)
+  assert.equal(calls.length, 1, 'no registration needed')
+})
+
+test('start-controller.sh registers this repository as the marketplace when the allowlist names it', () => {
+  const { argv, log, calls } = runWithStub([], allowlisted)
+  assert.equal(calls[0], `plugin marketplace add ${ROOT}`)
+  assert.match(log, /channel: registered this repository as the marketplace cc-voice-gateway/)
+  assert.equal(valueOf(argv, '--channels'), 'plugin:voice@cc-voice-gateway')
+})
+
+test('start-controller.sh falls back to the development flag, and says why', () => {
+  const elsewhere = runWithStub([], config => {
+    allowlisted(config)
+    registered(config, '/somewhere/else')
+  })
+  assert.equal(valueOf(elsewhere.argv, '--dangerously-load-development-channels'), 'server:voice')
+  assert.match(elsewhere.log, /the marketplace cc-voice-gateway on this computer is \/somewhere\/else, not /)
+
+  const endpoint = runWithStub([], config => registered(config))
+  assert.match(endpoint.log, /not on the organisation's channel allowlist/)
 })
 
 test('controller settings: confined tools run without asking, deny rules, no bypass or auto mode', () => {
   const { permissions } = SETTINGS
   // Seen in voice mode: an approval for every write is too much while driving.
-  const voiceTools = ['reply', 'list_workers', 'dispatch', 'worker_status', 'stop_worker'].map(t => `mcp__voice__${t}`)
+  // The gateway's tools, by the name of the server in .mcp.json and as the
+  // plugin's server (mcp__plugin_<plugin>_<server>__<tool>).
+  const names = ['reply', 'list_workers', 'dispatch', 'worker_status', 'stop_worker', 'restart_controller']
+  const voiceTools = [...names.map(t => `mcp__voice__${t}`), ...names.map(t => `mcp__plugin_voice_voice__${t}`)]
   assert.deepEqual(permissions.allow, [...voiceTools, 'Bash', 'Write', 'Edit', 'NotebookEdit'])
   assert.equal(permissions.ask, undefined)
   const [entry] = SETTINGS.hooks.PreToolUse
   // The gateway's own tools are not file or shell tools; the rest is confined.
-  for (const rule of permissions.allow.filter(rule => !rule.startsWith('mcp__voice__'))) {
+  for (const rule of permissions.allow.filter(rule => !voiceTools.includes(rule))) {
     assert.match(rule, new RegExp(`^(${entry.matcher})$`), `${rule} runs without asking, so the hook must confine it`)
   }
   assert.equal(permissions.defaultMode, undefined)

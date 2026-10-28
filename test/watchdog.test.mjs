@@ -23,16 +23,24 @@ const BIN = join(TMP, 'bin')
 const TOKEN = '123456789:TEST-token-never-in-a-log'
 
 const FAKE_CLAUDE = `#!/usr/bin/env node
-import { appendFileSync, readFileSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 const planFile = process.env.FAKE_CLAUDE_PLAN
 const plan = JSON.parse(readFileSync(planFile, 'utf8'))
 const step = plan.shift() ?? { exit: 0 }
 writeFileSync(planFile, JSON.stringify(plan))
-const note = event => appendFileSync(process.env.FAKE_CLAUDE_LOG, JSON.stringify({ pid: process.pid, event, step }) + '\\n')
+const lock = process.env.VOICE_GW_WATCHDOG_LOCK
+const restarted = lock && existsSync(lock + '/restarted') ? readFileSync(lock + '/restarted', 'utf8').trim() : null
+const note = event => appendFileSync(process.env.FAKE_CLAUDE_LOG, JSON.stringify({
+  pid: process.pid, event, step, lock: lock ?? null, mode: process.env.VOICE_GW_CHANNEL_MODE ?? null, restarted,
+}) + '\\n')
 note('start')
 process.on('SIGTERM', () => { note('SIGTERM'); process.exit(143) })
-if (step.serve) {
+if (step.restart) {
+  // what the gateway does for restart_controller: a note for the watchdog, then SIGTERM
+  writeFileSync(lock + '/restart', JSON.stringify({ by: 'voice', at: new Date().toISOString() }))
+  process.exit(143)
+} else if (step.serve) {
   // the gateway answers for a while, then no longer, while the session goes on
   const server = createServer((req, res) => res.end('ok')).listen(Number(process.env.VOICE_GW_PORT), '127.0.0.1')
   setTimeout(() => server.close(), step.serve)
@@ -105,6 +113,8 @@ function setup(plan, { secrets = true, env = {} } = {}) {
       VOICE_GW_WATCHDOG_INTERVAL: '0.2',
       FAKE_CLAUDE_PLAN: join(dir, 'plan.json'),
       FAKE_CLAUDE_LOG: join(dir, 'claude.jsonl'),
+      CLAUDE_CONFIG_DIR: join(dir, 'claude-config'),
+      VOICE_GW_MANAGED_SETTINGS: join(dir, 'no-managed-settings.json'),
       ...env,
     },
   }
@@ -206,6 +216,34 @@ test('one watchdog at a time; --status and --stop, after which nothing restarts'
   assert.match(c.log(), /the controller session was stopped \(exit code 143\): not restarting/)
   assert.ok(!existsSync(join(c.dir, 'state', 'controller.lock')), 'the lock is gone')
   assert.match((await run(c, ['--status'])).stdout, /not running/)
+})
+
+test('a restart the controller asked for starts again at once, does not count, and leaves a note', async () => {
+  const before = telegram.messages.length
+  const c = setup([{ restart: true }, { restart: true }, { exit: 0 }], {
+    env: { VOICE_GW_WATCHDOG_MAX_RESTARTS: '1', VOICE_GW_WATCHDOG_BACKOFF: '30' },
+  })
+  const started = Date.now()
+  const out = await run(c)
+  assert.equal(out.status, 0, out.stderr)
+  assert.ok(Date.now() - started < 15000, 'no pause before a requested restart')
+  const starts = c.starts()
+  assert.equal(starts.length, 3, 'two requested restarts, although at most one restart may count')
+  assert.equal(starts[0].restarted, null)
+  assert.equal(starts[1].restarted, 'a restart requested by voice', 'the next gateway learns why it was restarted')
+  assert.ok(starts.every(s => s.lock === join(c.dir, 'state', 'controller.lock')), 'the session knows the lock folder')
+  assert.ok(starts.every(s => s.mode === 'development'))
+  const log = c.log()
+  assert.match(log, /the controller session ended for a restart requested by voice \(exit code 143\): starting it again at once, not counted as a crash/)
+  assert.match(log, /starting the controller session again \(requested restart\)/)
+  assert.doesNotMatch(log, /ended unexpectedly|giving up/)
+  assert.equal(telegram.messages.length, before, 'no crash message')
+})
+
+test('after a crash the next session finds a note with the reason', async () => {
+  const c = setup([{ exit: 1 }, { exit: 0 }])
+  assert.equal((await run(c)).status, 0)
+  assert.equal(c.starts()[1].restarted, 'a crash (exit code 1)')
 })
 
 test('a lock left behind by a killed watchdog does not block the next start', async () => {

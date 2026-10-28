@@ -105,9 +105,11 @@ gateway starts `claude -p` in that checkout, without approvals:
 
    On the first start Claude Code asks in the terminal three times: trust for the folder, a
    warning about the development channel, and consent for the MCP server from `.mcp.json`.
-   Confirm all three; the warning comes again at every start. For an always-on setup run it
-   inside tmux: `tmux new -s voice scripts/start-controller.sh`. A watchdog in the script starts
-   the session again after a crash ([Keeping the controller running](#keeping-the-controller-running)).
+   Confirm all three; the warning comes again at every start, until the channel loads as a plugin
+   on the organisation's allowlist ([The channel as a plugin](#the-channel-as-a-plugin-without-the-warning)).
+   For an always-on setup run it inside tmux: `tmux new -s voice scripts/start-controller.sh`. A
+   watchdog in the script starts the session again after a crash
+   ([Keeping the controller running](#keeping-the-controller-running)).
 
 3. **Publish the endpoint** at a public HTTPS address, as described in
    [Publishing the endpoint](#publishing-the-endpoint). With Tailscale Funnel that is
@@ -211,6 +213,7 @@ Name the repository as its folder is called; the controller matches loosely ("dr
 | "Tell the cc-voice-gateway worker to fix the typo in the README." | The worker commits on a `voice/` branch, pushes and opens a draft pull request |
 | "What is the cc-voice-gateway worker doing?" | `worker_status`, summarised in one or two sentences |
 | "Anything new from Claude Code?" | Results of workers that have finished since you last asked |
+| "Controller neu starten." | The controller says what a restart would do, running workers included, and asks; after your yes it [restarts through the watchdog](#restarting-the-controller-by-voice), and Telegram tells you when it is ready again |
 | "Tell it to add a test for that too." | Follow-up in the same worker session, on the same branch |
 | "Yes, publish it." | Answer to a worker's question, for example before pushing a public repository |
 | "Stop the drawio-mcp worker." | `stop_worker` |
@@ -263,23 +266,98 @@ terminal, in tmux as above; the watchdog waits for it to end and starts it again
 - **Without it:** `VOICE_GW_WATCHDOG=0 scripts/start-controller.sh` starts the session directly,
   as before.
 
-**After a restart, the development-channel warning waits for you.** Claude Code asks at every
-start whether to load the development channel, and nothing in its settings or flags skips that
-question for a channel that is not on the approved list ([channels reference][ref]). Until
-someone answers it at the terminal, the gateway does not start and voice requests do not arrive;
-the Telegram message says so. The options:
+### The channel as a plugin, without the warning
 
-1. **Answer it at the terminal**, as now: `tmux attach -t voice`, then Enter. Over SSH from the
-   phone works too.
-2. **Put the gateway on an allowlist**, the supported way without the warning: package the gateway
-   as a Claude Code plugin in a marketplace of your own, and have an admin of the organisation add
-   it to `allowedChannelPlugins` in the organisation's managed settings, with `channelsEnabled`
-   ([enterprise controls][channels-admin]). The controller then starts with
-   `--channels plugin:<name>@<marketplace>` instead of the development flag. That list replaces
-   Anthropic's list of approved channel plugins for the whole organisation. Not built: it needs the
-   packaging and the admin's decision.
-3. **Answer the warning automatically**, for example with `tmux send-keys` after each restart.
-   Possible, but it confirms a safety prompt without a person; not built.
+With `--dangerously-load-development-channels`, Claude Code asks at every start whether to load the
+channel, and nothing skips that question for a channel that is not on the approved list
+([channels reference][ref]). After a restart the session then waits at the terminal, and voice
+requests do not arrive until someone presses Enter. The supported way around it: this repository
+is also a plugin marketplace, `cc-voice-gateway`, with one plugin, `voice`
+(`.claude-plugin/`), whose MCP server is the gateway (`src/plugin.mjs`) and whose channel is that
+server. Once the organisation's channel allowlist names it, the controller starts with
+`--channels plugin:voice@cc-voice-gateway` instead, and Claude Code asks nothing.
+
+**What the start script does, before every start** (`scripts/channel-mode.mjs`):
+
+- It reads the allowlist from the organisation's managed settings: the copy Claude Code keeps in
+  `~/.claude/remote-settings.json`, or the managed settings file on this computer.
+- If `allowedChannelPlugins` names `voice` from `cc-voice-gateway`, it registers this repository as
+  that marketplace on this computer, once (`claude plugin marketplace add <this folder>`), and
+  starts the session with the plugin enabled for that session only, and the project's own `voice`
+  server from `controller/.mcp.json` switched off for it. The log says
+  `channel: the plugin voice@cc-voice-gateway, on the organisation's channel allowlist`.
+- Otherwise it starts as before, with the development flag, and the log says why:
+  `channel: the development flag, since voice@cc-voice-gateway is not on the organisation's channel allowlist (allowedChannelPlugins) yet`.
+- Both ways read the gateway's settings from `controller/.mcp.json`. The plugin never loads in
+  other sessions, workers included: it is off unless a session enables it.
+- `node scripts/channel-mode.mjs` shows the decision; `VOICE_GW_CHANNEL=development` or `plugin`
+  overrides it.
+
+**For the draw.io admin** (Owner or Primary Owner of the organisation on claude.ai; a worker
+cannot do this):
+
+1. Sign in at claude.ai and open
+   [Organization settings > Claude Code > Managed settings](https://claude.ai/admin-settings/claude-code).
+2. In the JSON there, keep what is in it, such as `"channelsEnabled": true`, and add the
+   allowlist:
+
+   ```json
+   {
+     "channelsEnabled": true,
+     "allowedChannelPlugins": [
+       { "marketplace": "cc-voice-gateway", "plugin": "voice" }
+     ]
+   }
+   ```
+
+3. **Mind the consequence before you save:** this list replaces Anthropic's default list of
+   approved channel plugins **for the whole organisation**. Telegram, Discord, iMessage and
+   fakechat from `claude-plugins-official` stop working as channels for every member unless the
+   list names them too, for example `{ "marketplace": "claude-plugins-official", "plugin": "telegram" }`.
+   An entry matches by name only: whoever registers a marketplace called `cc-voice-gateway` with a
+   plugin `voice` can load it as a channel, and still has to opt in per session with `--channels`.
+4. Save. Claude Code picks it up at its next start, or within an hour in a running session;
+   `claude doctor` shows the `Managed settings (remote)` line.
+
+Then nothing is left to do on the server: the next start or restart of the controller uses the
+plugin. The tools keep their names in the controller's rules, but Claude Code calls them
+`mcp__plugin_voice_voice__…` instead of `mcp__voice__…`; `controller/.claude/settings.json` allows
+both.
+
+If the allowlist cannot be used, two options remain: answer the warning at the terminal
+(`tmux attach -t voice`, then Enter; over SSH from the phone works too), or answer it automatically,
+for example with `tmux send-keys` after each restart. The latter confirms a safety prompt without a
+person and is not built.
+
+### Restarting the controller by voice
+
+"Controller neu starten" ("restart the controller"):
+
+1. The controller asks `restart_controller` what a restart would do, and asks you, with that, in
+   plain words: which worker runs are going (they keep running and report to the restarted
+   controller), that open requests with an answer stay deliverable while unfinished ones end with
+   a note, and whether someone has to confirm at the terminal (only with the development flag).
+2. Only after your yes it answers you ("restarting now") and calls `restart_controller` with
+   `confirm`.
+3. The gateway leaves a note for the watchdog (`.state/controller.lock/restart`) and ends the
+   session. The watchdog starts it again at once: a requested restart, without a pause, and not
+   counted towards the crash limit.
+4. Once the new gateway and session are connected, you get a Telegram message that the controller
+   is ready again, if the Telegram secrets exist. The same message follows a restart after a
+   crash.
+
+What survives, since the gateway runs inside the session and ends with it:
+
+- **Worker runs:** they run outside the session, and the new gateway follows them and reports
+  their results. A result the old controller had not answered yet goes to the new one again.
+- **Voice requests:** the gateway keeps them in `.state/requests.json`. Answers given before the
+  restart stay deliverable; a request the old session had not finished ends with
+  "The controller restarted before it finished this request. Say it again if it is still needed."
+- **Not:** open approvals, which belong to the old session, and the old session's conversation.
+  The restarted controller starts fresh.
+
+Without the watchdog (`VOICE_GW_WATCHDOG=0`, or a session not started by
+`scripts/start-controller.sh`) the controller says it cannot restart itself.
 
 ## At the desk
 
@@ -402,6 +480,7 @@ The [watchdog](#keeping-the-controller-running) reads its settings from the envi
 | Variable | Default | Meaning |
 |---|---|---|
 | `VOICE_GW_WATCHDOG` | `1` | `0` starts the session without the watchdog |
+| `VOICE_GW_CHANNEL` | decided per start | `plugin` or `development`: how the channel loads, instead of [the allowlist check](#the-channel-as-a-plugin-without-the-warning) |
 | `VOICE_GW_WATCHDOG_INTERVAL` | `30` | seconds between checks of the gateway's `/healthz` |
 | `VOICE_GW_WATCHDOG_HEALTH_FAILS` | `3` | failed checks in a row, after the gateway has answered once, that end the session |
 | `VOICE_GW_WATCHDOG_MAX_RESTARTS` | `5` | restarts within the window before the watchdog gives up |
@@ -433,6 +512,8 @@ The [watchdog](#keeping-the-controller-running) reads its settings from the envi
 | What did a worker do? | `.state/tasks/<task>.jsonl` holds the whole run. `claude --resume <session>` in the repository opens the session; `.state/workers.json` lists the session ids. |
 | A private repository is handled like a public one | `gh` is not logged in or not on the `PATH`, so the visibility is unknown, and the worker asks before pushing to be safe. |
 | No approval by voice | Expected for Bash, Write and Edit: they run without asking. For other tools: the session runs in auto or bypass mode, an allow rule covers the tool, or it is a trust or consent dialog, which is not relayed. Start the session with `scripts/start-controller.sh`. |
+| The controller still starts with the development flag after the admin step | The log line `channel: the development flag, since …` says why. `node scripts/channel-mode.mjs` checks again; Claude Code fetches the organisation's settings at its start, so start any `claude` once (or wait an hour). `claude doctor` shows whether the managed settings arrived. |
+| "Controller neu starten" and the controller says it cannot restart itself | It was not started by `scripts/start-controller.sh` with the watchdog. Restart it at the computer. |
 | Voice requests stop arriving after a crash | The watchdog started the session again, and the development-channel warning waits: `tmux attach -t voice`, then Enter. `grep watchdog .logs/gateway.log` shows what happened. |
 | `the controller is already running (watchdog …)` | A watchdog runs already, for example in another tmux window. `scripts/start-controller.sh --status`; `--stop` ends it. |
 | `watchdog: giving up …` | The session kept crashing, for example because the login expired. Look at the controller terminal, fix the cause, and start it again. |
@@ -448,20 +529,26 @@ src/
   voice.mjs          HTTP side: MCP tools for the voice assistant
   oauth.mjs          sign-in: OAuth metadata, registration, sign-in page, tokens
   workers.mjs        workers: find repositories, start and follow claude -p runs
+  plugin.mjs         the gateway as the MCP server of the plugin voice@cc-voice-gateway
+  restart.mjs        restarting the controller by voice, through the watchdog
   admin.mjs          Unix socket for pair.mjs and fake-voice
   store.mjs          requests, approvals, waiting for changes
   http.mjs           small HTTP helpers
   config.mjs         environment variables
   log.mjs            log to stderr and file, never to stdout
+.claude-plugin/
+  marketplace.json   this repository as the marketplace cc-voice-gateway
+  plugin.json        the plugin voice: the gateway as an MCP server, and its channel
 controller/
-  .mcp.json          starts the gateway as server "voice"
+  .mcp.json          starts the gateway as server "voice"; its env block holds the gateway's settings
   .claude/settings.json   allow and deny rules, confine hook
   .claude/hooks/confine.mjs   file tools inside controller/ (writes: playground/), Bash allowlist
   CLAUDE.md          rules for the controller session
   playground/        working folder for requests
 scripts/
-  start-controller.sh   start the controller with the development channel, under a watchdog
-  telegram-notify.mjs   one Telegram message, for the watchdog
+  start-controller.sh   start the controller with its channel, under a watchdog
+  channel-mode.mjs   plugin or development flag: is the plugin on the organisation's allowlist?
+  telegram-notify.mjs   one Telegram message, for the watchdog and the gateway
   funnel.sh          publish the endpoint with Tailscale Funnel, print the connector URL
   check-public.mjs   check the endpoint through Funnel's public relays
   pair.mjs           pairing codes, list and revoke connections
@@ -472,6 +559,7 @@ test/
   workers.test.mjs   workers with a stand-in for claude and gh
   controller.test.mjs   launcher flags, controller settings, confine hook
   watchdog.test.mjs  the watchdog, with stand-ins for claude and Telegram
+  restart.test.mjs   the channel as a plugin, restarting by voice, requests across restarts
 docs/
   *.drawio.svg       diagrams: an image on GitHub, editable in draw.io
   workers-plan.md    how workers came about, and what is next
@@ -485,8 +573,8 @@ docs/
   ends.
 - While the controller is busy, new events arrive together in its next turn. Real parallelism
   needs separate sessions ([channels reference][ref]).
-- Open requests live in memory only; a restart forgets them. Connections and worker runs survive
-  restarts.
+- Open requests survive a restart of the controller (`.state/requests.json`), but a request the old
+  session had not finished must be said again. Connections and worker runs survive restarts too.
 - During the research preview, custom channels only run with the development flag. Flag syntax and
   protocol may change ([channels][channels]).
 - After a crash the watchdog starts the session again, but the development-channel warning needs
