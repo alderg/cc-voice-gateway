@@ -61,8 +61,10 @@ answer wins, whether it comes by voice or from the terminal ([channels reference
 answer arrives as a new request that refers to the original `id`.
 
 **Workers:** every git repository in the folder that holds this one (`~/Developer`) has a worker,
-named after its folder. The controller does no repository work itself. It calls `dispatch`, and the
-gateway starts `claude -p` in that checkout, without approvals:
+named after its folder. The controller does no repository work itself; it only answers status
+questions about pull requests, reviews and checks with read-only `gh` commands, and merges pull
+requests when you ask, each one after your approval by voice. For everything else it calls
+`dispatch`, and the gateway starts `claude -p` in that checkout, without approvals:
 - **Before the run** the gateway checks for uncommitted changes, a run already going in that
   repository, and the limit of two runs at a time.
 - **During the run** the worker branches `voice/<name>` off the current branch, commits only its
@@ -226,9 +228,14 @@ Name the repository as its folder is called; the controller matches loosely ("dr
 |---|---|
 | "Ask Claude Code which repositories it can work in." | `list_workers`: names, branch, uncommitted changes, what each worker is doing |
 | "Ask the cc-voice-gateway worker whether the tests pass." | `dispatch`; the controller confirms at once that it is on its way, and the result follows as news |
-| "Tell the cc-voice-gateway worker to fix the typo in the README." | The worker commits on a `voice/` branch, pushes and opens a draft pull request |
+| "Tell the cc-voice-gateway worker to fix the typo in the README." | The worker commits on a `voice/` branch, pushes and opens a draft pull request; you hear only that it is out |
+| "Request a review for pull request 12 in alpha." | Only on your word: the worker reviews the diff itself and posts its findings as a review, or adds the person you name as reviewer |
+| "Fix the review comments on pull request 12." | Only on your word: the worker fixes them, runs the tests, pushes to the same branch, replies on each thread, and says what is left open |
 | "What is the cc-voice-gateway worker doing?" | `worker_status`, summarised in one or two sentences |
 | "Anything new from Claude Code?" | Results of workers that have finished since you last asked |
+| "Is anyone reviewing pull request 1 in cc-voice-gateway?" | The controller answers itself with `gh pr view` and `gh pr checks`, without a worker |
+| "Did the last CI run on main pass?" | `gh run list` and, for a failure, `gh run view --log-failed`; why it fails in the code is a task for the worker |
+| "Merge pull request 3 in cc-voice-gateway." | The controller asks back with the title and the merge method. After your yes it runs `gh pr merge`, which raises an approval: you confirm a second time, then hear the result |
 | "Notstopp!" | The [kill switch](#kill-switch): the gateway locks before anything reaches the controller, every worker stops. Unlocking only at the computer |
 | "Tell it to add a test for that too." | Follow-up in the same worker session, on the same branch |
 | "Yes, publish it." | Answer to a worker's question, for example before pushing a public repository |
@@ -239,6 +246,36 @@ If a checkout has uncommitted changes, the controller asks first whether the wor
 ahead; a worker never commits, stashes or discards changes it did not make. Workers change files
 and switch branches in your checkouts, so do not work in the same repository at the desk while a
 worker runs there.
+
+### Pull requests and reviews
+
+Reviews do not get in your way:
+
+- **After a push** you only hear that the pull request is out, and which one. Details when you ask.
+- **No review offers.** The controller never suggests a review, not even where nothing reviews
+  automatically. A review happens when you ask for one ("request a review"), and comments get
+  fixed when you say so ("fix the review comments").
+- **Automatic checks and reviews** run where the repository has them: GitHub Actions on pull
+  requests, required reviewers or CODEOWNERS, bots such as Copilot or the Claude app. Their results
+  reach you later as news, summarised in a sentence or two, without a question.
+
+How the gateway knows: when a run ends, it looks for links to pull requests of that repository in
+the run's output, and asks `gh` whether they are open on a `voice/` branch. It names them in the
+result for the controller and then watches them with `gh`, every minute at first and every five
+minutes later (`VOICE_GW_PR_POLL`). It does not guess from the repository's settings what will
+run; it watches what shows up on the pull request:
+
+- **Checks:** when every check on the latest push has finished, once per push.
+- **Reviews and comments:** new ones, with their inline comments. Reviews and comments of the
+  account `gh` is logged in as are what workers post on your behalf, so they are not news.
+- **Nothing shows up** within the first five polls (no checks, no requested reviewers, no
+  reviews): nothing automatic runs, and it stops quietly. Bot reviewers often skip drafts. A
+  later run on the same pull request, such as a requested review, starts watching again.
+- **It stops** when the pull request is merged or closed, or after 24 hours
+  (`VOICE_GW_PR_WATCH_HOURS`).
+- **Without a `gh` login** it does nothing; the log says so once.
+
+Workers in Docker at access level `read-only` open no pull requests, so none of this applies there.
 
 ## Telegram fallback
 
@@ -699,21 +736,44 @@ again afterwards: `scripts/start-workers-container.sh`.
   could answer them anyway. These limits hold regardless:
   - File tools read only inside `controller/` and write only inside `controller/playground/`
     (PreToolUse hook `controller/.claude/hooks/confine.mjs`, resolves symlinks, fails closed).
-  - Bash runs only `ls` inside `controller/`, `sleep <seconds>` and `rm [-f]` with plain file
-    names in `playground/` (same hook). Claude Code's own Bash sandbox would allow more, but on
-    Ubuntu 24.04 and later AppArmor's `bwrap-userns-restrict` profile stops it from starting
-    ([sandboxing][sandbox]).
+  - Bash runs only `ls` inside `controller/`, `sleep <seconds>`, `rm [-f]` with plain file
+    names in `playground/`, and read-only `gh` commands (same hook). Claude Code's own Bash
+    sandbox would allow more, but on Ubuntu 24.04 and later AppArmor's `bwrap-userns-restrict`
+    profile stops it from starting ([sandboxing][sandbox]).
+  - `gh` is an allowlist as well: `gh pr view`, `list`, `checks`, `diff` and `status`, and
+    `gh run view` and `list`, each with `--repo owner/name` and only with listed read-only flags,
+    such as `--json` with a plain field list, `--state`, `--limit`, `--author`, `--branch`, and
+    `--log` or `--log-failed` for runs. Everything else is blocked, in particular `gh auth` (it
+    would print the token), `gh api` (it can write), `gh config`, `gh alias`, `gh extension`,
+    every other subcommand that writes (checkout, edit, comment, review, close, ready, rerun,
+    cancel, delete, download), `--web`, `--jq` and `--template`. Read-only still means: the
+    controller can read pull requests, diffs and CI logs of every repository your `gh` login can
+    see, and tell them to whoever is signed in.
+  - The one write is `gh pr merge <number> --repo owner/name` with exactly one of `--squash`,
+    `--merge` or `--rebase`, and optionally `--delete-branch`. Blocked: `--admin` (past branch
+    protection), `--auto`, `--disable-auto`, `--match-head-commit`, the message options and branch
+    names instead of numbers. For an allowed merge the hook answers "ask" instead of letting it
+    run: that overrides the settings' allow rule for Bash, so Claude Code opens an approval prompt,
+    which the channel relays to the car. Verified with Claude Code 2.1.310: without the "ask" the
+    allow rule lets the merge run at once; with it, the merge runs only once the prompt is
+    allowed. `controller/CLAUDE.md` adds a spoken yes before the command, so every merge needs
+    two: first to the controller's question, then to the approval.
   - Denied: claude.ai connectors (Gmail, Slack, Drive, …), web fetch and search, messages to
     other Claude sessions, remote and scheduled agents, artifacts, Monitor, workflows and
     worktrees. Bypass and auto mode cannot be switched on.
-  - What is left: reading `controller/`, and writing or deleting in the playground. The answers
-    go back to the voice assistant.
+  - What is left: reading `controller/`, writing or deleting in the playground, reading the
+    state of pull requests and runs on GitHub, and merging pull requests after an approval. The
+    answers go back to the voice assistant.
+  - Changes to the confinement, such as the `gh` commands, take effect after a controller
+    restart: the session reads `controller/CLAUDE.md` and its settings when it starts.
   - The confinement keeps the controller to its job, talking and dispatching. It does not limit
     workers.
 - The gateway binds to `127.0.0.1` only.
-- Approval by voice means: whoever can call `approve` can approve tools. The voice assistant is
-  told to approve only after an explicit yes; that is an instruction, not enforcement. Turn it off
-  with `VOICE_GW_PERMISSION_RELAY=0`.
+- Approval by voice means: whoever can call `approve` can approve tools, merges included. The voice
+  assistant is told to approve only after an explicit yes; that is an instruction, not
+  enforcement. What the approval does guarantee: the controller cannot merge by itself, for
+  example because a pull request's text told it to. Turn it off with
+  `VOICE_GW_PERMISSION_RELAY=0`; then merges can only be approved at the terminal.
 - Claude Code masks recognisable credentials in relayed approval texts, but not every secret
   ([channels reference][ref]).
 - The Telegram fallback sends results, questions and approval details through Telegram's servers.
@@ -753,6 +813,8 @@ Claude Code starts the gateway, so environment variables go into `controller/.mc
 | `VOICE_GW_WORKER_ROOT` | the folder holding this repository | every git repository directly in it has a worker |
 | `VOICE_GW_MAX_WORKERS` | `2` | runs at the same time |
 | `VOICE_GW_WORKER_TIMEOUT` | `60` | minutes before a run is stopped |
+| `VOICE_GW_PR_POLL` | `60` | seconds between looks at a [watched pull request](#pull-requests-and-reviews); five times as long after 15 looks |
+| `VOICE_GW_PR_WATCH_HOURS` | `24` | hours after which the gateway stops watching a pull request |
 | `VOICE_GW_DOCKER` | empty | name of the [worker container](#workers-in-docker); empty: workers run on this computer |
 | `VOICE_GW_DOCKER_REPOS` | `/repos` | where the mounted folder is inside the container |
 | `VOICE_CLEAN_ROOT` | the folder holding this repository | for `scripts/fetch-from-container.sh` only: where the clean clones are |
@@ -807,6 +869,9 @@ Claude Code starts the gateway, so environment variables go into `controller/.mc
 | `dispatch=locked`, `[state=locked]` or an `[ALARM]` line | The kill switch is locked; the alarm names the trigger. `node scripts/unlock.mjs --status` shows it, `node scripts/unlock.mjs` at the server unlocks it. |
 | The kill switch locked for no good reason | Read the reason. A rule that misfires: raise its `VOICE_GW_KILL_*` threshold, or add a folder to `VOICE_GW_KILL_ALLOW_PATHS`. |
 | `/stop` on Telegram does nothing | Only your configured private chat counts, and the gateway must poll the bot: the log says `telegram commands: …` if a webhook or another program takes the updates. |
+| No news about checks or reviews on a worker's pull request | The log says why: `gh is not logged in`, or `stopped watching pull request … : nothing automatic runs` (often a draft that bot reviewers skip), `merged`, `closed` or `time limit`. Only pull requests on `voice/` branches that a run linked to are watched. `.state/pulls.json` lists the watches. |
+| The controller cannot merge a pull request | A draft must be marked ready first (a task for the worker). Required reviews or checks, conflicts and other branch protection apply; `--admin` is blocked on purpose. With `VOICE_GW_PERMISSION_RELAY=0` the approval only appears at the terminal. |
+| The controller says a `gh` command was blocked | Only the read-only commands under [Security](#security) pass, each with `--repo owner/name` and flags as separate words. If it does not know about `gh` at all, restart the controller so that it reads the current `controller/CLAUDE.md`. |
 | No approval by voice | Expected for Bash, Write and Edit: they run without asking. For other tools: the session runs in auto or bypass mode, an allow rule covers the tool, or it is a trust or consent dialog, which is not relayed. Start the session with `scripts/start-controller.sh`. |
 
 Claude Code's debug log is at `~/.claude/debug/<session-id>.txt`.
@@ -825,6 +890,7 @@ src/
   guard.mjs          the kill switch's rules on the workers' runs
   runners.mjs        where workers run: this computer, or the Docker container
   access.mjs         access levels in the container, from the GitHub token
+  pulls.mjs          watch the pull requests workers open: checks and reviews as news
   admin.mjs          Unix socket for pair.mjs and fake-voice
   store.mjs          requests, approvals, waiting for changes
   http.mjs           small HTTP helpers
@@ -838,7 +904,7 @@ docker/
 controller/
   .mcp.json          starts the gateway as server "voice"
   .claude/settings.json   allow and deny rules, confine hook
-  .claude/hooks/confine.mjs   file tools inside controller/ (writes: playground/), Bash allowlist
+  .claude/hooks/confine.mjs   file tools inside controller/ (writes: playground/), Bash allowlist, read-only gh
   CLAUDE.md          rules for the controller session
   playground/        working folder for requests
 scripts/
@@ -857,11 +923,12 @@ test/
   telegram.test.mjs  Telegram fallback with a stand-in Bot API
   killswitch.test.mjs   the kill switch: every trigger, its effects, restart and unlocking
   docker.test.mjs    workers in the container, access levels and the bundle helper, with stand-ins for docker and GitHub
+  pulls.test.mjs     watching pull requests, with a stand-in for gh
   controller.test.mjs   launcher flags, controller settings, confine hook
 docs/
   *.drawio.svg       diagrams: an image on GitHub, editable in draw.io
   workers-plan.md    how workers came about, and what is next
-.state/              worker state and run output (not in git)
+.state/              worker state, run output and watched pull requests (not in git)
 ```
 
 ## Limits and next steps

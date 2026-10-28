@@ -93,6 +93,11 @@ export const config = {
   killCheckSeconds: num(process.env.VOICE_GW_KILL_CHECK, 30),
   // How long one poll of the Telegram bot for commands waits, in seconds.
   telegramPollSeconds: num(process.env.VOICE_GW_TELEGRAM_POLL, 25),
+
+  // Pull requests that workers open (pulls.mjs): how often the gateway looks
+  // at their checks and reviews, in seconds, and for how many hours at most.
+  prPollSeconds: num(process.env.VOICE_GW_PR_POLL, 60),
+  prWatchHours: num(process.env.VOICE_GW_PR_WATCH_HOURS, 24),
 }
 
 config.oauthStateFile = join(config.secretsDir, 'oauth.json')
@@ -104,3 +109,4 @@ config.killSwitchFile = join(config.secretsDir, 'killswitch.json')
 // The worker container's secrets, mounted read-only into it.
 config.workerSecretsDir = join(config.secretsDir, 'worker')
 config.githubTokenFile = join(config.workerSecretsDir, 'github_token')
+config.pullsStateFile = join(config.stateDir, 'pulls.json')
