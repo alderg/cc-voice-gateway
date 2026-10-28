@@ -121,7 +121,7 @@ test('controller settings: confined tools run without asking, deny rules, no byp
   // Seen in voice mode: an approval for every write is too much while driving.
   // The gateway's tools, by the name of the server in .mcp.json and as the
   // plugin's server (mcp__plugin_<plugin>_<server>__<tool>).
-  const names = ['reply', 'list_workers', 'dispatch', 'worker_status', 'stop_worker', 'restart_controller']
+  const names = ['reply', 'list_workers', 'dispatch', 'worker_status', 'stop_worker', 'restart_controller', 'raise_alarm']
   const voiceTools = [...names.map(t => `mcp__voice__${t}`), ...names.map(t => `mcp__plugin_voice_voice__${t}`)]
   assert.deepEqual(permissions.allow, [...voiceTools, 'Bash', 'Write', 'Edit', 'NotebookEdit'])
   assert.equal(permissions.ask, undefined)

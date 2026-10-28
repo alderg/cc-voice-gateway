@@ -63,6 +63,15 @@ export class HostRunner {
     return spawn(command, args, { cwd, detached: true, stdio, env })
   }
 
+  // The kill switch stops the runs; there is no container here.
+  async lockdown() {
+    return true
+  }
+
+  async mounts() {
+    return null
+  }
+
   stop(task) {
     const signal = name => {
       try {
@@ -133,6 +142,28 @@ export class DockerRunner {
       warnings.push(`it runs as ${user}, not as ${uid}:${gid}, so the files in the folder are not yours`)
     }
     return { folder: mount?.Type === 'bind' ? mount.Source : null, user, warnings }
+  }
+
+  // The kill switch: the container stops, and does not come back by itself.
+  // Started again while locked (scripts/start-workers-container.sh), it gets
+  // the repositories read-only.
+  async lockdown() {
+    await run(this.dockerBin, ['update', '--restart=no', this.container], 15000)
+    const stopped = await run(this.dockerBin, ['stop', '--time', '10', this.container], 30000)
+    return stopped.ok
+  }
+
+  // Whether the container runs, and whether /repos is writable in it.
+  async mounts() {
+    const inspected = await run(this.dockerBin, ['inspect', this.container], 15000)
+    if (!inspected.ok) return null
+    try {
+      const [info] = JSON.parse(inspected.stdout)
+      const mount = (info.Mounts ?? []).find(m => m.Destination === this.root)
+      return { running: info.State?.Running !== false, writable: mount ? mount.RW !== false : null }
+    } catch {
+      return null
+    }
   }
 
   // voice-run (docker/voice-run) hands the run its tokens and puts it in its

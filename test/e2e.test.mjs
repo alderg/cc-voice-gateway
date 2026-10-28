@@ -155,13 +155,21 @@ test('declares the channel and permission capabilities and the reply tool', asyn
   assert.deepEqual(caps.experimental['claude/channel'], {})
   assert.deepEqual(caps.experimental['claude/channel/permission'], {})
   const { tools } = await claudeCode.listTools()
-  assert.deepEqual(tools.map(t => t.name), ['reply', 'list_workers', 'dispatch', 'worker_status', 'stop_worker', 'restart_controller'])
+  assert.deepEqual(tools.map(t => t.name), [
+    'reply',
+    'list_workers',
+    'dispatch',
+    'worker_status',
+    'stop_worker',
+    'restart_controller',
+    'raise_alarm',
+  ])
   assert.match(claudeCode.getInstructions(), /request_id/)
 })
 
 test('voice endpoint exposes the voice tools', async () => {
   const { tools } = await voice.listTools()
-  assert.deepEqual(tools.map(t => t.name).sort(), ['approve', 'ask', 'get_reply', 'send', 'status'])
+  assert.deepEqual(tools.map(t => t.name).sort(), ['approve', 'ask', 'emergency_stop', 'get_reply', 'send', 'status'])
 })
 
 test('logs every voice call with client, method and tool, never the token', async () => {

@@ -175,6 +175,7 @@ export class Workers extends EventEmitter {
     root,
     runner = new HostRunner(root),
     access = null,
+    killswitch = null,
     stateDir,
     claudeBin = 'claude',
     ghBin = 'gh',
@@ -184,6 +185,7 @@ export class Workers extends EventEmitter {
     super()
     this.runner = runner
     this.access = access // GitHubAccess in the container, null on this computer
+    this.killswitch = killswitch // while it is locked, nothing starts
     this.stateDir = stateDir
     this.stateFile = join(stateDir, 'workers.json')
     this.tasksDir = join(stateDir, 'tasks')
@@ -302,6 +304,7 @@ export class Workers extends EventEmitter {
   // --- runs ---------------------------------------------------------------
 
   async dispatch({ worker, task, words, fresh = false, allowDirty = false, direct = false }) {
+    if (this.killswitch?.locked) return { status: 'locked', state: this.killswitch.state }
     const names = await this.repos()
     if (!names.includes(worker)) return { status: 'unknown', names }
     const busy = this.running().find(t => t.repo === worker)
@@ -359,7 +362,9 @@ export class Workers extends EventEmitter {
       resumed: Boolean(previous),
       access: facts.access?.level ?? null,
       direct,
-      slug: facts.slug, // owner/repo on GitHub, or null
+      dir: facts.dir,
+      slug: facts.slug ?? null, // owner/repo on GitHub, or null
+      defaultBranch: facts.access?.branch ?? null,
       pulls: [], // numbers of this repository's pull requests the run named
       startedAt: Date.now(),
       finishedAt: null,
@@ -379,6 +384,7 @@ export class Workers extends EventEmitter {
     this.state.repos[facts.name] = { sessionId }
     this.save()
     log('worker start', facts.name, id, previous ? 'resumed session' : 'new session', preview(task, 60))
+    this.emit('started', record)
     return { status: 'started', task: record, facts }
   }
 
@@ -391,6 +397,18 @@ export class Workers extends EventEmitter {
     task.reported = !report
     this.finish(task, 'stopped', reason)
     return task
+  }
+
+  // The kill switch: every run stops. The controller hears about it once,
+  // from the gateway, not per run.
+  stopAll(reason) {
+    const stopped = this.running()
+    for (const task of stopped) {
+      this.runner.stop(task)
+      task.reported = true
+      this.finish(task, 'stopped', reason)
+    }
+    return stopped
   }
 
   // --- following runs -----------------------------------------------------
@@ -450,6 +468,7 @@ export class Workers extends EventEmitter {
       for (const part of message.message?.content ?? []) {
         if (part.type === 'tool_use') {
           task.steps = [...task.steps, describeStep(part.name, part.input, this.runner.dir(task.repo))].slice(-MAX_STEPS)
+          this.emit('tool', task, part) // for the kill switch's rules (guard.mjs)
         } else if (part.type === 'text' && part.text?.trim()) {
           task.lastText = preview(part.text, 300)
           this.notePulls(task, part.text)
@@ -495,6 +514,7 @@ export class Workers extends EventEmitter {
     this.followed.delete(task.id)
     this.save()
     log(`worker ${state}`, task.repo, task.id, `after ${duration(task.finishedAt - task.startedAt)}`, error ? preview(error, 120) : '')
+    this.emit('ended', task)
   }
 
   // --- texts for the controller -------------------------------------------

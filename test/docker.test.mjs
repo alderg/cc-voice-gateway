@@ -19,6 +19,7 @@ import { fileURLToPath } from 'node:url'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { z } from 'zod'
+import { adminRequest } from '../src/admin.mjs'
 import { GitHubAccess } from '../src/access.mjs'
 import { DockerRunner } from '../src/runners.mjs'
 
@@ -33,6 +34,7 @@ const TOKEN = 'github_pat_TEST_token_never_in_a_log'
 const CONTAINER = 'voice-workers'
 const DOWN = join(TMP, 'container-down') // while it exists, the fake container does not answer
 const SCRIPT = fileURLToPath(new URL('../scripts/fetch-from-container.sh', import.meta.url))
+const START_CONTAINER = fileURLToPath(new URL('../scripts/start-workers-container.sh', import.meta.url))
 const CLEAN = join(TMP, 'clean') // the clean clones on this computer
 const MARKERS = join(TMP, 'markers') // what ran on the host side
 
@@ -88,14 +90,20 @@ import { join } from 'node:path'
 const argv = process.argv.slice(2)
 appendFileSync(process.env.FAKE_DOCKER_LOG, JSON.stringify(argv) + '\\n')
 const verb = argv.shift()
+if (['update', 'stop', 'rm', 'run'].includes(verb)) {
+  // a stopped container no longer answers
+  if (verb === 'stop') writeFileSync(process.env.FAKE_DOCKER_DOWN, '')
+  process.exit(0)
+}
 if (verb === 'inspect') {
   // docker inspect [--format template] <container>: its mount of the host folder
   if (argv.at(-1) !== process.env.FAKE_DOCKER_CONTAINER) {
     process.stderr.write('Error: No such object: ' + argv.at(-1) + '\\n')
     process.exit(1)
   }
-  const mount = { Type: process.env.FAKE_DOCKER_MOUNT_TYPE || 'bind', Source: process.env.FAKE_DOCKER_FOLDER, Destination: process.env.FAKE_DOCKER_REPOS }
-  process.stdout.write((argv[0] === '--format' ? mount.Source : JSON.stringify([{ Mounts: [mount] }])) + '\\n')
+  const mount = { Type: process.env.FAKE_DOCKER_MOUNT_TYPE || 'bind', Source: process.env.FAKE_DOCKER_FOLDER, Destination: process.env.FAKE_DOCKER_REPOS, RW: true }
+  const info = { State: { Running: !existsSync(process.env.FAKE_DOCKER_DOWN) }, Mounts: [mount] }
+  process.stdout.write((argv[0] === '--format' ? mount.Source : JSON.stringify([info])) + '\\n')
   process.exit(0)
 }
 if (verb !== 'exec') process.exit(2)
@@ -200,6 +208,7 @@ before(async () => {
       VOICE_GW_DOCKER_BIN: join(BIN, 'docker'),
       VOICE_GW_DOCKER_REPOS: REPOS,
       VOICE_GW_GITHUB_API: api.url,
+      VOICE_GW_KILL_CHECK: '1',
       VOICE_GW_CLAUDE_BIN: join(BIN, 'claude'), // the command inside the container
       VOICE_GW_GH_BIN: join(BIN, 'no-gh'),
       VOICE_GW_LOG_FILE: '',
@@ -578,4 +587,49 @@ test('why a bundle: git on the host in the container folder reads its config, an
   spawnSync('git', ['status', '--short'], { cwd: join(REPOS, 'fixme') })
   assert.deepEqual(markers(), ['fsmonitor'], 'what a git-aware prompt or an editor would set off')
   rmSync(join(MARKERS, 'fsmonitor'))
+})
+
+// --- the kill switch in the Docker setup -------------------------------------------
+
+test('start-workers-container.sh: the folder read-only and no restart policy while the kill switch is locked', () => {
+  const secrets = join(TMP, 'start-secrets')
+  mkdirSync(join(secrets, 'worker'), { recursive: true })
+  const start = () =>
+    spawnSync('bash', [START_CONTAINER], {
+      encoding: 'utf8',
+      env: { ...fakeDockerEnv(), VOICE_GW_DOCKER_BIN: join(BIN, 'docker'), VOICE_GW_DOCKER_FOLDER: REPOS, VOICE_GW_SECRETS_DIR: secrets, VOICE_GW_DOCKER_IMAGE: 'cc-voice-worker' },
+    })
+  const lastRun = () => dockerCalls().findLast(call => call[0] === 'run')
+
+  assert.equal(start().status, 0)
+  assert.ok(lastRun().includes(`${REPOS}:/repos:rw`))
+  assert.equal(lastRun()[lastRun().indexOf('--restart') + 1], 'unless-stopped')
+
+  writeFileSync(join(secrets, 'killswitch.json'), JSON.stringify({ trigger: 'voice', reason: 'test', at: new Date().toISOString() }))
+  const locked = start()
+  assert.equal(locked.status, 0)
+  assert.match(locked.stderr, /the kill switch is locked; .* is mounted read-only/)
+  assert.ok(lastRun().includes(`${REPOS}:/repos:ro`))
+  assert.equal(lastRun()[lastRun().indexOf('--restart') + 1], 'no')
+  assert.ok(lastRun().includes(`${secrets}/worker:/run/secrets/voice:ro`))
+})
+
+test('Docker: the kill switch stops the container for good, and again if it comes back with a writable /repos', async () => {
+  const before = dockerCalls().length
+  const out = await controller('raise_alarm', { reason: 'A worker reads files it has no business with.' })
+  assert.match(out.text, /^\[killswitch=locked\]/)
+  await waitUntil(() => dockerCalls().slice(before).some(call => call[0] === 'stop'))
+  const calls = dockerCalls().slice(before)
+  assert.ok(calls.some(call => call.join(' ') === `update --restart=no ${CONTAINER}`), 'no restart policy')
+  assert.ok(calls.some(call => call.join(' ') === `stop --time 10 ${CONTAINER}`))
+  assert.match((await controller('dispatch', { worker: 'open', task: 'x', words: 'x' })).text, /^\[dispatch=locked/)
+
+  // Someone starts it again, with /repos writable: the gateway stops it.
+  rmSync(DOWN)
+  const stops = dockerCalls().filter(call => call[0] === 'stop').length
+  await waitUntil(() => dockerCalls().filter(call => call[0] === 'stop').length > stops, 5000)
+  await waitUntil(() => /runs with a writable \/repos; stopping it/.test(gw.log))
+
+  await adminRequest(join(SECRETS, 'admin.sock'), 'POST', '/unlock', { by: 'test' })
+  rmSync(DOWN, { force: true })
 })

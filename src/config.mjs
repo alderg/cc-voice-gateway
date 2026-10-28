@@ -81,6 +81,23 @@ export const config = {
   // full for every repository. Empty: detected per repository from the token.
   access: process.env.VOICE_GW_ACCESS || '',
   githubApi: process.env.VOICE_GW_GITHUB_API || 'https://api.github.com',
+
+  // The kill switch's rules on a worker run (guard.mjs): at most this many file
+  // edits, and at the end at most this many files and lines changed.
+  killMaxEdits: num(process.env.VOICE_GW_KILL_MAX_EDITS, 500),
+  killMaxFiles: num(process.env.VOICE_GW_KILL_MAX_FILES, 300),
+  killMaxLines: num(process.env.VOICE_GW_KILL_MAX_LINES, 30000),
+  // Folders, besides the repository and the temporary ones, that workers may
+  // write to; comma-separated.
+  killAllowPaths: (process.env.VOICE_GW_KILL_ALLOW_PATHS || '')
+    .split(',')
+    .map(path => path.trim())
+    .filter(Boolean),
+  // How often the default branch on GitHub, and while locked the container,
+  // are checked, in seconds.
+  killCheckSeconds: num(process.env.VOICE_GW_KILL_CHECK, 30),
+  // How long one poll of the Telegram bot for commands waits, in seconds.
+  telegramPollSeconds: num(process.env.VOICE_GW_TELEGRAM_POLL, 25),
 }
 
 config.oauthStateFile = join(config.secretsDir, 'oauth.json')
@@ -90,6 +107,8 @@ config.adminSocket = join(config.secretsDir, 'admin.sock')
 config.pullsStateFile = join(config.stateDir, 'pulls.json')
 config.telegramTokenFile = join(config.secretsDir, 'telegram_token')
 config.telegramChatIdFile = join(config.secretsDir, 'telegram_chat_id')
+// The kill switch's state: outside controller/, and not in .secrets/worker.
+config.killSwitchFile = join(config.secretsDir, 'killswitch.json')
 // The worker container's secrets, mounted read-only into it.
 config.workerSecretsDir = join(config.secretsDir, 'worker')
 config.githubTokenFile = join(config.workerSecretsDir, 'github_token')
