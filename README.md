@@ -270,9 +270,15 @@ approval prompts) and the voice assistant, including the whole sign-in.
 ## Workers in Docker
 
 Optional. Without it, workers run in your checkouts on this computer, as described above. With
-it, they run in a container that holds only clones of your repositories and Claude Code: no access
-to your files, your SSH keys or your `gh` login. The gateway stays on this computer and starts
-every git command and every run in the container with `docker exec`.
+it, they run in a container that holds Claude Code, git and `gh`, and sees nothing of this
+computer but one folder of repositories, for example `~/docker-developer`, mounted at `/repos`:
+no other files, no SSH keys, no `gh` login. The container runs as your own user id, so the files
+in that folder are yours. The gateway stays on this computer and starts every git command and
+every run in the container with `docker exec`.
+
+On this computer, git never runs in that folder, and nobody pushes from it: the container's side
+controls its config, hooks and attributes. Changes come out as a bundle into a separate clean
+clone, and you push from there ([Getting changes out of the container](#getting-changes-out-of-the-container)).
 
 ![Workers in Docker](docs/docker.drawio.svg)
 
@@ -282,11 +288,11 @@ What workers in the container may do with a repository depends on the GitHub tok
 container. The gateway checks it for each repository and tells the worker and the controller;
 `list_workers` shows the level and why, for example `access pr (main is protected by a ruleset)`.
 
-| Level | Token | Default branch | What workers do |
-|---|---|---|---|
-| `read-only` | none, or one that cannot push or open pull requests | any | Commit on a local `voice/` branch, worktrees too. Never push, never open a pull request; they report the local branch and commit |
-| `pr` | can push (Contents) and open pull requests | protected by a ruleset or branch protection | Push a `voice/` branch and open a draft pull request, so that GitHub's reviews run |
-| `full` | as `pr` | not protected | A draft pull request too, by default. A direct push to the default branch only when you explicitly ask for it ("push it straight to main") |
+| Level | Token | Default branch | What workers do | How changes reach GitHub |
+|---|---|---|---|---|
+| `read-only` | none, or one that cannot push or open pull requests | any | Commit on a local `voice/` branch, worktrees too. Never push, never open a pull request; they report the local branch and commit | Only through the clean clone: you fetch the branch and push it yourself |
+| `pr` | can push (Contents) and open pull requests | protected by a ruleset or branch protection | Push a `voice/` branch and open a draft pull request, so that GitHub's reviews run | The container pushes; the clean clone works as well, for example to try a branch here first |
+| `full` | as `pr` | not protected | A draft pull request too, by default. A direct push to the default branch only when you explicitly ask for it ("push it straight to main") | As for `pr` |
 
 On public repositories, workers ask before every push, at every level.
 
@@ -302,17 +308,29 @@ instead.
 
 ### Set it up
 
-1. **Build the image** (Debian, Node 22, git, `gh`, Claude Code):
+1. **Choose the folder** for the container's repositories. It must not hold your own checkouts,
+   and this computer's git will never run in it. Docker installed as a snap cannot mount folders
+   from `/tmp`; a folder in your home is fine.
 
    ```bash
-   docker build -t cc-voice-worker docker/
+   folder="$HOME/docker-developer"
+   mkdir -p "$folder"
    ```
 
-   `--build-arg CLAUDE_CODE_VERSION=<version>` pins Claude Code; rebuild to update it.
+2. **Build the image** (Debian, Node 22, git, `gh`, Claude Code) for your user and group id:
 
-2. **Store the container's secrets** in `.secrets/worker/`, which the container mounts read-only.
+   ```bash
+   docker build -t cc-voice-worker --build-arg UID="$(id -u)" --build-arg GID="$(id -g)" docker/
+   ```
+
+   The image's user `worker` gets your ids, so it owns what it writes in the folder, and git in the
+   container sees the repositories as its own. `--build-arg CLAUDE_CODE_VERSION=<version>` pins
+   Claude Code; rebuild to update it.
+
+3. **Store the container's secrets** in `.secrets/worker/`, which the container mounts read-only.
    Claude Code's login comes from a long-lived token: run `claude setup-token` on this computer and
-   paste the token. The GitHub token is optional; see the next section for which one.
+   paste the token. The GitHub token is optional; see
+   [GitHub tokens for each level](#github-tokens-for-each-level).
 
    ```bash
    mkdir -p -m 700 .secrets/worker
@@ -320,25 +338,24 @@ instead.
    (umask 077; read -rsp 'GitHub token: ' t; printf '%s' "$t" > .secrets/worker/github_token)
    ```
 
-   The container's user has user id 1000. If `id -u` shows another number, make the files
-   readable for it: `chmod 755 .secrets/worker && chmod 644 .secrets/worker/*`. Other users on
-   this computer still cannot reach them, because `.secrets/` stays mode 0700.
+   The container runs as you, so mode 0600 is enough.
 
-3. **Start the container**, from this folder:
+4. **Start the container**, from this folder:
 
    ```bash
    docker run -d --name voice-workers --init --restart unless-stopped \
-     -v voice-repos:/repos -v voice-home:/home/node \
+     --user "$(id -u):$(id -g)" \
+     -v "$folder:/repos" -v voice-home:/home/worker \
      -v "$PWD/.secrets/worker:/run/secrets/voice:ro" \
      cc-voice-worker
    ```
 
-   `voice-repos` holds the clones, `voice-home` Claude Code's settings and sessions, so that
-   follow-ups continue. The tokens never become part of the container's configuration: the
-   gateway's `voice-run` hands them to each run, and git gets the GitHub token from a credential
-   helper. Docker installed as a snap cannot mount folders from `/tmp`; this folder is fine.
+   `voice-home` keeps Claude Code's settings and sessions, so that follow-ups continue, and git's
+   settings. The tokens never become part of the container's configuration: the gateway's
+   `voice-run` hands them to each run, and git gets the GitHub token from a credential helper.
 
-4. **Clone the repositories** the workers should see, and tell git who commits:
+5. **Clone the repositories** the workers should see, from inside the container, and tell git who
+   commits:
 
    ```bash
    docker exec voice-workers git clone https://github.com/<owner>/<repo>.git /repos/<repo>
@@ -349,24 +366,75 @@ instead.
    Use `https://` addresses; the container has no SSH keys. Private repositories need a token
    that can read them, even at level `read-only`.
 
-5. **Point the gateway at the container** in `controller/.mcp.json`, then restart the controller:
+6. **Point the gateway at the container** in `controller/.mcp.json`, then restart the controller:
 
    ```json
    "env": { "VOICE_GW_DOCKER": "voice-workers" }
    ```
 
-   The log shows `workers run in the Docker container voice-workers`, and "Which repositories can
-   you work in?" lists the clones with their access levels. Remove the variable and restart to go
-   back to workers on this computer.
+   The log shows `worker container voice-workers: repositories from host folder …, running as
+   <uid>:<gid>`, with a warning if `/repos` is not a host folder or the container runs as someone
+   else. "Which repositories can you work in?" lists the repositories with their access levels.
+   Remove the variable and restart to go back to workers on this computer.
 
-**Getting changes out at level `read-only`:** look at them with
-`docker exec voice-workers git -C /repos/<repo> log -p voice/<name>`, or fetch the branch into
-your own checkout through a bundle:
+7. **Have a clean clone** of each repository whose changes you want to bring out: an ordinary
+   clone from GitHub, outside the container's folder. Your checkouts in `~/Developer` will do; the
+   helper below only adds refs to them and never touches their working tree.
+
+### Getting changes out of the container
 
 ```bash
-docker exec voice-workers git -C /repos/<repo> bundle create - voice/<name> > /tmp/voice.bundle
-git fetch /tmp/voice.bundle voice/<name>:voice/<name>
+scripts/fetch-from-container.sh <repo> <branch>
 ```
+
+1. The container writes a git bundle of the branch (`docker exec … git bundle create`), with only
+   the commits your clean clone does not have yet.
+2. git on this computer verifies the bundle in the clean clone and fetches it as
+   `container/<branch>`, checking every object (`transfer.fsckObjects`), without tags or
+   submodules.
+3. It shows the new commits and prints two commands: one to review them (`git log -p`), and the
+   push from the clean clone. It never checks out and never pushes. Pushing is your explicit
+   step:
+
+   ```bash
+   git -C ~/Developer/<repo> push origin refs/remotes/container/<branch>:refs/heads/<branch>
+   ```
+
+`VOICE_CLEAN_ROOT` says where the clean clones are (default: the folder that holds this
+repository), `VOICE_GW_DOCKER` and `VOICE_GW_DOCKER_REPOS` which container and path. The script
+refuses a clean clone inside the container's folder, and names that are not plain repository or
+branch names.
+
+**Why a bundle, and not `git fetch ~/docker-developer/<repo>`.** Checked with git 2.53:
+
+- A fetch from a local path, plain or `file://`, starts `git upload-pack` in the source
+  repository, and upload-pack reads that repository's config. A container-side
+  `uploadpack.hideRefs` decided which branches the host could fetch. No command ran: git ignores
+  `uploadpack.packObjectsHook` from a repository's own config, upload-pack runs no hooks, and
+  since 2.45.1 it refuses the lazy fetch of a crafted "partial clone" that once allowed code
+  execution (CVE-2024-32004). Still, the host then opens a repository that the other side
+  controls, and every new config key that upload-pack honours widens that.
+- `--no-local` does not exist for `git fetch`; it only changes how `git clone` copies a local
+  repository. `protocol.file.allow` does not help either: it is `user` by default, which allows
+  fetches you start yourself, and `never` blocks local paths and bundles alike.
+- A bundle is data: a list of refs and a pack. Fetching it reads no config, runs no hook and needs
+  no repository on the other side. The container creates it, with its own config, where that does
+  no harm.
+- `git status` on this computer inside the container's folder ran a container-side
+  `core.fsmonitor` command. That is why git must never run there: not by hand, not through a
+  git-aware shell prompt, not through an editor that opens the folder.
+- Fetching, `git log -p` and `git diff` of the fetched branch ran nothing. Checking it out did:
+  its committed `.gitattributes` called a filter that was configured on this computer, as git-lfs
+  is. Review before you check out.
+
+**Threat model.** Anything in the container may be hostile: a worker can be steered by prompt
+injection from the repositories it reads, and it controls every file in the mounted folder,
+`.git` included. What this setup keeps from your computer: nothing from that folder runs here,
+because git on this computer never opens a repository in it and only fetches a verified bundle
+into a clean clone; and nothing goes to GitHub from this computer unless you push it. What it
+does not do: decide whether the changes are good. Review them before you push or check them out,
+workflow files under `.github/` above all, since they run with the repository's secrets on
+GitHub. At levels `pr` and `full` the container can push by itself, within what its token allows.
 
 ### GitHub tokens for each level
 
@@ -425,7 +493,7 @@ main open. Workers still open a draft pull request unless you explicitly ask for
 
 **Levels are limits only as far as the token goes.** With a write token, a worker at
 `read-only` (for example by `VOICE_GW_ACCESS`) could still push; its rules forbid it. To be sure
-nothing leaves the container, give it no write token.
+nothing leaves the container but through the clean clone, give it no write token.
 
 ## Security
 
@@ -450,10 +518,12 @@ nothing leaves the container, give it no write token.
   - A run stops after 60 minutes, and at most two run at a time.
   - Everything else, such as staying on a `voice/` branch or never force-pushing, is in the
     worker's instructions: rules, not limits.
-- **Workers in Docker** see only their clones, the container's tokens and the network. They do
-  not reach your files, SSH keys or `gh` login, and a level is only as strict as the token
-  (see [Access levels](#access-levels)). Whoever controls the gateway can control Docker, which
-  on Linux is as good as root.
+- **Workers in Docker** see only the mounted folder, the container's tokens and the network. They
+  do not reach your other files, SSH keys or `gh` login, and a level is only as strict as the
+  token (see [Access levels](#access-levels)). Everything in that folder counts as hostile: git on
+  this computer never runs there, and changes come out only as a verified bundle into a clean
+  clone (see the [threat model](#getting-changes-out-of-the-container)). Whoever controls the
+  gateway can control Docker, which on Linux is as good as root.
 - **The endpoint is public.** Anyone on the internet can reach the sign-in page. A certificate from
   a public authority, Tailscale Funnel's included, also publishes the host name in the certificate
   transparency logs.
@@ -514,7 +584,8 @@ Claude Code starts the gateway, so environment variables go into `controller/.mc
 | `VOICE_GW_MAX_WORKERS` | `2` | runs at the same time |
 | `VOICE_GW_WORKER_TIMEOUT` | `60` | minutes before a run is stopped |
 | `VOICE_GW_DOCKER` | empty | name of the [worker container](#workers-in-docker); empty: workers run on this computer |
-| `VOICE_GW_DOCKER_REPOS` | `/repos` | where the clones are inside the container |
+| `VOICE_GW_DOCKER_REPOS` | `/repos` | where the mounted folder is inside the container |
+| `VOICE_CLEAN_ROOT` | the folder holding this repository | for `scripts/fetch-from-container.sh` only: where the clean clones are |
 | `VOICE_GW_DOCKER_BIN` | `docker` | the Docker CLI |
 | `VOICE_GW_ACCESS` | empty | `read-only`, `pr` or `full` for every repository in the container; empty: [detected](#access-levels) from the token |
 | `VOICE_GW_GITHUB_API` | `https://api.github.com` | GitHub API for the level check; the tests point it at a stand-in |
@@ -549,6 +620,8 @@ Claude Code starts the gateway, so environment variables go into `controller/.mc
 | `access read-only (no GitHub token)` although there is one | It must be `.secrets/worker/github_token`, readable for the gateway. A new token counts at the next check, within ten minutes. |
 | `access read-only (the token cannot see the repository (404))` | The token's repository access does not include it, or the organisation has not approved the token yet. |
 | `access full` where you expected `pr` | No ruleset or branch protection requires pull requests on the default branch, or the private repository's plan has none. Protect it, or set `VOICE_GW_ACCESS=pr`. |
+| `worker container …: /repos is a volume, not a host folder` or `… it runs as …` | The container was started without `-v <folder>:/repos` or without `--user "$(id -u):$(id -g)"`. Remove it (`docker rm -f voice-workers`) and start it as in [Set it up](#set-it-up). |
+| `fetch-from-container: the container could not bundle …` | The branch does not exist in the container's repository, or the container is not running. The worker names its branch at the end of each run. |
 | A worker in Docker fails at once | Claude Code is not logged in: `.secrets/worker/claude_token` is missing or expired; run `claude setup-token` again. Otherwise read `.state/tasks/<task>.err`. |
 | No approval by voice | Expected for Bash, Write and Edit: they run without asking. For other tools: the session runs in auto or bypass mode, an allow rule covers the tool, or it is a trust or consent dialog, which is not relayed. Start the session with `scripts/start-controller.sh`. |
 
@@ -571,7 +644,7 @@ src/
   config.mjs         environment variables
   log.mjs            log to stderr and file, never to stdout
 docker/
-  Dockerfile         the worker container: clones and Claude Code
+  Dockerfile         the worker container: Claude Code, git and gh, as your user id
   voice-run          starts a run with its tokens, in its own process group
   voice-stop         ends a run with everything it started
   git-credential-voice   the GitHub token for git
@@ -587,11 +660,12 @@ scripts/
   check-public.mjs   check the endpoint through Funnel's public relays
   pair.mjs           pairing codes, list and revoke connections
   fake-voice.mjs     play the voice assistant at the desk
+  fetch-from-container.sh   bring a branch from the container into a clean clone, as a bundle
 test/
   e2e.test.mjs       both sides end to end, without Claude Code
   oauth.test.mjs     the sign-in as Claude's connector goes through it
   workers.test.mjs   workers with a stand-in for claude and gh
-  docker.test.mjs    workers in the container and access levels, with stand-ins for docker and GitHub
+  docker.test.mjs    workers in the container, access levels and the bundle helper, with stand-ins for docker and GitHub
   controller.test.mjs   launcher flags, controller settings, confine hook
 docs/
   *.drawio.svg       diagrams: an image on GitHub, editable in draw.io

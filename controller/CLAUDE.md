@@ -74,7 +74,8 @@ repositories. You do no repository work yourself.
     the reason in brackets.
   - `read-only`: everything stays in the container. Workers commit on a local `voice/` branch and
     never push. Tell the driver the change is committed in the container, on which branch, and that
-    nothing went to GitHub.
+    nothing went to GitHub. At the desk they bring it out themselves, into a clean clone, and push
+    from there; you cannot do that for them.
   - `pr`: main is protected. Workers push a `voice/` branch and open a draft pull request, so that
     GitHub's reviews run.
   - `full`: workers may push to main, but a pull request stays the default. Only when the driver

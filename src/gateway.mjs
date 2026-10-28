@@ -34,10 +34,17 @@ if (config.docker) {
       : 'access level per repository from the GitHub token',
   )
 }
+const runner = config.docker
+  ? new DockerRunner({ container: config.docker, root: config.dockerRepos, dockerBin: config.dockerBin })
+  : new HostRunner(config.workerRoot)
+if (config.docker) {
+  runner.check().then(({ folder, user, warnings }) => {
+    log(`worker container ${config.docker}: repositories from host folder ${folder ?? '?'}, running as ${user ?? '?'}`)
+    for (const warning of warnings) log(`worker container ${config.docker}: ${warning}`)
+  })
+}
 const workers = new Workers({
-  runner: config.docker
-    ? new DockerRunner({ container: config.docker, root: config.dockerRepos, dockerBin: config.dockerBin })
-    : new HostRunner(config.workerRoot),
+  runner,
   access: config.docker
     ? new GitHubAccess({ tokenFile: config.githubTokenFile, apiBase: config.githubApi, forced: config.access })
     : null,

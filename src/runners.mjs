@@ -2,6 +2,12 @@
 // in the checkouts on this computer (HostRunner, the default), or in the
 // worker container (DockerRunner, when VOICE_GW_DOCKER names one; see
 // docker/). The gateway itself always runs here.
+//
+// In the container, the repositories live in a host folder mounted at /repos,
+// written as your user. Still, git on this computer never runs in that folder:
+// its config, hooks and fsmonitor come from the container's side. The gateway
+// runs every git command there through docker exec, and changes reach a clean
+// clone here as a bundle (scripts/fetch-from-container.sh).
 
 import { execFile, spawn } from 'node:child_process'
 import { existsSync, readdirSync } from 'node:fs'
@@ -102,6 +108,31 @@ export class DockerRunner {
   async git(dir, ...args) {
     const { ok, stdout } = await this.exec(['git', '-C', dir, ...args])
     return ok ? stdout : null
+  }
+
+  // Which host folder is mounted at /repos and as whom the container runs,
+  // with what is not as it should be: { folder, user, warnings }.
+  async check(uid = process.getuid(), gid = process.getgid()) {
+    const inspected = await run(this.dockerBin, ['inspect', this.container], 15000)
+    if (!inspected.ok) {
+      const why = (inspected.stderr || inspected.error?.message || '').trim().split('\n')[0]
+      return { folder: null, user: null, warnings: [`docker inspect failed (${why})`] }
+    }
+    let mount
+    try {
+      mount = (JSON.parse(inspected.stdout)[0]?.Mounts ?? []).find(m => m.Destination === this.root)
+    } catch {
+      mount = undefined
+    }
+    const id = await this.exec(['sh', '-c', 'echo "$(id -u):$(id -g)"'])
+    const user = id.ok ? id.stdout.trim() : null
+    const warnings = []
+    if (!mount) warnings.push(`no host folder is mounted at ${this.root}`)
+    else if (mount.Type !== 'bind') warnings.push(`${this.root} is a ${mount.Type}, not a host folder`)
+    if (user && user !== `${uid}:${gid}`) {
+      warnings.push(`it runs as ${user}, not as ${uid}:${gid}, so the files in the folder are not yours`)
+    }
+    return { folder: mount?.Type === 'bind' ? mount.Source : null, user, warnings }
   }
 
   // voice-run (docker/voice-run) hands the run its tokens and puts it in its

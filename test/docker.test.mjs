@@ -1,15 +1,17 @@
-// Workers in the Docker container, and their access levels.
+// Workers in the Docker container, their access levels, and how changes get
+// from the container's folder into a clean clone.
 //
 // A local HTTP server stands in for the GitHub API, so the level detection is
 // tested without a real token. For the gateway as a whole, a fake `docker`
 // runs `docker exec` commands right here, as if this computer were the
-// container: its clones live in a temporary folder, and a fake `claude`
-// stands in for Claude Code, as in workers.test.mjs.
+// container: the mounted folder is a temporary one, and a fake `claude`
+// stands in for Claude Code, as in workers.test.mjs. What the fake container
+// runs sees CONTAINER_SIDE=1, so the tests can tell it from the host.
 
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { execFileSync } from 'node:child_process'
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { execFileSync, spawnSync } from 'node:child_process'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -18,6 +20,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { z } from 'zod'
 import { GitHubAccess } from '../src/access.mjs'
+import { DockerRunner } from '../src/runners.mjs'
 
 const GATEWAY = fileURLToPath(new URL('../src/gateway.mjs', import.meta.url))
 const TMP = mkdtempSync(join(tmpdir(), 'voice-gw-docker-'))
@@ -29,6 +32,9 @@ const TOKEN_FILE = join(SECRETS, 'worker', 'github_token')
 const TOKEN = 'github_pat_TEST_token_never_in_a_log'
 const CONTAINER = 'voice-workers'
 const DOWN = join(TMP, 'container-down') // while it exists, the fake container does not answer
+const SCRIPT = fileURLToPath(new URL('../scripts/fetch-from-container.sh', import.meta.url))
+const CLEAN = join(TMP, 'clean') // the clean clones on this computer
+const MARKERS = join(TMP, 'markers') // what ran on the host side
 
 // --- the stand-in GitHub API -------------------------------------------------
 
@@ -81,7 +87,19 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } fr
 import { join } from 'node:path'
 const argv = process.argv.slice(2)
 appendFileSync(process.env.FAKE_DOCKER_LOG, JSON.stringify(argv) + '\\n')
-if (argv.shift() !== 'exec') process.exit(2)
+const verb = argv.shift()
+if (verb === 'inspect') {
+  // docker inspect [--format template] <container>: its mount of the host folder
+  if (argv.at(-1) !== process.env.FAKE_DOCKER_CONTAINER) {
+    process.stderr.write('Error: No such object: ' + argv.at(-1) + '\\n')
+    process.exit(1)
+  }
+  const mount = { Type: process.env.FAKE_DOCKER_MOUNT_TYPE || 'bind', Source: process.env.FAKE_DOCKER_FOLDER, Destination: process.env.FAKE_DOCKER_REPOS }
+  process.stdout.write((argv[0] === '--format' ? mount.Source : JSON.stringify([{ Mounts: [mount] }])) + '\\n')
+  process.exit(0)
+}
+if (verb !== 'exec') process.exit(2)
+const env = { ...process.env, CONTAINER_SIDE: '1' }
 let cwd = process.cwd()
 while (argv[0]?.startsWith('-')) if (argv.shift() === '-w') cwd = argv.shift()
 const container = argv.shift()
@@ -96,11 +114,11 @@ if (command === 'voice-run') {
   const [task, run, ...rest] = args
   mkdirSync(runs, { recursive: true })
   writeFileSync(join(runs, task), String(process.pid))
-  spawn(run, rest, { cwd, stdio: 'inherit' }).on('exit', code => process.exit(code ?? 1))
+  spawn(run, rest, { cwd, stdio: 'inherit', env }).on('exit', code => process.exit(code ?? 1))
 } else if (command === 'voice-stop') {
   try { process.kill(-Number(readFileSync(join(runs, args[0]), 'utf8')), 'SIGTERM') } catch {}
 } else {
-  process.exit(spawnSync(command, args, { cwd, stdio: 'inherit' }).status ?? 1)
+  process.exit(spawnSync(command, args, { cwd, stdio: 'inherit', env }).status ?? 1)
 }
 `
 
@@ -189,6 +207,8 @@ before(async () => {
       FAKE_DOCKER_CONTAINER: CONTAINER,
       FAKE_DOCKER_DOWN: DOWN,
       FAKE_DOCKER_RUNS: join(TMP, 'runs'),
+      FAKE_DOCKER_FOLDER: REPOS, // the host folder mounted at /repos
+      FAKE_DOCKER_REPOS: REPOS,
       FAKE_CLAUDE_LOG: join(TMP, 'claude-calls.jsonl'),
     },
     stderr: 'pipe',
@@ -324,7 +344,7 @@ test('Docker: list_workers shows the clones in the container with their access l
   assert.match(text, /^site: acme\/site, public, access full /m)
   assert.match(text, /^local: no remote, access read-only \(no GitHub remote\), branch main, clean, idle$/m)
   assert.doesNotMatch(text, /host-only/, 'the checkouts on this computer are not used')
-  assert.ok(dockerCalls().every(call => call[0] === 'exec' && call.includes(CONTAINER)))
+  assert.ok(dockerCalls().every(call => ['exec', 'inspect'].includes(call[0]) && call.includes(CONTAINER)))
 })
 
 test('Docker: runs go through voice-run in the container, with the rules of their level', async () => {
@@ -407,4 +427,155 @@ test('Docker: the token never reaches the log, the docker calls or the worker ar
   assert.ok(!gw.log.includes(TOKEN), 'log')
   assert.ok(!JSON.stringify(dockerCalls()).includes(TOKEN), 'docker calls')
   assert.ok(!JSON.stringify(claudeCalls()).includes(TOKEN), 'claude calls')
+})
+
+// --- the host folder, the user, and getting changes out --------------------------
+
+// What the fake docker needs when a test calls it directly.
+const fakeDockerEnv = () => ({
+  ...process.env,
+  FAKE_DOCKER_LOG: join(TMP, 'docker-calls.jsonl'),
+  FAKE_DOCKER_CONTAINER: CONTAINER,
+  FAKE_DOCKER_DOWN: DOWN,
+  FAKE_DOCKER_RUNS: join(TMP, 'runs'),
+  FAKE_DOCKER_FOLDER: REPOS,
+  FAKE_DOCKER_REPOS: REPOS,
+})
+
+test('Docker: the gateway names the host folder and the user the container runs as, and warns when they are off', async () => {
+  const uid = `${process.getuid()}:${process.getgid()}`
+  await waitUntil(() => /worker container voice-workers: repositories from host folder/.test(gw.log))
+  assert.match(gw.log, new RegExp(`worker container voice-workers: repositories from host folder ${REPOS}, running as ${uid}\\n`))
+  assert.doesNotMatch(gw.log, /worker container voice-workers: (no host folder|\S+ is a |it runs as)/)
+
+  const runner = new DockerRunner({ container: CONTAINER, root: REPOS, dockerBin: join(BIN, 'docker') })
+  Object.assign(process.env, fakeDockerEnv(), { FAKE_DOCKER_MOUNT_TYPE: 'volume' })
+  try {
+    const off = await runner.check(4242, 4243)
+    assert.equal(off.folder, null)
+    assert.deepEqual(off.warnings, [
+      `${REPOS} is a volume, not a host folder`,
+      `it runs as ${uid}, not as 4242:4243, so the files in the folder are not yours`,
+    ])
+  } finally {
+    delete process.env.FAKE_DOCKER_MOUNT_TYPE
+  }
+})
+
+// A repository in the container's folder whose config and hooks try to run
+// something on the host: each payload leaves a marker, unless it runs in the
+// container. And the commits carry a .gitattributes for a filter that the
+// host user has configured, as with git-lfs.
+function containerRepoAndCleanClone(name) {
+  const q = (cwd, ...args) => execFileSync('git', ['-c', 'user.name=T', '-c', 'user.email=t@example.com', ...args], { cwd, stdio: 'pipe', encoding: 'utf8' })
+  const origin = join(TMP, 'origin', `${name}.git`)
+  mkdirSync(origin, { recursive: true })
+  q(origin, 'init', '-q', '--bare', '-b', 'main')
+  const seed = join(TMP, 'seed', name)
+  mkdirSync(seed, { recursive: true })
+  q(seed, 'init', '-q', '-b', 'main')
+  writeFileSync(join(seed, 'README.md'), `# ${name}\n`)
+  q(seed, 'add', '.')
+  q(seed, 'commit', '-q', '-m', 'init')
+  q(seed, 'push', '-q', origin, 'main')
+  q(TMP, 'clone', '-q', origin, join(CLEAN, name))
+  const repo = join(REPOS, name)
+  q(TMP, 'clone', '-q', origin, repo)
+  q(repo, 'switch', '-q', '-c', 'voice/fix')
+  writeFileSync(join(repo, '.gitattributes'), '* filter=lfstest\n')
+  writeFileSync(join(repo, 'fix.txt'), 'fixed\n')
+  q(repo, 'add', '.')
+  q(repo, 'commit', '-q', '-m', 'Fix it')
+  q(repo, 'branch', 'voice/hidden')
+  const sha = q(repo, 'rev-parse', 'voice/fix').trim()
+  q(repo, 'switch', '-q', 'main')
+
+  mkdirSync(MARKERS, { recursive: true })
+  const payload = join(TMP, 'payload.sh')
+  writeFileSync(payload, `#!/bin/sh\n[ -n "$CONTAINER_SIDE" ] || touch "${MARKERS}/$LABEL"\ncat >/dev/null 2>&1\nexit 0\n`)
+  chmodSync(payload, 0o755)
+  const command = label => {
+    const link = join(TMP, 'payloads', label)
+    mkdirSync(join(TMP, 'payloads'), { recursive: true })
+    if (!existsSync(link)) writeFileSync(link, `#!/bin/sh\nLABEL=${label}\nexport LABEL\nexec ${payload} "$@"\n`, { mode: 0o755 })
+    return link
+  }
+  const hooks = join(repo, '.git', 'evil-hooks')
+  mkdirSync(hooks, { recursive: true })
+  for (const hook of ['pre-commit', 'post-checkout', 'reference-transaction', 'post-update', 'pre-auto-gc']) {
+    writeFileSync(join(hooks, hook), `#!/bin/sh\nexec ${command(`hook-${hook}`)}\n`, { mode: 0o755 })
+  }
+  const set = (key, value) => q(repo, 'config', key, value)
+  set('core.hooksPath', hooks)
+  set('core.fsmonitor', command('fsmonitor'))
+  set('uploadpack.packObjectsHook', command('packObjectsHook'))
+  set('core.alternateRefsCommand', command('alternateRefsCommand'))
+  set('core.pager', command('pager'))
+  set('core.sshCommand', command('sshCommand'))
+  set('uploadpack.hideRefs', 'refs/heads/voice/hidden')
+  // The host user's own filter, as git-lfs would be configured.
+  execFileSync('git', ['config', 'filter.lfstest.smudge', command('host-filter')], { cwd: join(CLEAN, name) })
+  return { origin, repo, sha, clean: join(CLEAN, name) }
+}
+
+const markers = () => (existsSync(MARKERS) ? readdirSync(MARKERS).sort() : [])
+const helper = (args, env = {}) =>
+  spawnSync('bash', [SCRIPT, ...args], {
+    encoding: 'utf8',
+    env: {
+      ...fakeDockerEnv(),
+      LC_ALL: 'C',
+      VOICE_GW_DOCKER: CONTAINER,
+      VOICE_GW_DOCKER_REPOS: REPOS,
+      VOICE_GW_DOCKER_BIN: join(BIN, 'docker'),
+      VOICE_CLEAN_ROOT: CLEAN,
+      ...env,
+    },
+  })
+
+test('fetch-from-container: the branch reaches the clean clone as a bundle, nothing from the container runs here', () => {
+  const { origin, sha, clean } = containerRepoAndCleanClone('fixme')
+  const base = execFileSync('git', ['rev-parse', 'origin/HEAD'], { cwd: clean, encoding: 'utf8' }).trim()
+  const out = helper(['fixme', 'voice/fix'])
+  assert.equal(out.status, 0, out.stderr)
+  assert.match(out.stdout, new RegExp(`^Fetched voice/fix from the container into ${clean} as container/voice/fix:\\n[0-9a-f]+ Fix it\\n`))
+  assert.match(out.stdout, new RegExp(`git -C ${clean} push origin refs/remotes/container/voice/fix:refs/heads/voice/fix`))
+
+  const git = (...args) => execFileSync('git', args, { cwd: clean, encoding: 'utf8' }).trim()
+  assert.equal(git('rev-parse', 'refs/remotes/container/voice/fix'), sha)
+  assert.equal(git('branch', '--show-current'), 'main', 'nothing checked out')
+  assert.equal(git('status', '--porcelain'), '')
+  assert.equal(execFileSync('git', ['for-each-ref', 'refs/heads/voice'], { cwd: origin, encoding: 'utf8' }), '', 'nothing pushed')
+  assert.deepEqual(markers(), [], 'no config, hook or filter ran on the host')
+
+  // The bundle came from the container, with only what the clean clone lacks.
+  const bundle = dockerCalls().findLast(call => call.includes('bundle'))
+  assert.deepEqual(bundle.slice(0, 6), ['exec', CONTAINER, 'git', '-C', join(REPOS, 'fixme'), 'bundle'])
+  assert.ok(bundle.includes(`^${base}`))
+})
+
+test('fetch-from-container: refuses a clean clone in the container folder, odd names and missing clones', () => {
+  for (const [args, env, message] of [
+    [['fixme', 'voice/fix'], { VOICE_CLEAN_ROOT: REPOS }, /is inside the container's folder/],
+    [['fixme', '-x'], {}, /not a branch name: -x/],
+    [['fixme', 'a..b'], {}, /not a branch name: a\.\.b/],
+    [['../fixme', 'voice/fix'], {}, /not a repository name/],
+    [['nope', 'voice/fix'], {}, /no clean clone at .*\/nope/],
+    [['fixme'], {}, /usage/],
+  ]) {
+    const out = helper(args, env)
+    assert.notEqual(out.status, 0, JSON.stringify(args))
+    assert.match(out.stderr, message)
+  }
+  assert.deepEqual(markers(), [])
+})
+
+test('why a bundle: git on the host in the container folder reads its config, and git status runs its fsmonitor', () => {
+  const clean = join(CLEAN, 'fixme')
+  const direct = spawnSync('git', ['fetch', '-q', join(REPOS, 'fixme'), 'refs/heads/voice/hidden'], { cwd: clean, encoding: 'utf8' })
+  assert.notEqual(direct.status, 0, 'a plain local fetch runs upload-pack with the container side\'s uploadpack.hideRefs')
+  assert.deepEqual(markers(), [])
+  spawnSync('git', ['status', '--short'], { cwd: join(REPOS, 'fixme') })
+  assert.deepEqual(markers(), ['fsmonitor'], 'what a git-aware prompt or an editor would set off')
+  rmSync(join(MARKERS, 'fsmonitor'))
 })
