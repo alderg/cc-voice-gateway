@@ -1,6 +1,7 @@
 {
   "name": "cc-voice-gateway",
   "version": "0.1.0",
+  "license": "Apache-2.0",
   "private": true,
   "description": "Control Claude Code by talking to Claude: a custom MCP connector for Claude voice mode, relayed into a Claude Code session through a channel.",
   "type": "module",

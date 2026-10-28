@@ -17,6 +17,8 @@ This README is the technical documentation. The idea in a short video is on the
 > Used with Claude voice mode in the Claude app on the iPhone. Claude Code channels are a research
 > preview; their flags and protocol may change.
 
+Licensed under the [Apache License 2.0](LICENSE).
+
 ## Getting started
 
 From a clone to the first voice request, on a computer with the [prerequisites](#6-prerequisites):
