@@ -2,9 +2,9 @@
 // one-time token, the session, the rate limit, the origin check and the
 // timeouts), and its steps with stand-ins: one local HTTP server answers as
 // the Telegram Bot API and as the GitHub API, and fake docker, tmux,
-// systemctl, gh and claude commands record what they are asked to do. At the
-// end: the files in .secrets and their modes, and that no secret reaches a
-// log line, the terminal or a response.
+// systemctl, loginctl, gh and claude commands record what they are asked to
+// do. At the end: the files in .secrets and their modes, and that no secret
+// reaches a log line, the terminal or a response.
 
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
@@ -30,6 +30,7 @@ const DEV = join(TMP, 'dev') // the checkouts on this computer
 const HOME = join(TMP, 'home')
 const CALLS = join(TMP, 'calls.jsonl') // what the fake commands were asked to do
 const ECHO = join(TMP, 'echo') // a line the fake docker build prints, to test redaction
+const LINGER = join(TMP, 'linger') // the fake loginctl's lingering: yes, no (without the file), or denied
 
 const TELEGRAM_TOKEN = '987654321:TEST-telegram-token-never-shown-xyz12'
 const GITHUB_TOKEN = 'github_pat_TEST_setup_token_never_shown_0123456789'
@@ -101,6 +102,15 @@ switch (${JSON.stringify(name)}) {
     break
   case 'systemctl':
     break
+  case 'loginctl': {
+    const linger = existsSync(${JSON.stringify(LINGER)}) ? readFileSync(${JSON.stringify(LINGER)}, 'utf8') : 'no'
+    if (argv[0] === 'show-user') out('Linger=' + (linger === 'yes' ? 'yes' : 'no'))
+    if (argv[0] === 'enable-linger' && linger === 'denied') {
+      process.stderr.write('Could not enable linger: Access denied\\n')
+      process.exit(1)
+    }
+    break
+  }
   case 'docker':
     if (argv[0] === 'version') out('29.0.0')
     if (argv[0] === 'image') process.exit(existsSync(BUILT) ? 0 : 1)
@@ -138,6 +148,7 @@ const setupEnv = () => ({
   VOICE_GW_GH_BIN: join(BIN, 'gh'),
   VOICE_SETUP_TMUX_BIN: join(BIN, 'tmux'),
   VOICE_SETUP_SYSTEMCTL_BIN: join(BIN, 'systemctl'),
+  VOICE_SETUP_LOGINCTL_BIN: join(BIN, 'loginctl'),
   VOICE_SETUP_TAILSCALE_BIN: join(BIN, 'no-tailscale'),
   VOICE_GW_TELEGRAM_API: api.url,
   VOICE_GW_GITHUB_API: api.url,
@@ -183,7 +194,7 @@ const say = line => terminal.push(line)
 
 before(async () => {
   mkdirSync(BIN, { recursive: true })
-  for (const name of ['claude', 'gh', 'tmux', 'systemctl', 'docker']) {
+  for (const name of ['claude', 'gh', 'tmux', 'systemctl', 'loginctl', 'docker']) {
     writeFileSync(join(BIN, name), FAKE(name))
     chmodSync(join(BIN, name), 0o755)
   }
@@ -373,6 +384,7 @@ test('the start: checks, current settings, repositories and the plugin, without 
   assert.equal(data.plugin.mode, 'development')
   assert.deepEqual(data.plugin.allowlist, { marketplace: 'cc-voice-gateway', plugin: 'voice' })
   assert.match(data.watchdog.unit, /systemd\/user\/cc-voice-gateway\.service$/)
+  assert.equal(data.watchdog.linger, false)
   assert.ok(data.models.includes('opus'))
   assert.ok(data.efforts.includes('xhigh'))
 })
@@ -506,7 +518,7 @@ test('finishing: the files in .secrets with mode 0600 in folders of 0700, the co
   assert.ok(docker.some(argv => argv.join(' ') === `exec voice-workers git clone https://github.com/acme/guarded.git ${FOLDER}/guarded`))
   assert.ok(existsSync(join(FOLDER, 'open')))
 
-  // The watchdog: a systemd user service, enabled, and started now in tmux.
+  // The watchdog: a systemd user service, enabled, lingering turned on, and started now in tmux.
   const unit = readFileSync(join(HOME, '.config', 'systemd', 'user', 'cc-voice-gateway.service'), 'utf8')
   assert.match(unit, /^ExecStart=".*\/tmux" new-session -d -s voice ".*\/scripts\/start-controller\.sh"$/m)
   assert.match(unit, /^ExecStop=".*\/scripts\/start-controller\.sh" --stop$/m)
@@ -518,6 +530,8 @@ test('finishing: the files in .secrets with mode 0600 in folders of 0700, the co
   if (!analyze.error) assert.equal(analyze.status, 0, analyze.stderr)
   const systemctl = calls().filter(c => c.command === 'systemctl').map(c => c.argv.join(' '))
   assert.deepEqual(systemctl, ['--user daemon-reload', '--user enable cc-voice-gateway.service'])
+  assert.ok(calls().some(c => c.command === 'loginctl' && c.argv.join(' ') === `enable-linger ${process.getuid()}`))
+  assert.match(done.lines.join('\n'), /lingering turned on: the controller starts at boot and keeps running without a login/)
   assert.ok(calls().some(c => c.command === 'tmux' && c.argv.slice(0, 4).join(' ') === 'new-session -d -s voice'))
   assert.ok(!calls().some(c => c.command === 'claude' && c.argv[0] === 'plugin'), 'not on the allowlist: nothing to register')
 
@@ -562,6 +576,35 @@ test('finishing with Telegram turned off removes its saved files, and keeps ever
   assert.ok(!existsSync(join(secrets, 'telegram_chat_id')))
   assert.equal(statSync(join(secrets, 'worker', 'github_token')).mode & 0o777, 0o600, 'a saved secret gets mode 0600')
   assert.deepEqual(readSettings(join(secrets, 'gateway.env')), { VOICE_GW_KILL_MAX_EDITS: '900' }, 'other settings stay; Docker is off')
+})
+
+test('the autostart: lingering already on is left alone, and a refused one leaves the step done, with the sudo command', async () => {
+  const uid = process.getuid()
+  async function autostart(linger) {
+    writeFileSync(LINGER, linger)
+    const start = calls().length
+    const setup = createSetup({ root: ROOT, secretsDir: join(TMP, `secrets-linger-${linger}`), env: setupEnv(), home: HOME, platform: 'linux', say })
+    const { job } = await setup.api['POST /api/finish']({
+      body: { settings: { VOICE_GW_PORT: '8787', VOICE_GW_DOCKER: '' }, telegram: { enabled: false }, docker: { enabled: false }, watchdog: { autostart: true } },
+    })
+    let state
+    for (let i = 0; i < 250 && (state = setup.api['GET /api/jobs/:id']({ id: job })).state === 'running'; i++) await sleep(20)
+    const loginctl = calls().slice(start).filter(c => c.command === 'loginctl').map(c => c.argv.join(' '))
+    return { state: state.state, text: state.lines.join('\n'), loginctl }
+  }
+
+  const on = await autostart('yes')
+  assert.equal(on.state, 'done', on.text)
+  assert.deepEqual(on.loginctl, [`show-user ${uid} -p Linger`])
+  assert.match(on.text, /lingering already on: the controller starts at boot and keeps running without a login/)
+
+  const denied = await autostart('denied')
+  assert.equal(denied.state, 'done', denied.text)
+  assert.deepEqual(denied.loginctl, [`show-user ${uid} -p Linger`, `enable-linger ${uid}`])
+  assert.match(denied.text, /Could not enable linger: Access denied/)
+  assert.match(denied.text, new RegExp(`it needs sudo loginctl enable-linger ${uid}, and until then the controller starts only at a login`))
+  assert.match(denied.text, /\ndone$/)
+  rmSync(LINGER, { force: true })
 })
 
 test('the settings file: one line per setting, read without running anything', () => {

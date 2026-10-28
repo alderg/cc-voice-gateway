@@ -188,8 +188,8 @@ function fillWatchdog() {
   $('#watchdog-status').textContent = state.watchdog.status || 'unknown'
   $('#watchdog-unit').textContent =
     state.watchdog.platform === 'darwin'
-      ? `(a LaunchAgent, ${state.watchdog.unit})`
-      : `(a systemd user service, ${state.watchdog.unit}${state.watchdog.unitExists ? ', exists already' : ''})`
+      ? `(at login: a LaunchAgent, ${state.watchdog.unit})`
+      : `(at boot: a systemd user service, ${state.watchdog.unit}${state.watchdog.unitExists ? ', exists already' : ''}${state.watchdog.linger ? ', lingering on already' : ''})`
   const tmux = state.checks.find(check => check.name === 'tmux')
   if (!tmux?.ok) {
     for (const id of ['#watchdog-autostart', '#watchdog-now']) $(id).disabled = true

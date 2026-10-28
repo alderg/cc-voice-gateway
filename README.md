@@ -805,7 +805,7 @@ is guarded as follows:
 | GitHub CLI `gh` | Tested with 2.46.0 | Host workers (push, pull requests), the controller's status questions and merges, the pull request watch, the kill switch's default-branch check | `gh auth login` on this computer |
 | Docker | Tested with 29.8.0 | Optional: workers in a container | Docker installed as a snap cannot mount folders from `/tmp` |
 | tmux | Tested with 3.6 | Optional: the controller in the background | The setup assistant's autostart uses it |
-| systemd user services | – | Optional: autostart at login on Linux | `loginctl enable-linger` for a start at boot |
+| systemd user services | – | Optional: autostart at boot on Linux | With lingering (`loginctl enable-linger`), which the setup assistant turns on; without it, only at a login and until the last logout |
 | A public HTTPS address on port 443 | – | Claude's servers reach the gateway | Tailscale Funnel (tested, 1.104.2) or a reverse proxy |
 | Claude app | Current | Voice mode with the connector | Used on the iPhone |
 
@@ -871,7 +871,7 @@ the `localhost` link).
 | Models | Model and effort for the controller (`--model`, `--effort` from `start-controller.sh`) and for every worker run, on the host and in Docker | Choices, or Claude Code's defaults |
 | Telegram | Checks the token (`getMe`), finds your private chat with `getUpdates` once you wrote to the bot, sends a test message | A token from [@BotFather](https://t.me/BotFather), one message to the bot |
 | Workers in Docker | Checks the GitHub token and shows the level per repository with the gateway's detection. Builds the image with its progress shown. Starts the container, sets git's name and email in it, and clones the chosen repositories inside it | A token from `claude setup-token`, optionally a GitHub token ([5.6](#56-access-levels-and-their-detection)), the repositories |
-| Watchdog | On Linux, writes and enables a systemd user service that starts the controller in tmux at login; or starts it now in tmux. On macOS it writes a LaunchAgent and shows the `launchctl bootstrap` command | Choices |
+| Watchdog | On Linux, writes and enables a systemd user service that starts the controller in tmux at boot, and turns on lingering for your user so that it keeps running without a login (if that is refused, it shows the `sudo` command); or starts it now in tmux. On macOS it writes a LaunchAgent and shows the `launchctl bootstrap` command | Choices |
 | Plugin | Shows whether `voice@cc-voice-gateway` is on the organisation's channel allowlist; registers the marketplace if it is; otherwise shows the admin steps | The admin |
 | Finish | Writes `.secrets/` (5.10) and ends | – |
 
@@ -936,7 +936,8 @@ docker exec voice-workers git config --global user.email "you@example.com"
 
 **Autostart on Linux:** a systemd user service that runs
 `tmux new-session -d -s voice <repo>/scripts/start-controller.sh` (Type=forking, with your
-`PATH`), then `systemctl --user enable cc-voice-gateway.service`.
+`PATH`), then `systemctl --user enable cc-voice-gateway.service` and `loginctl enable-linger`, so
+that it starts at boot and keeps running without a login.
 
 Then go on with [Getting started](#getting-started) from step 4.
 
@@ -1326,6 +1327,7 @@ do not set them.
 | Voice requests stop arriving after a crash | The watchdog started the session again, and the development-channel warning waits: `tmux attach -t voice`, then Enter. `grep watchdog .logs/gateway.log` shows what happened. |
 | `the controller is already running (watchdog …)` | A watchdog runs already, for example in another tmux window. `scripts/start-controller.sh --status`; `--stop` ends it. |
 | `watchdog: giving up …` | The session kept crashing, for example because the login expired. Look at the controller terminal, fix the cause, and start it again. |
+| After a reboot the controller runs only while you are logged in, and stops when your SSH session ends | Lingering is off for your user: `loginctl enable-linger`, or `sudo loginctl enable-linger $USER` if that is refused. The setup assistant turns it on with the autostart. |
 
 Claude Code's debug log is at `~/.claude/debug/<session-id>.txt`.
 

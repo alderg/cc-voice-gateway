@@ -201,8 +201,13 @@
     crash, in a tmux session. On its first start Claude Code asks a few questions at the terminal:
     attach with <code>tmux attach -t voice</code> and answer them.
   </p>
+  <p class="guide">
+    On Linux the autostart also turns on lingering for your user (<code>loginctl enable-linger</code>):
+    without it, systemd starts the service only at a login and stops it after the last one, an SSH
+    session too.
+  </p>
   <p>Now: <span id="watchdog-status"></span></p>
-  <label><input type="checkbox" id="watchdog-autostart"> Start it at login <span id="watchdog-unit" class="sub"></span></label>
+  <label><input type="checkbox" id="watchdog-autostart"> Start it automatically <span id="watchdog-unit" class="sub"></span></label>
   <label><input type="checkbox" id="watchdog-now"> Start it now in the tmux session "voice"</label>
 </section>
 

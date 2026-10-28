@@ -150,6 +150,7 @@ export function createSetup({
     git: env.VOICE_SETUP_GIT_BIN || 'git',
     tmux: env.VOICE_SETUP_TMUX_BIN || 'tmux',
     systemctl: env.VOICE_SETUP_SYSTEMCTL_BIN || 'systemctl',
+    loginctl: env.VOICE_SETUP_LOGINCTL_BIN || 'loginctl',
     tailscale: env.VOICE_SETUP_TAILSCALE_BIN || 'tailscale',
   }
   const telegramApi = env.VOICE_GW_TELEGRAM_API || 'https://api.telegram.org'
@@ -279,13 +280,21 @@ export function createSetup({
       : join(home, '.config', 'systemd', 'user', `${SERVICE}.service`)
   }
 
+  // Lingering: systemd starts the user's services at boot and keeps them
+  // running without a login. Without it they start at a login and stop soon
+  // after the last one ends, an SSH session too.
+  async function lingering() {
+    return /^Linger=yes$/m.test((await output(bin.loginctl, ['show-user', String(uid), '-p', 'Linger'])).text)
+  }
+
   async function state({ server }) {
     const current = readSettings(settingsFile)
     const settings = Object.fromEntries(Object.entries(FIELDS).map(([name, field]) => [name, current[name] ?? field.default]))
-    const [list, git, watchdog] = await Promise.all([
+    const [list, git, watchdog, linger] = await Promise.all([
       checks(),
       Promise.all([output(bin.git, ['config', '--global', 'user.name']), output(bin.git, ['config', '--global', 'user.email'])]),
       output(join(root, 'scripts', 'start-controller.sh'), ['--status'], { env: { ...env, VOICE_GW_SECRETS_DIR: secretsDir } }),
+      platform === 'darwin' ? null : lingering(),
     ])
     const plugin = channelMode({ env, root })
     return {
@@ -309,6 +318,7 @@ export function createSetup({
         platform,
         unit: unitFile(),
         unitExists: existsSync(unitFile()),
+        linger,
       },
       plugin: {
         mode: plugin.mode,
@@ -627,8 +637,24 @@ export function createSetup({
         const reload = await runCommand(bin.systemctl, ['--user', 'daemon-reload'], { env, onLine: line, timeoutMs: 30000 })
         const enable = await runCommand(bin.systemctl, ['--user', 'enable', `${SERVICE}.service`], { env, onLine: line, timeoutMs: 30000 })
         ok = reload === 0 && enable === 0
-        line(ok ? `the controller starts at your next login (systemd user service ${SERVICE})` : 'systemctl failed; the unit file is there')
-        line('so that it also starts at boot without a login: loginctl enable-linger')
+        if (!ok) {
+          line('systemctl failed; the unit file is there')
+        } else {
+          line(`systemd user service ${SERVICE} enabled`)
+          // Lingering makes it a start at boot. Refused, the step stays done:
+          // the service still starts at a login, and the line says what to run.
+          const boot = 'the controller starts at boot and keeps running without a login'
+          if (await lingering()) {
+            line(`lingering already on: ${boot}`)
+          } else {
+            const linger = await runCommand(bin.loginctl, ['enable-linger', String(uid)], { env, onLine: line, timeoutMs: 30000 })
+            line(
+              linger === 0
+                ? `lingering turned on: ${boot}`
+                : `loginctl enable-linger failed; it needs sudo loginctl enable-linger ${uid}, and until then the controller starts only at a login`,
+            )
+          }
+        }
       }
     }
     if (watchdog.startNow) {
