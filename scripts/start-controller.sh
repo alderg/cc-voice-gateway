@@ -90,7 +90,7 @@ log() {
   local line
   line="$(date -u +%Y-%m-%dT%H:%M:%SZ) watchdog: $*"
   if [ -n "$LOG" ]; then
-    mkdir -p "$(dirname "$LOG")" && printf '%s\n' "$line" >>"$LOG" || true
+    (umask 077 && mkdir -p "$(dirname "$LOG")") && printf '%s\n' "$line" >>"$LOG" || true
   fi
   if [ "$quiet" = 0 ] || [ -z "$LOG" ]; then printf '%s\n' "$line" >&2; fi
 }
@@ -113,7 +113,7 @@ running_pid() {
 }
 
 take_lock() {
-  mkdir -p "$STATE"
+  (umask 077 && mkdir -p "$STATE")
   if ! mkdir "$LOCK" 2>/dev/null; then
     local other
     other=$(running_pid)

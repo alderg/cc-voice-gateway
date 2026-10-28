@@ -597,6 +597,9 @@ unlock by voice, Telegram or the controller.
 | `.state/requests.json` | Voice requests and the answers, with what the voice client has read | 0600 |
 | `.logs/gateway.log`, `.logs/gateway.log.1` | Log, without tokens; rotated at `VOICE_GW_LOG_MAX_MB` | 0600, folder 0700 when the gateway creates it |
 
+Folders created by an earlier version keep their mode; tighten them once with
+`chmod 700 .state .logs`.
+
 `.secrets/`, `.state/` and `.logs/` are ignored by git. The controller's confinement keeps it
 away from `.secrets/`; the container sees only `.secrets/worker`.
 
@@ -1137,7 +1140,7 @@ do not set them.
 | Sign-in goes to an `http://` address or to the wrong host | The tunnel or proxy does not pass the public host name or `X-Forwarded-Proto: https` (see [Publishing the endpoint](#73-publishing-the-endpoint)). |
 | Sign-in page says the app is not registered | The sign-in state was reset, for example because `.secrets/oauth.json` was deleted. Remove the connector and add it again. |
 | Sign-in fails with Claude's published identity | Choose to register automatically instead. If the log shows `client id document not allowed: <URL>`, that host is missing from `VOICE_GW_OAUTH_HOSTS`. |
-| "Wrong or expired code" | Run `node scripts/pair.mjs` again. A code lasts five minutes and one sign-in, and five wrong attempts burn it. |
+| "Wrong or expired code" | Run `node scripts/pair.mjs` again. A code lasts five minutes and one sign-in. Five wrong attempts from one browser or address, or twenty in all, burn it. |
 | `pair.mjs` says the gateway is not running | Start the controller; the gateway runs inside its session. |
 | The connector stopped working after weeks unused | The refresh token expired after 30 days. Sign in again from the connector's settings. |
 | Claude asks before every tool call | Choose "Always allow" for the connector's tools. |
@@ -1172,6 +1175,7 @@ do not set them.
 | `fetch-from-container: the container could not bundle …` | The branch does not exist in the container's repository, or the container is not running. The worker names its branch at the end of each run. |
 | A worker in Docker fails at once | Claude Code is not logged in: `.secrets/worker/claude_token` is missing or expired; run `claude setup-token` again. Otherwise read `.state/tasks/<task>.err`. |
 | `dispatch=locked`, `[state=locked]` or an `[ALARM]` line | The kill switch is locked; the alarm names the trigger. `node scripts/unlock.mjs --status` shows it, `node scripts/unlock.mjs` at the server unlocks it. |
+| `dispatch=origin` | In the container, the repository's `origin` is no longer the GitHub repository the gateway saw first ([5.6](#56-access-levels-and-their-detection)). Check the clone at the desk; if the change is wanted, stop the controller and remove the repository's line under `origins` in `.state/workers.json`. |
 | The kill switch locked for no good reason | Read the reason. A rule that misfires: raise its `VOICE_GW_KILL_*` threshold, or add a folder to `VOICE_GW_KILL_ALLOW_PATHS`. |
 | `/stop` on Telegram does nothing | Only your configured private chat counts, and the gateway must poll the bot: the log says `telegram commands: …` if a webhook or another program takes the updates. |
 | No approval by voice | Expected for Bash, Write and Edit: they run without asking. For other tools: the session runs in auto or bypass mode, an allow rule covers the tool, or it is a trust or consent dialog, which is not relayed. Start the session with `scripts/start-controller.sh`. |
