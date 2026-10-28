@@ -10,6 +10,10 @@
 //   full       as pr, but the default branch is not protected: still a pull
 //              request by default, a direct push only when the driver asks
 //
+// With pull requests turned off on GitHub, there is no pull request to open:
+// at full, workers push to the default branch directly (pulls: false); with
+// the default branch protected, nothing can be published, so read-only.
+//
 // The gateway checks each repository with the GitHub API, or takes the level
 // from VOICE_GW_ACCESS. Whatever it cannot tell counts as the lower level.
 // The token never reaches a log line or an error message.
@@ -48,11 +52,12 @@ export class GitHubAccess {
     }
   }
 
-  // { level, reason, visibility, branch } for a repository. slug is
-  // owner/repo for a GitHub remote, otherwise null. visibility and branch are
-  // null where the API was not asked.
+  // { level, reason, visibility, branch, pulls } for a repository. slug is
+  // owner/repo for a GitHub remote, otherwise null. visibility, branch and
+  // pulls (whether pull requests are turned on) are null where the API was not
+  // asked.
   async check(slug) {
-    const result = (level, reason) => ({ level, reason, visibility: null, branch: null })
+    const result = (level, reason) => ({ level, reason, visibility: null, branch: null, pulls: null })
     if (this.forced) return result(this.forced, 'set by VOICE_GW_ACCESS')
     if (!slug) return result('read-only', 'no GitHub remote')
     const token = this.token()
@@ -90,14 +95,16 @@ export class GitHubAccess {
   }
 
   async detect(slug, token) {
+    const unknown = { visibility: null, branch: null, pulls: null }
     const repo = await this.request(token, 'GET', `/repos/${slug}`)
-    if (repo.status === 401) return { level: 'read-only', reason: 'GitHub rejected the token', visibility: null, branch: null }
+    if (repo.status === 401) return { level: 'read-only', reason: 'GitHub rejected the token', ...unknown }
     if (repo.status !== 200) {
-      return { level: 'read-only', reason: `the token cannot see the repository (${repo.status})`, visibility: null, branch: null }
+      return { level: 'read-only', reason: `the token cannot see the repository (${repo.status})`, ...unknown }
     }
     const visibility = repo.data.visibility ?? (repo.data.private ? 'private' : 'public')
     const branch = repo.data.default_branch || 'main'
-    const level = (name, reason) => ({ level: name, reason, visibility, branch })
+    const pulls = repo.data.has_pull_requests !== false
+    const level = (name, reason) => ({ level: name, reason, visibility, branch, pulls })
 
     // The account's own permission first; a fine-grained token can have less.
     if (!repo.data.permissions?.push) return level('read-only', 'the account cannot push to it')
@@ -105,25 +112,32 @@ export class GitHubAccess {
     // 404 that it may not. Neither creates anything.
     const refs = await this.request(token, 'POST', `/repos/${slug}/git/refs`, {})
     if (refs.status !== 422) return level('read-only', 'the token cannot push (Contents is read-only)')
-    const pulls = await this.request(token, 'POST', `/repos/${slug}/pulls`, {})
-    if (pulls.status !== 422) return level('read-only', 'the token cannot open pull requests')
+    if (pulls) {
+      const probe = await this.request(token, 'POST', `/repos/${slug}/pulls`, {})
+      if (probe.status !== 422) return level('read-only', 'the token cannot open pull requests')
+    }
 
+    // Protected: pull requests only, and without them nothing gets out.
+    const guarded = (reason, off = reason) =>
+      pulls ? level('pr', reason) : level('read-only', `pull requests are turned off and ${off}`)
     const name = encodeURIComponent(branch)
     const [classic, rules] = await Promise.all([
       this.request(token, 'GET', `/repos/${slug}/branches/${name}`),
       this.request(token, 'GET', `/repos/${slug}/rules/branches/${name}`),
     ])
-    if (classic.status !== 200) return level('pr', `could not tell whether ${branch} is protected`)
-    if (classic.data?.protected) return level('pr', `${branch} is protected by branch protection`)
+    if (classic.status !== 200) return guarded(`could not tell whether ${branch} is protected`, `${branch} may be protected`)
+    if (classic.data?.protected) return guarded(`${branch} is protected by branch protection`)
     // 403 or 404: rulesets are not available for this repository, for
     // example a private one without GitHub Pro, so none applies.
     if (rules.status === 200) {
       if ((Array.isArray(rules.data) ? rules.data : []).some(rule => BLOCKING_RULES.includes(rule.type))) {
-        return level('pr', `${branch} is protected by a ruleset`)
+        return guarded(`${branch} is protected by a ruleset`)
       }
     } else if (rules.status !== 403 && rules.status !== 404) {
-      return level('pr', `could not tell whether ${branch} is protected`)
+      return guarded(`could not tell whether ${branch} is protected`, `${branch} may be protected`)
     }
-    return level('full', `${branch} is not protected`)
+    return pulls
+      ? level('full', `${branch} is not protected`)
+      : level('full', `pull requests are turned off, ${branch} is not protected: direct push`)
   }
 }

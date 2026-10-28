@@ -49,8 +49,16 @@ setTimeout(() => {
 }, /SLOW/.test(input) ? 4000 : 50)
 `
 
+// gh api repos/<slug>: public if the name says so; pull requests turned off
+// for names with "direct" in them.
 const FAKE_GH = `#!/bin/sh
-case "$*" in *public*) echo PUBLIC ;; *) echo PRIVATE ;; esac
+case "$1 $2" in
+  "api repos/"*)
+    case "$2" in *public*) v=public ;; *) v=private ;; esac
+    case "$2" in *direct*) p=false ;; *) p=true ;; esac
+    echo "{\\"visibility\\":\\"$v\\",\\"has_pull_requests\\":$p,\\"default_branch\\":\\"main\\"}" ;;
+  *) case "$*" in *public*) echo PUBLIC ;; *) echo PRIVATE ;; esac ;;
+esac
 `
 
 let gw // the running gateway with its two clients
@@ -170,6 +178,7 @@ before(async () => {
   repo('beta-public', { origin: 'https://github.com/acme/beta-public.git' })
   repo('gamma')
   repo('dirty', { origin: 'git@github.com:acme/dirty.git', dirty: true })
+  repo('delta', { origin: 'git@github.com:acme/delta-direct.git' })
   mkdirSync(join(ROOT, 'not-a-repo'))
   // Settings as the setup assistant writes them; the environment wins.
   mkdirSync(join(TMP, 'secrets'), { recursive: true })
@@ -216,11 +225,12 @@ const workerEvent = (worker, task) =>
 
 test('list_workers: git repositories only, with origin, visibility, branch and changes', async () => {
   const { text: list } = await controller('list_workers')
-  assert.match(list, /^\[workers=4 running=0 max=2\]/)
+  assert.match(list, /^\[workers=5 running=0 max=2\]/)
   assert.match(list, /^alpha: acme\/alpha, private, branch main, clean, idle$/m)
   assert.match(list, /^beta-public: acme\/beta-public, public, branch main, clean, idle$/m)
   assert.match(list, /^gamma: no remote, branch main, clean, idle$/m)
   assert.match(list, /^dirty: acme\/dirty, private, branch main, 1 uncommitted file, idle$/m)
+  assert.match(list, /^delta: acme\/delta-direct, private, pull requests off: pushes to main, branch main, clean, idle$/m)
   assert.doesNotMatch(list, /not-a-repo/)
 })
 
@@ -320,6 +330,29 @@ test('on this computer there are no access levels, and a direct push is refused'
   assert.doesNotMatch(lastCall().input, /Access level|Direct push/)
 })
 
+test('pull requests turned off on GitHub: the worker commits on the default branch and pushes there', async () => {
+  const run = await dispatch('delta', 'Fix the typo in the README.')
+  assert.match(run.text, /^\[dispatch=started worker=delta task=t[a-z0-9]{3} session=new push=direct\] /)
+  await workerEvent('delta', run.id)
+  const call = lastCall()
+  assert.match(call.input, /^- Pull requests: turned off on GitHub\. Commit on main and push it there, without a pull request\.$/m)
+  const rules = arg(call, '--append-system-prompt')
+  assert.match(rules, /pull requests are turned off on GitHub for this repository/)
+  assert.match(rules, /push the default branch with git push, without a pull request/)
+  assert.doesNotMatch(rules, /gh pr create|voice\/<short-name>/)
+  // asking for it explicitly is no reason to refuse, there is no other way
+  const direct = await dispatch('delta', 'Push it.', { direct: true })
+  assert.match(direct.text, /dispatch=started.*push=direct/)
+  await workerEvent('delta', direct.id)
+
+  // with pull requests on, the rules stay as they were
+  const alpha = await dispatch('alpha', 'Fix the typo.')
+  assert.doesNotMatch(alpha.text, /push=direct/)
+  await workerEvent('alpha', alpha.id)
+  assert.match(arg(lastCall(), '--append-system-prompt'), /gh pr create --draft/)
+  assert.doesNotMatch(lastCall().input, /Pull requests: turned off/)
+})
+
 test('one run per repository, two at a time; stop ends a run without an event', async () => {
   const slow = await dispatch('alpha', 'SLOW: run everything.')
   assert.match(slow.text, /dispatch=started/)
@@ -350,7 +383,7 @@ test('a failed run reports what went wrong', async () => {
 test('unknown repositories and missing arguments are errors', async () => {
   const unknown = await controller('dispatch', { worker: 'nope', task: 'x', words: 'x' })
   assert.equal(unknown.isError, true)
-  assert.match(unknown.text, /Known: alpha, beta-public, dirty, gamma/)
+  assert.match(unknown.text, /Known: alpha, beta-public, delta, dirty, gamma/)
   assert.equal((await controller('dispatch', { worker: 'alpha', task: ' ', words: 'x' })).isError, true)
   assert.equal((await controller('worker_status', {})).isError, true)
 })

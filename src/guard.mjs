@@ -2,7 +2,9 @@
 // them, whatever the instructions say. A violation trips the kill switch.
 //
 //   default branch  a push to the repository's default branch, or a merge,
-//                   that was not an explicit direct dispatch at level full.
+//                   that was not an explicit direct dispatch at level full,
+//                   in a repository with pull requests turned on (without
+//                   them, the default branch is where workers push).
 //                   In the run's commands: git push with the default branch
 //                   (or --all, --mirror) as target, and gh pr merge. On GitHub,
 //                   with gh: the default branch moved during the run, and the
@@ -95,7 +97,7 @@ export class RunGuard {
       dir: task.dir ?? this.runner.dir(task.repo),
       slug: task.slug ?? null,
       branch: task.defaultBranch ?? null,
-      direct: Boolean(task.direct) && task.access === 'full',
+      direct: (Boolean(task.direct) && task.access === 'full') || Boolean(task.pushDirect),
       startedAt: task.startedAt,
       head: null,
       edits: 0,
