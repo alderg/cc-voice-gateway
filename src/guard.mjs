@@ -17,7 +17,7 @@
 //                   committed.
 //
 // The rules observe the run; they cannot stop its first step. What they miss
-// is in the README ("Kill switch"): targets hidden in variables, scripts or
+// is in the README ("Limits"): targets hidden in variables, scripts or
 // other languages, and on GitHub anything gh cannot see. In the Docker setup,
 // git runs only in the container (runner.git); never on this computer in the
 // mounted folder.

@@ -2,7 +2,7 @@
 # computer. The repositories come from a host folder mounted at /repos, and
 # the container runs as your own user id, so their files stay yours. The
 # gateway runs workers in it with docker exec when VOICE_GW_DOCKER names the
-# container. See the README, "Workers in Docker".
+# container. See the README, "Workers: on this computer or in Docker".
 #
 #   docker build -t cc-voice-worker \
 #     --build-arg UID="$(id -u)" --build-arg GID="$(id -g)" docker/

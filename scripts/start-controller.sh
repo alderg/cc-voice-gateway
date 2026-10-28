@@ -31,7 +31,7 @@
 # good. One watchdog at a time. Restarts go to the gateway's log, and to
 # Telegram if .secrets/telegram_token and .secrets/telegram_chat_id exist.
 # With the development flag, a restart waits for the warning to be answered at
-# the terminal; see the README, "Keeping the controller running". The
+# the terminal; see the README, "The watchdog". The
 # controller can also ask for a restart (restart_controller, src/restart.mjs):
 # that one starts again at once and does not count as a crash.
 #
