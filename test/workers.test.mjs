@@ -299,6 +299,17 @@ test('uncommitted changes need the driver to say yes first', async () => {
   assert.match(lastCall().input, /Uncommitted files before you start: notes\.txt \(not yours, leave them alone\)/)
 })
 
+test('on this computer there are no access levels, and a direct push is refused', async () => {
+  const before = calls().length
+  const refused = await dispatch('alpha', 'Push it straight to main.', { direct: true })
+  assert.match(refused.text, /^\[dispatch=refused worker=alpha\] Direct pushes need workers in Docker with access level full\./)
+  assert.equal(calls().length, before, 'nothing started')
+  const run = await dispatch('gamma', 'Fix the typo.')
+  assert.doesNotMatch(run.text, /access=/)
+  await workerEvent('gamma', run.id)
+  assert.doesNotMatch(lastCall().input, /Access level|Direct push/)
+})
+
 test('one run per repository, two at a time; stop ends a run without an event', async () => {
   const slow = await dispatch('alpha', 'SLOW: run everything.')
   assert.match(slow.text, /dispatch=started/)

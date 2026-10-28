@@ -72,6 +72,9 @@ gateway starts `claude -p` in that checkout, without approvals:
 - **The result** goes to the controller as a channel event. The controller summarises it, and its
   answer reaches you as news with the next call.
 - **Restarts:** runs are detached and survive a controller restart; the new gateway picks them up.
+- **Optionally in Docker:** the workers run in a container that holds only clones of your
+  repositories and Claude Code. The GitHub token you give it sets what they may do: keep everything
+  local, open pull requests, or also push to main. See [Workers in Docker](#workers-in-docker).
 
 ![States](docs/states.drawio.svg)
 
@@ -85,6 +88,8 @@ gateway starts `claude -p` in that checkout, without approvals:
 - The Claude app on a paid plan, for custom connectors. The connector's Claude account does not
   have to be the one that runs Claude Code.
 - For workers: git, and the GitHub CLI `gh`, logged in, for pushing and pull requests.
+- Optional, for [workers in Docker](#workers-in-docker): Docker. The container brings its own
+  git, `gh` and Claude Code.
 
 ## Setup
 
@@ -213,6 +218,7 @@ Name the repository as its folder is called; the controller matches loosely ("dr
 | "Tell it to add a test for that too." | Follow-up in the same worker session, on the same branch |
 | "Yes, publish it." | Answer to a worker's question, for example before pushing a public repository |
 | "Stop the drawio-mcp worker." | `stop_worker` |
+| "Push it straight to main." | Only for [workers in Docker](#workers-in-docker) at access level `full`: `dispatch` with `direct`. Otherwise the controller says why it stays a pull request |
 
 If a checkout has uncommitted changes, the controller asks first whether the worker should go
 ahead; a worker never commits, stashes or discards changes it did not make. Workers change files
@@ -261,6 +267,166 @@ gateway at all, and how far it got.
 `npm test` plays both ends without Claude Code or a phone: Claude Code (channel events, `reply`,
 approval prompts) and the voice assistant, including the whole sign-in.
 
+## Workers in Docker
+
+Optional. Without it, workers run in your checkouts on this computer, as described above. With
+it, they run in a container that holds only clones of your repositories and Claude Code: no access
+to your files, your SSH keys or your `gh` login. The gateway stays on this computer and starts
+every git command and every run in the container with `docker exec`.
+
+![Workers in Docker](docs/docker.drawio.svg)
+
+### Access levels
+
+What workers in the container may do with a repository depends on the GitHub token you give the
+container. The gateway checks it for each repository and tells the worker and the controller;
+`list_workers` shows the level and why, for example `access pr (main is protected by a ruleset)`.
+
+| Level | Token | Default branch | What workers do |
+|---|---|---|---|
+| `read-only` | none, or one that cannot push or open pull requests | any | Commit on a local `voice/` branch, worktrees too. Never push, never open a pull request; they report the local branch and commit |
+| `pr` | can push (Contents) and open pull requests | protected by a ruleset or branch protection | Push a `voice/` branch and open a draft pull request, so that GitHub's reviews run |
+| `full` | as `pr` | not protected | A draft pull request too, by default. A direct push to the default branch only when you explicitly ask for it ("push it straight to main") |
+
+On public repositories, workers ask before every push, at every level.
+
+**How the gateway decides**, per repository: no token or no GitHub remote: `read-only`. Otherwise
+it asks the GitHub API whether your account may push, then sends two write requests without
+content (create a branch, open a pull request). GitHub answers them with "invalid request" if the
+token may write, and with "forbidden" if not; neither creates anything. If both may write, it
+looks at the default branch: protected by branch protection, or by a ruleset that requires pull
+requests, status checks or a merge queue, or restricts updates, means `pr`; otherwise `full`. Whatever it
+cannot tell counts as the lower level. It reads the token at every check and keeps each result for
+ten minutes. `VOICE_GW_ACCESS=read-only`, `pr` or `full` sets one level for every repository
+instead.
+
+### Set it up
+
+1. **Build the image** (Debian, Node 22, git, `gh`, Claude Code):
+
+   ```bash
+   docker build -t cc-voice-worker docker/
+   ```
+
+   `--build-arg CLAUDE_CODE_VERSION=<version>` pins Claude Code; rebuild to update it.
+
+2. **Store the container's secrets** in `.secrets/worker/`, which the container mounts read-only.
+   Claude Code's login comes from a long-lived token: run `claude setup-token` on this computer and
+   paste the token. The GitHub token is optional; see the next section for which one.
+
+   ```bash
+   mkdir -p -m 700 .secrets/worker
+   (umask 077; read -rsp 'Claude token: ' t; printf '%s' "$t" > .secrets/worker/claude_token)
+   (umask 077; read -rsp 'GitHub token: ' t; printf '%s' "$t" > .secrets/worker/github_token)
+   ```
+
+   The container's user has user id 1000. If `id -u` shows another number, make the files
+   readable for it: `chmod 755 .secrets/worker && chmod 644 .secrets/worker/*`. Other users on
+   this computer still cannot reach them, because `.secrets/` stays mode 0700.
+
+3. **Start the container**, from this folder:
+
+   ```bash
+   docker run -d --name voice-workers --init --restart unless-stopped \
+     -v voice-repos:/repos -v voice-home:/home/node \
+     -v "$PWD/.secrets/worker:/run/secrets/voice:ro" \
+     cc-voice-worker
+   ```
+
+   `voice-repos` holds the clones, `voice-home` Claude Code's settings and sessions, so that
+   follow-ups continue. The tokens never become part of the container's configuration: the
+   gateway's `voice-run` hands them to each run, and git gets the GitHub token from a credential
+   helper. Docker installed as a snap cannot mount folders from `/tmp`; this folder is fine.
+
+4. **Clone the repositories** the workers should see, and tell git who commits:
+
+   ```bash
+   docker exec voice-workers git clone https://github.com/<owner>/<repo>.git /repos/<repo>
+   docker exec voice-workers git config --global user.name "Your Name"
+   docker exec voice-workers git config --global user.email "you@example.com"
+   ```
+
+   Use `https://` addresses; the container has no SSH keys. Private repositories need a token
+   that can read them, even at level `read-only`.
+
+5. **Point the gateway at the container** in `controller/.mcp.json`, then restart the controller:
+
+   ```json
+   "env": { "VOICE_GW_DOCKER": "voice-workers" }
+   ```
+
+   The log shows `workers run in the Docker container voice-workers`, and "Which repositories can
+   you work in?" lists the clones with their access levels. Remove the variable and restart to go
+   back to workers on this computer.
+
+**Getting changes out at level `read-only`:** look at them with
+`docker exec voice-workers git -C /repos/<repo> log -p voice/<name>`, or fetch the branch into
+your own checkout through a bundle:
+
+```bash
+docker exec voice-workers git -C /repos/<repo> bundle create - voice/<name> > /tmp/voice.bundle
+git fetch /tmp/voice.bundle voice/<name>:voice/<name>
+```
+
+### GitHub tokens for each level
+
+Create tokens under GitHub → Settings → Developer settings → Personal access tokens. Fine-grained
+tokens are limited to the repositories and permissions you pick; prefer them. A classic token
+applies to every repository your account can reach. If an organisation owns the repositories,
+choose it as resource owner; it may have to allow or approve fine-grained tokens first.
+
+**Level `read-only`:**
+
+- Public repositories only: no token. Leave out `.secrets/worker/github_token`.
+- Private repositories: a fine-grained token.
+  1. Fine-grained tokens → Generate new token. Give it a name and an expiration.
+  2. Resource owner: your account, or the organisation that owns the repositories.
+  3. Repository access: Only select repositories, and pick the ones you clone.
+  4. Repository permissions: Contents: Read-only. Metadata: Read-only is added by itself. Nothing
+     else.
+  5. Generate the token and store it as `.secrets/worker/github_token`.
+- Not with a classic token: its only scope for private repositories, `repo`, can also write.
+
+**Level `pr`:** a token that can push and open pull requests, and a protected default branch.
+
+1. Fine-grained token as above, with these repository permissions: Contents: Read and write, Pull
+   requests: Read and write. Add Workflows: Read and write only if workers should change files in
+   `.github/workflows`.
+   A classic token with the `repo` scope (and `workflow` for workflow files) works too, but for
+   all your repositories at once.
+2. Protect the default branch in each repository, with a ruleset or with branch protection.
+
+   **Ruleset:** the repository's Settings → Rules → Rulesets → New ruleset → New branch ruleset.
+   1. Ruleset name, for example "Protect main"; Enforcement status: Active.
+   2. Bypass list: leave it empty. A bypass for you or for the admin role would also let your
+      token push to main.
+   3. Target branches: Add target → Include default branch.
+   4. Rules: Restrict deletions, Require a pull request before merging, Block force pushes. Add
+      required approvals or status checks as you like.
+   5. Create.
+
+   **Branch protection:** the repository's Settings → Branches → Add classic branch protection
+   rule.
+   1. Branch name pattern: `main`.
+   2. Require a pull request before merging.
+   3. Do not allow bypassing the above settings; otherwise admins, and their tokens, can still
+      push.
+   4. Create.
+
+   Rulesets and branch protection on private repositories need GitHub Pro, Team or Enterprise.
+   Without them a private repository's main cannot be protected and counts as `full`;
+   `VOICE_GW_ACCESS=pr` keeps workers to pull requests anyway, by their rules.
+3. Check: `list_workers` shows `access pr (main is protected by a ruleset)` or
+   `(… by branch protection)`.
+
+**Level `full`:** the same token as for `pr`, and a default branch without a ruleset or branch
+protection that requires pull requests. Rules that only block force pushes or deletions leave
+main open. Workers still open a draft pull request unless you explicitly ask for a direct push.
+
+**Levels are limits only as far as the token goes.** With a write token, a worker at
+`read-only` (for example by `VOICE_GW_ACCESS`) could still push; its rules forbid it. To be sure
+nothing leaves the container, give it no write token.
+
 ## Security
 
 - **Only signed-in clients get in.** Signing in needs a pairing code from this computer: eight
@@ -284,6 +450,10 @@ approval prompts) and the voice assistant, including the whole sign-in.
   - A run stops after 60 minutes, and at most two run at a time.
   - Everything else, such as staying on a `voice/` branch or never force-pushing, is in the
     worker's instructions: rules, not limits.
+- **Workers in Docker** see only their clones, the container's tokens and the network. They do
+  not reach your files, SSH keys or `gh` login, and a level is only as strict as the token
+  (see [Access levels](#access-levels)). Whoever controls the gateway can control Docker, which
+  on Linux is as good as root.
 - **The endpoint is public.** Anyone on the internet can reach the sign-in page. A certificate from
   a public authority, Tailscale Funnel's included, also publishes the host name in the certificate
   transparency logs.
@@ -343,8 +513,13 @@ Claude Code starts the gateway, so environment variables go into `controller/.mc
 | `VOICE_GW_WORKER_ROOT` | the folder holding this repository | every git repository directly in it has a worker |
 | `VOICE_GW_MAX_WORKERS` | `2` | runs at the same time |
 | `VOICE_GW_WORKER_TIMEOUT` | `60` | minutes before a run is stopped |
+| `VOICE_GW_DOCKER` | empty | name of the [worker container](#workers-in-docker); empty: workers run on this computer |
+| `VOICE_GW_DOCKER_REPOS` | `/repos` | where the clones are inside the container |
+| `VOICE_GW_DOCKER_BIN` | `docker` | the Docker CLI |
+| `VOICE_GW_ACCESS` | empty | `read-only`, `pr` or `full` for every repository in the container; empty: [detected](#access-levels) from the token |
+| `VOICE_GW_GITHUB_API` | `https://api.github.com` | GitHub API for the level check; the tests point it at a stand-in |
 | `VOICE_GW_STATE_DIR` | `.state` | worker state and the output of every run |
-| `VOICE_GW_CLAUDE_BIN` | `claude` | the Claude Code command for workers |
+| `VOICE_GW_CLAUDE_BIN` | `claude` | the Claude Code command for workers; with Docker, inside the container |
 | `VOICE_GW_GH_BIN` | `gh` | the GitHub CLI, used to tell public from private repositories |
 | `FUNNEL_PORT` | `443` | for `scripts/funnel.sh` only; keep 443 for Claude |
 
@@ -370,6 +545,11 @@ Claude Code starts the gateway, so environment variables go into `controller/.mc
 | A worker fails at once | `could not start claude`: Claude Code is not on the gateway's `PATH`; set `VOICE_GW_CLAUDE_BIN`. Otherwise read `.state/tasks/<task>.err`. |
 | What did a worker do? | `.state/tasks/<task>.jsonl` holds the whole run. `claude --resume <session>` in the repository opens the session; `.state/workers.json` lists the session ids. |
 | A private repository is handled like a public one | `gh` is not logged in or not on the `PATH`, so the visibility is unknown, and the worker asks before pushing to be safe. |
+| `The worker container voice-workers does not answer` | The container is stopped or was removed: `docker start voice-workers`, or start it as in [Workers in Docker](#workers-in-docker). |
+| `access read-only (no GitHub token)` although there is one | It must be `.secrets/worker/github_token`, readable for the gateway. A new token counts at the next check, within ten minutes. |
+| `access read-only (the token cannot see the repository (404))` | The token's repository access does not include it, or the organisation has not approved the token yet. |
+| `access full` where you expected `pr` | No ruleset or branch protection requires pull requests on the default branch, or the private repository's plan has none. Protect it, or set `VOICE_GW_ACCESS=pr`. |
+| A worker in Docker fails at once | Claude Code is not logged in: `.secrets/worker/claude_token` is missing or expired; run `claude setup-token` again. Otherwise read `.state/tasks/<task>.err`. |
 | No approval by voice | Expected for Bash, Write and Edit: they run without asking. For other tools: the session runs in auto or bypass mode, an allow rule covers the tool, or it is a trust or consent dialog, which is not relayed. Start the session with `scripts/start-controller.sh`. |
 
 Claude Code's debug log is at `~/.claude/debug/<session-id>.txt`.
@@ -383,11 +563,18 @@ src/
   voice.mjs          HTTP side: MCP tools for the voice assistant
   oauth.mjs          sign-in: OAuth metadata, registration, sign-in page, tokens
   workers.mjs        workers: find repositories, start and follow claude -p runs
+  runners.mjs        where workers run: this computer, or the Docker container
+  access.mjs         access levels in the container, from the GitHub token
   admin.mjs          Unix socket for pair.mjs and fake-voice
   store.mjs          requests, approvals, waiting for changes
   http.mjs           small HTTP helpers
   config.mjs         environment variables
   log.mjs            log to stderr and file, never to stdout
+docker/
+  Dockerfile         the worker container: clones and Claude Code
+  voice-run          starts a run with its tokens, in its own process group
+  voice-stop         ends a run with everything it started
+  git-credential-voice   the GitHub token for git
 controller/
   .mcp.json          starts the gateway as server "voice"
   .claude/settings.json   allow and deny rules, confine hook
@@ -404,6 +591,7 @@ test/
   e2e.test.mjs       both sides end to end, without Claude Code
   oauth.test.mjs     the sign-in as Claude's connector goes through it
   workers.test.mjs   workers with a stand-in for claude and gh
+  docker.test.mjs    workers in the container and access levels, with stand-ins for docker and GitHub
   controller.test.mjs   launcher flags, controller settings, confine hook
 docs/
   *.drawio.svg       diagrams: an image on GitHub, editable in draw.io

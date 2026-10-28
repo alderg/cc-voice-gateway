@@ -7,7 +7,8 @@
 //   HTTP   -> voice assistant in the car (MCP tools: status, send, ask, get_reply, approve),
 //             behind an OAuth sign-in
 // plus a Unix socket for scripts/pair.mjs (pairing codes, connections), and the
-// workers: headless Claude Code runs in the repositories next to this one.
+// workers: headless Claude Code runs in the repositories next to this one, or
+// in a Docker container with its own clones.
 
 import { config } from './config.mjs'
 import { log } from './log.mjs'
@@ -17,11 +18,29 @@ import { startAdmin } from './admin.mjs'
 import { startChannel } from './channel.mjs'
 import { startVoiceHttp } from './voice.mjs'
 import { Workers } from './workers.mjs'
+import { DockerRunner, HostRunner } from './runners.mjs'
+import { ACCESS_LEVELS, GitHubAccess } from './access.mjs'
 
 const store = new Store({ permissionTtlSeconds: config.permissionTtlSeconds })
 const auth = new Auth({ stateFile: config.oauthStateFile, allowedHosts: config.oauthHosts })
+if (config.access && !ACCESS_LEVELS.includes(config.access)) {
+  log(`VOICE_GW_ACCESS=${config.access} is not one of ${ACCESS_LEVELS.join(', ')}; detecting the level instead`)
+}
+if (config.docker) {
+  log(
+    `workers run in the Docker container ${config.docker},`,
+    ACCESS_LEVELS.includes(config.access)
+      ? `access level ${config.access} (VOICE_GW_ACCESS)`
+      : 'access level per repository from the GitHub token',
+  )
+}
 const workers = new Workers({
-  root: config.workerRoot,
+  runner: config.docker
+    ? new DockerRunner({ container: config.docker, root: config.dockerRepos, dockerBin: config.dockerBin })
+    : new HostRunner(config.workerRoot),
+  access: config.docker
+    ? new GitHubAccess({ tokenFile: config.githubTokenFile, apiBase: config.githubApi, forced: config.access })
+    : null,
   stateDir: config.stateDir,
   claudeBin: config.claudeBin,
   ghBin: config.ghBin,
