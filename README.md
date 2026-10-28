@@ -370,7 +370,8 @@ and fails closed.
   run unconfined and without a prompt.
 - **Blocked, among others:** every other MCP server's tools, also those from plugins; subagents
   (Agent, Task), since it is not clear that the hook sees their calls; skills; web fetch and
-  search; MCP resources; `AskUserQuestion` and plan mode, since nobody can click a form in a voice conversation.
+  search; MCP resources; `AskUserQuestion` and plan mode, since nobody can click a form in a
+  voice conversation.
 - **Only the gateway as MCP server, with the development flag.** The start script passes
   `--strict-mcp-config --mcp-config controller/.mcp.json`, so no other MCP server starts.
 - **Not with the plugin.** `--strict-mcp-config` also drops plugins' MCP servers, the gateway's
