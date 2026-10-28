@@ -1,15 +1,15 @@
 # cc-voice-gateway
 
-Drive Claude Code by voice from the car. Claude's voice mode calls a custom MCP connector, and the
-connector hands the request to a Claude Code session running on your computer: the controller. It
-answers, asks back, and hands work in your repositories to workers: headless Claude Code runs that
-commit, push and open draft pull requests. You can speak any language.
+Control Claude Code by talking to Claude. In a voice conversation in the Claude app, on the phone
+or for example on CarPlay, Claude calls a custom MCP connector. The connector hands the request to
+a Claude Code session running on your computer: the controller. It answers, asks back, and hands
+work in your repositories to workers: headless Claude Code runs that commit, push and open draft
+pull requests. You can speak any language.
 
 Plain JavaScript (ESM), no build step. The only dependencies are `@modelcontextprotocol/sdk` and `zod`.
 
-> **Status:** works with Claude voice mode on the iPhone; CarPlay has not been tried yet. Workers
-> are built and tested with a stand-in for Claude Code, not yet from the car. Claude Code channels
-> are a research preview.
+> **Status:** works with Claude voice mode on the iPhone. Workers are built and tested with a
+> stand-in for Claude Code and with one real run. Claude Code channels are a research preview.
 
 ![Architecture](docs/architecture.drawio.svg)
 
@@ -24,8 +24,8 @@ tunnel or a reverse proxy, forwards to this port, because Claude calls connector
 cloud.
 
 **Who thinks:** the gateway is deliberately not an AI. It keeps state and relays. The controller
-session (Claude Code) understands, answers, summarises and asks back. The voice assistant runs the
-conversation in the car.
+session (Claude Code) understands, answers, summarises and asks back. The voice assistant, Claude
+in the app, runs the conversation with you.
 
 | Side | Tool | Purpose |
 |---|---|---|
@@ -54,11 +54,11 @@ that, Claude's servers call the tools with an access token. The URL holds no sec
 **Approvals:** the controller runs its few tools without asking (see [Security](#security)). If
 anything else asks for approval, Claude Code also sends the prompt to the channel, because the
 gateway declares `claude/channel/permission`. The voice assistant reads it out, and the first
-answer wins, whether it comes from the car or from the terminal ([channels reference][ref]).
+answer wins, whether it comes by voice or from the terminal ([channels reference][ref]).
 
-**Questions:** nobody can click a form (`AskUserQuestion`) in the car. `controller/CLAUDE.md`
-therefore asks for questions as plain text with `state: "question"`. The driver's answer arrives as
-a new request that refers to the original `id`.
+**Questions:** nobody can click a form (`AskUserQuestion`) in a voice conversation.
+`controller/CLAUDE.md` therefore asks for questions as plain text with `state: "question"`. Your
+answer arrives as a new request that refers to the original `id`.
 
 **Workers:** every git repository in the folder that holds this one (`~/Developer`) has a worker,
 named after its folder. The controller does no repository work itself. It calls `dispatch`, and the
@@ -70,7 +70,7 @@ gateway starts `claude -p` in that checkout, without approvals:
   it asks before pushing. At the end it switches the checkout back.
 - **Follow-ups** continue the same Claude session, so the worker keeps its context.
 - **The result** goes to the controller as a channel event. The controller summarises it, and its
-  answer reaches the driver as news with the next call.
+  answer reaches you as news with the next call.
 - **Restarts:** runs are detached and survive a controller restart; the new gateway picks them up.
 
 ![States](docs/states.drawio.svg)
@@ -187,7 +187,7 @@ being told.
 | Let it ask back | "Tell Claude Code to clean up the playground and to ask me first what may go." | The controller answers with a question, which the assistant reads out. Your answer ("Only the test files") goes back with `send` |
 | See what is going on | "What is Claude Code working on right now?" | `status`: open requests, pending approvals, when the controller last answered |
 | Answer an approval | "Allow." or "Deny." | `approve` with the code. Rare: only tools outside the allow list ask |
-| Something out of reach | "Ask Claude Code what is in my email." | The controller says in one sentence that this is not possible from the car |
+| Something out of reach | "Ask Claude Code what is in my email." | The controller says in one sentence that this is not possible |
 
 **Any language works.** Say the same things in German, French or any other language. The voice
 assistant passes your words to Claude Code unchanged, and the controller answers in the language
@@ -370,7 +370,7 @@ Claude Code starts the gateway, so environment variables go into `controller/.mc
 | A worker fails at once | `could not start claude`: Claude Code is not on the gateway's `PATH`; set `VOICE_GW_CLAUDE_BIN`. Otherwise read `.state/tasks/<task>.err`. |
 | What did a worker do? | `.state/tasks/<task>.jsonl` holds the whole run. `claude --resume <session>` in the repository opens the session; `.state/workers.json` lists the session ids. |
 | A private repository is handled like a public one | `gh` is not logged in or not on the `PATH`, so the visibility is unknown, and the worker asks before pushing to be safe. |
-| No approval in the car | Expected for Bash, Write and Edit: they run without asking. For other tools: the session runs in auto or bypass mode, an allow rule covers the tool, or it is a trust or consent dialog, which is not relayed. Start the session with `scripts/start-controller.sh`. |
+| No approval by voice | Expected for Bash, Write and Edit: they run without asking. For other tools: the session runs in auto or bypass mode, an allow rule covers the tool, or it is a trust or consent dialog, which is not relayed. Start the session with `scripts/start-controller.sh`. |
 
 Claude Code's debug log is at `~/.claude/debug/<session-id>.txt`.
 

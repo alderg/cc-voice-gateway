@@ -2,7 +2,7 @@
   "name": "cc-voice-gateway",
   "version": "0.1.0",
   "private": true,
-  "description": "Drive Claude Code by voice from the car: a custom MCP connector for Claude voice mode, relayed into a Claude Code session through a channel.",
+  "description": "Control Claude Code by talking to Claude: a custom MCP connector for Claude voice mode, relayed into a Claude Code session through a channel.",
   "type": "module",
   "engines": {
     "node": ">=20"
