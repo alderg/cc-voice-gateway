@@ -399,6 +399,20 @@ API error). `VOICE_GW_ACCESS=read-only|pr|full` sets one level for every reposit
 level is only as strict as the token: a worker forced to `read-only` with a write token could still
 push; only its rules forbid it.
 
+**The repository is pinned.** The level is detected for the GitHub repository that the clone's
+origin names, and the kill switch watches that one ([5.9](#59-the-kill-switch)). A worker in the
+container can change the origin, so the gateway keeps the repository it saw first for each clone,
+in `.state/workers.json` under `origins` ("no GitHub remote" counts too). If the origin later names
+another one:
+
+- `dispatch` answers `dispatch=origin` and starts nothing, also with `direct`.
+- `list_workers` shows `the origin changed in the container from acme/x to acme/y; check it at
+  the desk`.
+- At the desk, set the origin back in the container:
+  `docker exec voice-workers git -C /repos/x remote set-url origin <url>`. If you changed it
+  yourself, stop the controller (`scripts/start-controller.sh --stop`), remove the clone's line
+  under `origins`, and start it again.
+
 Creating tokens:
 
 | For | GitHub token |
@@ -475,14 +489,30 @@ controller following instructions.
 |---|---|---|
 | Voice | "Notstopp", "Not-Stopp", "Notfallstopp", "Nothalt", "Not-Aus", "emergency stop", "kill switch"; or the tool `emergency_stop` | In `send` and `ask` before anything reaches the controller: the message starts with the phrase, or has at most six words |
 | Telegram | `/stop` or a phrase | See 5.8 |
-| Rule: default branch | A push to the default branch, or a merge, without a direct dispatch at level `full`, in a repository with pull requests turned on | In the run's commands: `git push` to the default branch, `--all`, `--mirror`, `gh pr merge`. With `gh`, every `VOICE_GW_KILL_CHECK` seconds and at the end: the default branch moved on GitHub, and the worker's repository holds the new head |
+| Rule: default branch | A push to the default branch, or a merge, without a direct dispatch at level `full`, in a repository with pull requests turned on | In the run's commands: `git push` to the default branch, `--all`, `--mirror`, `gh pr merge`, and `gh api` calls that merge (`PUT …/pulls/<n>/merge`, `POST …/merges`, the GraphQL mutations `mergePullRequest`, `enablePullRequestAutoMerge`, `mergeBranch`). With `gh`, every `VOICE_GW_KILL_CHECK` seconds and at the end: the default branch moved on GitHub, and the worker's repository holds the new head, or the new head merged a pull request of the run (below) |
 | Rule: outside | Writes outside the repository, `/tmp`, `/var/tmp` (and the system's temp folder on this computer) and `VOICE_GW_KILL_ALLOW_PATHS` | The file tools by path. Shell commands by explicit targets: redirections, `tee`, `cp`, `mv`, `rm`, `mkdir`, `touch`, `ln`, `chmod`, `chown`, `truncate`, `sed -i`, `dd of=`, also after `cd`; `$HOME` and `~` are expanded |
 | Rule: many changes | More than 500 file edits in a run; at its end more than 300 files or 30,000 lines changed | Edits as they happen; at the end the commits made during the run plus what is not committed. `VOICE_GW_KILL_MAX_*` |
 | Controller | `raise_alarm` with a reason | One more signal, never the only one |
 
+**Whose merge it is.** A merge on GitHub makes a commit that the worker's repository does not
+have. So when the default branch moved to such a commit, the gateway asks
+`gh api repos/{owner}/{repo}/commits/{sha}/pulls` which pull request it merged. That merge counts
+as the run's when:
+
+- **the run pushed the pull request's branch:** named in a `git push`, or logged in the worker's
+  repository as a push since the run started (the reflog of `origin/<branch>`); or
+- **the pull request was opened during the run,** from a `voice/` branch.
+
+A pull request that was there before the run, and that the run did not push to, is not the run's:
+your merge at the desk of an earlier worker's pull request does not trip the switch. Your merge of
+the running worker's own pull request does, so wait until the run has ended. GitHub cannot tell
+who merged when you and the workers use the same account. Direct dispatches and repositories with
+pull requests turned off are exempt, as for pushes.
+
 **Effects**, at once:
 
-- **No new work:** `dispatch` answers `locked`; `send` and `ask` hand nothing over.
+- **No new work:** `dispatch` answers `locked`, also a dispatch whose checks were still running
+  when the switch tripped; `send` and `ask` hand nothing over.
 - **Approvals:** open ones are denied, new ones are denied automatically.
 - **Workers:** every run stops. With Docker the container stops and loses its restart policy.
   While locked, `scripts/start-workers-container.sh` mounts the folder read-only, and the gateway
@@ -515,6 +545,7 @@ unlock by voice, Telegram or the controller.
 | `.secrets/killswitch.json` | Kill switch state, present while locked | 0600 |
 | `.secrets/worker/claude_token`, `.secrets/worker/github_token` | The container's logins, mounted read-only into it | 0600, folder 0700 |
 | `.state/` | Worker state, run output, open requests, watched pull requests, the watchdog's lock | – |
+| `.state/tasks/`, `.state/workers.json` | Each run's output with every tool input and result; the workers' state | 0600, folder 0700 |
 | `.logs/gateway.log` | Log, without tokens | – |
 
 `.secrets/`, `.state/` and `.logs/` are ignored by git. The controller's confinement keeps it

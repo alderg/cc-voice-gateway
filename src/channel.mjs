@@ -207,6 +207,15 @@ function dispatchText(worker, result) {
           'try another way.',
         true,
       )
+    case 'origin': {
+      const { from, to } = result.facts.moved
+      return toolText(
+        `[dispatch=origin worker=${worker}] The origin of ${worker} changed in the container from ` +
+          `${from ?? 'no GitHub remote'} to ${to ?? 'no GitHub remote'}; check it at the desk. Nothing started. ` +
+          'Tell the driver; do not try another way.',
+        true,
+      )
+    }
     case 'refused': {
       const access = result.facts.access
       return toolText(

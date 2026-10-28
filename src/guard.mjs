@@ -6,9 +6,11 @@
 //                   in a repository with pull requests turned on (without
 //                   them, the default branch is where workers push).
 //                   In the run's commands: git push with the default branch
-//                   (or --all, --mirror) as target, and gh pr merge. On GitHub,
-//                   with gh: the default branch moved during the run, and the
-//                   worker's repository holds the new head.
+//                   (or --all, --mirror) as target, gh pr merge, and gh api
+//                   calls that merge (REST and GraphQL). On GitHub, with gh:
+//                   the default branch moved during the run, and the worker's
+//                   repository holds the new head, or the new head merged a
+//                   pull request of the run (mergedPull).
 //   outside         writes outside the repository and the temporary folders:
 //                   the file tools by their path, shell commands by explicit
 //                   targets (redirections, tee, cp, mv, rm, mkdir, touch, ln,
@@ -34,6 +36,15 @@ const DEVICES = ['/dev/null', '/dev/stdout', '/dev/stderr', '/dev/tty']
 const WRAPPERS = new Set(['sudo', 'command', 'exec', 'nohup', 'time', 'env', 'nice'])
 const short = sha => String(sha).slice(0, 7)
 
+// gh api options that take a value; -f and -F (fields) make it a POST.
+const GH_API_VALUES = new Set(['-H', '--header', '-q', '--jq', '-t', '--template', '--cache', '--hostname', '-p', '--preview'])
+const GH_API_FIELDS = new Set(['-f', '--raw-field', '-F', '--field', '--input'])
+// GraphQL mutations that merge, or merge later (auto-merge).
+const MERGE_MUTATIONS = /\b(mergePullRequest|enablePullRequestAutoMerge|mergeBranch)\b/
+// A pull request opened this long before the run's start counts as opened
+// during it: the clocks here and on GitHub differ a little.
+const CLOCK_SLACK_MS = 60 * 1000
+
 function gh(ghBin, args) {
   return new Promise(resolve => {
     execFile(ghBin, args, { timeout: 30000, env: { ...process.env, GH_PROMPT_DISABLED: '1' } }, (error, stdout) => {
@@ -53,6 +64,60 @@ const words = segment =>
 
 // Segments of a command line: && || ; | and new lines.
 const segments = command => String(command).split(/&&|\|\||;|\n|\|/).map(s => s.trim()).filter(Boolean)
+
+// git [-C dir] [-c key=value] push [options] [remote [refspec...]]: the
+// branches it names as targets, and whether it pushes all of them; null for
+// another git command.
+function pushTargets(args) {
+  let at = 0
+  while (at < args.length && args[at] !== 'push') at += ['-C', '-c'].includes(args[at]) ? 2 : 1
+  if (args[at] !== 'push') return null
+  const rest = args.slice(at + 1)
+  const positional = []
+  for (let i = 0; i < rest.length; i++) {
+    if (['--repo', '-o', '--push-option', '--receive-pack', '--exec'].includes(rest[i])) i++
+    else if (!rest[i].startsWith('-')) positional.push(rest[i])
+  }
+  return {
+    all: rest.includes('--all') || rest.includes('--mirror'),
+    branches: positional.slice(1).map(spec => spec.replace(/^\+/, '').split(':').pop().replace(/^refs\/heads\//, '')),
+  }
+}
+
+// gh api [options] <endpoint> [options]: the method and the endpoint, the
+// method as gh chooses it: GET, or POST once there are fields or an input.
+function ghApi(args) {
+  let method = null
+  let body = false
+  let endpoint = null
+  for (let i = 1; i < args.length; i++) {
+    const arg = args[i]
+    const inline = /^(?:-X=?|--method=)(.+)$/.exec(arg)
+    if (arg === '-X' || arg === '--method') method = args[++i] ?? null
+    else if (inline) method = inline[1]
+    else if (GH_API_FIELDS.has(arg)) {
+      body = true
+      i++
+    } else if (/^(?:-[fF].|--(?:raw-)?field=|--input=)/.test(arg)) body = true
+    else if (GH_API_VALUES.has(arg)) i++
+    else if (!arg.startsWith('-') && endpoint === null) endpoint = arg
+  }
+  return { method: String(method ?? (body ? 'POST' : 'GET')).toUpperCase(), endpoint: endpoint ?? '' }
+}
+
+// What a gh command merges, in a few words, or null. The whole command line
+// for GraphQL, whose query may span lines.
+function ghMerge(args, command) {
+  if (args[0] === 'pr' && args[1] === 'merge') return 'merges a pull request'
+  if (args[0] !== 'api') return null
+  const { method, endpoint } = ghApi(args)
+  const path = endpoint.replace(/[?#].*$/, '').replace(/\/+$/, '')
+  const mutation = MERGE_MUTATIONS.exec(command)?.[1]
+  if (/(?:^|\/)graphql$/.test(path) && mutation) return `merges through the GraphQL API (${mutation})`
+  if (method === 'PUT' && /(?:^|\/)repos\/[^/]+\/[^/]+\/pulls\/[^/]+\/merge$/.test(path)) return 'merges a pull request'
+  if (method === 'POST' && /(?:^|\/)repos\/[^/]+\/[^/]+\/merges$/.test(path)) return 'merges a branch'
+  return null
+}
 
 export class RunGuard {
   constructor({ workers, runner, killswitch, ghBin = 'gh', limits = {}, allowed = [], mainCheckSeconds = 30, log = defaultLog }) {
@@ -100,6 +165,7 @@ export class RunGuard {
       direct: (Boolean(task.direct) && task.access === 'full') || Boolean(task.pushDirect),
       startedAt: task.startedAt,
       head: null,
+      pushed: new Set(), // branches the run's git push commands name
       edits: 0,
       files: new Set(),
       tripped: new Set(),
@@ -165,19 +231,56 @@ export class RunGuard {
     run.checking = (async () => {
       const head = await this.head(run)
       if (!head || head === run.head) return
+      const moved = `${run.branch} on GitHub moved from ${short(run.head)} to ${short(head)} during the run`
       const local = await this.runner.git(run.dir, 'cat-file', '-e', `${head}^{commit}`)
       if (local !== null) {
-        this.violation(
-          run,
-          'push to the default branch',
-          `${run.branch} on GitHub moved from ${short(run.head)} to ${short(head)} during the run, and the worker's repository holds the new head`,
-        )
+        this.violation(run, 'push to the default branch', `${moved}, and the worker's repository holds the new head`)
+      } else {
+        // A merge on GitHub makes a commit the worker does not have.
+        const pull = await this.mergedPull(run, head)
+        if (pull) {
+          this.violation(run, 'push to the default branch', `${moved}: it merged pull request ${pull.number} from ${pull.branch}, ${pull.why}`)
+        }
       }
-      run.head = head // otherwise someone else pushed; that is the new baseline
+      run.head = head // otherwise someone else pushed or merged; that is the new baseline
     })().finally(() => {
       run.checking = null
     })
     return run.checking
+  }
+
+  // The pull request the new head merged into the default branch, if it is
+  // the run's: the run pushed its branch (named in a git push, or logged by
+  // the worker's repository since the run started), or it was opened during
+  // the run from a voice/ branch. Not the run's: a merge of a pull request
+  // that was there before the run and that the run did not push to, such as
+  // the driver's merge at the desk of an earlier worker's pull request.
+  async mergedPull(run, head) {
+    const pulls = await gh(this.ghBin, ['api', `repos/${run.slug}/commits/${head}/pulls`])
+    for (const pull of Array.isArray(pulls) ? pulls : []) {
+      const branch = pull?.head?.ref
+      if (!pull?.merged_at || pull.base?.ref !== run.branch || typeof branch !== 'string') continue
+      const from = pull.head.repo?.full_name
+      if (from && from.toLowerCase() !== run.slug.toLowerCase()) continue // from a fork
+      const found = { number: pull.number, branch }
+      if (run.pushed.has(branch) || (await this.pushedSince(run, branch))) return { ...found, why: 'which the run pushed' }
+      const opened = Date.parse(pull.created_at)
+      if (branch.startsWith('voice/') && opened >= run.startedAt - CLOCK_SLACK_MS) {
+        return { ...found, why: 'opened during the run' }
+      }
+    }
+    return null
+  }
+
+  // Whether the worker's repository logged a push to the branch since the run
+  // started: git push moves origin/<branch>, with "update by push".
+  async pushedSince(run, branch) {
+    const reflog = await this.runner.git(run.dir, 'reflog', 'show', '--date=unix', '--format=%gd %gs', `refs/remotes/origin/${branch}`)
+    const since = Math.floor(run.startedAt / 1000)
+    return (reflog ?? '').split('\n').some(line => {
+      const match = /@\{(\d+)\} update by push$/.exec(line.trim())
+      return Boolean(match) && Number(match[1]) >= since
+    })
   }
 
   shell(run, command) {
@@ -192,14 +295,17 @@ export class RunGuard {
         cwd = args[0] ? this.resolve(cwd, args[0]) : this.home
         continue
       }
-      if (name === 'git' && this.pushesDefault(run, args) && !run.direct) {
+      const push = name === 'git' ? pushTargets(args) : null
+      if (push && (push.all || push.branches.includes(run.branch ?? 'main')) && !run.direct) {
         this.violation(run, 'push to the default branch', `the command "${preview(segment, 120)}"`)
       }
-      // Whatever the command line says, GitHub has the last word, a moment later.
-      if (name === 'git' && args.includes('push')) setTimeout(() => this.checkHead(run), 5000).unref()
-      if (name === 'gh' && args[0] === 'pr' && args[1] === 'merge' && !run.direct) {
-        this.violation(run, 'push to the default branch', `the command "${preview(segment, 120)}" merges a pull request`)
+      if (push) {
+        for (const branch of push.branches) run.pushed.add(branch)
+        // Whatever the command line says, GitHub has the last word, a moment later.
+        setTimeout(() => this.checkHead(run), 5000).unref()
       }
+      const merge = name === 'gh' && !run.direct ? ghMerge(args, command) : null
+      if (merge) this.violation(run, 'push to the default branch', `the command "${preview(segment, 120)}" ${merge}`)
       for (const target of this.targets(segment, name, args)) {
         const path = cwd === null ? null : this.resolve(cwd, target)
         if (path && !this.allowed(run, path)) {
@@ -207,25 +313,6 @@ export class RunGuard {
         }
       }
     }
-  }
-
-  // git [-C dir] [-c key=value] push [options] [remote [refspec...]]
-  pushesDefault(run, args) {
-    let at = 0
-    while (at < args.length && args[at] !== 'push') at += ['-C', '-c'].includes(args[at]) ? 2 : 1
-    if (args[at] !== 'push') return false
-    const rest = args.slice(at + 1)
-    if (rest.includes('--all') || rest.includes('--mirror')) return true
-    const positional = []
-    for (let i = 0; i < rest.length; i++) {
-      if (['--repo', '-o', '--push-option', '--receive-pack', '--exec'].includes(rest[i])) i++
-      else if (!rest[i].startsWith('-')) positional.push(rest[i])
-    }
-    const branch = run.branch ?? 'main'
-    return positional.slice(1).some(spec => {
-      const target = spec.replace(/^\+/, '').split(':').pop().replace(/^refs\/heads\//, '')
-      return target === branch
-    })
   }
 
   // --- writes -------------------------------------------------------------------

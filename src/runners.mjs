@@ -20,7 +20,8 @@ function run(command, args, timeout) {
   })
 }
 
-function alive(pid) {
+// Whether a process still exists; EPERM means it does, as someone else's.
+export function alive(pid) {
   if (!pid) return false
   try {
     process.kill(pid, 0)

@@ -13,14 +13,17 @@
 // The gateway checks the checkout before a run (uncommitted files, a run
 // already going, the cap on parallel runs) in code, not in the worker's
 // instructions. What the worker does with git is up to its instructions.
+//
+// The run output holds every tool input and result, so .state/tasks and
+// .state/workers.json are for this user only (folders 0700, files 0600).
 
 import { execFile } from 'node:child_process'
 import { randomInt, randomUUID } from 'node:crypto'
 import { EventEmitter } from 'node:events'
-import { closeSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, closeSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { join, relative } from 'node:path'
 import { log, preview } from './log.mjs'
-import { HostRunner } from './runners.mjs'
+import { HostRunner, alive } from './runners.mjs'
 
 const POLL_MS = 1000
 const GITHUB_CACHE_MS = 10 * 60 * 1000 // what gh says about a repository
@@ -144,6 +147,7 @@ export function workerRules(level, { pushDirect = false } = {}) {
 }
 
 const plural = (n, unit) => `${n} ${unit}${n === 1 ? '' : 's'}`
+const originName = slug => slug ?? 'no GitHub remote'
 
 function duration(ms) {
   const seconds = Math.round(ms / 1000)
@@ -154,16 +158,6 @@ function duration(ms) {
 export function githubSlug(url) {
   const match = /github\.com[:/]([^/\s]+\/[^/\s]+?)(?:\.git)?\/?$/.exec(url ?? '')
   return match ? match[1] : null
-}
-
-function alive(pid) {
-  if (!pid) return false
-  try {
-    process.kill(pid, 0)
-    return true
-  } catch (error) {
-    return error.code === 'EPERM'
-  }
 }
 
 function workerEnv() {
@@ -217,19 +211,28 @@ export class Workers extends EventEmitter {
     this.starting = new Set() // repositories between the checks and the start
     this.followed = new Map() // task id -> { offset, partial }
     this.state = this.load()
+    // Also a folder an older version left with the default mode.
+    try {
+      chmodSync(this.tasksDir, 0o700)
+    } catch {
+      // not there before the first run
+    }
     this.timer = setInterval(() => this.poll(), POLL_MS)
     this.timer.unref()
   }
 
   // --- state --------------------------------------------------------------
 
+  // origins: in the container, the GitHub slug the gateway saw first per
+  // repository (pinOrigin), without a prototype, as the names are folder names.
   load() {
+    const origins = data => Object.assign(Object.create(null), data?.origins)
     try {
       const data = JSON.parse(readFileSync(this.stateFile, 'utf8'))
-      return { repos: data.repos ?? {}, tasks: data.tasks ?? [] }
+      return { repos: data.repos ?? {}, tasks: data.tasks ?? [], origins: origins(data) }
     } catch (error) {
       if (error.code !== 'ENOENT') log('worker state unreadable, starting empty:', error.message)
-      return { repos: {}, tasks: [] }
+      return { repos: {}, tasks: [], origins: origins(null) }
     }
   }
 
@@ -241,9 +244,9 @@ export class Workers extends EventEmitter {
       rmSync(old.errFile, { force: true })
     }
     this.state.tasks = this.state.tasks.filter((t, i, all) => t.state === 'running' || i >= all.length - KEEP_TASKS)
-    mkdirSync(this.stateDir, { recursive: true })
+    mkdirSync(this.stateDir, { recursive: true, mode: 0o700 })
     const tmp = `${this.stateFile}.${process.pid}.tmp`
-    writeFileSync(tmp, JSON.stringify(this.state, null, 2) + '\n')
+    writeFileSync(tmp, JSON.stringify(this.state, null, 2) + '\n', { mode: 0o600 })
     renameSync(tmp, this.stateFile)
   }
 
@@ -308,6 +311,26 @@ export class Workers extends EventEmitter {
     return info
   }
 
+  // In the container, a worker can change its clone's origin, and with it the
+  // repository that the access check and the kill switch's rules look at. So
+  // the GitHub slug the gateway saw first counts (null: no GitHub remote).
+  // Returns { from, to } while the origin says something else, otherwise null.
+  pinOrigin(name, slug) {
+    if (!this.runner.container) return null
+    const origins = this.state.origins
+    if (!Object.hasOwn(origins, name)) {
+      origins[name] = slug
+      try {
+        this.save()
+      } catch (error) {
+        log('worker state not saved:', error.message) // the pin holds in this gateway
+      }
+      return null
+    }
+    const pinned = origins[name]
+    return (pinned ?? '').toLowerCase() === (slug ?? '').toLowerCase() ? null : { from: pinned, to: slug }
+  }
+
   async inspect(name) {
     const dir = this.runner.dir(name)
     const [branch, status, originUrl] = await Promise.all([
@@ -316,7 +339,8 @@ export class Workers extends EventEmitter {
       this.runner.git(dir, 'remote', 'get-url', 'origin'),
     ])
     const origin = originUrl?.trim() || null
-    const slug = githubSlug(origin)
+    const moved = this.pinOrigin(name, githubSlug(origin))
+    const slug = moved ? moved.from : githubSlug(origin)
     const access = this.access ? await this.access.check(slug) : null
     // In the container the token's check knows it; otherwise gh on this computer.
     const github = origin && !access?.visibility ? await this.githubInfo(slug) : null
@@ -333,6 +357,7 @@ export class Workers extends EventEmitter {
       // In the container only at level full, which the check makes sure of.
       pushDirect: access ? access.level === 'full' && access.pulls === false : github?.pulls === false,
       access, // { level, reason, ... } in the container, null on this computer
+      moved, // { from, to } when the origin in the container changed (pinOrigin)
     }
   }
 
@@ -350,6 +375,10 @@ export class Workers extends EventEmitter {
     this.starting.add(worker)
     try {
       const facts = await this.inspect(worker)
+      // The checks take a while (git, gh, the GitHub API), and the kill switch
+      // stops only runs that are already going.
+      if (this.killswitch?.locked) return { status: 'locked', state: this.killswitch.state }
+      if (facts.moved) return { status: 'origin', facts }
       // A push to the default branch only at level full, and only when asked;
       // or where pull requests are turned off, where it is the only way.
       if (direct && !facts.pushDirect && facts.access?.level !== 'full') return { status: 'refused', facts }
@@ -361,14 +390,15 @@ export class Workers extends EventEmitter {
   }
 
   start(facts, { task, words, fresh, direct = false }) {
+    if (this.killswitch?.locked) return { status: 'locked', state: this.killswitch.state }
     const previous = fresh ? null : this.state.repos[facts.name]?.sessionId
     const sessionId = previous || randomUUID()
     const id = this.newTaskId()
-    mkdirSync(this.tasksDir, { recursive: true })
+    mkdirSync(this.tasksDir, { recursive: true, mode: 0o700 })
     const file = join(this.tasksDir, `${id}.jsonl`)
     const errFile = join(this.tasksDir, `${id}.err`)
-    const out = openSync(file, 'a')
-    const err = openSync(errFile, 'a')
+    const out = openSync(file, 'a', 0o600)
+    const err = openSync(errFile, 'a', 0o600)
     const args = [
       '-p',
       '--output-format', 'stream-json',
@@ -439,14 +469,23 @@ export class Workers extends EventEmitter {
   }
 
   // The kill switch: every run stops. The controller hears about it once,
-  // from the gateway, not per run.
+  // from the gateway, not per run. Every run gets its signal and is marked
+  // stopped before the state is saved; an error in saving comes after that.
   stopAll(reason) {
     const stopped = this.running()
     for (const task of stopped) {
       this.runner.stop(task)
       task.reported = true
-      this.finish(task, 'stopped', reason)
     }
+    let failed = null
+    for (const task of stopped) {
+      try {
+        this.finish(task, 'stopped', reason)
+      } catch (error) {
+        failed ??= error
+      }
+    }
+    if (failed) throw failed
     return stopped
   }
 
@@ -566,8 +605,13 @@ export class Workers extends EventEmitter {
       `[workers=${names.length} running=${this.running().length} max=${this.maxRuns}${container ? ` docker=${container}` : ''}]`,
     ]
     for (const f of facts) {
-      const where = f.origin ? `${f.origin}, ${f.visibility}` : 'no remote'
-      const access = f.access ? `, access ${f.access.level} (${f.access.reason})` : ''
+      const where = f.moved
+        ? `the origin changed in the container from ${originName(f.moved.from)} to ${originName(f.moved.to)}; ` +
+          'check it at the desk, no dispatch until then'
+        : f.origin
+          ? `${f.origin}, ${f.visibility}`
+          : 'no remote'
+      const access = f.access && !f.moved ? `, access ${f.access.level} (${f.access.reason})` : ''
       const direct = f.pushDirect && !f.access ? `, pull requests off: pushes to ${f.defaultBranch || 'the default branch'}` : ''
       const changes = f.dirty.length ? plural(f.dirty.length, 'uncommitted file') : 'clean'
       lines.push(`${f.name}: ${where}${access}${direct}, branch ${f.branch || 'detached'}, ${changes}, ${this.stateText(f.name)}`)
