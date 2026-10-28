@@ -267,17 +267,36 @@ to a lost phone or a leaked token.
 
 The controller runs without approvals for its few tools, since whoever can reach it could answer
 approvals anyway. Its limits are enforced by a PreToolUse hook, `controller/.claude/hooks/confine.mjs`.
-A hook that exits with code 2 blocks a call before any permission rule or prompt. The hook resolves
-symlinks and fails closed.
+A hook that exits with code 2 blocks a call before any permission rule or prompt. The hook sees
+every tool call (matcher `*`) and blocks every tool that is not on its list. It resolves symlinks
+and fails closed.
 
 | Tool | Allowed |
 |---|---|
+| The gateway's tools | `reply`, `list_workers`, `dispatch`, `worker_status`, `stop_worker`, `restart_controller`, `raise_alarm`, as `mcp__voice__…` and `mcp__plugin_voice_voice__…` |
+| ToolSearch, TodoWrite, TaskCreate, TaskGet, TaskList, TaskUpdate | Always. They load deferred tools and keep the to-do list |
 | Read, Glob, Grep | Inside `controller/` |
 | Write, Edit, MultiEdit, NotebookEdit | Inside `controller/playground/` |
 | Bash | `ls` inside `controller/`; `sleep <seconds>`; `rm [-f]` with plain file names in `playground/`; the `gh` commands below |
 | `gh`, read-only | `gh pr view`, `list`, `checks`, `diff`, `status`; `gh run view`, `list`. Each needs `--repo owner/name` and only takes listed flags, for example `--json` with a plain field list, `--state`, `--limit`, `--author`, `--branch`, `--log`, `--log-failed` |
 | `gh pr merge` | `gh pr merge <number> --repo owner/name` with exactly one of `--squash`, `--merge`, `--rebase`, optionally `--delete-branch`. The hook answers "ask" |
+| Everything else | Blocked, with a reason for the controller |
 
+- **Why deny by default.** The controller keeps your user settings, because Claude Code needs them
+  for channels. So your plugins (with their skills and hooks), your allow rules and, in plugin
+  mode, your MCP servers load into it too. An MCP tool that your settings allow would otherwise
+  run unconfined and without a prompt.
+- **Blocked, among others:** every other MCP server's tools, also those from plugins; subagents
+  (Agent, Task), since it is not clear that the hook sees their calls; skills; web fetch and
+  search; MCP resources; `AskUserQuestion` and plan mode, since nobody can click a form in the car.
+- **Only the gateway as MCP server, with the development flag.** The start script passes
+  `--strict-mcp-config --mcp-config controller/.mcp.json`, so no other MCP server starts.
+- **Not with the plugin.** `--strict-mcp-config` also drops plugins' MCP servers, the gateway's
+  included (checked in Claude Code 2.1.284). In plugin mode your MCP servers start, and the hook
+  blocks their tools.
+- **No planted instructions.** The file tools and `rm` never touch files named `CLAUDE.md`,
+  `CLAUDE.local.md`, `AGENTS.md` or `.mcp.json`, or anything in a `.claude` folder, also in
+  `playground/`. Claude Code would read them as instructions or settings. Case does not matter.
 - **Blocked `gh` commands:** `gh auth` (prints the token), `gh api` (can write), `gh config`,
   `gh alias`, `gh extension`, every other subcommand that writes (checkout, edit, comment, review,
   close, ready, run rerun, cancel, delete, download), and `--web`, `--jq`, `--template`.
@@ -887,14 +906,19 @@ VOICE_GW_WATCHDOG=0 scripts/start-controller.sh # without the watchdog
     `--channels plugin:voice@cc-voice-gateway`, the plugin enabled for that session only and the
     project's own `voice` server switched off. The plugin's MCP server is `src/plugin.mjs`, which
     applies the env block of `controller/.mcp.json` and starts the gateway. Tool names become
-    `mcp__plugin_voice_voice__…`; `controller/.claude/settings.json` allows both forms.
-  - **development** otherwise: `--dangerously-load-development-channels server:voice`. Claude Code
-    asks at every start; answer at the terminal. `VOICE_GW_CHANNEL=plugin|development` overrides
-    the choice; `node scripts/channel-mode.mjs` shows it.
+    `mcp__plugin_voice_voice__…`; `controller/.claude/settings.json` and the confine hook allow
+    both forms. Your own MCP servers start too: `--strict-mcp-config` would also drop the plugin's
+    server. The confine hook blocks their tools.
+  - **development** otherwise: `--dangerously-load-development-channels server:voice`, with
+    `--strict-mcp-config --mcp-config controller/.mcp.json`. So the gateway is the only MCP server.
+    Claude Code asks at every start; answer at the terminal. `VOICE_GW_CHANNEL=plugin|development`
+    overrides the choice; `node scripts/channel-mode.mjs` shows it.
 
 Claude Code starts the gateway itself, from `controller/.mcp.json` or as the plugin's server, so
 the gateway lives and ends with the session. Do not drop the user settings with
-`--setting-sources`: Claude Code then reports channels as not enabled for the organisation.
+`--setting-sources`: Claude Code then reports channels as not enabled for the organisation. Your
+plugins, hooks and allow rules therefore load into the controller; the confine hook blocks every
+tool that is not on its list ([confinement](#53-the-controllers-confinement)).
 
 ### 8.2 The watchdog
 
@@ -1130,6 +1154,10 @@ do not set them.
 | No news about checks or reviews on a worker's pull request | The log says why: `gh is not logged in`, or `stopped watching pull request … : nothing automatic runs` (often a draft that bot reviewers skip), `merged`, `closed` or `time limit`. Only pull requests on `voice/` branches that a run linked to are watched. `.state/pulls.json` lists the watches. |
 | The controller cannot merge a pull request | A draft must be marked ready first (a task for the worker). Required reviews or checks, conflicts and other branch protection apply; `--admin` is blocked on purpose. With `VOICE_GW_PERMISSION_RELAY=0` the approval only appears at the terminal. |
 | The controller says a `gh` command was blocked | Only the commands in [The controller's confinement](#53-the-controllers-confinement) pass, each with `--repo owner/name` and flags as separate words. If it does not know about `gh` at all, restart the controller so that it reads the current `controller/CLAUDE.md`. |
+| The controller says a tool is blocked | Expected for every tool that is not on the confine hook's list ([confinement](#53-the-controllers-confinement)): MCP tools from your settings or plugins, subagents, skills, web access. Ask for it at the desk, or let a worker do it with `dispatch`. |
+| The controller says one of its own voice tools is blocked | The gateway has a tool that the hook does not know. Add its name to `GATEWAY_TOOLS` in `controller/.claude/hooks/confine.mjs` and to the allow rules in `controller/.claude/settings.json`, then restart the controller. |
+| The controller cannot write `CLAUDE.md`, `AGENTS.md`, `.mcp.json` or into a `.claude` folder | Expected, also in `playground/`: Claude Code would read them as instructions or settings. Choose another name. |
+| With the development flag, Claude Code refuses `--mcp-config` or `--strict-mcp-config` at the start | Your organisation's managed settings forbid it. `disableSideloadFlags`: use the plugin instead ([Admin steps](#74-admin-steps-for-team-and-enterprise)). "An enterprise MCP config is present": the organisation's `managed-mcp.json` decides which MCP servers run; ask its admin. |
 | The setup link says it is not valid or already used | The link works once, in one browser. Go on in that browser, or start `node scripts/setup.mjs` again for a new link. |
 | The setup page says "Too many wrong links" | Five wrong links from one address within ten minutes, or 30 in total, block every attempt for a while. Wait, or start the assistant again. |
 | The setup assistant does not start | `needs a terminal`: it shows its link only on a terminal, so run it directly, not with its output redirected. `cannot listen on …: EADDRINUSE`: choose another `--port`. |

@@ -50,7 +50,10 @@ Example: "The tests pass again, all 112 green. I replaced two outdated mocks."
 Work in this folder and create files only in `playground/`. This session is confined, and no
 approval can lift these limits:
 
-- File tools read only inside this folder and write only inside `playground/`.
+- Only the `voice` tools, the file tools, the shell commands below, ToolSearch and the to-do list
+  work. Every other tool is blocked: other MCP servers, subagents, skills.
+- File tools read only inside this folder and write only inside `playground/`, but never
+  `CLAUDE.md`, `AGENTS.md`, `.mcp.json` or anything in a `.claude` folder.
 - The shell runs only these commands: `ls` with folders in here (to look around), `sleep <seconds>`
   (to wait), `rm` or `rm -f` with plain file names in `playground/`, read-only `gh` commands
   about pull requests and runs, and `gh pr merge` after the driver's yes (see below). No quotes,
