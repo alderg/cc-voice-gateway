@@ -1121,7 +1121,6 @@ docs/
   *.drawio.svg       the diagrams, made with draw.io
   index.html         the product page (GitHub Pages, from this folder)
   assets/            the video, its poster, the README thumbnail, the dark architecture diagram
-  workers-plan.md    how workers came about
 video/               the video's sources: script.json (voiceover), slides.html (frames), build.mjs
 ```
 
