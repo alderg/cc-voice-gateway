@@ -95,7 +95,20 @@ function hook(tool_name, tool_input, cwd = CONTROLLER) {
   return spawnSync(process.execPath, [HOOK], { input, encoding: 'utf8' })
 }
 
-const allowed = (...args) => assert.equal(hook(...args).status, 0, JSON.stringify(args))
+const allowed = (...args) => {
+  const result = hook(...args)
+  assert.equal(result.status, 0, JSON.stringify(args))
+  assert.equal(result.stdout, '', 'runs without a permission decision of its own')
+}
+// Allowed only after an approval prompt, whatever the allow rules say.
+const asked = (...args) => {
+  const result = hook(...args)
+  assert.equal(result.status, 0, JSON.stringify(args))
+  const { hookSpecificOutput } = JSON.parse(result.stdout)
+  assert.equal(hookSpecificOutput.hookEventName, 'PreToolUse')
+  assert.equal(hookSpecificOutput.permissionDecision, 'ask', JSON.stringify(args))
+  return hookSpecificOutput.permissionDecisionReason
+}
 const blocked = (...args) => {
   const result = hook(...args)
   assert.equal(result.status, 2, JSON.stringify(args))
@@ -293,6 +306,67 @@ test('confine hook: read-only gh commands about pull requests and runs, always w
     // commas and @ only for gh
     'ls playground,..',
     'rm playground/@x',
+  ]) {
+    blocked('Bash', { command })
+  }
+})
+
+test('confine hook: gh pr merge in one strict form, and always only after an approval prompt', () => {
+  // Verified with Claude Code 2.1.310: with Bash allowed in the settings, a
+  // merge runs without asking if the hook stays silent; with "ask" from the
+  // hook it raises a permission prompt, and runs only once that is allowed.
+  assert.equal(
+    asked('Bash', { command: 'gh pr merge 3 --repo alderg/cc-voice-gateway --squash --delete-branch' }),
+    "Merge pull request 3 in alderg/cc-voice-gateway (squash, then delete its branch). Every merge needs the driver's approval.",
+  )
+  assert.match(asked('Bash', { command: 'gh pr merge 12 -R jgraph/drawio --merge' }), /^Merge pull request 12 in jgraph\/drawio \(merge commit\)\./)
+  assert.match(asked('Bash', { command: 'gh pr merge --rebase 7 --repo alderg/x' }), /\(rebase\)/)
+  asked('Bash', { command: 'gh pr merge 7 --delete-branch --repo alderg/x --squash' })
+
+  const merge = 'gh pr merge 3 --repo alderg/cc-voice-gateway'
+  for (const command of [
+    // past branch protection, later, or with a message
+    `${merge} --squash --admin`,
+    `${merge} --squash --auto`,
+    `${merge} --disable-auto`,
+    `${merge} --squash --body x`,
+    `${merge} --squash -b x`,
+    `${merge} --squash --subject x`,
+    `${merge} --squash -t x`,
+    `${merge} --squash --body-file playground/x`,
+    `${merge} --squash -F playground/x`,
+    `${merge} --squash --author-email x`,
+    `${merge} --squash -A x`,
+    `${merge} --squash --match-head-commit abc1234`,
+    // exactly one method, long forms only
+    merge,
+    `${merge} --delete-branch`,
+    `${merge} --squash --merge`,
+    `${merge} --squash --squash`,
+    `${merge} -s`,
+    `${merge} -m`,
+    `${merge} -r`,
+    `${merge} --squash -d`,
+    `${merge} --squash --delete-branch --delete-branch`,
+    `${merge} --squash=true`,
+    `${merge} --squash --yes`,
+    // a pull request number, one repository
+    'gh pr merge --repo alderg/cc-voice-gateway --squash',
+    'gh pr merge voice/controller-gh --repo alderg/cc-voice-gateway --squash',
+    'gh pr merge 3 4 --repo alderg/cc-voice-gateway --squash',
+    'gh pr merge 3 --squash',
+    'gh pr merge 3 --repo alderg/cc-voice-gateway --repo alderg/other --squash',
+    'gh pr merge 3 --repo alderg --squash',
+    'gh pr merge 3 --repo=alderg/cc-voice-gateway --squash',
+    'gh pr merge 3 --repo https://github.com/alderg/cc-voice-gateway --squash',
+    // shell syntax and other writes stay out
+    `${merge} --squash; gh auth token`,
+    `${merge} --squash && gh pr merge 4 --repo alderg/cc-voice-gateway --squash`,
+    `${merge} --squash | cat`,
+    `GH_TOKEN=x ${merge} --squash`,
+    `gh pr ready 3 --repo alderg/cc-voice-gateway`,
+    `gh pr close 3 --repo alderg/cc-voice-gateway`,
+    `gh pr review 3 --repo alderg/cc-voice-gateway --approve`,
   ]) {
     blocked('Bash', { command })
   }

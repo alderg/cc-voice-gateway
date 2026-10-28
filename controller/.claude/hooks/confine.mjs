@@ -4,8 +4,9 @@
 //   Read, Glob, Grep           only inside controller/
 //   Write, Edit, NotebookEdit  only inside controller/playground/
 //   Bash                       only `ls` inside controller/, `sleep <seconds>`,
-//                              `rm [-f] <files in playground/>` and read-only
-//                              `gh pr` and `gh run` commands with --repo
+//                              `rm [-f] <files in playground/>`, read-only
+//                              `gh pr` and `gh run` commands with --repo, and
+//                              `gh pr merge`, which always asks for approval
 //
 // Whoever knows the connector URL can also answer approval prompts, so an ask
 // rule is no protection against them; the settings let these tools run without
@@ -21,6 +22,9 @@
 // versions have no Glob or Grep tool, so `ls` is the only way to list a folder.
 // The gh commands answer status questions about pull requests, reviews and
 // checks; every subcommand, flag and value of them is on an allowlist too.
+// A merge is the one write: for it the hook answers "ask" instead of letting
+// it run, which overrides the settings' allow rule for Bash, so Claude Code
+// opens an approval prompt that the channel relays to the car.
 //
 // Fails closed: anything unexpected blocks the call.
 
@@ -37,14 +41,26 @@ const WRITE_TOOLS = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit'])
 
 const SHELL_RULE =
   'Shell commands are limited to `ls [-aAlhR1tSr] [folders here]`, `sleep <seconds>`, ' +
-  '`rm [-f] <files in playground/>` and read-only `gh pr view|list|checks|diff|status` and ' +
-  '`gh run view|list` with `--repo owner/name`, without quotes, wildcards, pipes or other shell syntax. ' +
+  '`rm [-f] <files in playground/>`, read-only `gh pr view|list|checks|diff|status` and ' +
+  '`gh run view|list` with `--repo owner/name`, and `gh pr merge <number> --repo owner/name ' +
+  '--squash|--merge|--rebase [--delete-branch]`, without quotes, wildcards, pipes or other shell syntax. ' +
   'gh takes plain flags only: no --web, --jq or --template, and `--json` with a comma-separated field ' +
   'list. Use ls and Read to look around.'
 
 function block(reason) {
   process.stderr.write(`${reason}\n`)
   process.exit(2)
+}
+
+// Lets the call go ahead only after an approval prompt, whatever the allow
+// rules say. The reason is shown with the prompt.
+function ask(reason) {
+  process.stdout.write(
+    JSON.stringify({
+      hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'ask', permissionDecisionReason: reason },
+    }),
+  )
+  process.exit(0)
 }
 
 const inside = (path, root) => path === root || path.startsWith(root + sep)
@@ -182,8 +198,35 @@ const GH = {
   },
 }
 
-// words: everything after "gh".
+const MERGE_METHODS = { '--squash': 'squash', '--merge': 'merge commit', '--rebase': 'rebase' }
+
+// gh pr merge <number> --repo owner/name --squash|--merge|--rebase [--delete-branch]
+// and nothing else: no --admin past branch protection, no --auto, no message
+// flags, no branch instead of a number. Returns what the approval prompt says.
+function checkMerge(words) {
+  let number = null
+  let repo = null
+  let method = null
+  let deleteBranch = false
+  for (let i = 2; i < words.length; i++) {
+    const word = words[i]
+    if (NUMBER.test(word) && number === null) number = word
+    else if ((word === '--repo' || word === '-R') && repo === null && REPO.test(words[i + 1] ?? '')) repo = words[++i]
+    else if (Object.hasOwn(MERGE_METHODS, word) && method === null) method = MERGE_METHODS[word]
+    else if (word === '--delete-branch' && !deleteBranch) deleteBranch = true
+    else return null
+  }
+  if (number === null || repo === null || method === null) return null
+  return (
+    `Merge pull request ${number} in ${repo} (${method}${deleteBranch ? ', then delete its branch' : ''}). ` +
+    'Every merge needs the driver\'s approval.'
+  )
+}
+
+// words: everything after "gh". Returns 'allow', or the reason for an
+// approval prompt (a merge), or false.
 function checkGh(words) {
+  if (words[0] === 'pr' && words[1] === 'merge') return checkMerge(words) ?? false
   const spec = GH[`${words[0]} ${words[1]}`]
   if (!spec) return false
   const flags = { ...REPO_FLAGS, ...spec.flags }
@@ -201,17 +244,21 @@ function checkGh(words) {
     if (value === undefined || !flags[word].test(value)) return false
     if (word in REPO_FLAGS) repo = true
   }
-  return repo
+  return repo && 'allow'
 }
 
 // Four command shapes, made of plain words: no quoting, variables, globbing,
 // redirection or chaining can hide in them. Commas (field lists) and @ (@me)
-// only for gh.
+// only for gh. Returns 'allow', the reason for an approval prompt, or false.
 function checkShell(command, base) {
   if (typeof command !== 'string' || !/^[A-Za-z0-9._/ ,@-]+$/.test(command)) return false
   const words = command.trim().split(/ +/)
   if (words[0] === 'gh') return checkGh(words.slice(1))
   if (/[,@]/.test(command)) return false
+  return checkLocal(words, base) && 'allow'
+}
+
+function checkLocal(words, base) {
   if (words[0] === 'sleep') return words.length === 2 && /^[0-9]{1,4}$/.test(words[1])
   if (words[0] === 'ls') {
     return words
@@ -243,7 +290,9 @@ const tool = event.tool_name
 const base = event.cwd || CONTROLLER
 
 if (tool === 'Bash') {
-  if (!checkShell(event.tool_input?.command, base)) block(`Blocked in the voice controller session. ${SHELL_RULE}`)
+  const decision = checkShell(event.tool_input?.command, base)
+  if (!decision) block(`Blocked in the voice controller session. ${SHELL_RULE}`)
+  if (decision !== 'allow') ask(decision)
   process.exit(0)
 }
 if (!READ_TOOLS.has(tool) && !WRITE_TOOLS.has(tool)) process.exit(0)

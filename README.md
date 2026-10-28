@@ -62,8 +62,9 @@ answer arrives as a new request that refers to the original `id`.
 
 **Workers:** every git repository in the folder that holds this one (`~/Developer`) has a worker,
 named after its folder. The controller does no repository work itself; it only answers status
-questions about pull requests, reviews and checks with read-only `gh` commands. For everything else
-it calls `dispatch`, and the gateway starts `claude -p` in that checkout, without approvals:
+questions about pull requests, reviews and checks with read-only `gh` commands, and merges pull
+requests when you ask, each one after your approval by voice. For everything else it calls
+`dispatch`, and the gateway starts `claude -p` in that checkout, without approvals:
 - **Before the run** the gateway checks for uncommitted changes, a run already going in that
   repository, and the limit of two runs at a time.
 - **During the run** the worker branches `voice/<name>` off the current branch, commits only its
@@ -213,6 +214,7 @@ Name the repository as its folder is called; the controller matches loosely ("dr
 | "Anything new from Claude Code?" | Results of workers that have finished since you last asked |
 | "Is anyone reviewing pull request 1 in cc-voice-gateway?" | The controller answers itself with `gh pr view` and `gh pr checks`, without a worker |
 | "Did the last CI run on main pass?" | `gh run list` and, for a failure, `gh run view --log-failed`; why it fails in the code is a task for the worker |
+| "Merge pull request 3 in cc-voice-gateway." | The controller asks back with the title and the merge method. After your yes it runs `gh pr merge`, which raises an approval: you confirm a second time, then hear the result |
 | "Tell it to add a test for that too." | Follow-up in the same worker session, on the same branch |
 | "Yes, publish it." | Answer to a worker's question, for example before pushing a public repository |
 | "Stop the drawio-mcp worker." | `stop_worker` |
@@ -303,23 +305,35 @@ approval prompts) and the voice assistant, including the whole sign-in.
     such as `--json` with a plain field list, `--state`, `--limit`, `--author`, `--branch`, and
     `--log` or `--log-failed` for runs. Everything else is blocked, in particular `gh auth` (it
     would print the token), `gh api` (it can write), `gh config`, `gh alias`, `gh extension`,
-    every subcommand that writes (checkout, merge, edit, comment, review, close, ready, rerun,
+    every other subcommand that writes (checkout, edit, comment, review, close, ready, rerun,
     cancel, delete, download), `--web`, `--jq` and `--template`. Read-only still means: the
     controller can read pull requests, diffs and CI logs of every repository your `gh` login can
     see, and tell them to whoever is signed in.
+  - The one write is `gh pr merge <number> --repo owner/name` with exactly one of `--squash`,
+    `--merge` or `--rebase`, and optionally `--delete-branch`. Blocked: `--admin` (past branch
+    protection), `--auto`, `--disable-auto`, `--match-head-commit`, the message options and branch
+    names instead of numbers. For an allowed merge the hook answers "ask" instead of letting it
+    run: that overrides the settings' allow rule for Bash, so Claude Code opens an approval prompt,
+    which the channel relays to the car. Verified with Claude Code 2.1.310: without the "ask" the
+    allow rule lets the merge run at once; with it, the merge runs only once the prompt is
+    allowed. `controller/CLAUDE.md` adds a spoken yes before the command, so every merge needs
+    two: first to the controller's question, then to the approval.
   - Denied: claude.ai connectors (Gmail, Slack, Drive, …), web fetch and search, messages to
     other Claude sessions, remote and scheduled agents, artifacts, Monitor, workflows and
     worktrees. Bypass and auto mode cannot be switched on.
-  - What is left: reading `controller/`, writing or deleting in the playground, and reading the
-    state of pull requests and runs on GitHub. The answers go back to the voice assistant.
+  - What is left: reading `controller/`, writing or deleting in the playground, reading the
+    state of pull requests and runs on GitHub, and merging pull requests after an approval. The
+    answers go back to the voice assistant.
   - Changes to the confinement, such as the `gh` commands, take effect after a controller
     restart: the session reads `controller/CLAUDE.md` and its settings when it starts.
   - The confinement keeps the controller to its job, talking and dispatching. It does not limit
     workers.
 - The gateway binds to `127.0.0.1` only.
-- Approval by voice means: whoever can call `approve` can approve tools. The voice assistant is
-  told to approve only after an explicit yes; that is an instruction, not enforcement. Turn it off
-  with `VOICE_GW_PERMISSION_RELAY=0`.
+- Approval by voice means: whoever can call `approve` can approve tools, merges included. The voice
+  assistant is told to approve only after an explicit yes; that is an instruction, not
+  enforcement. What the approval does guarantee: the controller cannot merge by itself, for
+  example because a pull request's text told it to. Turn it off with
+  `VOICE_GW_PERMISSION_RELAY=0`; then merges can only be approved at the terminal.
 - Claude Code masks recognisable credentials in relayed approval texts, but not every secret
   ([channels reference][ref]).
 - Start the controller only with `scripts/start-controller.sh`, never with
@@ -384,6 +398,7 @@ Claude Code starts the gateway, so environment variables go into `controller/.mc
 | A worker fails at once | `could not start claude`: Claude Code is not on the gateway's `PATH`; set `VOICE_GW_CLAUDE_BIN`. Otherwise read `.state/tasks/<task>.err`. |
 | What did a worker do? | `.state/tasks/<task>.jsonl` holds the whole run. `claude --resume <session>` in the repository opens the session; `.state/workers.json` lists the session ids. |
 | A private repository is handled like a public one | `gh` is not logged in or not on the `PATH`, so the visibility is unknown, and the worker asks before pushing to be safe. |
+| The controller cannot merge a pull request | A draft must be marked ready first (a task for the worker). Required reviews or checks, conflicts and other branch protection apply; `--admin` is blocked on purpose. With `VOICE_GW_PERMISSION_RELAY=0` the approval only appears at the terminal. |
 | The controller says a `gh` command was blocked | Only the read-only commands under [Security](#security) pass, each with `--repo owner/name` and flags as separate words. If it does not know about `gh` at all, restart the controller so that it reads the current `controller/CLAUDE.md`. |
 | No approval by voice | Expected for Bash, Write and Edit: they run without asking. For other tools: the session runs in auto or bypass mode, an allow rule covers the tool, or it is a trust or consent dialog, which is not relayed. Start the session with `scripts/start-controller.sh`. |
 
