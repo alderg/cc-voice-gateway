@@ -181,17 +181,19 @@ in its next turn, so one request at a time works best.
 
 ### Planned: talking to workers
 
-Not built yet; see [docs/workers-plan.md](docs/workers-plan.md). The controller will hand work to
-one headless Claude Code session per repository and report back:
+Not built yet; see [docs/workers-plan.md](docs/workers-plan.md). Every git repository in
+`~/Developer` becomes a worker, named after its folder. The controller hands work to a headless
+Claude Code run in that repository and reports back. A worker commits on a `voice/…` branch,
+pushes it and opens a draft pull request:
 
 | Example | What will happen |
 |---|---|
-| "Ask Claude Code which workers there are." | `list_workers`: names, what each is for, what each is doing |
-| "Tell the gateway worker to run the tests." | `dispatch` to the worker `gateway`; the controller confirms at once that it has started |
-| "What is the gateway worker doing?" | `worker_status`, summarised in one or two sentences |
+| "Ask Claude Code which repositories it can work in." | `list_workers`: names, branch, uncommitted changes, what each worker is doing |
+| "Tell the cc-voice-gateway worker to run the tests." | `dispatch`; the controller confirms at once that it has started |
+| "What is the cc-voice-gateway worker doing?" | `worker_status`, summarised in one or two sentences |
 | "Anything new from Claude Code?" | Results of workers that have finished since you last asked |
-| "Tell it to add a test for that too." | Follow-up in the same worker session |
-| "Stop the gateway worker." | `stop_worker` |
+| "Tell it to add a test for that too." | Follow-up in the same worker session, on the same branch |
+| "Stop the drawio-mcp worker." | `stop_worker` |
 
 ## Connections
 
