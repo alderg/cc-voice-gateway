@@ -217,7 +217,13 @@ export class Workers extends EventEmitter {
     } catch {
       // not there before the first run
     }
-    this.timer = setInterval(() => this.poll(), POLL_MS)
+    this.timer = setInterval(() => {
+      try {
+        this.poll()
+      } catch (error) {
+        log('following worker runs failed:', error.message) // for example .state not writable; the next poll tries again
+      }
+    }, POLL_MS)
     this.timer.unref()
   }
 
@@ -590,9 +596,17 @@ export class Workers extends EventEmitter {
     task.finishedAt = Date.now()
     task.error = error
     this.followed.delete(task.id)
-    this.save()
+    // The run has ended whether or not the state can be saved: the rules and
+    // the report hear about it first, then the caller about the save.
+    let unsaved = null
+    try {
+      this.save()
+    } catch (saveError) {
+      unsaved = saveError
+    }
     log(`worker ${state}`, task.repo, task.id, `after ${duration(task.finishedAt - task.startedAt)}`, error ? preview(error, 120) : '')
     this.emit('ended', task)
+    if (unsaved) throw unsaved
   }
 
   // --- texts for the controller -------------------------------------------
