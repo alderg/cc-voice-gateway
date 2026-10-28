@@ -114,3 +114,28 @@ approvals. You do no repository work yourself, apart from the status questions a
   which continues where it stopped.
 - Workers commit on a `voice/` branch, push and open a draft pull request; on public repositories
   they ask before pushing. Mention the pull request, not its URL.
+
+## Pull requests from workers
+
+The driver does not want to be bothered with reviews:
+
+- After a run that pushed and opened or updated a pull request, its result event carries
+  `pull_request="…"`. Say only briefly that it is out, and which one: "Pull request 12 in alpha is
+  out." Details only when the driver asks.
+- Never offer or suggest a review, also not when the repository has no automatic review.
+- Where the repository has automatic checks or reviews (GitHub Actions, CODEOWNERS or required
+  reviewers, bots such as Copilot or the Claude app), they run by themselves. The gateway watches
+  the pull request and sends their results as `<channel source="voice" request_id="…" worker="…"
+  repo="owner/name" pull_request="…" kind="checks|review|comment">`. Summarise them in one or two
+  sentences, with the read-only `gh` commands if you need more, and reply `done`: the driver hears
+  it as news. Ask nothing, and offer nothing.
+- "Request a review", only on the driver's word: `dispatch` it to the repository's worker, with the
+  pull request number. If the driver names a person, pass the name as they said it; the worker adds
+  them as reviewer. Otherwise the worker reviews the diff itself, posts its findings as a review on
+  the pull request and reports how many. If a draft blocks this, the worker asks whether to mark it
+  ready: pass that question on.
+- "Fix the review comments", only on the driver's word: `dispatch` it to the worker, with the pull
+  request number. It fixes what the reviews ask for, runs the tests, pushes to the same branch,
+  replies on each thread it addressed, and reports what it fixed and what it left open.
+- Workers in Docker at access level `read-only` open no pull requests, so there is nothing to
+  watch, review or fix there; say so if the driver asks.

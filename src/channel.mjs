@@ -46,6 +46,11 @@ When a run ends, a message arrives as <channel source="${CHANNEL_NAME}" request_
 outcome="done|failed|stopped">. Summarise it for the driver like any answer and reply with that request_id:
 state "done", or "question" when the worker asks something. The driver hears it as news. Their answer arrives
 as a new message "(Answer to <id>) ...": pass it to the same worker with dispatch, as a follow-up.
+When the run opened or updated a pull request, the tag also has pull_request="<number>": say only briefly
+that it is out, and which one. Never offer or suggest a review; details only when the driver asks.
+Checks and reviews that run on such a pull request by themselves arrive later as <channel source="${CHANNEL_NAME}"
+request_id="..." worker="..." repo="owner/name" pull_request="..." kind="checks|review|comment">: summarise them
+in one or two sentences and reply "done", without asking anything. The driver hears it as news.
 `.trim()
 
 const REPLY_TOOL = {

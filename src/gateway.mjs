@@ -6,8 +6,9 @@
 //   stdio  -> Claude Code controller session (a channel: push events, reply tool, permission relay)
 //   HTTP   -> voice assistant in the car (MCP tools: status, send, ask, get_reply, approve),
 //             behind an OAuth sign-in
-// plus a Unix socket for scripts/pair.mjs (pairing codes, connections), and the
-// workers: headless Claude Code runs in the repositories next to this one.
+// plus a Unix socket for scripts/pair.mjs (pairing codes, connections), the
+// workers: headless Claude Code runs in the repositories next to this one, and
+// a watch on the pull requests they open, for checks and reviews.
 
 import { config } from './config.mjs'
 import { log } from './log.mjs'
@@ -17,6 +18,7 @@ import { startAdmin } from './admin.mjs'
 import { startChannel } from './channel.mjs'
 import { startVoiceHttp } from './voice.mjs'
 import { Workers } from './workers.mjs'
+import { PullWatcher } from './pulls.mjs'
 
 const store = new Store({ permissionTtlSeconds: config.permissionTtlSeconds })
 const auth = new Auth({ stateFile: config.oauthStateFile, allowedHosts: config.oauthHosts })
@@ -29,6 +31,13 @@ const workers = new Workers({
   timeoutMinutes: config.workerTimeoutMinutes,
 })
 
+const pulls = new PullWatcher({
+  ghBin: config.ghBin,
+  stateFile: config.pullsStateFile,
+  pollSeconds: config.prPollSeconds,
+  watchHours: config.prWatchHours,
+})
+
 let http
 let admin
 let shuttingDown = false
@@ -39,6 +48,7 @@ function shutdown(reason) {
   http?.close()
   admin?.close()
   workers.close() // runs go on; the next gateway picks them up
+  pulls.close() // so do the watches on pull requests
   // Give pending log writes and HTTP responses a moment, then leave.
   setTimeout(() => process.exit(0), 200).unref()
 }
@@ -49,21 +59,45 @@ const channel = await startChannel(store, {
   onClose: () => shutdown('stdio closed'),
 })
 
-// When a run ends, its result goes to the controller as a channel event. The
-// controller's reply to it reaches the driver as news.
+// When a run ends, its result goes to the controller as a channel event, with
+// the pull requests it opened or worked on. The controller's reply to it
+// reaches the driver as news.
 const reporting = new Set()
 workers.on('finished', async task => {
   if (reporting.has(task.id)) return
   reporting.add(task.id)
   try {
     await channel.ready
-    const request = store.createRequest(workers.resultText(task), { origin: 'worker' })
-    await channel.push(request, { worker: task.repo, task: task.id, outcome: task.state })
+    const opened = await pulls.fromRun(task).catch(error => {
+      log('pull requests of', task.id, 'not checked:', error.message)
+      return []
+    })
+    const request = store.createRequest(workers.resultText(task, opened), { origin: 'worker' })
+    const meta = { worker: task.repo, task: task.id, outcome: task.state }
+    if (opened.length) meta.pull_request = opened.map(pull => pull.number).join(',')
+    await channel.push(request, meta)
     workers.markReported(task)
   } catch (error) {
     log('worker result not delivered:', error.message)
   } finally {
     reporting.delete(task.id)
+  }
+})
+
+// Checks and reviews on those pull requests reach the controller as events
+// too, and the driver as news.
+pulls.on('news', async news => {
+  try {
+    await channel.ready
+    const request = store.createRequest(news.text, { origin: 'worker' })
+    await channel.push(request, {
+      worker: news.worker,
+      repo: news.slug,
+      pull_request: String(news.number),
+      kind: news.kind,
+    })
+  } catch (error) {
+    log('pull request news not delivered:', error.message)
   }
 })
 

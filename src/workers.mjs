@@ -83,8 +83,18 @@ summarise your result for them. Nobody can answer you during the run.
 - At the end, switch back to the starting branch, so the checkout is as the driver left it.
 - Run the tests that cover your change. Tasks that change nothing, such as questions or test runs, need no
   branch.
+- Review requests, only when the task asks for one: if it names a person, add them as reviewer with
+  gh pr edit --add-reviewer. Otherwise review the pull request's diff yourself and post your findings as one
+  pull request review with gh api (event COMMENT, comments inline on the changed lines where possible, the
+  rest in the review body), and report how many findings you posted. If the pull request is a draft and that
+  blocks it, do not mark it ready yourself: end by asking whether to.
+- Review comments, only when the task asks to fix them: read the open review threads and review bodies (gh
+  pr view --comments, and gh api graphql for the unresolved reviewThreads), fix what they ask for, run the
+  tests, commit and push to the same branch, and reply in one sentence on each thread you addressed. Report
+  what you fixed and what you left open, and why.
 - End with at most three short sentences for the controller: the result first, then the branch or pull
-  request, then what is open. No code blocks, no lists.
+  request, with the pull request's URL if you opened or updated one, then what is open. No code blocks, no
+  lists.
 `.trim()
 
 const plural = (n, unit) => `${n} ${unit}${n === 1 ? '' : 's'}`
@@ -121,6 +131,14 @@ function workerEnv() {
   for (const name of SESSION_ENV) delete env[name]
   return env
 }
+
+// The text of a tool result: a string, or a list of text blocks.
+function resultContent(content) {
+  if (typeof content === 'string') return content
+  return Array.isArray(content) ? content.map(part => (typeof part?.text === 'string' ? part.text : '')).join('\n') : ''
+}
+
+const PULL_URL = /https:\/\/github\.com\/([\w.-]+\/[\w.-]+)\/pull\/(\d+)/gi
 
 function describeStep(name, input, dir) {
   const target = input?.file_path ?? input?.notebook_path ?? input?.path ?? input?.command ?? input?.pattern ?? input?.url
@@ -245,6 +263,7 @@ export class Workers extends EventEmitter {
     return {
       name,
       dir,
+      slug, // owner/repo on GitHub, or null
       branch: branch?.trim() ?? '',
       dirty: (status ?? '').split('\n').filter(Boolean).map(line => line.slice(3)),
       origin: slug ?? origin,
@@ -310,6 +329,8 @@ export class Workers extends EventEmitter {
       pid: child.pid ?? null,
       sessionId,
       resumed: Boolean(previous),
+      slug: facts.slug, // owner/repo on GitHub, or null
+      pulls: [], // numbers of this repository's pull requests the run named
       startedAt: Date.now(),
       finishedAt: null,
       file,
@@ -415,12 +436,30 @@ export class Workers extends EventEmitter {
           task.steps = [...task.steps, describeStep(part.name, part.input, join(this.root, task.repo))].slice(-MAX_STEPS)
         } else if (part.type === 'text' && part.text?.trim()) {
           task.lastText = preview(part.text, 300)
+          this.notePulls(task, part.text)
         }
+      }
+    } else if (message.type === 'user') {
+      for (const part of message.message?.content ?? []) {
+        if (part.type === 'tool_result') this.notePulls(task, resultContent(part.content))
       }
     } else if (message.type === 'result') {
       task.resultSeen = true
       task.isError = Boolean(message.is_error) || message.subtype !== 'success'
       task.result = String(message.result ?? message.subtype ?? '').trim()
+      this.notePulls(task, task.result)
+    }
+  }
+
+  // Pull requests of the run's own repository that it names by URL, for
+  // example in the output of gh pr create; pulls.mjs checks them with gh.
+  notePulls(task, text) {
+    if (!task.slug || !text) return
+    for (const [, slug, number] of text.matchAll(PULL_URL)) {
+      const pulls = task.pulls ?? []
+      if (slug.toLowerCase() === task.slug.toLowerCase() && !pulls.includes(Number(number))) {
+        task.pulls = [...pulls, Number(number)].slice(-5)
+      }
     }
   }
 
@@ -483,14 +522,18 @@ export class Workers extends EventEmitter {
     return lines.join('\n')
   }
 
-  // The channel event the controller gets when a run ends.
-  resultText(task) {
+  // The channel event the controller gets when a run ends, with the pull
+  // requests it opened or worked on, as gh shows them (pulls.mjs).
+  resultText(task, pulls = []) {
     const lines = [
       `Worker ${task.repo} finished task ${task.id}: ${task.state} after ${duration(task.finishedAt - task.startedAt)}.`,
       `Task: ${preview(task.task, 200)}`,
     ]
     if (task.result) lines.push(`Result: ${task.result}`)
     if (task.error && task.error !== task.result) lines.push(`Problem: ${task.error}`)
+    for (const pull of pulls) {
+      lines.push(`Pull request: ${pull.number} in ${task.slug}, "${preview(pull.title, 80)}"${pull.isDraft ? ', a draft' : ''}.`)
+    }
     return lines.join('\n')
   }
 }

@@ -209,7 +209,9 @@ Name the repository as its folder is called; the controller matches loosely ("dr
 |---|---|
 | "Ask Claude Code which repositories it can work in." | `list_workers`: names, branch, uncommitted changes, what each worker is doing |
 | "Ask the cc-voice-gateway worker whether the tests pass." | `dispatch`; the controller confirms at once that it is on its way, and the result follows as news |
-| "Tell the cc-voice-gateway worker to fix the typo in the README." | The worker commits on a `voice/` branch, pushes and opens a draft pull request |
+| "Tell the cc-voice-gateway worker to fix the typo in the README." | The worker commits on a `voice/` branch, pushes and opens a draft pull request; you hear only that it is out |
+| "Request a review for pull request 12 in alpha." | Only on your word: the worker reviews the diff itself and posts its findings as a review, or adds the person you name as reviewer |
+| "Fix the review comments on pull request 12." | Only on your word: the worker fixes them, runs the tests, pushes to the same branch, replies on each thread, and says what is left open |
 | "What is the cc-voice-gateway worker doing?" | `worker_status`, summarised in one or two sentences |
 | "Anything new from Claude Code?" | Results of workers that have finished since you last asked |
 | "Is anyone reviewing pull request 1 in cc-voice-gateway?" | The controller answers itself with `gh pr view` and `gh pr checks`, without a worker |
@@ -223,6 +225,36 @@ If a checkout has uncommitted changes, the controller asks first whether the wor
 ahead; a worker never commits, stashes or discards changes it did not make. Workers change files
 and switch branches in your checkouts, so do not work in the same repository at the desk while a
 worker runs there.
+
+### Pull requests and reviews
+
+Reviews do not get in your way:
+
+- **After a push** you only hear that the pull request is out, and which one. Details when you ask.
+- **No review offers.** The controller never suggests a review, not even where nothing reviews
+  automatically. A review happens when you ask for one ("request a review"), and comments get
+  fixed when you say so ("fix the review comments").
+- **Automatic checks and reviews** run where the repository has them: GitHub Actions on pull
+  requests, required reviewers or CODEOWNERS, bots such as Copilot or the Claude app. Their results
+  reach you later as news, summarised in a sentence or two, without a question.
+
+How the gateway knows: when a run ends, it looks for links to pull requests of that repository in
+the run's output, and asks `gh` whether they are open on a `voice/` branch. It names them in the
+result for the controller and then watches them with `gh`, every minute at first and every five
+minutes later (`VOICE_GW_PR_POLL`). It does not guess from the repository's settings what will
+run; it watches what shows up on the pull request:
+
+- **Checks:** when every check on the latest push has finished, once per push.
+- **Reviews and comments:** new ones, with their inline comments. Reviews and comments of the
+  account `gh` is logged in as are what workers post on your behalf, so they are not news.
+- **Nothing shows up** within the first five polls (no checks, no requested reviewers, no
+  reviews): nothing automatic runs, and it stops quietly. Bot reviewers often skip drafts. A
+  later run on the same pull request, such as a requested review, starts watching again.
+- **It stops** when the pull request is merged or closed, or after 24 hours
+  (`VOICE_GW_PR_WATCH_HOURS`).
+- **Without a `gh` login** it does nothing; the log says so once.
+
+Workers in Docker at access level `read-only` open no pull requests, so none of this applies there.
 
 ## Connections
 
@@ -371,6 +403,8 @@ Claude Code starts the gateway, so environment variables go into `controller/.mc
 | `VOICE_GW_WORKER_ROOT` | the folder holding this repository | every git repository directly in it has a worker |
 | `VOICE_GW_MAX_WORKERS` | `2` | runs at the same time |
 | `VOICE_GW_WORKER_TIMEOUT` | `60` | minutes before a run is stopped |
+| `VOICE_GW_PR_POLL` | `60` | seconds between looks at a [watched pull request](#pull-requests-and-reviews); five times as long after 15 looks |
+| `VOICE_GW_PR_WATCH_HOURS` | `24` | hours after which the gateway stops watching a pull request |
 | `VOICE_GW_STATE_DIR` | `.state` | worker state and the output of every run |
 | `VOICE_GW_CLAUDE_BIN` | `claude` | the Claude Code command for workers |
 | `VOICE_GW_GH_BIN` | `gh` | the GitHub CLI, used to tell public from private repositories |
@@ -398,6 +432,7 @@ Claude Code starts the gateway, so environment variables go into `controller/.mc
 | A worker fails at once | `could not start claude`: Claude Code is not on the gateway's `PATH`; set `VOICE_GW_CLAUDE_BIN`. Otherwise read `.state/tasks/<task>.err`. |
 | What did a worker do? | `.state/tasks/<task>.jsonl` holds the whole run. `claude --resume <session>` in the repository opens the session; `.state/workers.json` lists the session ids. |
 | A private repository is handled like a public one | `gh` is not logged in or not on the `PATH`, so the visibility is unknown, and the worker asks before pushing to be safe. |
+| No news about checks or reviews on a worker's pull request | The log says why: `gh is not logged in`, or `stopped watching pull request … : nothing automatic runs` (often a draft that bot reviewers skip), `merged`, `closed` or `time limit`. Only pull requests on `voice/` branches that a run linked to are watched. `.state/pulls.json` lists the watches. |
 | The controller cannot merge a pull request | A draft must be marked ready first (a task for the worker). Required reviews or checks, conflicts and other branch protection apply; `--admin` is blocked on purpose. With `VOICE_GW_PERMISSION_RELAY=0` the approval only appears at the terminal. |
 | The controller says a `gh` command was blocked | Only the read-only commands under [Security](#security) pass, each with `--repo owner/name` and flags as separate words. If it does not know about `gh` at all, restart the controller so that it reads the current `controller/CLAUDE.md`. |
 | No approval by voice | Expected for Bash, Write and Edit: they run without asking. For other tools: the session runs in auto or bypass mode, an allow rule covers the tool, or it is a trust or consent dialog, which is not relayed. Start the session with `scripts/start-controller.sh`. |
@@ -413,6 +448,7 @@ src/
   voice.mjs          HTTP side: MCP tools for the voice assistant
   oauth.mjs          sign-in: OAuth metadata, registration, sign-in page, tokens
   workers.mjs        workers: find repositories, start and follow claude -p runs
+  pulls.mjs          watch the pull requests workers open: checks and reviews as news
   admin.mjs          Unix socket for pair.mjs and fake-voice
   store.mjs          requests, approvals, waiting for changes
   http.mjs           small HTTP helpers
@@ -434,11 +470,12 @@ test/
   e2e.test.mjs       both sides end to end, without Claude Code
   oauth.test.mjs     the sign-in as Claude's connector goes through it
   workers.test.mjs   workers with a stand-in for claude and gh
+  pulls.test.mjs     watching pull requests, with a stand-in for gh
   controller.test.mjs   launcher flags, controller settings, confine hook
 docs/
   *.drawio.svg       diagrams: an image on GitHub, editable in draw.io
   workers-plan.md    how workers came about, and what is next
-.state/              worker state and run output (not in git)
+.state/              worker state, run output and watched pull requests (not in git)
 ```
 
 ## Limits and next steps

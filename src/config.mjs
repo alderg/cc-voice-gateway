@@ -59,7 +59,13 @@ export const config = {
   ghBin: process.env.VOICE_GW_GH_BIN || 'gh',
   // Worker state and the output of every run.
   stateDir: process.env.VOICE_GW_STATE_DIR || join(ROOT, '.state'),
+
+  // Pull requests that workers open (pulls.mjs): how often the gateway looks
+  // at their checks and reviews, in seconds, and for how many hours at most.
+  prPollSeconds: num(process.env.VOICE_GW_PR_POLL, 60),
+  prWatchHours: num(process.env.VOICE_GW_PR_WATCH_HOURS, 24),
 }
 
 config.oauthStateFile = join(config.secretsDir, 'oauth.json')
 config.adminSocket = join(config.secretsDir, 'admin.sock')
+config.pullsStateFile = join(config.stateDir, 'pulls.json')
