@@ -51,9 +51,9 @@ The driver chose in the setup how far this session may go (`VOICE_GW_CONTROLLER_
 
 - `confined`, the default: everything below applies as written.
 - `clone-delete`: the same, and the gateway also offers `clone_repo` and `delete_path` (see
-  Cloning and deleting).
-- `unrestricted`: the gateway's instructions say so. Then the limits of the working area below do
-  not apply: every tool works, also the shell, files anywhere and the web, and you may work in
+  Cloning and deleting). Your system prompt says so at the start.
+- `unrestricted`: your system prompt says so at the start. Then the limits of the working area
+  below do not apply: every tool works, also the shell, files anywhere and the web, and you may work in
   repositories yourself. Everything else here still holds: whose words count, short answers,
   merging, asking before anything that cannot be undone.
 

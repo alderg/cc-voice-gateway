@@ -184,10 +184,14 @@ test('start-controller.sh passes the level: deny rules up to clone-delete, allow
     const { argv } = runWithStub([], () => {}, { level })
     assert.deepEqual(JSON.parse(valueOf(argv, '--settings')).permissions, { deny: CONTROLLER_DENY }, level)
     assert.equal(valueOf(argv, '--permission-mode'), 'manual')
+    if (level !== 'clone-delete') assert.ok(!argv.includes('--append-system-prompt'), level)
   }
+  // The session knows its level from the start.
+  assert.match(valueOf(runWithStub([], () => {}, { level: 'clone-delete' }).argv, '--append-system-prompt'), /^Controller level clone-delete: /)
   assert.match(runWithStub([], () => {}, { level: 'clone-delete' }).log, /controller level clone-delete: by voice, the controller clones/)
   const open = runWithStub([], () => {}, { level: 'unrestricted' })
   assert.deepEqual(JSON.parse(valueOf(open.argv, '--settings')).permissions, { allow: UNRESTRICTED_ALLOW })
+  assert.match(valueOf(open.argv, '--append-system-prompt'), /^Controller level unrestricted: .*The limits of the working area in CLAUDE\.md do not apply/)
   // Never past Claude Code's own prompts: manual mode, no bypass.
   assert.equal(valueOf(open.argv, '--permission-mode'), 'manual')
   assert.ok(!open.argv.includes('--dangerously-skip-permissions'))

@@ -33,7 +33,8 @@
 #
 # VOICE_GW_CONTROLLER_LEVEL sets how far the session may go: confined (the
 # default), clone-delete or unrestricted. The deny rules, or at unrestricted
-# the allow rules, come with --settings (scripts/controller-settings.mjs); the
+# the allow rules, come with --settings, and above confined a word about the
+# level with --append-system-prompt (scripts/controller-settings.mjs); the
 # confine hook reads the level too. A new level counts from the next start of
 # this script: --stop, then start it again.
 #
@@ -192,13 +193,15 @@ choose_channel() {
   fi
   # What the session may do: its level and the settings for it, with the
   # plugin's (scripts/controller-settings.mjs).
-  local out level
+  local out level prompt
   if ! out=$(node "$ROOT/scripts/controller-settings.mjs" "$channel_mode") || [ -z "$out" ]; then
     log "the controller's settings could not be built (scripts/controller-settings.mjs): not starting"
     exit 1
   fi
-  level=${out%%$'\n'*}
-  claude_args+=(--settings "${out#*$'\n'}")
+  level=$(sed -n 1p <<<"$out")
+  prompt=$(sed -n 3p <<<"$out")
+  claude_args+=(--settings "$(sed -n 2p <<<"$out")")
+  if [ -n "$prompt" ]; then claude_args+=(--append-system-prompt "$prompt"); fi
   # The session's hook and gateway go by the same level, until the next start.
   export VOICE_GW_CONTROLLER_LEVEL=$level
   case $level in

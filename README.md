@@ -359,8 +359,10 @@ a warning for the two levels above the default:
 | `clone-delete` | The same, plus `clone_repo` and `delete_path` (below) | Whoever can talk to the connector can have repositories cloned, and files and folders in the worker root deleted, whole repositories with work that exists nowhere else included. Whoever can call the connector also gives the approval for each deletion. A deletion cannot be undone |
 | `unrestricted` | Everything your user can: the hook lets every tool through, and the start script passes allow rules instead of deny rules. Tools of other MCP servers and claude.ai connectors still ask, by voice | Whoever can talk to the connector can run any command as you, read and change any file (`.secrets/`, SSH keys and logins included) and reach the web. Text that a worker result or a web page brings in can steer a session that can do everything, and the kill switch's rules watch only the workers. Only on a computer or VM you can afford to lose |
 
-The level counts from the next start of `scripts/start-controller.sh` (`--stop`, then start
-again); an unknown value counts as `confined`. At no level does the session run in bypass mode or
+Above `confined`, the start script also tells the session its level with
+`--append-system-prompt`, since `controller/CLAUDE.md` describes the confined working area. The
+level counts from the next start of `scripts/start-controller.sh` (`--stop`, then start again); an
+unknown value counts as `confined`. At no level does the session run in bypass mode or
 with `--dangerously-skip-permissions`.
 
 **Cloning and deleting** (`src/folders.mjs`), at `clone-delete` and `unrestricted`, with workers
