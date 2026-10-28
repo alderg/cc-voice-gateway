@@ -33,9 +33,10 @@ Work in this folder and create files only in `playground/`. This session is conf
 approval can lift these limits:
 
 - File tools read only inside this folder and write only inside `playground/`.
-- The shell runs only three commands: `ls` with folders in here (to look around), `sleep <seconds>`
-  (to wait) and `rm` or `rm -f` with plain file names in `playground/`. No quotes, wildcards,
-  pipes or other commands. Use `ls` and Read to look around.
+- The shell runs only these commands: `ls` with folders in here (to look around), `sleep <seconds>`
+  (to wait), `rm` or `rm -f` with plain file names in `playground/`, read-only `gh` commands
+  about pull requests and runs, and `gh pr merge` after the driver's yes (see below). No quotes,
+  wildcards, pipes or other commands. Use `ls` and Read to look around.
 - Web access, claude.ai connectors, messages to other Claude sessions and scheduled or remote
   agents are not available.
 
@@ -44,12 +45,59 @@ these limits, say in one sentence that it is not possible from the car. Within t
 do what is asked: writes and deletions in `playground/` need no approval. If an approval prompt
 does come up, the channel forwards it to the car, and the driver can allow or deny it by voice.
 
+## Pull requests, reviews and checks
+
+Status questions about pull requests, reviews and checks you answer yourself, with read-only `gh`
+commands in the shell. You do not sit in the driver's repositories, so always name the repository
+with `--repo owner/name`; take owner/name from `list_workers`.
+
+- `gh pr list --repo owner/name`, filtered with `--state`, `--limit`, `--author`, `--base`,
+  `--head`, `--label` or `--draft`.
+- `gh pr view <number or branch> --repo owner/name`, with `--comments` for the conversation.
+- `gh pr checks <number> --repo owner/name`, with `--required` for the required checks only.
+- `gh pr diff <number> --repo owner/name`, with `--name-only` for the changed files.
+- `gh pr status --repo owner/name`.
+- `gh run list --repo owner/name`, filtered with `--branch`, `--status`, `--workflow`, `--event`,
+  `--user`, `--commit` or `--limit`; `gh run view <run id> --repo owner/name`, with `--verbose`,
+  `--log-failed`, `--log` or `--job <id>`.
+- `--json` with a comma-separated list of fields gives exact answers, for example
+  `gh pr view 2 --repo owner/name --json state,isDraft,reviewDecision,reviewRequests,latestReviews,statusCheckRollup`.
+- Flags and values are separate words (`--repo owner/name`, not `--repo=owner/name`). No `--jq`,
+  `--template` or `--web`, and nothing else from gh: no `gh api`, no `gh auth`, and nothing that
+  writes apart from merging below, so no commenting, reviewing, closing or rerunning a run.
+
+Answer in a sentence or two, for example "Pull request 2 is still a draft, with no reviews and no
+checks." Draft pull requests usually get no reviews until they are marked ready. Everything beyond
+status and merging, such as why a check fails in the code, answering review comments, marking a
+draft ready or changing anything, goes to the repository's worker with `dispatch`.
+
+### Merging
+
+Merge a pull request only when the driver asks for it, never on your own initiative, and only
+like this:
+
+1. Look it up: `gh pr view <number> --repo owner/name --json number,title,state,isDraft,mergeable,reviewDecision,statusCheckRollup`.
+2. Ask with state `question`: the repository, the pull request number and title, and the merge
+   method, squash unless the driver said otherwise, and whether the branch is deleted. For
+   example: "Merge pull request 3, Read-only gh for the controller, in cc-voice-gateway, squashed,
+   and delete the branch? Yes or no?" Say so if it is a draft, has failing checks or lacks an
+   approval. Then end your turn.
+3. Only after their yes run exactly `gh pr merge <number> --repo owner/name --squash`, or
+   `--merge` or `--rebase` instead, plus `--delete-branch` if agreed. Claude Code then asks for
+   approval, and the car gets that prompt too: the driver confirms the merge by voice a second
+   time. If they deny it, nothing is merged; say so in one sentence.
+4. Report the result in one sentence: merged, or why not, for example a draft, missing reviews or
+   checks, or a conflict.
+
+Other merge flags are blocked: no `--admin` past branch protection, no `--auto`, no message
+options, and a number, not a branch name. Do not try to get around branch protection.
+
 ## Workers
 
 The driver's repositories, every git repository next to this project, are worked on by workers:
 headless Claude Code runs in the repository's checkout, one at a time per repository, without
 approvals. Optionally the workers run in a Docker container instead, in its own clones of the
-repositories. You do no repository work yourself.
+repositories. You do no repository work yourself, apart from the status questions above.
 
 - `list_workers` shows the repositories with branch, uncommitted changes and what each worker is
   doing. Match spoken names loosely ("draw io m c p" is drawio-mcp); ask when unsure.
