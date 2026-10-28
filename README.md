@@ -17,6 +17,69 @@ This README is the technical documentation. The idea in a short video is on the
 > Used with Claude voice mode in the Claude app on the iPhone. Claude Code channels are a research
 > preview; their flags and protocol may change.
 
+## Getting started
+
+From a clone to the first voice request, on a computer with the [prerequisites](#6-prerequisites):
+Node.js 20 or later, Claude Code logged in with claude.ai, `gh` logged in, tmux and Tailscale. On
+Team and Enterprise an Owner first does the [admin steps](#74-admin-steps-for-team-and-enterprise).
+
+1. **Clone the repository** with the GitHub CLI:
+
+   ```bash
+   gh repo clone alderg/cc-voice-gateway && cd cc-voice-gateway
+   ```
+
+   You are in the new folder `cc-voice-gateway`.
+
+2. **Install the dependencies:**
+
+   ```bash
+   npm install
+   ```
+
+   92 packages land in `node_modules`; nothing is compiled ([what it installs](#6-prerequisites)).
+
+3. **Start the controller.** It comes before the funnel and the pairing code: Claude Code starts
+   the gateway inside it, and both need the running gateway.
+
+   ```bash
+   tmux new -s voice scripts/start-controller.sh
+   ```
+
+   Claude Code opens in `controller/` and asks at the terminal: trust and the MCP server on the
+   first start, and with the development flag the channel warning at every start
+   ([8.1](#81-starting-and-stopping)). Run the next steps in a second terminal.
+
+4. **Start the funnel.** On Linux, run `sudo tailscale set --operator=$USER` once before.
+
+   ```bash
+   scripts/funnel.sh start
+   ```
+
+   It prints the connector URL `https://<host>.ts.net/mcp` and reports when all Funnel relays
+   answer, which can take a few minutes the first time. The URL holds no secret; the sign-in needs
+   the pairing code from step 6 ([7.3](#73-publishing-the-endpoint)).
+
+5. **Add the connector in Claude Desktop:** Customize → Connectors → add a custom connector, with
+   the URL from step 4 ([7.1](#71-with-the-setup-assistant), step 3).
+
+   Claude opens the sign-in page "Connect to Claude Code", which asks for a pairing code.
+
+6. **Get the pairing code:**
+
+   ```bash
+   node scripts/pair.mjs
+   ```
+
+   It prints an eight-digit code for the page, valid for five minutes and one sign-in
+   ([5.2](#52-the-voice-endpoint-and-oauth)). Then choose "Always allow" for the connector's tools,
+   or voice mode asks at every call.
+
+Then try it in voice mode with the same account: "Ask Claude Code whether the gateway is up."
+Telegram, workers in Docker, models and the autostart come from the setup assistant,
+`node scripts/setup.mjs`, best run between steps 2 and 3; if it starts the controller, attach with
+`tmux attach -t voice` instead of step 3 ([7.1](#71-with-the-setup-assistant)).
+
 ## Contents
 
 1. [Overview](#1-overview)
