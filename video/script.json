@@ -1,0 +1,85 @@
+{
+  "voice": "Daniel",
+  "rate": 160,
+  "scenes": [
+    {
+      "id": "traffic",
+      "lines": [
+        { "say": "Hours every week, stuck in traffic.", "build": 0 },
+        { "say": "Your ideas keep coming. Your computer is back at home.", "build": 1 }
+      ]
+    },
+    {
+      "id": "gap",
+      "lines": [
+        { "say": "Claude's voice mode is great to talk to.", "build": 0 },
+        {
+          "say": "But it can't reach Claude Code, the agent that does the real work in your repositories.",
+          "build": 1
+        }
+      ]
+    },
+    {
+      "id": "bridge",
+      "lines": [
+        {
+          "say": "C C voice gateway connects the two.",
+          "caption": "cc-voice-gateway connects the two.",
+          "build": 0
+        },
+        { "say": "You talk to Claude in your car, or on your phone.", "build": 1 },
+        {
+          "say": "A Claude Code session on your own computer picks it up, and gets to work.",
+          "build": 2
+        }
+      ]
+    },
+    {
+      "id": "dialog",
+      "lines": [
+        { "say": "Ask why the build failed.", "build": 0 },
+        { "say": "Have it fixed, with the tests run.", "build": 1 },
+        { "say": "A worker creates a branch, commits, and opens a pull request.", "build": 2 },
+        { "say": "When it's done, you hear the result in a sentence or two.", "build": 3 }
+      ]
+    },
+    {
+      "id": "review",
+      "lines": [
+        { "say": "Nothing lands behind your back.", "build": 0 },
+        { "say": "Every change is versioned with git, and arrives as a pull request.", "build": 1 },
+        {
+          "say": "Checked on GitHub, reviewed by Claude, and merged only when you say yes.",
+          "build": 2
+        }
+      ]
+    },
+    {
+      "id": "road",
+      "lines": [
+        { "say": "It's built for the road: voice only, short answers, nothing to read.", "build": 0 },
+        { "say": "Approvals happen by voice.", "build": 1 },
+        { "say": "And one phrase, emergency stop, locks everything at once.", "build": 2 }
+      ]
+    },
+    {
+      "id": "payoff",
+      "captions": false,
+      "lines": [
+        { "say": "Stuck in traffic?", "build": 0 },
+        { "say": "Turn your commute into commits.", "build": 1 }
+      ]
+    },
+    {
+      "id": "end",
+      "captions": false,
+      "lines": [
+        {
+          "say": "C C voice gateway. A prototype, open on GitHub, and provided as is.",
+          "caption": "cc-voice-gateway: a prototype, open on GitHub, provided as-is.",
+          "build": 0
+        }
+      ]
+    }
+  ]
+}

@@ -4,6 +4,11 @@ Talk to Claude in the Claude app's voice mode, on the phone or in the car, and h
 session on your own computer do the work: answer questions about your repositories, change code,
 push branches, open and merge pull requests. Plain JavaScript (ESM, Node.js), no build step.
 
+This README is the technical documentation. The idea in 90 seconds, with a video, is on the
+[product page](https://alderg.github.io/cc-voice-gateway/).
+
+[![Video: Stuck in traffic? Turn your commute into commits.](docs/assets/video-thumbnail.png)](https://alderg.github.io/cc-voice-gateway/#video)
+
 > **Provided as-is, as a prototype.** This is solely a prototype of an idea: a way to use Claude
 > Code from Claude's voice mode, which cannot reach Claude Code on its own. It comes without
 > warranty and without support, and there is no communication of any kind about this project: no
@@ -141,7 +146,10 @@ What it costs:
 
 ## 4. Diagrams
 
-All diagrams are draw.io files saved as SVG: an image on GitHub, editable in draw.io.
+All diagrams are made with [draw.io](https://www.drawio.com) and saved as `.drawio.svg`: an SVG
+image with the diagram embedded, so GitHub shows it as a picture and draw.io opens it for editing.
+In VS Code, the [vscode-drawio](https://github.com/hediet/vscode-drawio) extension edits them
+inline, right in the repository.
 
 ### 4.1 Architecture
 
@@ -1087,7 +1095,12 @@ scripts/
   fake-voice.mjs               play the voice AI at the desk
 test/                one file per area; npm test runs them all, with stand-ins for Claude Code,
                      gh, docker, the GitHub API and Telegram
-docs/                diagrams (*.drawio.svg) and workers-plan.md
+docs/
+  *.drawio.svg       the diagrams, made with draw.io
+  index.html         the product page (GitHub Pages, from this folder)
+  assets/            the video, its poster and the README thumbnail
+  workers-plan.md    how workers came about
+video/               the video's sources: script.json (voiceover), slides.html (frames), build.mjs
 ```
 
 ## 10. Sources
