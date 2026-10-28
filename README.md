@@ -72,8 +72,17 @@ requests when you ask, each one after your approval by voice. For everything els
   it asks before pushing. At the end it switches the checkout back.
 - **Follow-ups** continue the same Claude session, so the worker keeps its context.
 - **The result** goes to the controller as a channel event. The controller summarises it, and its
-  answer reaches you as news with the next call.
+  answer reaches you as news with the next call; once the voice mode has ended, also by
+  [Telegram](#telegram-fallback) if it is set up.
 - **Restarts:** runs are detached and survive a controller restart; the new gateway picks them up.
+- **Optionally in Docker:** the workers run in a container that holds only clones of your
+  repositories and Claude Code. The GitHub token you give it sets what they may do: keep everything
+  local, open pull requests, or also push to main. See [Workers in Docker](#workers-in-docker).
+
+**Telegram (optional):** voice assistants only poll, so once the conversation has ended, nobody
+hears a late result. If a Telegram bot is set up, the gateway notices the silence and sends
+results, questions and approval requests to your Telegram chat as well. See
+[Telegram fallback](#telegram-fallback).
 
 ![States](docs/states.drawio.svg)
 
@@ -87,6 +96,10 @@ requests when you ask, each one after your approval by voice. For everything els
 - The Claude app on a paid plan, for custom connectors. The connector's Claude account does not
   have to be the one that runs Claude Code.
 - For workers: git, and the GitHub CLI `gh`, logged in, for pushing and pull requests.
+- Optional, for the [Telegram fallback](#telegram-fallback): a Telegram account and a bot, and `jq`
+  to read the chat ID.
+- Optional, for [workers in Docker](#workers-in-docker): Docker. The container brings its own
+  git, `gh` and Claude Code.
 
 ## Setup
 
@@ -134,6 +147,9 @@ requests when you ask, each one after your approval by voice. For everything els
    a confirmation at every step, including every `get_reply` during a long task.
 
 6. **Try it** in voice mode: "Ask Claude Code whether the gateway is up."
+
+7. **Optional: Telegram.** To get results, questions and approval requests as Telegram messages
+   once a voice conversation has ended, set up the [Telegram fallback](#telegram-fallback).
 
 ## Publishing the endpoint
 
@@ -218,11 +234,86 @@ Name the repository as its folder is called; the controller matches loosely ("dr
 | "Tell it to add a test for that too." | Follow-up in the same worker session, on the same branch |
 | "Yes, publish it." | Answer to a worker's question, for example before pushing a public repository |
 | "Stop the drawio-mcp worker." | `stop_worker` |
+| "Push it straight to main." | Only for [workers in Docker](#workers-in-docker) at access level `full`: `dispatch` with `direct`. Otherwise the controller says why it stays a pull request |
 
 If a checkout has uncommitted changes, the controller asks first whether the worker should go
 ahead; a worker never commits, stashes or discards changes it did not make. Workers change files
 and switch branches in your checkouts, so do not work in the same repository at the desk while a
 worker runs there.
+
+## Telegram fallback
+
+Optional and outbound only. Voice assistants only poll: once the voice conversation has ended,
+nobody picks up a late result, question or approval request. With a Telegram bot set up, the
+gateway also sends these to your Telegram chat. The dashed parts of the diagrams show it.
+
+**When it kicks in.** The gateway decides by itself. Every voice tool call (`status`, `send`,
+`ask`, `get_reply`, `approve`) shows that the voice mode is on, and so does a `get_reply` that is
+still waiting. When no call has come for 60 seconds (`VOICE_GW_TELEGRAM_AFTER`), the voice mode
+counts as ended, and the log says `voice mode ended (no voice call for 60 s): telegram fallback on`.
+From then on the gateway sends to Telegram:
+
+- what the voice assistant had not picked up at that moment, and
+- everything that arrives later, for example the controller's summary of a worker run that ends
+  twenty minutes after you hung up.
+
+As soon as the voice assistant calls again, Telegram goes quiet
+(`voice mode on: telegram fallback paused`).
+
+**What goes out.** Each message starts with what it is and what it belongs to:
+
+| Kind | Sent for | First line, for example |
+|---|---|---|
+| Result | an answer with state `done`, including the controller's summary of a finished worker run | `Result for request k7f3 ("Run the tests.")`, `Result for request m2pq (worker cc-voice-gateway, task t3cz)` |
+| Question | an answer with state `question` | `Question for request k7f3 (…)`; the message ends with `Answer in voice mode and mention k7f3.` |
+| Approval request | an approval Claude Code relays (see [Security](#security)) | `Approval request abcde (controller session)`, then the tool and its details |
+
+Interim `working` updates stay off Telegram. Each item goes out once, and only if the voice
+assistant has not received it; an approval it already read out is not repeated. Telegram comes on
+top of the voice path, not instead of it: when you open voice mode again, the assistant still
+hears everything it has not picked up. You cannot answer by Telegram. Answer questions and
+approvals in voice mode, naming the id or code, or at the terminal.
+
+**Setup.** The fallback is on only when `.secrets/telegram_token` and `.secrets/telegram_chat_id`
+both exist and are not empty. Without them the gateway logs one line,
+`telegram fallback off: telegram_token and telegram_chat_id not both set`, and works as before.
+
+1. **Create a bot.** In Telegram, write `/newbot` to [@BotFather](https://t.me/BotFather) and copy
+   the token it gives you.
+2. **Store the token** without leaving it in the shell history:
+
+   ```bash
+   mkdir -p -m 700 .secrets
+   (umask 077; read -rsp 'Bot token: ' t; printf '%s' "$t" > .secrets/telegram_token)
+   ```
+
+3. **Write to your bot** from your own Telegram account: open it with the link from BotFather, tap
+   Start and send any message, for example "Hallo".
+4. **Read your chat ID** from the bot's updates (needs `jq`) and store it:
+
+   ```bash
+   curl -s "https://api.telegram.org/bot$(cat .secrets/telegram_token)/getUpdates" \
+     | jq '.result[].message.chat | {id, type, first_name}'
+   (umask 077; printf '%s' '<id of your private chat>' > .secrets/telegram_chat_id)
+   ```
+
+   Take the `id` of the chat with type `private`. If the list is empty, send the message again:
+   Telegram keeps updates for 24 hours, and another program polling the same bot takes them
+   away. If the bot has a webhook, `getUpdates` answers `409 Conflict`.
+5. **Restart the controller** (quit the session and run `scripts/start-controller.sh` again). The
+   gateway reads both files and `VOICE_GW_TELEGRAM_AFTER` only at startup, so restart it after
+   every change, also to turn the fallback off by deleting a file. The log then shows
+   `telegram fallback ready: after 60 s without a voice call`.
+
+**Timeout.** 60 seconds by default. To change it, set `VOICE_GW_TELEGRAM_AFTER` (in seconds) in
+`controller/.mcp.json`, as described in [Configuration](#configuration), for example
+`"env": { "VOICE_GW_TELEGRAM_AFTER": "120" }`, and restart the controller. Much less than 30
+seconds risks messages while the voice assistant is only speaking between two polls.
+
+**Logs and failures.** The token stays in `.secrets/` and never appears in the log. Every message
+is logged as `telegram sent: <first line>`, a failed one as
+`telegram send failed: <first line> - <Telegram's error>`. A failed message is not retried, and the
+voice path does not notice it.
 
 ## Connections
 
@@ -266,6 +357,234 @@ gateway at all, and how far it got.
 `npm test` plays both ends without Claude Code or a phone: Claude Code (channel events, `reply`,
 approval prompts) and the voice assistant, including the whole sign-in.
 
+## Workers in Docker
+
+Optional. Without it, workers run in your checkouts on this computer, as described above. With
+it, they run in a container that holds Claude Code, git and `gh`, and sees nothing of this
+computer but one folder of repositories, for example `~/docker-developer`, mounted at `/repos`:
+no other files, no SSH keys, no `gh` login. The container runs as your own user id, so the files
+in that folder are yours. The gateway stays on this computer and starts every git command and
+every run in the container with `docker exec`.
+
+On this computer, git never runs in that folder, and nobody pushes from it: the container's side
+controls its config, hooks and attributes. Changes come out as a bundle into a separate clean
+clone, and you push from there ([Getting changes out of the container](#getting-changes-out-of-the-container)).
+
+![Workers in Docker](docs/docker.drawio.svg)
+
+### Access levels
+
+What workers in the container may do with a repository depends on the GitHub token you give the
+container. The gateway checks it for each repository and tells the worker and the controller;
+`list_workers` shows the level and why, for example `access pr (main is protected by a ruleset)`.
+
+| Level | Token | Default branch | What workers do | How changes reach GitHub |
+|---|---|---|---|---|
+| `read-only` | none, or one that cannot push or open pull requests | any | Commit on a local `voice/` branch, worktrees too. Never push, never open a pull request; they report the local branch and commit | Only through the clean clone: you fetch the branch and push it yourself |
+| `pr` | can push (Contents) and open pull requests | protected by a ruleset or branch protection | Push a `voice/` branch and open a draft pull request, so that GitHub's reviews run | The container pushes; the clean clone works as well, for example to try a branch here first |
+| `full` | as `pr` | not protected | A draft pull request too, by default. A direct push to the default branch only when you explicitly ask for it ("push it straight to main") | As for `pr` |
+
+On public repositories, workers ask before every push, at every level.
+
+**How the gateway decides**, per repository: no token or no GitHub remote: `read-only`. Otherwise
+it asks the GitHub API whether your account may push, then sends two write requests without
+content (create a branch, open a pull request). GitHub answers them with "invalid request" if the
+token may write, and with "forbidden" if not; neither creates anything. If both may write, it
+looks at the default branch: protected by branch protection, or by a ruleset that requires pull
+requests, status checks or a merge queue, or restricts updates, means `pr`; otherwise `full`. Whatever it
+cannot tell counts as the lower level. It reads the token at every check and keeps each result for
+ten minutes. `VOICE_GW_ACCESS=read-only`, `pr` or `full` sets one level for every repository
+instead.
+
+### Set it up
+
+1. **Choose the folder** for the container's repositories. It must not hold your own checkouts,
+   and this computer's git will never run in it. Docker installed as a snap cannot mount folders
+   from `/tmp`; a folder in your home is fine.
+
+   ```bash
+   folder="$HOME/docker-developer"
+   mkdir -p "$folder"
+   ```
+
+2. **Build the image** (Debian, Node 22, git, `gh`, Claude Code) for your user and group id:
+
+   ```bash
+   docker build -t cc-voice-worker --build-arg UID="$(id -u)" --build-arg GID="$(id -g)" docker/
+   ```
+
+   The image's user `worker` gets your ids, so it owns what it writes in the folder, and git in the
+   container sees the repositories as its own. `--build-arg CLAUDE_CODE_VERSION=<version>` pins
+   Claude Code; rebuild to update it.
+
+3. **Store the container's secrets** in `.secrets/worker/`, which the container mounts read-only.
+   Claude Code's login comes from a long-lived token: run `claude setup-token` on this computer and
+   paste the token. The GitHub token is optional; see
+   [GitHub tokens for each level](#github-tokens-for-each-level).
+
+   ```bash
+   mkdir -p -m 700 .secrets/worker
+   (umask 077; read -rsp 'Claude token: ' t; printf '%s' "$t" > .secrets/worker/claude_token)
+   (umask 077; read -rsp 'GitHub token: ' t; printf '%s' "$t" > .secrets/worker/github_token)
+   ```
+
+   The container runs as you, so mode 0600 is enough.
+
+4. **Start the container**, from this folder:
+
+   ```bash
+   docker run -d --name voice-workers --init --restart unless-stopped \
+     --user "$(id -u):$(id -g)" \
+     -v "$folder:/repos" -v voice-home:/home/worker \
+     -v "$PWD/.secrets/worker:/run/secrets/voice:ro" \
+     cc-voice-worker
+   ```
+
+   `voice-home` keeps Claude Code's settings and sessions, so that follow-ups continue, and git's
+   settings. The tokens never become part of the container's configuration: the gateway's
+   `voice-run` hands them to each run, and git gets the GitHub token from a credential helper.
+
+5. **Clone the repositories** the workers should see, from inside the container, and tell git who
+   commits:
+
+   ```bash
+   docker exec voice-workers git clone https://github.com/<owner>/<repo>.git /repos/<repo>
+   docker exec voice-workers git config --global user.name "Your Name"
+   docker exec voice-workers git config --global user.email "you@example.com"
+   ```
+
+   Use `https://` addresses; the container has no SSH keys. Private repositories need a token
+   that can read them, even at level `read-only`.
+
+6. **Point the gateway at the container** in `controller/.mcp.json`, then restart the controller:
+
+   ```json
+   "env": { "VOICE_GW_DOCKER": "voice-workers" }
+   ```
+
+   The log shows `worker container voice-workers: repositories from host folder …, running as
+   <uid>:<gid>`, with a warning if `/repos` is not a host folder or the container runs as someone
+   else. "Which repositories can you work in?" lists the repositories with their access levels.
+   Remove the variable and restart to go back to workers on this computer.
+
+7. **Have a clean clone** of each repository whose changes you want to bring out: an ordinary
+   clone from GitHub, outside the container's folder. Your checkouts in `~/Developer` will do; the
+   helper below only adds refs to them and never touches their working tree.
+
+### Getting changes out of the container
+
+```bash
+scripts/fetch-from-container.sh <repo> <branch>
+```
+
+1. The container writes a git bundle of the branch (`docker exec … git bundle create`), with only
+   the commits your clean clone does not have yet.
+2. git on this computer verifies the bundle in the clean clone and fetches it as
+   `container/<branch>`, checking every object (`transfer.fsckObjects`), without tags or
+   submodules.
+3. It shows the new commits and prints two commands: one to review them (`git log -p`), and the
+   push from the clean clone. It never checks out and never pushes. Pushing is your explicit
+   step:
+
+   ```bash
+   git -C ~/Developer/<repo> push origin refs/remotes/container/<branch>:refs/heads/<branch>
+   ```
+
+`VOICE_CLEAN_ROOT` says where the clean clones are (default: the folder that holds this
+repository), `VOICE_GW_DOCKER` and `VOICE_GW_DOCKER_REPOS` which container and path. The script
+refuses a clean clone inside the container's folder, and names that are not plain repository or
+branch names.
+
+**Why a bundle, and not `git fetch ~/docker-developer/<repo>`.** Checked with git 2.53:
+
+- A fetch from a local path, plain or `file://`, starts `git upload-pack` in the source
+  repository, and upload-pack reads that repository's config. A container-side
+  `uploadpack.hideRefs` decided which branches the host could fetch. No command ran: git ignores
+  `uploadpack.packObjectsHook` from a repository's own config, upload-pack runs no hooks, and
+  since 2.45.1 it refuses the lazy fetch of a crafted "partial clone" that once allowed code
+  execution (CVE-2024-32004). Still, the host then opens a repository that the other side
+  controls, and every new config key that upload-pack honours widens that.
+- `--no-local` does not exist for `git fetch`; it only changes how `git clone` copies a local
+  repository. `protocol.file.allow` does not help either: it is `user` by default, which allows
+  fetches you start yourself, and `never` blocks local paths and bundles alike.
+- A bundle is data: a list of refs and a pack. Fetching it reads no config, runs no hook and needs
+  no repository on the other side. The container creates it, with its own config, where that does
+  no harm.
+- `git status` on this computer inside the container's folder ran a container-side
+  `core.fsmonitor` command. That is why git must never run there: not by hand, not through a
+  git-aware shell prompt, not through an editor that opens the folder.
+- Fetching, `git log -p` and `git diff` of the fetched branch ran nothing. Checking it out did:
+  its committed `.gitattributes` called a filter that was configured on this computer, as git-lfs
+  is. Review before you check out.
+
+**Threat model.** Anything in the container may be hostile: a worker can be steered by prompt
+injection from the repositories it reads, and it controls every file in the mounted folder,
+`.git` included. What this setup keeps from your computer: nothing from that folder runs here,
+because git on this computer never opens a repository in it and only fetches a verified bundle
+into a clean clone; and nothing goes to GitHub from this computer unless you push it. What it
+does not do: decide whether the changes are good. Review them before you push or check them out,
+workflow files under `.github/` above all, since they run with the repository's secrets on
+GitHub. At levels `pr` and `full` the container can push by itself, within what its token allows.
+
+### GitHub tokens for each level
+
+Create tokens under GitHub → Settings → Developer settings → Personal access tokens. Fine-grained
+tokens are limited to the repositories and permissions you pick; prefer them. A classic token
+applies to every repository your account can reach. If an organisation owns the repositories,
+choose it as resource owner; it may have to allow or approve fine-grained tokens first.
+
+**Level `read-only`:**
+
+- Public repositories only: no token. Leave out `.secrets/worker/github_token`.
+- Private repositories: a fine-grained token.
+  1. Fine-grained tokens → Generate new token. Give it a name and an expiration.
+  2. Resource owner: your account, or the organisation that owns the repositories.
+  3. Repository access: Only select repositories, and pick the ones you clone.
+  4. Repository permissions: Contents: Read-only. Metadata: Read-only is added by itself. Nothing
+     else.
+  5. Generate the token and store it as `.secrets/worker/github_token`.
+- Not with a classic token: its only scope for private repositories, `repo`, can also write.
+
+**Level `pr`:** a token that can push and open pull requests, and a protected default branch.
+
+1. Fine-grained token as above, with these repository permissions: Contents: Read and write, Pull
+   requests: Read and write. Add Workflows: Read and write only if workers should change files in
+   `.github/workflows`.
+   A classic token with the `repo` scope (and `workflow` for workflow files) works too, but for
+   all your repositories at once.
+2. Protect the default branch in each repository, with a ruleset or with branch protection.
+
+   **Ruleset:** the repository's Settings → Rules → Rulesets → New ruleset → New branch ruleset.
+   1. Ruleset name, for example "Protect main"; Enforcement status: Active.
+   2. Bypass list: leave it empty. A bypass for you or for the admin role would also let your
+      token push to main.
+   3. Target branches: Add target → Include default branch.
+   4. Rules: Restrict deletions, Require a pull request before merging, Block force pushes. Add
+      required approvals or status checks as you like.
+   5. Create.
+
+   **Branch protection:** the repository's Settings → Branches → Add classic branch protection
+   rule.
+   1. Branch name pattern: `main`.
+   2. Require a pull request before merging.
+   3. Do not allow bypassing the above settings; otherwise admins, and their tokens, can still
+      push.
+   4. Create.
+
+   Rulesets and branch protection on private repositories need GitHub Pro, Team or Enterprise.
+   Without them a private repository's main cannot be protected and counts as `full`;
+   `VOICE_GW_ACCESS=pr` keeps workers to pull requests anyway, by their rules.
+3. Check: `list_workers` shows `access pr (main is protected by a ruleset)` or
+   `(… by branch protection)`.
+
+**Level `full`:** the same token as for `pr`, and a default branch without a ruleset or branch
+protection that requires pull requests. Rules that only block force pushes or deletions leave
+main open. Workers still open a draft pull request unless you explicitly ask for a direct push.
+
+**Levels are limits only as far as the token goes.** With a write token, a worker at
+`read-only` (for example by `VOICE_GW_ACCESS`) could still push; its rules forbid it. To be sure
+nothing leaves the container but through the clean clone, give it no write token.
+
 ## Security
 
 - **Only signed-in clients get in.** Signing in needs a pairing code from this computer: eight
@@ -289,6 +608,12 @@ approval prompts) and the voice assistant, including the whole sign-in.
   - A run stops after 60 minutes, and at most two run at a time.
   - Everything else, such as staying on a `voice/` branch or never force-pushing, is in the
     worker's instructions: rules, not limits.
+- **Workers in Docker** see only the mounted folder, the container's tokens and the network. They
+  do not reach your other files, SSH keys or `gh` login, and a level is only as strict as the
+  token (see [Access levels](#access-levels)). Everything in that folder counts as hostile: git on
+  this computer never runs there, and changes come out only as a verified bundle into a clean
+  clone (see the [threat model](#getting-changes-out-of-the-container)). Whoever controls the
+  gateway can control Docker, which on Linux is as good as root.
 - **The endpoint is public.** Anyone on the internet can reach the sign-in page. A certificate from
   a public authority, Tailscale Funnel's included, also publishes the host name in the certificate
   transparency logs.
@@ -336,6 +661,8 @@ approval prompts) and the voice assistant, including the whole sign-in.
   `VOICE_GW_PERMISSION_RELAY=0`; then merges can only be approved at the terminal.
 - Claude Code masks recognisable credentials in relayed approval texts, but not every secret
   ([channels reference][ref]).
+- The Telegram fallback sends results, questions and approval details through Telegram's servers.
+  Bot chats are not end-to-end encrypted. Leave the two files out if that is not acceptable.
 - Start the controller only with `scripts/start-controller.sh`, never with
   `--dangerously-skip-permissions`. It runs the session in manual mode, whatever default
   `~/.claude/settings.json` sets.
@@ -371,9 +698,17 @@ Claude Code starts the gateway, so environment variables go into `controller/.mc
 | `VOICE_GW_WORKER_ROOT` | the folder holding this repository | every git repository directly in it has a worker |
 | `VOICE_GW_MAX_WORKERS` | `2` | runs at the same time |
 | `VOICE_GW_WORKER_TIMEOUT` | `60` | minutes before a run is stopped |
+| `VOICE_GW_DOCKER` | empty | name of the [worker container](#workers-in-docker); empty: workers run on this computer |
+| `VOICE_GW_DOCKER_REPOS` | `/repos` | where the mounted folder is inside the container |
+| `VOICE_CLEAN_ROOT` | the folder holding this repository | for `scripts/fetch-from-container.sh` only: where the clean clones are |
+| `VOICE_GW_DOCKER_BIN` | `docker` | the Docker CLI |
+| `VOICE_GW_ACCESS` | empty | `read-only`, `pr` or `full` for every repository in the container; empty: [detected](#access-levels) from the token |
+| `VOICE_GW_GITHUB_API` | `https://api.github.com` | GitHub API for the level check; the tests point it at a stand-in |
 | `VOICE_GW_STATE_DIR` | `.state` | worker state and the output of every run |
-| `VOICE_GW_CLAUDE_BIN` | `claude` | the Claude Code command for workers |
+| `VOICE_GW_CLAUDE_BIN` | `claude` | the Claude Code command for workers; with Docker, inside the container |
 | `VOICE_GW_GH_BIN` | `gh` | the GitHub CLI, used to tell public from private repositories |
+| `VOICE_GW_TELEGRAM_AFTER` | `60` | seconds without a voice tool call after which the voice mode counts as ended and the [Telegram fallback](#telegram-fallback) sends; read at startup |
+| `VOICE_GW_TELEGRAM_API` | `https://api.telegram.org` | Telegram Bot API address; the tests point it at a stand-in |
 | `FUNNEL_PORT` | `443` | for `scripts/funnel.sh` only; keep 443 for Claude |
 
 ## Troubleshooting
@@ -400,6 +735,14 @@ Claude Code starts the gateway, so environment variables go into `controller/.mc
 | A private repository is handled like a public one | `gh` is not logged in or not on the `PATH`, so the visibility is unknown, and the worker asks before pushing to be safe. |
 | The controller cannot merge a pull request | A draft must be marked ready first (a task for the worker). Required reviews or checks, conflicts and other branch protection apply; `--admin` is blocked on purpose. With `VOICE_GW_PERMISSION_RELAY=0` the approval only appears at the terminal. |
 | The controller says a `gh` command was blocked | Only the read-only commands under [Security](#security) pass, each with `--repo owner/name` and flags as separate words. If it does not know about `gh` at all, restart the controller so that it reads the current `controller/CLAUDE.md`. |
+| No Telegram message | Messages go out only after `VOICE_GW_TELEGRAM_AFTER` seconds without a voice call, and only for what the voice assistant has not picked up. `telegram fallback off` in the log: a file was missing or empty when the gateway started; fix it and restart the controller. `telegram send failed: 400 Bad Request: chat not found`: wrong chat ID, or you never wrote to the bot. `401 Unauthorized`: wrong token. |
+| `The worker container voice-workers does not answer` | The container is stopped or was removed: `docker start voice-workers`, or start it as in [Workers in Docker](#workers-in-docker). |
+| `access read-only (no GitHub token)` although there is one | It must be `.secrets/worker/github_token`, readable for the gateway. A new token counts at the next check, within ten minutes. |
+| `access read-only (the token cannot see the repository (404))` | The token's repository access does not include it, or the organisation has not approved the token yet. |
+| `access full` where you expected `pr` | No ruleset or branch protection requires pull requests on the default branch, or the private repository's plan has none. Protect it, or set `VOICE_GW_ACCESS=pr`. |
+| `worker container …: /repos is a volume, not a host folder` or `… it runs as …` | The container was started without `-v <folder>:/repos` or without `--user "$(id -u):$(id -g)"`. Remove it (`docker rm -f voice-workers`) and start it as in [Set it up](#set-it-up). |
+| `fetch-from-container: the container could not bundle …` | The branch does not exist in the container's repository, or the container is not running. The worker names its branch at the end of each run. |
+| A worker in Docker fails at once | Claude Code is not logged in: `.secrets/worker/claude_token` is missing or expired; run `claude setup-token` again. Otherwise read `.state/tasks/<task>.err`. |
 | No approval by voice | Expected for Bash, Write and Edit: they run without asking. For other tools: the session runs in auto or bypass mode, an allow rule covers the tool, or it is a trust or consent dialog, which is not relayed. Start the session with `scripts/start-controller.sh`. |
 
 Claude Code's debug log is at `~/.claude/debug/<session-id>.txt`.
@@ -413,11 +756,19 @@ src/
   voice.mjs          HTTP side: MCP tools for the voice assistant
   oauth.mjs          sign-in: OAuth metadata, registration, sign-in page, tokens
   workers.mjs        workers: find repositories, start and follow claude -p runs
+  telegram.mjs       Telegram fallback once the voice mode has ended
+  runners.mjs        where workers run: this computer, or the Docker container
+  access.mjs         access levels in the container, from the GitHub token
   admin.mjs          Unix socket for pair.mjs and fake-voice
   store.mjs          requests, approvals, waiting for changes
   http.mjs           small HTTP helpers
   config.mjs         environment variables
   log.mjs            log to stderr and file, never to stdout
+docker/
+  Dockerfile         the worker container: Claude Code, git and gh, as your user id
+  voice-run          starts a run with its tokens, in its own process group
+  voice-stop         ends a run with everything it started
+  git-credential-voice   the GitHub token for git
 controller/
   .mcp.json          starts the gateway as server "voice"
   .claude/settings.json   allow and deny rules, confine hook
@@ -430,10 +781,13 @@ scripts/
   check-public.mjs   check the endpoint through Funnel's public relays
   pair.mjs           pairing codes, list and revoke connections
   fake-voice.mjs     play the voice assistant at the desk
+  fetch-from-container.sh   bring a branch from the container into a clean clone, as a bundle
 test/
   e2e.test.mjs       both sides end to end, without Claude Code
   oauth.test.mjs     the sign-in as Claude's connector goes through it
   workers.test.mjs   workers with a stand-in for claude and gh
+  telegram.test.mjs  Telegram fallback with a stand-in Bot API
+  docker.test.mjs    workers in the container, access levels and the bundle helper, with stand-ins for docker and GitHub
   controller.test.mjs   launcher flags, controller settings, confine hook
 docs/
   *.drawio.svg       diagrams: an image on GitHub, editable in draw.io
@@ -445,7 +799,9 @@ docs/
 
 - Workers have no live view. Follow a run with `worker_status`, or read its output in `.state/tasks/`.
 - Voice assistants only poll, so you hear about a finished run with your next request, not when it
-  ends.
+  ends. With the Telegram fallback, the result also arrives as a message once the voice mode has
+  ended.
+- Telegram is outbound only: answers and approvals still go through voice mode or the terminal.
 - While the controller is busy, new events arrive together in its next turn. Real parallelism
   needs separate sessions ([channels reference][ref]).
 - Open requests live in memory only; a restart forgets them. Connections and worker runs survive
