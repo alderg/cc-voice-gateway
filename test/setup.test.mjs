@@ -510,6 +510,12 @@ test('finishing: the files in .secrets with mode 0600 in folders of 0700, the co
   const unit = readFileSync(join(HOME, '.config', 'systemd', 'user', 'cc-voice-gateway.service'), 'utf8')
   assert.match(unit, /^ExecStart=".*\/tmux" new-session -d -s voice ".*\/scripts\/start-controller\.sh"$/m)
   assert.match(unit, /^ExecStop=".*\/scripts\/start-controller\.sh" --stop$/m)
+  // Without quotes: with them, systemd refused the unit at the next login.
+  assert.match(unit, /^WorkingDirectory=\/[^"]*$/m)
+  const analyze = spawnSync('systemd-analyze', ['--user', 'verify', join(HOME, '.config', 'systemd', 'user', 'cc-voice-gateway.service')], {
+    encoding: 'utf8',
+  })
+  if (!analyze.error) assert.equal(analyze.status, 0, analyze.stderr)
   const systemctl = calls().filter(c => c.command === 'systemctl').map(c => c.argv.join(' '))
   assert.deepEqual(systemctl, ['--user daemon-reload', '--user enable cc-voice-gateway.service'])
   assert.ok(calls().some(c => c.command === 'tmux' && c.argv.slice(0, 4).join(' ') === 'new-session -d -s voice'))

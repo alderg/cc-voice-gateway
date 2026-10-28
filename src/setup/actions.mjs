@@ -587,7 +587,12 @@ export function createSetup({
         '',
       ].join('\n')
     }
-    const quote = text => `"${text.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`
+    // systemd reads % as a specifier everywhere and $ as a variable in Exec
+    // lines, so both are doubled there. WorkingDirectory= takes no quotes: with
+    // them, systemd refuses the whole unit ("path is not absolute").
+    const literal = text => text.replace(/%/g, '%%')
+    const quote = text => `"${literal(text).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`
+    const exec = text => quote(text).replace(/\$/g, '$$$$')
     return [
       '# Written by the cc-voice-gateway setup assistant (scripts/setup.mjs).',
       '[Unit]',
@@ -597,10 +602,10 @@ export function createSetup({
       '[Service]',
       'Type=forking',
       'RemainAfterExit=yes',
-      `WorkingDirectory=${quote(root)}`,
+      `WorkingDirectory=${literal(root)}`,
       `Environment=${quote(`PATH=${env.PATH ?? ''}`)}`,
-      `ExecStart=${quote(bin.tmux)} new-session -d -s voice ${quote(start)}`,
-      `ExecStop=${quote(start)} --stop`,
+      `ExecStart=${exec(bin.tmux)} new-session -d -s voice ${exec(start)}`,
+      `ExecStop=${exec(start)} --stop`,
       '',
       '[Install]',
       'WantedBy=default.target',
