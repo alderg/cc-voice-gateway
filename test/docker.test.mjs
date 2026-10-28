@@ -439,6 +439,43 @@ test('Docker: a direct push only at level full, and only when asked', async () =
   assert.match(arg(siteCall, '--append-system-prompt'), /If the task says the repository is public\n  or its visibility is unknown, do not push/)
 })
 
+test('Docker: a clone whose origin changed in the container gets no run until it is checked at the desk', async () => {
+  repo(REPOS, 'moved', 'https://github.com/acme/guarded.git')
+  assert.match((await controller('list_workers')).text, /^moved: acme\/guarded, private, access pr /m)
+  const origins = () => JSON.parse(readFileSync(join(TMP, 'state', 'workers.json'), 'utf8')).origins
+  assert.equal(origins().moved, 'acme/guarded', 'pinned the first time the gateway saw it')
+  assert.equal(origins().local, null, 'no GitHub remote is pinned too')
+
+  // A worker points its clone at a repository whose main the token may push to.
+  const git = (...args) => execFileSync('git', args, { cwd: join(REPOS, 'moved'), stdio: 'ignore' })
+  git('remote', 'set-url', 'origin', 'git@github.com:acme/open.git')
+  const before = claudeCalls().length
+  assert.match(
+    (await controller('list_workers')).text,
+    /^moved: the origin changed in the container from acme\/guarded to acme\/open; check it at the desk, no dispatch until then, branch main, clean, idle$/m,
+  )
+  for (const extra of [{}, { direct: true }]) {
+    const refused = await dispatch('moved', 'Push it straight to main.', extra)
+    assert.equal(refused.isError, true)
+    assert.match(refused.text, /^\[dispatch=origin worker=moved\] The origin of moved changed in the container from acme\/guarded to acme\/open; check it at the desk\. Nothing started\./)
+  }
+  // From no GitHub remote to one counts as well.
+  execFileSync('git', ['remote', 'add', 'origin', 'https://github.com/acme/open.git'], { cwd: join(REPOS, 'local') })
+  try {
+    assert.match((await dispatch('local', 'Push it.')).text, /^\[dispatch=origin worker=local\] .* from no GitHub remote to acme\/open;/)
+  } finally {
+    execFileSync('git', ['remote', 'remove', 'origin'], { cwd: join(REPOS, 'local') })
+  }
+  assert.equal(claudeCalls().length, before, 'nothing started')
+  assert.equal(origins().moved, 'acme/guarded', 'the pin stays')
+
+  // Set back at the desk: runs again, at the level of the pinned repository.
+  git('remote', 'set-url', 'origin', 'https://github.com/acme/guarded.git')
+  const run = await dispatch('moved', 'Fix the typo.')
+  assert.match(run.text, /^\[dispatch=started worker=moved task=t[a-z0-9]{3} session=new access=pr\]/)
+  await runOf('moved', run.id)
+})
+
 test('Docker: stop_worker ends the run in the container with voice-stop', async () => {
   const run = await dispatch('local', 'SLOW: a long task.')
   assert.match(run.text, /dispatch=started/)

@@ -8,7 +8,7 @@
 
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { execFileSync, spawn } from 'node:child_process'
+import { execFileSync, spawn, spawnSync } from 'node:child_process'
 import { EventEmitter } from 'node:events'
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
@@ -23,6 +23,7 @@ import { z } from 'zod'
 import { adminRequest } from '../src/admin.mjs'
 import { KillSwitch, emergencyPhrase } from '../src/killswitch.mjs'
 import { RunGuard } from '../src/guard.mjs'
+import { Workers } from '../src/workers.mjs'
 import { Telegram, TelegramCommands, isStopCommand } from '../src/telegram.mjs'
 
 const GATEWAY = fileURLToPath(new URL('../src/gateway.mjs', import.meta.url))
@@ -62,6 +63,9 @@ if (args[0] === 'repo' && args[1] === 'view') { process.stdout.write('PRIVATE\\n
 if (args[0] === 'api') {
   const branch = /^repos\\/([^/]+\\/[^/]+)\\/branches\\/(.+)$/.exec(args[1])
   if (branch && state.heads?.[branch[1]]) out({ name: branch[2], commit: { sha: state.heads[branch[1]] } })
+  // the pull requests a commit on the default branch merged
+  const merged = /^repos\\/[^/]+\\/[^/]+\\/commits\\/([^/]+)\\/pulls$/.exec(args[1])
+  if (merged) out(state.pulls?.[merged[1]] ?? [])
   const repo = /^repos\\/([^/]+\\/[^/]+)$/.exec(args[1])
   if (repo) out({ default_branch: 'main' })
 }
@@ -308,6 +312,84 @@ test('rule: the default branch moved on GitHub during the run, and the worker ha
   other.guard.close()
 })
 
+test('rule: gh api calls that merge are merges, unless it was an explicit direct dispatch', () => {
+  for (const command of [
+    'gh api -X PUT repos/acme/alpha/pulls/12/merge',
+    'gh api -XPUT /repos/{owner}/{repo}/pulls/12/merge -f merge_method=squash',
+    'gh api --method PUT https://api.github.com/repos/acme/alpha/pulls/12/merge',
+    'gh api repos/acme/alpha/pulls/12/merge --method=put',
+    'gh api repos/acme/alpha/merges -f base=main -f head=voice/fix',
+    `gh api graphql -f query='mutation { mergePullRequest(input: {pullRequestId: "PR_kw"}) { clientMutationId } }'`,
+    "gh api graphql -F id=PR_kw -f query='\nmutation($id: ID!) {\n  enablePullRequestAutoMerge(input: {pullRequestId: $id}) { clientMutationId }\n}'",
+  ]) {
+    const { tripped, bash, guard } = guarded()
+    bash(command)
+    assert.equal(tripped.length, 1, command)
+    assert.match(tripped[0].reason, /^push to the default branch: the command "gh api .*" merges /, command)
+    guard.close()
+  }
+  for (const command of [
+    'gh api repos/acme/alpha/pulls/12/merge', // GET: whether it is merged
+    'gh api repos/acme/alpha/pulls/12/reviews -f event=COMMENT -f body=Fine',
+    `gh api graphql -f query='{ repository(owner: "acme", name: "alpha") { pullRequest(number: 12) { reviewThreads(first: 50) { nodes { isResolved } } } } }'`,
+    'gh pr comment 12 --body "no mergePullRequest here"',
+  ]) {
+    const { tripped, bash, guard } = guarded()
+    bash(command)
+    assert.deepEqual(tripped, [], command)
+    guard.close()
+  }
+  const direct = guarded({ direct: true })
+  direct.bash('gh api -X PUT repos/acme/alpha/pulls/12/merge')
+  assert.deepEqual(direct.tripped, [], 'a direct dispatch at level full may merge, as with gh pr merge')
+  direct.guard.close()
+})
+
+test("rule: a merge on GitHub of the run's pull request; not someone else's, such as the driver's at the desk", async () => {
+  const now = new Date().toISOString()
+  const yesterday = new Date(Date.now() - 24 * 3600 * 1000).toISOString()
+  const pull = (number, ref, created, extra = {}) => ({
+    number,
+    merged_at: now,
+    created_at: created,
+    base: { ref: 'main' },
+    head: { ref, repo: { full_name: 'acme/alpha' } },
+    ...extra,
+  })
+  const seconds = Math.floor(Date.now() / 1000)
+  const cases = [
+    ['opened during the run from a voice/ branch', pull(12, 'voice/fix', now), {}, null,
+      /: it merged pull request 12 from voice\/fix, opened during the run/],
+    ['an older pull request whose branch the run pushed by name', pull(13, 'feature/x', yesterday), {}, 'git push -u origin feature/x',
+      /: it merged pull request 13 from feature\/x, which the run pushed/],
+    ["an older pull request whose branch the worker's repository pushed during the run", pull(14, 'voice/older', yesterday),
+      { git: { 'reflog show': `origin/voice/older@{${seconds}} update by push\norigin/voice/older@{1700000000} update by push\n` } }, null,
+      /: it merged pull request 14 from voice\/older, which the run pushed/],
+    ["an earlier worker's pull request, merged at the desk", pull(15, 'voice/earlier', yesterday),
+      { git: { 'reflog show': 'origin/voice/earlier@{1700000000} update by push\n' } }, null, null],
+    ['a pull request into another branch', pull(16, 'voice/fix', now, { base: { ref: 'dev' } }), {}, null, null],
+    ['a pull request from a fork', pull(17, 'voice/fix', now, { head: { ref: 'voice/fix', repo: { full_name: 'someone/alpha' } } }), {}, null, null],
+    ['a direct dispatch', pull(18, 'voice/fix', now), { direct: true }, null, null],
+  ]
+  for (const [i, [what, merged, options, command, expected]] of cases.entries()) {
+    writeFileSync(GH_STATE, JSON.stringify({ heads: { 'acme/alpha': 'aaaaaaa1111' } }))
+    const run = guarded(options)
+    await run.guard.runs.get('tabc').ready
+    if (command) run.bash(command)
+    const sha = `c${i}c${i}c${i}c${i}9999`
+    writeFileSync(GH_STATE, JSON.stringify({ heads: { 'acme/alpha': sha }, pulls: { [sha]: [merged] } }))
+    await run.guard.ended(run.task)
+    if (expected) {
+      assert.equal(run.tripped.length, 1, what)
+      assert.match(run.tripped[0].reason, /^push to the default branch: main on GitHub moved from aaaaaaa to c\dc\dc\dc during the run: /, what)
+      assert.match(run.tripped[0].reason, expected, what)
+    } else {
+      assert.deepEqual(run.tripped, [], what)
+    }
+    run.guard.close()
+  }
+})
+
 test('rule: unusually many changes, in edits during the run and in git at its end', async () => {
   const edits = guarded({ limits: { maxEdits: 3 } })
   for (let i = 0; i < 4; i++) edits.tool('Edit', { file_path: `f${i}.js`, old_string: 'a', new_string: 'b' })
@@ -326,6 +408,52 @@ test('rule: unusually many changes, in edits during the run and in git at its en
   await small.guard.ended(small.task)
   assert.deepEqual(small.tripped, [])
   small.guard.close()
+})
+
+// --- a dispatch in flight ------------------------------------------------------------------
+
+test('a dispatch still checking the repository when the switch trips starts nothing', async () => {
+  const killswitch = new KillSwitch({ file: join(TMP, 'race', 'killswitch.json'), log: () => {} })
+  // A slow stand-in for git: the checks wait until the test lets them go.
+  let release
+  const waiting = new Promise(resolve => (release = resolve))
+  let asked = 0
+  const spawned = []
+  const runner = {
+    root: '/work',
+    dir: name => `/work/${name}`,
+    names: async () => ['alpha'],
+    git: async (dir, ...args) => {
+      asked++
+      await waiting
+      return args[0] === 'branch' ? 'main\n' : ''
+    },
+    spawn: (...args) => {
+      spawned.push(args)
+      throw new Error('no run may start')
+    },
+    stop: () => {},
+  }
+  const workers = new Workers({ runner, killswitch, stateDir: join(TMP, 'race', 'state'), claudeBin: join(BIN, 'claude') })
+  try {
+    const pending = workers.dispatch({ worker: 'alpha', task: 'Fix it.', words: 'Fix it.' })
+    await waitUntil(() => asked === 3) // branch, status and origin: inspect waits
+    killswitch.trip({ trigger: 'voice', reason: 'Notstopp' })
+    release()
+    const result = await pending
+    assert.equal(result.status, 'locked')
+    assert.equal(result.state.trigger, 'voice')
+    assert.deepEqual(spawned, [])
+    assert.deepEqual(workers.running(), [])
+    assert.equal(workers.starting.size, 0)
+
+    // start() itself refuses too, whoever calls it.
+    const facts = { name: 'alpha', dir: '/work/alpha', branch: 'main', dirty: [], origin: null, visibility: 'none', access: null }
+    assert.equal(workers.start(facts, { task: 'Fix it.', words: 'Fix it.' }).status, 'locked')
+    assert.deepEqual(spawned, [])
+  } finally {
+    workers.close()
+  }
 })
 
 // --- Telegram commands -------------------------------------------------------------------
@@ -585,4 +713,48 @@ test('a rule: a push to main in a run locks it, and every running worker stops',
     }
   })
   await unlockByAdmin()
+})
+
+test('locked at startup with a worker state that cannot be saved: logged, and the gateway stays up and locked', async () => {
+  const secrets = join(TMP, 'stuck', 'secrets')
+  const state = join(TMP, 'stuck', 'state')
+  mkdirSync(secrets, { recursive: true, mode: 0o700 })
+  mkdirSync(state, { recursive: true })
+  writeFileSync(join(secrets, 'killswitch.json'), JSON.stringify({ id: 'x', trigger: 'voice', reason: 'test', at: new Date().toISOString(), events: [] }))
+  // A run from before the restart, whose process is gone; stopping it saves the state.
+  const { pid } = spawnSync(process.execPath, ['-e', ''])
+  const task = { id: 'tgon', repo: 'alpha', task: 'x', words: 'x', state: 'running', pid, sessionId: 's', startedAt: Date.now(), finishedAt: null }
+  Object.assign(task, { file: join(state, 'tasks', 'tgon.jsonl'), errFile: join(state, 'tasks', 'tgon.err'), steps: [], pulls: [], reported: false })
+  writeFileSync(join(state, 'workers.json'), JSON.stringify({ repos: {}, tasks: [task] }))
+  chmodSync(state, 0o500) // .state not writable
+  let log = ''
+  const client = new Client({ name: 'fake-claude-code', version: '0.0.0' })
+  const stdio = new StdioClientTransport({
+    command: process.execPath,
+    args: [GATEWAY],
+    env: {
+      ...process.env,
+      VOICE_GW_PORT: String(await freePort()),
+      VOICE_GW_SECRETS_DIR: secrets,
+      VOICE_GW_STATE_DIR: state,
+      VOICE_GW_WORKER_ROOT: ROOT,
+      VOICE_GW_CLAUDE_BIN: join(BIN, 'claude'),
+      VOICE_GW_GH_BIN: join(BIN, 'gh'),
+      VOICE_GW_LOG_FILE: '',
+    },
+    stderr: 'pipe',
+  })
+  stdio.stderr.on('data', chunk => (log += chunk))
+  try {
+    await client.connect(stdio)
+    await waitUntil(() => /kill switch: worker runs stopped, but their state was not saved: /.test(log))
+    await sleep(300) // an unhandled rejection would end the gateway about now
+    const dispatch = await client.callTool({ name: 'dispatch', arguments: { worker: 'alpha', task: 'Fix it.', words: 'x' } })
+    assert.match(dispatch.content[0].text, /^\[dispatch=locked worker=alpha\]/)
+    const status = await client.callTool({ name: 'worker_status', arguments: { worker: 'alpha' } })
+    assert.match(status.content[0].text, /^\[worker=alpha state=stopped task=tgon/)
+  } finally {
+    await client.close()
+    chmodSync(state, 0o700)
+  }
 })

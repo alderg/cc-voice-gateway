@@ -8,7 +8,7 @@
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -371,6 +371,22 @@ test('one run per repository, two at a time; stop ends a run without an event', 
   for (const call of calls().filter(c => c.input.startsWith('SLOW'))) {
     assert.throws(() => process.kill(call.pid, 0), { code: 'ESRCH' }, 'the run is really gone')
   }
+})
+
+test('run output and the worker state are for this user only, also a folder from before', async () => {
+  const tasks = join(TMP, 'state', 'tasks')
+  const mode = path => statSync(path).mode & 0o777
+  const run = await dispatch('gamma', 'Look at the README.')
+  await workerEvent('gamma', run.id)
+  assert.equal(mode(tasks), 0o700)
+  for (const name of [`${run.id}.jsonl`, `${run.id}.err`]) assert.equal(mode(join(tasks, name)), 0o600, name)
+  assert.equal(mode(join(TMP, 'state', 'workers.json')), 0o600)
+
+  // As an older version left it: the next gateway closes the folder.
+  chmodSync(tasks, 0o755)
+  await stopGateway()
+  gw = await startGateway()
+  assert.equal(mode(tasks), 0o700)
 })
 
 test('a failed run reports what went wrong', async () => {

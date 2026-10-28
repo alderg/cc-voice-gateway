@@ -182,10 +182,16 @@ if (telegram) {
 // --- the kill switch's effects, in code ---------------------------------------
 
 // No new tasks (Workers.dispatch and the voice tools check the switch), every
-// run and the worker container stop, open approvals are denied.
+// run and the worker container stop, open approvals are denied. An error here
+// is logged; the lock holds whatever happens, and so does the gateway.
 async function lockdown(why) {
-  const stopped = workers.stopAll(`kill switch (${why})`)
-  if (stopped.length) log('kill switch stopped', stopped.map(task => `${task.repo} ${task.id}`).join(', '))
+  try {
+    const stopped = workers.stopAll(`kill switch (${why})`)
+    if (stopped.length) log('kill switch stopped', stopped.map(task => `${task.repo} ${task.id}`).join(', '))
+  } catch (error) {
+    // The runs got their signal before the state was to be saved.
+    log('kill switch: worker runs stopped, but their state was not saved:', error.message)
+  }
   for (const permission of store.openPermissions()) {
     store.resolvePermission(permission.code, 'deny')
     channel.sendVerdict(permission.code, 'deny').catch(() => {})
@@ -196,8 +202,10 @@ async function lockdown(why) {
   }
 }
 
+const lockdownFailed = error => log('kill switch: lockdown incomplete, still locked:', error.message)
+
 killswitch.on('tripped', async (state, event, first) => {
-  await lockdown(event.trigger)
+  await lockdown(event.trigger).catch(lockdownFailed)
   // Telegram at once; every voice chat hears it with its next call (voice.mjs).
   const when = new Date(event.at).toISOString().replace('T', ' ').slice(0, 16)
   telegram
@@ -221,7 +229,7 @@ killswitch.on('tripped', async (state, event, first) => {
   }
 })
 
-if (killswitch.locked) lockdown('locked at startup')
+if (killswitch.locked) lockdown('locked at startup').catch(lockdownFailed)
 
 // While locked, a worker container with a writable /repos is stopped, however
 // it was started.
