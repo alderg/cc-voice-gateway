@@ -6,9 +6,10 @@
 //   stdio  -> Claude Code controller session (a channel: push events, reply tool, permission relay)
 //   HTTP   -> voice assistant in the car (MCP tools: status, send, ask, get_reply, approve),
 //             behind an OAuth sign-in
-// plus a Unix socket for scripts/pair.mjs (pairing codes, connections), and the
+// plus a Unix socket for scripts/pair.mjs (pairing codes, connections), the
 // workers: headless Claude Code runs in the repositories next to this one, or
-// in a Docker container with its own clones.
+// in a Docker container with its own clones, and optionally Telegram, for news
+// after the voice mode ended.
 
 import { config } from './config.mjs'
 import { log } from './log.mjs'
@@ -18,6 +19,7 @@ import { startAdmin } from './admin.mjs'
 import { startChannel } from './channel.mjs'
 import { startVoiceHttp } from './voice.mjs'
 import { Workers } from './workers.mjs'
+import { TelegramFallback, loadTelegram } from './telegram.mjs'
 import { DockerRunner, HostRunner } from './runners.mjs'
 import { ACCESS_LEVELS, GitHubAccess } from './access.mjs'
 
@@ -83,7 +85,10 @@ workers.on('finished', async task => {
   reporting.add(task.id)
   try {
     await channel.ready
-    const request = store.createRequest(workers.resultText(task), { origin: 'worker' })
+    const request = store.createRequest(workers.resultText(task), {
+      origin: 'worker',
+      worker: { repo: task.repo, task: task.id },
+    })
     await channel.push(request, { worker: task.repo, task: task.id, outcome: task.state })
     workers.markReported(task)
   } catch (error) {
@@ -92,6 +97,19 @@ workers.on('finished', async task => {
     reporting.delete(task.id)
   }
 })
+
+// Telegram, if set up, reaches the driver once the voice mode has ended.
+const telegram = loadTelegram({
+  tokenFile: config.telegramTokenFile,
+  chatIdFile: config.telegramChatIdFile,
+  apiBase: config.telegramApi,
+})
+if (telegram) {
+  new TelegramFallback(store, { send: text => telegram.send(text), afterSeconds: config.telegramAfterSeconds })
+  log(`telegram fallback ready: after ${config.telegramAfterSeconds} s without a voice call`)
+} else {
+  log('telegram fallback off: telegram_token and telegram_chat_id not both set')
+}
 
 admin = await startAdmin(auth, config.adminSocket)
 http = startVoiceHttp(store, channel, auth, config)

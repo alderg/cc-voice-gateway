@@ -370,6 +370,12 @@ export function startVoiceHttp(store, channel, auth, settings) {
     }
     logCall(req, body, grant)
 
+    // Tool calls show that the voice mode is still on (Telegram fallback).
+    if ((Array.isArray(body) ? body : [body]).some(message => message?.method === 'tools/call')) {
+      store.voiceCallStarted()
+      res.on('close', () => store.voiceCallEnded())
+    }
+
     const mcp = buildVoiceServer(store, channel, settings)
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
