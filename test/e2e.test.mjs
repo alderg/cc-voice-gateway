@@ -161,8 +161,8 @@ test('declares the channel and permission capabilities and the reply tool', asyn
     'dispatch',
     'worker_status',
     'stop_worker',
-    'raise_alarm',
     'restart_controller',
+    'raise_alarm',
   ])
   assert.match(claudeCode.getInstructions(), /request_id/)
 })

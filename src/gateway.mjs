@@ -20,14 +20,14 @@ import { startAdmin } from './admin.mjs'
 import { startChannel } from './channel.mjs'
 import { startVoiceHttp } from './voice.mjs'
 import { Workers } from './workers.mjs'
+import { Restarter } from './restart.mjs'
+import { PullWatcher } from './pulls.mjs'
 import { TelegramCommands, TelegramFallback, loadTelegram } from './telegram.mjs'
 import { KillSwitch, alarmText } from './killswitch.mjs'
 import { RunGuard } from './guard.mjs'
 import { hostname } from 'node:os'
 import { DockerRunner, HostRunner } from './runners.mjs'
 import { ACCESS_LEVELS, GitHubAccess } from './access.mjs'
-import { PullWatcher } from './pulls.mjs'
-import { Restarter } from './restart.mjs'
 
 const store = new Store({ permissionTtlSeconds: config.permissionTtlSeconds, file: config.requestsFile })
 const killswitch = new KillSwitch({ file: config.killSwitchFile })
@@ -116,8 +116,8 @@ const restarter = new Restarter({ store, workers, secretsDir: config.secretsDir 
 const channel = await startChannel(store, {
   permissionRelay: config.permissionRelay,
   workers,
-  killswitch,
   restarter,
+  killswitch,
   onClose: () => shutdown('stdio closed'),
 })
 
