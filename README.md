@@ -39,7 +39,7 @@ Team and Enterprise an Owner first does the [admin steps](#74-admin-steps-for-te
    npm install
    ```
 
-   92 packages land in `node_modules`; nothing is compiled ([what it installs](#6-prerequisites)).
+   95 packages land in `node_modules`; nothing is compiled ([what it installs](#6-prerequisites)).
 
 3. **Run the setup assistant,** a temporary web server on this computer that writes the
    configuration files. Without it, the gateway runs with its defaults.
@@ -74,10 +74,13 @@ Team and Enterprise an Owner first does the [admin steps](#74-admin-steps-for-te
 
    It prints the connector URL `https://<host>.ts.net/mcp` and reports when all Funnel relays
    answer, which can take a few minutes the first time. The URL holds no secret; the sign-in needs
-   the pairing code from step 7 ([7.3](#73-publishing-the-endpoint)).
+   the pairing code from step 7. Without Tailscale, any HTTPS address on port 443 that forwards
+   to `127.0.0.1:8787` will do ([7.3](#73-publishing-the-endpoint)).
 
 6. **Add the connector in Claude Desktop:** Customize → Connectors → add a custom connector, with
-   the URL from step 5 ([7.1](#71-with-the-setup-assistant)).
+   the URL from step 5. Use Claude's published OAuth client; if signing in fails with it, choose to
+   register automatically ([5.2](#52-the-voice-endpoint-and-oauth)). Labels vary between app
+   versions.
 
    Claude opens the sign-in page "Connect to Claude Code", which asks for a pairing code.
 
@@ -825,23 +828,8 @@ it stay. Unticking Telegram deletes its two files. Options: `--host` (`0.0.0.0`)
 `--timeout` (minutes, `30`), `--idle` (minutes, `10`), or `VOICE_SETUP_HOST`, `VOICE_SETUP_PORT`,
 `VOICE_SETUP_TIMEOUT`, `VOICE_SETUP_IDLE`. Run it again to change something.
 
-Then:
-
-1. **Start the controller** unless the assistant did:
-   `tmux new -s voice scripts/start-controller.sh`. On the first start Claude Code asks in the
-   terminal for trust in the folder and consent for the MCP server from `.mcp.json`. With the
-   development flag it also shows the channel warning, at every start. If the assistant started it,
-   attach first: `tmux attach -t voice`.
-2. **Publish the endpoint** ([7.3](#73-publishing-the-endpoint)). The connector URL is the public
-   address followed by `/mcp`.
-3. **Add the connector** in the Claude app: Customize → Connectors → add a custom connector, with
-   the URL and sign-in. Use Claude's published OAuth client; if signing in fails with it, choose to
-   register automatically. Labels vary between app versions.
-4. **Pair.** Claude opens the page "Connect to Claude Code". On the computer run
-   `node scripts/pair.mjs` and enter the eight-digit code within five minutes.
-5. **Allow the tools.** Choose "Always allow" for the connector's tools. Otherwise voice mode stops
-   for a confirmation at every call, every `get_reply` included.
-6. **Try it** in voice mode: "Ask Claude Code whether the gateway is up."
+Then go on with [Getting started](#getting-started) from step 4: start the controller, publish the
+endpoint, add the connector and pair.
 
 ### 7.2 By hand
 
@@ -891,12 +879,14 @@ docker exec voice-workers git config --global user.email "you@example.com"
 - **Clones** use `https://` addresses, since the container has no SSH keys.
   `--build-arg CLAUDE_CODE_VERSION=<version>` pins Claude Code; rebuild to update it.
 - **Clean clones** for the fetch helper ([4.5](#45-pushing-from-a-read-only-container)) are
-  ordinary clones from GitHub outside the folder. Your checkouts in `~/Developer` will do: the
+  ordinary clones from GitHub outside the folder. Your checkouts in the worker root will do: the
   helper only adds refs to them.
 
 **Autostart on Linux:** a systemd user service that runs
 `tmux new-session -d -s voice <repo>/scripts/start-controller.sh` (Type=forking, with your
 `PATH`), then `systemctl --user enable cc-voice-gateway.service`.
+
+Then go on with [Getting started](#getting-started) from step 4.
 
 ### 7.3 Publishing the endpoint
 
