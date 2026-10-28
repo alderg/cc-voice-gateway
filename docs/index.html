@@ -80,8 +80,9 @@
   .green .icon { background: rgba(74, 222, 128, .14); }
 
   .split { display: grid; grid-template-columns: 1.05fr 1fr; gap: 56px; align-items: center; }
-  .diagram { margin-top: 44px; background: #ffffff; border-radius: 18px; padding: 28px; border: 1px solid var(--line); }
-  .diagram img { display: block; width: 100%; height: auto; color-scheme: light; }
+  /* The background of draw.io's dark theme, so its label backgrounds blend in. */
+  .diagram { margin-top: 44px; background: #151719; border-radius: 18px; padding: 28px; border: 1px solid var(--line); }
+  .diagram img { display: block; width: 100%; height: auto; }
   .diagram + .note a { color: var(--muted); text-decoration: underline; }
 
   .quotes { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; margin-top: 34px; }
@@ -193,7 +194,7 @@
         <p>Workers run Claude Code in your repositories, on your computer or in a Docker container. You hear the result in a sentence or two.</p>
       </div>
     </div>
-    <div class="diagram"><img src="architecture.drawio.svg" alt="Architecture: the Claude app's voice mode calls the gateway on your computer over HTTPS; the gateway hands requests to a Claude Code session, which dispatches workers into your repositories; Telegram is an optional second return channel; a watchdog and a kill switch guard it all." loading="lazy"></div>
+    <div class="diagram"><img src="assets/architecture-dark.svg" alt="Architecture: the Claude app's voice mode calls the gateway on your computer over HTTPS; the gateway hands requests to a Claude Code session, which dispatches workers into your repositories; Telegram is an optional second return channel; a watchdog and a kill switch guard it all." loading="lazy"></div>
     <p class="note">The architecture. More diagrams, from a single request to the security design, are in the <a href="https://github.com/alderg/cc-voice-gateway#4-diagrams">technical README</a>.</p>
   </div>
 </section>

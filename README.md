@@ -151,6 +151,13 @@ image with the diagram embedded, so GitHub shows it as a picture and draw.io ope
 In VS Code, the [vscode-drawio](https://github.com/hediet/vscode-drawio) extension edits them
 inline, right in the repository.
 
+The product page is dark, so it shows a copy of the architecture diagram exported with draw.io's
+dark theme. After changing the diagram, export that copy again:
+
+```bash
+draw.io -x -f svg --theme dark -o docs/assets/architecture-dark.svg docs/architecture.drawio.svg
+```
+
 ### 4.1 Architecture
 
 See the diagram in the [Overview](#1-overview). The gateway is the only own code at run time;
@@ -1098,7 +1105,7 @@ test/                one file per area; npm test runs them all, with stand-ins f
 docs/
   *.drawio.svg       the diagrams, made with draw.io
   index.html         the product page (GitHub Pages, from this folder)
-  assets/            the video, its poster and the README thumbnail
+  assets/            the video, its poster, the README thumbnail, the dark architecture diagram
   workers-plan.md    how workers came about
 video/               the video's sources: script.json (voiceover), slides.html (frames), build.mjs
 ```
