@@ -105,8 +105,9 @@ gateway starts `claude -p` in that checkout, without approvals:
 
    On the first start Claude Code asks in the terminal three times: trust for the folder, a
    warning about the development channel, and consent for the MCP server from `.mcp.json`.
-   Confirm all three. For an always-on setup run it inside tmux:
-   `tmux new -s voice scripts/start-controller.sh`.
+   Confirm all three; the warning comes again at every start. For an always-on setup run it
+   inside tmux: `tmux new -s voice scripts/start-controller.sh`. A watchdog in the script starts
+   the session again after a crash ([Keeping the controller running](#keeping-the-controller-running)).
 
 3. **Publish the endpoint** at a public HTTPS address, as described in
    [Publishing the endpoint](#publishing-the-endpoint). With Tailscale Funnel that is
@@ -233,6 +234,53 @@ an hour, and Claude renews it with a refresh token. Each renewal issues a new re
 for 30 days, so a connector that stays unused for longer has to sign in again. Take the endpoint
 offline when you do not need it, for example with `scripts/funnel.sh stop`.
 
+## Keeping the controller running
+
+`scripts/start-controller.sh` runs the controller session under a watchdog. The session keeps the
+terminal, in tmux as above; the watchdog waits for it to end and starts it again after a crash.
+
+![Watchdog](docs/watchdog.drawio.svg)
+
+- **Crash or on purpose.** Exit code 0 (quitting the session) or 130 (Ctrl+C) means you ended it,
+  and the watchdog ends too; so does `scripts/start-controller.sh --stop`. Any other exit code, or
+  a signal such as SEGV or the kernel's out-of-memory KILL, is a crash.
+- **A session that runs but no longer works.** Every 30 seconds the watchdog asks the gateway's
+  `/healthz` (on the port from `controller/.mcp.json`). Once the gateway has answered, three
+  failed checks in a row end the session, and it starts again. Before that, for example while the
+  development-channel warning waits, it only waits.
+- **No restart loops.** The pause before a restart starts at 5 seconds and doubles after each
+  quick crash, up to 5 minutes; a session that ran for 10 minutes starts the pause over. After 5
+  restarts within 30 minutes the watchdog gives up and exits with an error.
+- **One at a time.** A lock in `.state/controller.lock` keeps a second watchdog from starting.
+  `scripts/start-controller.sh --status` says whether one runs; `--stop` ends the session and the
+  watchdog, without a restart. A lock left behind by a killed watchdog does not block the next
+  start.
+- **Log and Telegram.** Each start, each restart with its reason, and giving up go to
+  `.logs/gateway.log` as `watchdog:` lines. If `.secrets/telegram_token` and
+  `.secrets/telegram_chat_id` exist, a bot token from [@BotFather](https://t.me/BotFather) and your
+  chat id, the watchdog also sends a short Telegram message on each restart and when it gives up,
+  through `scripts/telegram-notify.mjs`, which never shows the token.
+- **Without it:** `VOICE_GW_WATCHDOG=0 scripts/start-controller.sh` starts the session directly,
+  as before.
+
+**After a restart, the development-channel warning waits for you.** Claude Code asks at every
+start whether to load the development channel, and nothing in its settings or flags skips that
+question for a channel that is not on the approved list ([channels reference][ref]). Until
+someone answers it at the terminal, the gateway does not start and voice requests do not arrive;
+the Telegram message says so. The options:
+
+1. **Answer it at the terminal**, as now: `tmux attach -t voice`, then Enter. Over SSH from the
+   phone works too.
+2. **Put the gateway on an allowlist**, the supported way without the warning: package the gateway
+   as a Claude Code plugin in a marketplace of your own, and have an admin of the organisation add
+   it to `allowedChannelPlugins` in the organisation's managed settings, with `channelsEnabled`
+   ([enterprise controls][channels-admin]). The controller then starts with
+   `--channels plugin:<name>@<marketplace>` instead of the development flag. That list replaces
+   Anthropic's list of approved channel plugins for the whole organisation. Not built: it needs the
+   packaging and the admin's decision.
+3. **Answer the warning automatically**, for example with `tmux send-keys` after each restart.
+   Possible, but it confirms a safety prompt without a person; not built.
+
 ## At the desk
 
 `scripts/fake-voice.mjs` plays the voice assistant, so the chain can be tried without a phone. It
@@ -348,6 +396,20 @@ Claude Code starts the gateway, so environment variables go into `controller/.mc
 | `VOICE_GW_GH_BIN` | `gh` | the GitHub CLI, used to tell public from private repositories |
 | `FUNNEL_PORT` | `443` | for `scripts/funnel.sh` only; keep 443 for Claude |
 
+The [watchdog](#keeping-the-controller-running) reads its settings from the environment of
+`scripts/start-controller.sh`, for example `VOICE_GW_WATCHDOG_MAX_RESTARTS=10 scripts/start-controller.sh`:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `VOICE_GW_WATCHDOG` | `1` | `0` starts the session without the watchdog |
+| `VOICE_GW_WATCHDOG_INTERVAL` | `30` | seconds between checks of the gateway's `/healthz` |
+| `VOICE_GW_WATCHDOG_HEALTH_FAILS` | `3` | failed checks in a row, after the gateway has answered once, that end the session |
+| `VOICE_GW_WATCHDOG_MAX_RESTARTS` | `5` | restarts within the window before the watchdog gives up |
+| `VOICE_GW_WATCHDOG_WINDOW` | `1800` | that window, in seconds |
+| `VOICE_GW_WATCHDOG_BACKOFF` | `5` | first pause before a restart, in seconds; doubled after each quick crash |
+| `VOICE_GW_WATCHDOG_BACKOFF_MAX` | `300` | longest pause, in seconds |
+| `VOICE_GW_WATCHDOG_STABLE` | `600` | seconds a session must run for the pause to start over |
+
 ## Troubleshooting
 
 | Symptom | Cause and fix |
@@ -371,6 +433,9 @@ Claude Code starts the gateway, so environment variables go into `controller/.mc
 | What did a worker do? | `.state/tasks/<task>.jsonl` holds the whole run. `claude --resume <session>` in the repository opens the session; `.state/workers.json` lists the session ids. |
 | A private repository is handled like a public one | `gh` is not logged in or not on the `PATH`, so the visibility is unknown, and the worker asks before pushing to be safe. |
 | No approval by voice | Expected for Bash, Write and Edit: they run without asking. For other tools: the session runs in auto or bypass mode, an allow rule covers the tool, or it is a trust or consent dialog, which is not relayed. Start the session with `scripts/start-controller.sh`. |
+| Voice requests stop arriving after a crash | The watchdog started the session again, and the development-channel warning waits: `tmux attach -t voice`, then Enter. `grep watchdog .logs/gateway.log` shows what happened. |
+| `the controller is already running (watchdog …)` | A watchdog runs already, for example in another tmux window. `scripts/start-controller.sh --status`; `--stop` ends it. |
+| `watchdog: giving up …` | The session kept crashing, for example because the login expired. Look at the controller terminal, fix the cause, and start it again. |
 
 Claude Code's debug log is at `~/.claude/debug/<session-id>.txt`.
 
@@ -395,7 +460,8 @@ controller/
   CLAUDE.md          rules for the controller session
   playground/        working folder for requests
 scripts/
-  start-controller.sh   start the controller with the development channel
+  start-controller.sh   start the controller with the development channel, under a watchdog
+  telegram-notify.mjs   one Telegram message, for the watchdog
   funnel.sh          publish the endpoint with Tailscale Funnel, print the connector URL
   check-public.mjs   check the endpoint through Funnel's public relays
   pair.mjs           pairing codes, list and revoke connections
@@ -405,10 +471,11 @@ test/
   oauth.test.mjs     the sign-in as Claude's connector goes through it
   workers.test.mjs   workers with a stand-in for claude and gh
   controller.test.mjs   launcher flags, controller settings, confine hook
+  watchdog.test.mjs  the watchdog, with stand-ins for claude and Telegram
 docs/
   *.drawio.svg       diagrams: an image on GitHub, editable in draw.io
   workers-plan.md    how workers came about, and what is next
-.state/              worker state and run output (not in git)
+.state/              worker state, run output, the watchdog's lock (not in git)
 ```
 
 ## Limits and next steps
@@ -422,6 +489,8 @@ docs/
   restarts.
 - During the research preview, custom channels only run with the development flag. Flag syntax and
   protocol may change ([channels][channels]).
+- After a crash the watchdog starts the session again, but the development-channel warning needs
+  someone at the terminal ([Keeping the controller running](#keeping-the-controller-running)).
 
 ## Sources
 
@@ -436,6 +505,7 @@ docs/
 - [talk-to-claude-code][t2cc]: model for polling and voice-friendly tool results
 
 [channels]: https://code.claude.com/docs/en/channels
+[channels-admin]: https://code.claude.com/docs/en/channels#enterprise-controls
 [ref]: https://code.claude.com/docs/en/channels-reference
 [perm]: https://code.claude.com/docs/en/permissions
 [sandbox]: https://code.claude.com/docs/en/sandboxing

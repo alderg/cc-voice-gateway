@@ -27,8 +27,16 @@ function runWithStub(...args) {
     writeFileSync(stub, '#!/bin/sh\nprintf "%s\\n" "$PWD" "$@"\n')
     chmodSync(stub, 0o755)
     const out = execFileSync(SCRIPT, args, {
-      env: { ...process.env, PATH: `${bin}:${process.env.PATH}` },
+      env: {
+        ...process.env,
+        PATH: `${bin}:${process.env.PATH}`,
+        // The watchdog's lock, log and Telegram secrets: never the real ones.
+        VOICE_GW_STATE_DIR: join(bin, 'state'),
+        VOICE_GW_LOG_FILE: join(bin, 'log'),
+        VOICE_GW_SECRETS_DIR: join(bin, 'secrets'),
+      },
       encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
     })
     const [cwd, ...argv] = out.trimEnd().split('\n')
     return { cwd, argv }
