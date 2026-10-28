@@ -3,6 +3,11 @@
 //
 // Claude Code does not acknowledge channel events, so the gateway itself has to
 // track each request until the controller has answered it.
+//
+// Most requests come from the voice client. Worker results become requests
+// too (origin "worker"): the controller answers them with reply like any
+// other, and the voice client gets those answers as news with its next call.
+// So do late answers to a voice request whose "done" was already delivered.
 
 import { EventEmitter } from 'node:events'
 import { randomInt } from 'node:crypto'
@@ -34,16 +39,18 @@ export class Store extends EventEmitter {
     }
   }
 
-  // --- requests from the voice client -------------------------------------
+  // --- requests from the voice client or from workers ---------------------
 
-  createRequest(text) {
+  createRequest(text, { origin = 'voice' } = {}) {
     const request = {
       id: this.newId(),
       text,
+      origin, // voice | worker
       state: 'sent',
       createdAt: Date.now(),
       updates: [], // { at, state, text } from the controller
       cursor: 0, // index of the first update the voice client has not seen
+      closed: false, // the voice client has received state done
     }
     this.requests.set(request.id, request)
     this.prune()
@@ -56,7 +63,7 @@ export class Store extends EventEmitter {
   }
 
   openRequests() {
-    return [...this.requests.values()].filter(r => r.state !== 'done')
+    return [...this.requests.values()].filter(r => r.origin === 'voice' && r.state !== 'done')
   }
 
   // --- answers from the controller ----------------------------------------
@@ -79,6 +86,24 @@ export class Store extends EventEmitter {
     const fresh = request.updates.slice(request.cursor)
     request.cursor = request.updates.length
     return fresh
+  }
+
+  // News: answers the voice client gets with whatever it calls next, because
+  // nobody polls for them by id.
+  newsSources(except) {
+    return [...this.requests.values()].filter(
+      r => r !== except && (r.origin === 'worker' || r.closed) && this.hasUnread(r),
+    )
+  }
+
+  hasNews(except) {
+    return this.newsSources(except).length > 0
+  }
+
+  takeNews(except) {
+    return this.newsSources(except).flatMap(request =>
+      this.takeUnread(request).map(update => ({ id: request.id, ...update })),
+    )
   }
 
   // --- permission prompts relayed by Claude Code --------------------------

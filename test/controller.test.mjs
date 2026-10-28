@@ -53,10 +53,12 @@ test('start-controller.sh runs claude in controller/ with the channel in manual 
 test('controller settings: confined tools run without asking, deny rules, no bypass or auto mode', () => {
   const { permissions } = SETTINGS
   // Seen in voice mode: an approval for every write is too much while driving.
-  assert.deepEqual(permissions.allow, ['mcp__voice__reply', 'Bash', 'Write', 'Edit', 'NotebookEdit'])
+  const voiceTools = ['reply', 'list_workers', 'dispatch', 'worker_status', 'stop_worker'].map(t => `mcp__voice__${t}`)
+  assert.deepEqual(permissions.allow, [...voiceTools, 'Bash', 'Write', 'Edit', 'NotebookEdit'])
   assert.equal(permissions.ask, undefined)
   const [entry] = SETTINGS.hooks.PreToolUse
-  for (const rule of permissions.allow.filter(rule => rule !== 'mcp__voice__reply')) {
+  // The gateway's own tools are not file or shell tools; the rest is confined.
+  for (const rule of permissions.allow.filter(rule => !rule.startsWith('mcp__voice__'))) {
     assert.match(rule, new RegExp(`^(${entry.matcher})$`), `${rule} runs without asking, so the hook must confine it`)
   }
   assert.equal(permissions.defaultMode, undefined)
@@ -64,7 +66,9 @@ test('controller settings: confined tools run without asking, deny rules, no byp
   for (const rule of ['mcp__claude_ai_*', 'WebFetch', 'WebSearch', 'SendMessage', 'ListAgents', 'RemoteTrigger', 'CronCreate', 'Artifact*', 'Monitor', 'EnterWorktree']) {
     assert.ok(permissions.deny.includes(rule), rule)
   }
-  assert.ok(!permissions.deny.some(rule => 'mcp__voice__reply'.startsWith(rule.replace(/\*$/, ''))), 'reply stays usable')
+  for (const tool of voiceTools) {
+    assert.ok(!permissions.deny.some(rule => tool.startsWith(rule.replace(/\*$/, ''))), `${tool} stays usable`)
+  }
   assert.equal(permissions.disableBypassPermissionsMode, 'disable')
   assert.equal(permissions.disableAutoMode, 'disable')
 })

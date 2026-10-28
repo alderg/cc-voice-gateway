@@ -22,6 +22,7 @@ Workflow: send (or ask) -> get_reply, repeated while state is "sent" or "working
 to about 40 seconds) -> read the answer. Between polls tell the user in a few words that it is still
 running. Relay Claude Code's answers faithfully; you may shorten them but never invent results.
 Approvals: read them out and call approve only after the user explicitly said yes or no to that action.
+News: results of work Claude Code finished in the background arrive with any call. Read them out too.
 `.trim()
 
 const RELAY_RULE =
@@ -44,6 +45,18 @@ function ago(timestamp) {
   const minutes = Math.round(seconds / 60)
   if (minutes < 90) return `${plural(minutes, 'minute')} ago`
   return `${plural(Math.round(minutes / 60), 'hour')} ago`
+}
+
+function describeNews(news) {
+  const lines = news.map(
+    item => `News from Claude Code (id=${item.id}${item.state === 'question' ? ', a question' : ''}): ${item.text}`,
+  )
+  const question = news.find(item => item.state === 'question')
+  lines.push(
+    'Read the news to the user.' +
+      (question ? ` If they answer a question, send the answer with send (in_reply_to=${question.id}).` : ''),
+  )
+  return lines
 }
 
 function describePermission(permission) {
@@ -71,6 +84,10 @@ function report(store, request, settings) {
   const lines = [`[${head.join(' ')}]`]
   for (const update of fresh) lines.push(`Claude Code: ${update.text}`)
   for (const permission of permissions) lines.push(describePermission(permission))
+  // After this, further answers to the request count as news.
+  if (request.state === 'done') request.closed = true
+  const news = store.takeNews(request)
+  if (news.length) lines.push(...describeNews(news))
 
   if (permissions.length) {
     lines.push(
@@ -111,6 +128,7 @@ async function waitAndReport(store, request, waitSeconds, signal, settings) {
   await store.waitFor(
     () =>
       store.hasUnread(request) ||
+      store.hasNews(request) ||
       store.hasUnannouncedPermission() ||
       request.state === 'done' ||
       request.state === 'question',
@@ -141,6 +159,8 @@ function statusText(store, settings) {
   if (permissions.length) {
     lines.push('Pending approvals: ' + permissions.map(p => `${p.code} (${p.toolName})`).join('; '))
   }
+  const news = store.takeNews()
+  if (news.length) lines.push(...describeNews(news))
   return lines.join('\n')
 }
 

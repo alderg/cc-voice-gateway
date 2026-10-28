@@ -2,13 +2,14 @@
 
 Drive Claude Code by voice from the car. Claude's voice mode calls a custom MCP connector, and the
 connector hands the request to a Claude Code session running on your computer: the controller. It
-answers, asks back and does the work. You can speak any language.
+answers, asks back, and hands work in your repositories to workers: headless Claude Code runs that
+commit, push and open draft pull requests. You can speak any language.
 
 Plain JavaScript (ESM), no build step. The only dependencies are `@modelcontextprotocol/sdk` and `zod`.
 
-> **Status:** works with Claude voice mode on the iPhone; CarPlay has not been tried yet. Claude Code
-> channels are a research preview. Open requests live in memory only. Workers for real
-> repositories are planned ([docs/workers-plan.md](docs/workers-plan.md)).
+> **Status:** works with Claude voice mode on the iPhone; CarPlay has not been tried yet. Workers
+> are built and tested with a stand-in for Claude Code, not yet from the car. Claude Code channels
+> are a research preview.
 
 ![Architecture](docs/architecture.drawio.svg)
 
@@ -34,6 +35,10 @@ conversation in the car.
 | Voice assistant | `get_reply` | Fetch news for an `id`, waits up to 40 s |
 | Voice assistant | `approve` | Allow or deny an approval with its five-letter code |
 | Controller | `reply` | Answer with `state` `working`, `question` or `done` |
+| Controller | `list_workers` | The repositories: origin, public or private, branch, uncommitted files, what each worker does |
+| Controller | `dispatch` | Hand a task to a repository's worker, returns at once |
+| Controller | `worker_status` | What a worker is doing or did last |
+| Controller | `stop_worker` | Stop a worker's run |
 
 ![Request flow](docs/request-flow.drawio.svg)
 
@@ -55,6 +60,19 @@ answer wins, whether it comes from the car or from the terminal ([channels refer
 therefore asks for questions as plain text with `state: "question"`. The driver's answer arrives as
 a new request that refers to the original `id`.
 
+**Workers:** every git repository in the folder that holds this one (`~/Developer`) has a worker,
+named after its folder. The controller does no repository work itself. It calls `dispatch`, and the
+gateway starts `claude -p` in that checkout, without approvals:
+- **Before the run** the gateway checks for uncommitted changes, a run already going in that
+  repository, and the limit of two runs at a time.
+- **During the run** the worker branches `voice/<name>` off the current branch, commits only its
+  own changes, pushes, and opens a draft pull request against that branch. On public repositories
+  it asks before pushing. At the end it switches the checkout back.
+- **Follow-ups** continue the same Claude session, so the worker keeps its context.
+- **The result** goes to the controller as a channel event. The controller summarises it, and its
+  answer reaches the driver as news with the next call.
+- **Restarts:** runs are detached and survive a controller restart; the new gateway picks them up.
+
 ![States](docs/states.drawio.svg)
 
 ## Requirements
@@ -66,6 +84,7 @@ a new request that refers to the original `id`.
   reverse proxy on a machine with a public IP. See [Publishing the endpoint](#publishing-the-endpoint).
 - The Claude app on a paid plan, for custom connectors. The connector's Claude account does not
   have to be the one that runs Claude Code.
+- For workers: git, and the GitHub CLI `gh`, logged in, for pushing and pull requests.
 
 ## Setup
 
@@ -179,21 +198,26 @@ The answers are short by design: at most three sentences, no code, paths or list
 (`controller/CLAUDE.md`). Requests that arrive while the controller is busy are answered together
 in its next turn, so one request at a time works best.
 
-### Planned: talking to workers
+### Working in your repositories
 
-Not built yet; see [docs/workers-plan.md](docs/workers-plan.md). Every git repository in
-`~/Developer` becomes a worker, named after its folder. The controller hands work to a headless
-Claude Code run in that repository and reports back. A worker commits on a `voice/…` branch,
-pushes it and opens a draft pull request:
+Name the repository as its folder is called; the controller matches loosely ("draw io m c p" is
+`drawio-mcp`) and asks when unsure.
 
-| Example | What will happen |
+| Example | What happens |
 |---|---|
 | "Ask Claude Code which repositories it can work in." | `list_workers`: names, branch, uncommitted changes, what each worker is doing |
-| "Tell the cc-voice-gateway worker to run the tests." | `dispatch`; the controller confirms at once that it has started |
+| "Ask the cc-voice-gateway worker whether the tests pass." | `dispatch`; the controller confirms at once that it is on its way, and the result follows as news |
+| "Tell the cc-voice-gateway worker to fix the typo in the README." | The worker commits on a `voice/` branch, pushes and opens a draft pull request |
 | "What is the cc-voice-gateway worker doing?" | `worker_status`, summarised in one or two sentences |
 | "Anything new from Claude Code?" | Results of workers that have finished since you last asked |
 | "Tell it to add a test for that too." | Follow-up in the same worker session, on the same branch |
+| "Yes, publish it." | Answer to a worker's question, for example before pushing a public repository |
 | "Stop the drawio-mcp worker." | `stop_worker` |
+
+If a checkout has uncommitted changes, the controller asks first whether the worker should go
+ahead; a worker never commits, stashes or discards changes it did not make. Workers change files
+and switch branches in your checkouts, so do not work in the same repository at the desk while a
+worker runs there.
 
 ## Connections
 
@@ -244,9 +268,22 @@ approval prompts) and the voice assistant, including the whole sign-in.
   addresses are limited to Claude's hosts (`claude.ai`, `claude.com`) and loopback.
 - **Tokens are stored as hashes only,** in `.secrets/oauth.json`. `pair.mjs` reaches the gateway
   through the Unix socket `.secrets/admin.sock`. Both are mode 0600, in a folder that is mode 0700.
-- **Whoever controls the Claude account with the connector can make Claude Code work,** and so
-  can a voice assistant manipulated by prompt injection. If in doubt, run
-  `node scripts/pair.mjs revoke all`.
+- **Whoever is signed in can have any command run as you.** Workers run without approvals and
+  outside the controller's confinement, as your user. They can use what this machine is signed in
+  to: your GitHub login (push to every repository you can write to), your SSH keys and your network.
+  That includes a voice assistant manipulated by prompt injection, and prompt injection through
+  repository content. Run it on a VM, and if in doubt, run `node scripts/pair.mjs revoke all`.
+- **What limits workers:**
+  - The Claude account's connectors, messages to other sessions, and remote and scheduled agents
+    are denied.
+  - A repository's own MCP servers do not start.
+  - Workers do not inherit the controller session's variables, so they cannot reach its messaging
+    socket.
+  - Public repositories: the worker asks before pushing.
+  - Uncommitted changes: the controller asks before a run.
+  - A run stops after 60 minutes, and at most two run at a time.
+  - Everything else, such as staying on a `voice/` branch or never force-pushing, is in the
+    worker's instructions: rules, not limits.
 - **The endpoint is public.** Anyone on the internet can reach the sign-in page. A certificate from
   a public authority, Tailscale Funnel's included, also publishes the host name in the certificate
   transparency logs.
@@ -263,8 +300,8 @@ approval prompts) and the voice assistant, including the whole sign-in.
     worktrees. Bypass and auto mode cannot be switched on.
   - What is left: reading `controller/`, and writing or deleting in the playground. The answers
     go back to the voice assistant.
-  - On a VM, the VM protects the host. The confinement protects what is signed in on the machine
-    itself: the Claude account's connectors, GitHub, SSH keys and the tailnet.
+  - The confinement keeps the controller to its job, talking and dispatching. It does not limit
+    workers.
 - The gateway binds to `127.0.0.1` only.
 - Approval by voice means: whoever can call `approve` can approve tools. The voice assistant is
   told to approve only after an explicit yes; that is an instruction, not enforcement. Turn it off
@@ -303,6 +340,12 @@ Claude Code starts the gateway, so environment variables go into `controller/.mc
 | `VOICE_GW_HINT_AFTER` | `20` | when a diagnostic hint appears |
 | `VOICE_GW_PERMISSION_TTL` | `900` | open approvals expire after this many seconds |
 | `VOICE_GW_LOG_FILE` | `.logs/gateway.log` | set empty for stderr only |
+| `VOICE_GW_WORKER_ROOT` | the folder holding this repository | every git repository directly in it has a worker |
+| `VOICE_GW_MAX_WORKERS` | `2` | runs at the same time |
+| `VOICE_GW_WORKER_TIMEOUT` | `60` | minutes before a run is stopped |
+| `VOICE_GW_STATE_DIR` | `.state` | worker state and the output of every run |
+| `VOICE_GW_CLAUDE_BIN` | `claude` | the Claude Code command for workers |
+| `VOICE_GW_GH_BIN` | `gh` | the GitHub CLI, used to tell public from private repositories |
 | `FUNNEL_PORT` | `443` | for `scripts/funnel.sh` only; keep 443 for Claude |
 
 ## Troubleshooting
@@ -323,6 +366,10 @@ Claude Code starts the gateway, so environment variables go into `controller/.mc
 | `EADDRINUSE` in the log | A second controller session is running. Start only one. |
 | Voice assistant answers itself instead of asking | Say "Ask Claude Code …" explicitly. |
 | Voice assistant says the connector does not work | Look at `.logs/gateway.log`. No `voice initialize`: the request never arrived (URL, tunnel or proxy, DNS). `voice 401`: the client has to sign in again. `initialize` and `tools/list` but no `tools/call`: the assistant chose not to call a tool. |
+| A repository is missing from `list_workers` | Only folders directly in the worker root with a `.git` count. Check `VOICE_GW_WORKER_ROOT`. |
+| A worker fails at once | `could not start claude`: Claude Code is not on the gateway's `PATH`; set `VOICE_GW_CLAUDE_BIN`. Otherwise read `.state/tasks/<task>.err`. |
+| What did a worker do? | `.state/tasks/<task>.jsonl` holds the whole run. `claude --resume <session>` in the repository opens the session; `.state/workers.json` lists the session ids. |
+| A private repository is handled like a public one | `gh` is not logged in or not on the `PATH`, so the visibility is unknown, and the worker asks before pushing to be safe. |
 | No approval in the car | Expected for Bash, Write and Edit: they run without asking. For other tools: the session runs in auto or bypass mode, an allow rule covers the tool, or it is a trust or consent dialog, which is not relayed. Start the session with `scripts/start-controller.sh`. |
 
 Claude Code's debug log is at `~/.claude/debug/<session-id>.txt`.
@@ -335,6 +382,7 @@ src/
   channel.mjs        stdio side: channel, reply tool, permission relay
   voice.mjs          HTTP side: MCP tools for the voice assistant
   oauth.mjs          sign-in: OAuth metadata, registration, sign-in page, tokens
+  workers.mjs        workers: find repositories, start and follow claude -p runs
   admin.mjs          Unix socket for pair.mjs and fake-voice
   store.mjs          requests, approvals, waiting for changes
   http.mjs           small HTTP helpers
@@ -355,19 +403,23 @@ scripts/
 test/
   e2e.test.mjs       both sides end to end, without Claude Code
   oauth.test.mjs     the sign-in as Claude's connector goes through it
+  workers.test.mjs   workers with a stand-in for claude and gh
   controller.test.mjs   launcher flags, controller settings, confine hook
 docs/
   *.drawio.svg       diagrams: an image on GitHub, editable in draw.io
-  workers-plan.md    plan for worker sessions
+  workers-plan.md    how workers came about, and what is next
+.state/              worker state and run output (not in git)
 ```
 
 ## Limits and next steps
 
-- One controller session only, no workers yet. Next step: one headless worker per repository,
-  see [docs/workers-plan.md](docs/workers-plan.md).
+- Workers have no live view. Follow a run with `worker_status`, or read its output in `.state/tasks/`.
+- Voice assistants only poll, so you hear about a finished run with your next request, not when it
+  ends.
 - While the controller is busy, new events arrive together in its next turn. Real parallelism
   needs separate sessions ([channels reference][ref]).
-- Open requests live in memory only; a restart forgets them. Connections survive restarts.
+- Open requests live in memory only; a restart forgets them. Connections and worker runs survive
+  restarts.
 - During the research preview, custom channels only run with the development flag. Flag syntax and
   protocol may change ([channels][channels]).
 

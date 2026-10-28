@@ -1,6 +1,7 @@
 node_modules/
 .secrets/
 .logs/
+.state/
 controller/playground/*
 !controller/playground/.gitkeep
 .claude/settings.local.json

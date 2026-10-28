@@ -47,6 +47,8 @@ async function startGateway() {
     env: {
       ...process.env,
       VOICE_GW_SECRETS_DIR: SECRETS,
+      VOICE_GW_STATE_DIR: join(SECRETS, 'state'),
+      VOICE_GW_WORKER_ROOT: join(SECRETS, 'no-repositories'),
       VOICE_GW_PORT: String(port),
       VOICE_GW_LOG_FILE: '',
       // 127.0.0.1 only so the test can serve a client ID metadata document.

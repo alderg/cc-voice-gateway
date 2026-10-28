@@ -110,6 +110,8 @@ before(async () => {
     env: {
       ...process.env,
       VOICE_GW_SECRETS_DIR: SECRETS,
+      VOICE_GW_STATE_DIR: join(SECRETS, 'state'),
+      VOICE_GW_WORKER_ROOT: join(SECRETS, 'no-repositories'),
       VOICE_GW_PORT: String(port),
       VOICE_GW_MAX_WAIT: '3',
       VOICE_GW_DEFAULT_WAIT: '2',
@@ -153,7 +155,7 @@ test('declares the channel and permission capabilities and the reply tool', asyn
   assert.deepEqual(caps.experimental['claude/channel'], {})
   assert.deepEqual(caps.experimental['claude/channel/permission'], {})
   const { tools } = await claudeCode.listTools()
-  assert.deepEqual(tools.map(t => t.name), ['reply'])
+  assert.deepEqual(tools.map(t => t.name), ['reply', 'list_workers', 'dispatch', 'worker_status', 'stop_worker'])
   assert.match(claudeCode.getInstructions(), /request_id/)
 })
 
@@ -340,6 +342,8 @@ test('a gateway whose Claude Code session dies exits instead of holding the port
     env: {
       ...process.env,
       VOICE_GW_SECRETS_DIR: join(SECRETS, 'dying'),
+      VOICE_GW_STATE_DIR: join(SECRETS, 'dying', 'state'),
+      VOICE_GW_WORKER_ROOT: join(SECRETS, 'no-repositories'),
       VOICE_GW_PORT: String(await freePort()),
       VOICE_GW_LOG_FILE: '',
     },

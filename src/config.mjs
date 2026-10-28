@@ -49,6 +49,16 @@ export const config = {
     .split(',')
     .map(host => host.trim())
     .filter(Boolean),
+
+  // Workers: every git repository in this folder, by default the one this
+  // repository sits in (~/Developer).
+  workerRoot: process.env.VOICE_GW_WORKER_ROOT || dirname(ROOT),
+  maxWorkers: num(process.env.VOICE_GW_MAX_WORKERS, 2),
+  workerTimeoutMinutes: num(process.env.VOICE_GW_WORKER_TIMEOUT, 60),
+  claudeBin: process.env.VOICE_GW_CLAUDE_BIN || 'claude',
+  ghBin: process.env.VOICE_GW_GH_BIN || 'gh',
+  // Worker state and the output of every run.
+  stateDir: process.env.VOICE_GW_STATE_DIR || join(ROOT, '.state'),
 }
 
 config.oauthStateFile = join(config.secretsDir, 'oauth.json')

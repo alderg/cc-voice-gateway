@@ -6,7 +6,8 @@
 //   stdio  -> Claude Code controller session (a channel: push events, reply tool, permission relay)
 //   HTTP   -> voice assistant in the car (MCP tools: status, send, ask, get_reply, approve),
 //             behind an OAuth sign-in
-// plus a Unix socket for scripts/pair.mjs (pairing codes, connections).
+// plus a Unix socket for scripts/pair.mjs (pairing codes, connections), and the
+// workers: headless Claude Code runs in the repositories next to this one.
 
 import { config } from './config.mjs'
 import { log } from './log.mjs'
@@ -15,9 +16,18 @@ import { Auth } from './oauth.mjs'
 import { startAdmin } from './admin.mjs'
 import { startChannel } from './channel.mjs'
 import { startVoiceHttp } from './voice.mjs'
+import { Workers } from './workers.mjs'
 
 const store = new Store({ permissionTtlSeconds: config.permissionTtlSeconds })
 const auth = new Auth({ stateFile: config.oauthStateFile, allowedHosts: config.oauthHosts })
+const workers = new Workers({
+  root: config.workerRoot,
+  stateDir: config.stateDir,
+  claudeBin: config.claudeBin,
+  ghBin: config.ghBin,
+  maxRuns: config.maxWorkers,
+  timeoutMinutes: config.workerTimeoutMinutes,
+})
 
 let http
 let admin
@@ -28,13 +38,33 @@ function shutdown(reason) {
   log('shutting down:', reason)
   http?.close()
   admin?.close()
+  workers.close() // runs go on; the next gateway picks them up
   // Give pending log writes and HTTP responses a moment, then leave.
   setTimeout(() => process.exit(0), 200).unref()
 }
 
 const channel = await startChannel(store, {
   permissionRelay: config.permissionRelay,
+  workers,
   onClose: () => shutdown('stdio closed'),
+})
+
+// When a run ends, its result goes to the controller as a channel event. The
+// controller's reply to it reaches the driver as news.
+const reporting = new Set()
+workers.on('finished', async task => {
+  if (reporting.has(task.id)) return
+  reporting.add(task.id)
+  try {
+    await channel.ready
+    const request = store.createRequest(workers.resultText(task), { origin: 'worker' })
+    await channel.push(request, { worker: task.repo, task: task.id, outcome: task.state })
+    workers.markReported(task)
+  } catch (error) {
+    log('worker result not delivered:', error.message)
+  } finally {
+    reporting.delete(task.id)
+  }
 })
 
 admin = await startAdmin(auth, config.adminSocket)

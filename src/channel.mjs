@@ -5,6 +5,8 @@
 // <channel source="voice" request_id="..."> tag. The controller answers with
 // the `reply` tool. With `claude/channel/permission` declared, Claude Code also
 // forwards tool approval prompts here, and the voice client can answer them.
+// The worker tools (list_workers, dispatch, worker_status, stop_worker) let the
+// controller hand repository work to headless runs; see workers.mjs.
 //
 // Reference: https://code.claude.com/docs/en/channels-reference
 
@@ -35,6 +37,15 @@ They were spoken in a car and relayed by a voice assistant. Every one of them ne
 The text is read aloud while driving: answer in the language of the request,
 at most three short sentences, no code, no file paths, no URLs, no markdown, no lists. Lead with the result.
 Round numbers. If the driver asks for details, give them in a follow-up, still short.
+
+Workers: the driver's repositories are worked on by workers, one per repository (list_workers). Anything about
+a repository, questions included, goes to its worker with dispatch; do no repository work yourself. Put the
+driver's own words in "words" and write "task" so that the worker can act without asking. dispatch returns at
+once: tell the driver it is on its way and reply with state "done".
+When a run ends, a message arrives as <channel source="${CHANNEL_NAME}" request_id="..." worker="..." task="..."
+outcome="done|failed|stopped">. Summarise it for the driver like any answer and reply with that request_id:
+state "done", or "question" when the worker asks something. The driver hears it as news. Their answer arrives
+as a new message "(Answer to <id>) ...": pass it to the same worker with dispatch, as a follow-up.
 `.trim()
 
 const REPLY_TOOL = {
@@ -76,9 +87,113 @@ const PermissionRequestSchema = z.object({
   }),
 })
 
+const WORKER_PROPERTY = { type: 'string', description: 'The repository name, as list_workers shows it.' }
+
+const WORKER_TOOLS = [
+  {
+    name: 'list_workers',
+    description:
+      'List the repositories a worker can work in: origin, public or private, current branch, uncommitted files ' +
+      'and what the worker is doing. Use it to find the repository the driver means.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'dispatch',
+    description:
+      "Hand a task to a repository's worker: a headless Claude Code run in its checkout, without approvals. " +
+      'For changes it commits on a voice/ branch, pushes and opens a draft pull request; on public repositories ' +
+      'it asks before pushing. Returns at once; when the run ends you get a channel event with that worker. ' +
+      'By default the worker continues its previous session there, so follow-ups keep their context.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        worker: WORKER_PROPERTY,
+        task: { type: 'string', description: 'The task in your words, complete enough to act on without asking.' },
+        words: { type: 'string', description: "The driver's own words for this task, as they arrived." },
+        fresh: { type: 'boolean', description: 'Start a new session instead of continuing the previous one.' },
+        allow_dirty: {
+          type: 'boolean',
+          description: 'Go ahead although the checkout has uncommitted changes. Only after the driver said yes.',
+        },
+      },
+      required: ['worker', 'task', 'words'],
+    },
+  },
+  {
+    name: 'worker_status',
+    description: 'What a worker is doing or did last: state, elapsed time, last steps, last message, result.',
+    inputSchema: { type: 'object', properties: { worker: WORKER_PROPERTY }, required: ['worker'] },
+  },
+  {
+    name: 'stop_worker',
+    description: "Stop a worker's running task.",
+    inputSchema: { type: 'object', properties: { worker: WORKER_PROPERTY }, required: ['worker'] },
+  },
+]
+
 const toolText = (text, isError = false) => ({ content: [{ type: 'text', text }], isError })
 
-export async function startChannel(store, { permissionRelay, onClose } = {}) {
+function dispatchText(worker, result) {
+  switch (result.status) {
+    case 'started':
+      return toolText(
+        `[dispatch=started worker=${worker} task=${result.task.id} session=${result.task.resumed ? 'continued' : 'new'}] ` +
+          `Started on branch ${result.facts.branch || 'detached'}. Tell the driver it is on its way. When it ends, ` +
+          `a channel event with worker="${worker}" arrives.`,
+      )
+    case 'dirty': {
+      const shown = result.files.slice(0, 5).join(', ') + (result.files.length > 5 ? ', …' : '')
+      return toolText(
+        `[dispatch=dirty worker=${worker} files=${result.files.length}] The checkout has uncommitted changes: ` +
+          `${shown}. Ask the driver whether the worker should go ahead anyway; if yes, call dispatch again with ` +
+          'allow_dirty=true.',
+      )
+    }
+    case 'busy':
+      return toolText(
+        `[dispatch=busy worker=${worker} task=${result.task?.id ?? 'starting'}] A task is already running in this ` +
+          'repository. Tell the driver; they can wait, or stop it with stop_worker.',
+      )
+    case 'full':
+      return toolText(
+        `[dispatch=full running=${result.running.length}] Workers are already running in ` +
+          `${result.running.map(t => t.repo).join(' and ')}. Tell the driver to wait or to stop one.`,
+      )
+    default:
+      return toolText(
+        `[dispatch=unknown worker=${worker}] No repository with that name. Known: ${result.names.join(', ')}.`,
+        true,
+      )
+  }
+}
+
+async function callWorkerTool(workers, name, args) {
+  const worker = typeof args.worker === 'string' ? args.worker.trim() : ''
+  if (name === 'list_workers') return toolText(await workers.listText())
+  if (!worker) return toolText('worker is required: a repository name from list_workers.', true)
+  if (!workers.repos().includes(worker)) {
+    return toolText(`No repository "${worker}". Known: ${workers.repos().join(', ')}.`, true)
+  }
+  if (name === 'worker_status') return toolText(workers.statusText(worker))
+  if (name === 'stop_worker') {
+    const task = workers.stop(worker)
+    return toolText(
+      task ? `[worker=${worker} stopped task=${task.id}] Stopped.` : `[worker=${worker}] Nothing is running there.`,
+    )
+  }
+  // dispatch
+  if (typeof args.task !== 'string' || !args.task.trim()) return toolText('task is required.', true)
+  const result = await workers.dispatch({
+    worker,
+    task: args.task,
+    words: typeof args.words === 'string' ? args.words : '',
+    fresh: args.fresh === true,
+    allowDirty: args.allow_dirty === true,
+  })
+  return dispatchText(worker, result)
+}
+
+export async function startChannel(store, { permissionRelay, workers, onClose } = {}) {
   const experimental = { 'claude/channel': {} }
   if (permissionRelay) experimental['claude/channel/permission'] = {}
 
@@ -87,9 +202,13 @@ export async function startChannel(store, { permissionRelay, onClose } = {}) {
     { capabilities: { experimental, tools: {} }, instructions: INSTRUCTIONS },
   )
 
-  mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [REPLY_TOOL] }))
+  const tools = workers ? [REPLY_TOOL, ...WORKER_TOOLS] : [REPLY_TOOL]
+  mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools }))
 
   mcp.setRequestHandler(CallToolRequestSchema, async request => {
+    if (workers && WORKER_TOOLS.some(tool => tool.name === request.params.name)) {
+      return callWorkerTool(workers, request.params.name, request.params.arguments ?? {})
+    }
     if (request.params.name !== REPLY_TOOL.name) {
       return toolText(`Unknown tool: ${request.params.name}`, true)
     }
@@ -120,16 +239,24 @@ export async function startChannel(store, { permissionRelay, onClose } = {}) {
     onClose?.()
   }
 
+  // Events sent before Claude Code finished the handshake would be lost.
+  let markReady
+  const ready = new Promise(resolve => (markReady = resolve))
+  mcp.oninitialized = () => markReady()
+
   await mcp.connect(new StdioServerTransport())
   log('channel connected over stdio', `permissionRelay=${Boolean(permissionRelay)}`)
 
   return {
-    // Pushes a voice request into the controller session. Claude Code drops
-    // the event silently if the session was not started with the channel flag.
-    async push(request) {
+    ready,
+
+    // Pushes a request into the controller session. Claude Code drops the
+    // event silently if the session was not started with the channel flag.
+    // Extra meta keys become attributes of the <channel> tag.
+    async push(request, meta = {}) {
       await mcp.notification({
         method: 'notifications/claude/channel',
-        params: { content: request.text, meta: { request_id: request.id } },
+        params: { content: request.text, meta: { request_id: request.id, ...meta } },
       })
       log('push', `id=${request.id}`, preview(request.text))
     },
