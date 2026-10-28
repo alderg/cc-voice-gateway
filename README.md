@@ -1,20 +1,14 @@
 # cc-voice-gateway
 
-Feasibility test: drive Claude Code sessions by voice from the car. A voice assistant on CarPlay
-(Claude voice mode or Grok) calls a custom MCP connector. The connector hands the request to a
-running Claude Code session, which acts as a controller: it answers, asks back and gets approvals.
+Drive Claude Code by voice from the car. Claude's voice mode calls a custom MCP connector, and the
+connector hands the request to a Claude Code session running on your computer: the controller. It
+answers, asks back and does the work. You can speak any language.
 
 Plain JavaScript (ESM), no build step. The only dependencies are `@modelcontextprotocol/sdk` and `zod`.
 
-> **Status:** test setup, not for continuous use. State lives in memory only, and Claude Code
-> channels are a research preview.
-
-## What the test is meant to answer
-
-1. Does the voice assistant on CarPlay call a custom MCP connector at all? Everything else depends
-   on this.
-2. Does it keep polling through tasks that take longer than 60 seconds?
-3. Do questions and approvals (Bash, Write, Edit) work by voice?
+> **Status:** works with Claude voice mode on the iPhone; CarPlay has not been tried yet. Claude Code
+> channels are a research preview. Open requests live in memory only. Workers for real
+> repositories are planned ([docs/workers-plan.md](docs/workers-plan.md)).
 
 ![Architecture](docs/architecture.drawio.svg)
 
@@ -24,8 +18,9 @@ Plain JavaScript (ESM), no build step. The only dependencies are `@modelcontextp
 listed in `controller/.mcp.json`, and talks to it over stdio. The gateway declares the
 `claude/channel` capability, so every voice request lands in the running controller session as
 `<channel source="voice" request_id="…">text</channel>`. The same process listens on
-`127.0.0.1:8787` and offers MCP tools to the voice assistant there. Tailscale Funnel makes this
-port reachable over HTTPS, because Claude and Grok call connectors from their own cloud.
+`127.0.0.1:8787` and offers MCP tools to the voice assistant there. A public HTTPS address, from a
+tunnel or a reverse proxy, forwards to this port, because Claude calls connectors from its own
+cloud.
 
 **Who thinks:** the gateway is deliberately not an AI. It keeps state and relays. The controller
 session (Claude Code) understands, answers, summarises and asks back. The voice assistant runs the
@@ -47,10 +42,14 @@ after 60 seconds ([talk-to-claude-code][t2cc]). `get_reply` therefore waits at m
 returns as soon as there is news. The first line of every result is machine-readable, for example
 `[state=working id=k7f3 elapsed=34s]`, so the voice assistant knows whether to poll again.
 
-**Approvals:** because the gateway also declares `claude/channel/permission`, Claude Code sends
-every approval prompt to the channel in parallel with the terminal dialog. The first answer wins,
-whether it comes from the car or from the terminal ([channels reference][ref]). Workspace trust
-and MCP consent dialogs are not relayed.
+**Sign-in:** the gateway is its own OAuth server. When you add the connector, Claude opens a
+sign-in page served by the gateway, and you type a pairing code that this computer shows. After
+that, Claude's servers call the tools with an access token. The URL holds no secret.
+
+**Approvals:** the controller runs its few tools without asking (see [Security](#security)). If
+anything else asks for approval, Claude Code also sends the prompt to the channel, because the
+gateway declares `claude/channel/permission`. The voice assistant reads it out, and the first
+answer wins, whether it comes from the car or from the terminal ([channels reference][ref]).
 
 **Questions:** nobody can click a form (`AskUserQuestion`) in the car. `controller/CLAUDE.md`
 therefore asks for questions as plain text with `state: "question"`. The driver's answer arrives as
@@ -61,48 +60,162 @@ a new request that refers to the original `id`.
 ## Requirements
 
 - Node.js 20 or newer (tested with 22) and npm
-- Claude Code with a claude.ai login, channels need v2.1.80 or later. Team and Enterprise
-  organisations need an admin to enable channels; Pro and Max do not ([channels][channels]).
-- Tailscale with Funnel, or another HTTPS tunnel. On Linux, run `sudo tailscale set --operator=$USER`
-  once so `scripts/funnel.sh` works without root.
-- A voice assistant with custom connectors: the Claude app (custom connectors on paid plans only)
-  or Grok ([grok.com/connectors][grok])
+- Claude Code with a claude.ai login, version 2.1.80 or later for channels. In Team and Enterprise
+  organisations an Owner has to enable channels; Pro and Max do not need this ([channels][channels]).
+- A public HTTPS address that forwards to the gateway: a tunnel such as Tailscale Funnel, or a
+  reverse proxy on a machine with a public IP. See [Publishing the endpoint](#publishing-the-endpoint).
+- The Claude app on a paid plan, for custom connectors. The connector's Claude account does not
+  have to be the one that runs Claude Code.
 
-## Installation
+## Setup
+
+1. **Install.**
+
+   ```bash
+   git clone git@github.com:alderg/cc-voice-gateway.git
+   cd cc-voice-gateway
+   npm install
+   npm test
+   ```
+
+2. **Start the controller.**
+
+   ```bash
+   scripts/start-controller.sh
+   ```
+
+   On the first start Claude Code asks in the terminal three times: trust for the folder, a
+   warning about the development channel, and consent for the MCP server from `.mcp.json`.
+   Confirm all three. For an always-on setup run it inside tmux:
+   `tmux new -s voice scripts/start-controller.sh`.
+
+3. **Publish the endpoint** at a public HTTPS address, as described in
+   [Publishing the endpoint](#publishing-the-endpoint). With Tailscale Funnel that is
+   `scripts/funnel.sh start`. The connector URL is that address followed by `/mcp`.
+
+4. **Add the connector** in the Claude app under Customize → Connectors → add a custom connector.
+   Labels vary between app versions.
+   - URL: `https://<your public host>/mcp`.
+   - Authentication: sign in.
+   - OAuth client: Claude's published identity. If signing in fails with it, choose to register
+     automatically instead.
+
+   Claude opens the page "Connect to Claude Code". On the computer, in this folder, run:
+
+   ```bash
+   node scripts/pair.mjs
+   ```
+
+   Enter the eight-digit code it prints. It is valid for five minutes and for one sign-in.
+
+5. **Allow the tools.** The Claude app asks before every call to a new connector's tools. Choose
+   **Always allow**, or set it per tool in the connector's settings. Otherwise voice mode stops for
+   a confirmation at every step, including every `get_reply` during a long task.
+
+6. **Try it** in voice mode: "Ask Claude Code whether the gateway is up."
+
+## Publishing the endpoint
+
+Claude's servers have to reach the gateway from the internet. Any tunnel or reverse proxy works if
+it meets these conditions:
+
+- **HTTPS on port 443** with a valid certificate. In our tests Claude's servers never reached
+  port 8443.
+- **Forwards every path to `127.0.0.1:8787`,** not only `/mcp`: the sign-in uses `/.well-known/…`
+  and `/oauth/…`. Keep the gateway bound to loopback, and do not open port 8787 itself.
+- **Passes the public host name** in `Host` or `X-Forwarded-Host`, and sends
+  `X-Forwarded-Proto: https`. The gateway builds the addresses in its sign-in metadata from them.
+- **Allows responses that take up to a minute,** because `get_reply` waits up to 40 seconds.
+
+**Tailscale Funnel** (tested). On Linux, run `sudo tailscale set --operator=$USER` once, so that
+the script works without root.
 
 ```bash
-git clone git@github.com:alderg/cc-voice-gateway.git
-cd cc-voice-gateway
-npm install
-npm test          # 22 tests, no Claude Code and no car needed
+scripts/funnel.sh start    # prints https://<host>.ts.net/mcp
+scripts/funnel.sh stop
 ```
 
-`npm test` starts the gateway over stdio and plays both ends: Claude Code (channel events,
-`reply`, approval prompts) and the voice assistant (HTTP tools).
+On the first start Tailscale fetches a certificate, and the public name and all of Funnel's relays
+can take a few minutes. The script checks through the relays and reports when all of them answer.
+If another web server on the same machine listens on port 443, devices inside the tailnet reach
+that one instead; the public path is not affected.
 
-## Test plan
+**Reverse proxy on a machine with a public IP,** for example Caddy, which gets a certificate on its
+own and sets the headers above by default:
 
-Go through the stages in order. Each stage adds exactly one new link.
+```text
+voice.example.com {
+	reverse_proxy 127.0.0.1:8787
+}
+```
 
-### Stage 0: desk, no tunnel
+With nginx, add `proxy_set_header Host $host;` and `proxy_set_header X-Forwarded-Proto https;`.
+Other tunnels, such as Cloudflare Tunnel or ngrok, work the same way when they meet the conditions.
+
+## Using it by voice
+
+Start a request with "Ask Claude Code …" or "Tell Claude Code …"; otherwise the voice assistant may
+answer by itself. Within the same conversation it usually sends follow-ups to Claude Code without
+being told.
+
+| What you want | Example | What happens |
+|---|---|---|
+| Check the connection | "Ask Claude Code whether the gateway is up." | `ask`, answer within seconds |
+| Ask something | "Ask Claude Code how many files are in the playground." | `ask`; the controller looks with `ls` and answers |
+| Have something done | "Tell Claude Code to create a file shopping.txt in the playground with milk and bread." | `ask` or `send`; the controller writes the file without an approval and says it is done |
+| Follow up | "Add eggs to it." | Same session, so the controller knows that "it" is `shopping.txt` |
+| A longer task | "Tell Claude Code to wait 90 seconds and then let me know." | `send`, then `get_reply` about every 25 seconds. You hear interim statuses, then the result |
+| Let it ask back | "Tell Claude Code to clean up the playground and to ask me first what may go." | The controller answers with a question, which the assistant reads out. Your answer ("Only the test files") goes back with `send` |
+| See what is going on | "What is Claude Code working on right now?" | `status`: open requests, pending approvals, when the controller last answered |
+| Answer an approval | "Allow." or "Deny." | `approve` with the code. Rare: only tools outside the allow list ask |
+| Something out of reach | "Ask Claude Code what is in my email." | The controller says in one sentence that this is not possible from the car |
+
+**Any language works.** Say the same things in German, French or any other language. The voice
+assistant passes your words to Claude Code unchanged, and the controller answers in the language
+of the request. The Claude app reads answers out in its own app language, so speak the language
+your app is set to.
+
+The answers are short by design: at most three sentences, no code, paths or lists
+(`controller/CLAUDE.md`). Requests that arrive while the controller is busy are answered together
+in its next turn, so one request at a time works best.
+
+### Planned: talking to workers
+
+Not built yet; see [docs/workers-plan.md](docs/workers-plan.md). The controller will hand work to
+one headless Claude Code session per repository and report back:
+
+| Example | What will happen |
+|---|---|
+| "Ask Claude Code which workers there are." | `list_workers`: names, what each is for, what each is doing |
+| "Tell the gateway worker to run the tests." | `dispatch` to the worker `gateway`; the controller confirms at once that it has started |
+| "What is the gateway worker doing?" | `worker_status`, summarised in one or two sentences |
+| "Anything new from Claude Code?" | Results of workers that have finished since you last asked |
+| "Tell it to add a test for that too." | Follow-up in the same worker session |
+| "Stop the gateway worker." | `stop_worker` |
+
+## Connections
 
 ```bash
-scripts/start-controller.sh        # terminal 1: controller with the channel
-node scripts/fake-voice.mjs        # terminal 2: plays the voice assistant
+node scripts/pair.mjs               # pairing code for the sign-in page
+node scripts/pair.mjs list          # connected clients, with when they last called
+node scripts/pair.mjs revoke <id>   # disconnect one client
+node scripts/pair.mjs revoke all    # disconnect every client
 ```
 
-On the first start Claude Code asks in the terminal: trust for the folder, a warning about the
-development channel, and consent for the new MCP server from `.mcp.json`. Confirm all of them; the
-permission for `mcp__voice__reply` in `controller/.claude/settings.json` only applies once the
-folder is trusted.
+`pair.mjs` talks to the running gateway, so the controller must be running. An access token lasts
+an hour, and Claude renews it with a refresh token. Each renewal issues a new refresh token valid
+for 30 days, so a connector that stays unused for longer has to sign in again. Take the endpoint
+offline when you do not need it, for example with `scripts/funnel.sh stop`.
 
-The script starts the session in manual mode (`--permission-mode manual`), whatever default
-`~/.claude/settings.json` sets. `controller/.claude/settings.json` lets Bash, Write and Edit run
-without asking, because the confine hook limits them (see [Security](#security)), and denies tools
-that reach beyond the folder. Anything else that needs an approval is relayed to the voice
-assistant. Stay in manual mode: in auto mode a classifier decides instead of the rules.
+## At the desk
 
-In the second terminal:
+`scripts/fake-voice.mjs` plays the voice assistant, so the chain can be tried without a phone. It
+gets its token from the running gateway instead of the sign-in page.
+
+```bash
+node scripts/fake-voice.mjs                                 # local endpoint
+node scripts/fake-voice.mjs https://<your public host>/mcp  # through the public address
+```
 
 ```text
 > status
@@ -114,93 +227,51 @@ In the second terminal:
 If Claude Code asks for an approval, fake-voice shows `Approval needed (code=abcde)`; answer with
 `allow abcde` or `deny abcde`, then `follow`.
 
-The gateway's tool results are in English; the voice assistant speaks in your language either
-way, and the controller answers in the language of the request. The log is in `.logs/gateway.log`;
-it has one line per connector call (`voice initialize client=…`, `voice tools/list`,
-`voice tools/call ask`), so you can see whether a voice assistant called the connector at all.
+`.logs/gateway.log` has one line per connector call (`voice initialize client=… grant=…`,
+`voice tools/list`, `voice tools/call ask`) and one per sign-in step (`oauth discovery`,
+`oauth registered`, `oauth sign-in accepted`). It shows whether the voice assistant reached the
+gateway at all, and how far it got.
 
-### Stage 1: tunnel
-
-```bash
-scripts/funnel.sh start            # prints the connector URL
-node scripts/fake-voice.mjs "https://<host>.ts.net:8443/mcp/<token>"
-```
-
-The first start fetches a certificate (the script triggers that with one request), and the public
-DNS name can take up to about ten minutes to appear. From inside the tailnet the name resolves to
-the machine's Tailscale address, so that test skips the public path.
-
-Best checked from another network, for example the phone's hotspot.
-
-### Stage 2: connector in text chat
-
-Add a connector with the URL from stage 1, **without authentication**, because the secret is in the
-path:
-
-- **Claude:** Customize → Connectors → add a custom connector. Labels vary between app versions.
-- **Grok:** grok.com/connectors → New Connector → Custom ([xAI docs][grok]).
-
-In text chat on the phone: "Ask Claude Code for the gateway status."
-
-### Stage 3: voice mode on the phone, standing still
-
-Same question in voice mode. **This is the decisive test.** If the voice assistant does not call
-the tool here, that app is unsuitable for the car, however the server is built.
-
-### Stage 4: CarPlay, parked
-
-1. "Ask Claude Code for the status."
-2. "Ask Claude Code how many files are in the playground."
-3. Long task: "Tell Claude Code to wait 90 seconds and then create the file done.txt in the
-   playground." Expected: progress updates over a good 90 seconds, then "done". Writing in the
-   playground needs no approval.
-4. Question: "Tell Claude Code to clean up the playground and to ask first what may go."
-
-### Results
-
-| Check | Claude voice | Grok |
-|---|---|---|
-| Tool called in text chat | | |
-| Tool called in voice mode on the phone | | |
-| Tool called on CarPlay | | |
-| Polling beyond 60 s without dropping out | | |
-| Approval by voice | | |
-| Question answered | | |
-| Answers read out short and usable | | |
+`npm test` plays both ends without Claude Code or a phone: Claude Code (channel events, `reply`,
+approval prompts) and the voice assistant, including the whole sign-in.
 
 ## Security
 
-- **Whoever knows the URL can make Claude Code work on your computer.** That includes a voice
-  assistant that has been manipulated by prompt injection. Keep the URL secret and close the
-  tunnel after testing (`scripts/funnel.sh stop`).
-- **Tailscale Funnel is public.** It needs no open port on your router, but anyone on the
-  internet can reach the mapped port, and the host name is published in the certificate
-  transparency logs. Funnel has no authentication of its own; the secret in the path is the only
-  key.
-- **The controller session is confined.** It works without approvals, because whoever has the
-  URL could answer them anyway (see below). These limits hold regardless:
+- **Only signed-in clients get in.** Signing in needs a pairing code from this computer: eight
+  digits, valid for five minutes and for one sign-in, burnt after five wrong attempts. Return
+  addresses are limited to Claude's hosts (`claude.ai`, `claude.com`) and loopback.
+- **Tokens are stored as hashes only,** in `.secrets/oauth.json`. `pair.mjs` reaches the gateway
+  through the Unix socket `.secrets/admin.sock`. Both are mode 0600, in a folder that is mode 0700.
+- **Whoever controls the Claude account with the connector can make Claude Code work,** and so
+  can a voice assistant manipulated by prompt injection. If in doubt, run
+  `node scripts/pair.mjs revoke all`.
+- **The endpoint is public.** Anyone on the internet can reach the sign-in page. A certificate from
+  a public authority, Tailscale Funnel's included, also publishes the host name in the certificate
+  transparency logs.
+- **The controller session is confined.** It works without approvals, because whoever can reach it
+  could answer them anyway. These limits hold regardless:
   - File tools read only inside `controller/` and write only inside `controller/playground/`
     (PreToolUse hook `controller/.claude/hooks/confine.mjs`, resolves symlinks, fails closed).
   - Bash runs only `ls` inside `controller/`, `sleep <seconds>` and `rm [-f]` with plain file
-    names in `playground/` (same hook). Claude Code's own Bash sandbox would allow more, but on Ubuntu 24.04 and later
-    AppArmor's `bwrap-userns-restrict` profile stops it from starting ([sandboxing][sandbox]).
+    names in `playground/` (same hook). Claude Code's own Bash sandbox would allow more, but on
+    Ubuntu 24.04 and later AppArmor's `bwrap-userns-restrict` profile stops it from starting
+    ([sandboxing][sandbox]).
   - Denied: claude.ai connectors (Gmail, Slack, Drive, …), web fetch and search, messages to
     other Claude sessions, remote and scheduled agents, artifacts, Monitor, workflows and
     worktrees. Bypass and auto mode cannot be switched on.
   - What is left: reading `controller/`, and writing or deleting in the playground. The answers
     go back to the voice assistant.
-  - Planned: run the controller in a sandboxed VM, so that nothing on this machine is reachable
-    even if the hook has a gap.
-- New secret: delete `.secrets/token`, restart the controller, update the connector URL.
-- The gateway binds to `127.0.0.1` only. Requests without a valid secret get a bare 404, so
-  clients do not start an OAuth flow.
+  - On a VM, the VM protects the host. The confinement protects what is signed in on the machine
+    itself: the Claude account's connectors, GitHub, SSH keys and the tailnet.
+- The gateway binds to `127.0.0.1` only.
 - Approval by voice means: whoever can call `approve` can approve tools. The voice assistant is
   told to approve only after an explicit yes; that is an instruction, not enforcement. Turn it off
   with `VOICE_GW_PERMISSION_RELAY=0`.
 - Claude Code masks recognisable credentials in relayed approval texts, but not every secret
   ([channels reference][ref]).
 - Start the controller only with `scripts/start-controller.sh`, never with
-  `--dangerously-skip-permissions`.
+  `--dangerously-skip-permissions`. It runs the session in manual mode, whatever default
+  `~/.claude/settings.json` sets.
 
 ## Configuration
 
@@ -222,29 +293,35 @@ Claude Code starts the gateway, so environment variables go into `controller/.mc
 |---|---|---|
 | `VOICE_GW_PORT` | `8787` | local HTTP port |
 | `VOICE_GW_HOST` | `127.0.0.1` | bind address, only change it if you know why |
-| `VOICE_GW_TOKEN` | – | set the secret directly, otherwise `.secrets/token` |
-| `VOICE_GW_TOKEN_FILE` | `.secrets/token` | location of the secret file |
+| `VOICE_GW_SECRETS_DIR` | `.secrets` | sign-in state and the admin socket |
+| `VOICE_GW_OAUTH_HOSTS` | `claude.ai,claude.com` | hosts allowed as sign-in return addresses and for client ID metadata documents |
 | `VOICE_GW_PERMISSION_RELAY` | on | `0` turns approval by voice off |
 | `VOICE_GW_DEFAULT_WAIT` | `25` | wait time of `get_reply` in seconds |
 | `VOICE_GW_MAX_WAIT` | `40` | upper limit for `get_reply` and `ask` |
 | `VOICE_GW_HINT_AFTER` | `20` | when a diagnostic hint appears |
 | `VOICE_GW_PERMISSION_TTL` | `900` | open approvals expire after this many seconds |
 | `VOICE_GW_LOG_FILE` | `.logs/gateway.log` | set empty for stderr only |
-| `FUNNEL_PORT` | `8443` | for `scripts/funnel.sh`; allowed are 443, 8443, 10000 |
+| `FUNNEL_PORT` | `443` | for `scripts/funnel.sh` only; keep 443 for Claude |
 
 ## Troubleshooting
 
 | Symptom | Cause and fix |
 |---|---|
-| Startup warning that channels are not enabled for the organisation | Team and Enterprise, including a Max seat in a Team organisation: an Owner enables Organization settings → Claude Code → Channels. `claude --debug` logs "the organization is team" in that case. In our test channels still worked without it until the session was started with `--setting-sources project,local`; do not rely on that. |
+| Connector dialog says no server answered, and nothing is in the log | The public address is not on port 443, or it was only just set up. Tailscale Funnel needs a few minutes on the first start; `scripts/funnel.sh start` reports when all relays answer. |
+| Sign-in goes to an `http://` address or to the wrong host | The tunnel or proxy does not pass the public host name or `X-Forwarded-Proto: https` (see [Publishing the endpoint](#publishing-the-endpoint)). |
+| Sign-in page says the app is not registered | The sign-in state was reset, for example because `.secrets/oauth.json` was deleted. Remove the connector and add it again. |
+| Sign-in fails with Claude's published identity | Choose to register automatically instead. If the log shows `client id document not allowed: <URL>`, that host is missing from `VOICE_GW_OAUTH_HOSTS`. |
+| "Wrong or expired code" | Run `node scripts/pair.mjs` again. A code lasts five minutes and one sign-in, and five wrong attempts burn it. |
+| `pair.mjs` says the gateway is not running | Start the controller; the gateway runs inside its session. |
+| The connector stopped working after weeks unused | The refresh token expired after 30 days. Sign in again from the connector's settings. |
+| Claude asks before every tool call | Choose "Always allow" for the connector's tools. |
+| Startup warning that channels are not enabled for the organisation | Team and Enterprise, including a Max seat in a Team organisation: an Owner enables Organization settings → Claude Code → Channels. `claude --debug` logs "the organization is team" in that case. |
 | Channel event arrives, but no answer | The controller's turn failed, for example "Login expired". Look at the controller terminal; `/login` there. |
 | `status` reports `controller=unconfirmed`, `get_reply` shows a hint | Session started without `--dangerously-load-development-channels server:voice`, or the organisation blocks channels. Check `/mcp` in the session; otherwise Claude Code drops events silently. |
-| Connector asks for OAuth | URL without the secret in the path. It must be `…/mcp/<token>`. |
 | `EADDRINUSE` in the log | A second controller session is running. Start only one. |
-| Voice assistant answers itself instead of asking | Say "ask Claude Code …" explicitly. |
-| Voice assistant says the connector does not work | Look at `.logs/gateway.log`. No `voice initialize`: the request never arrived (URL, Funnel, DNS). `initialize` and `tools/list` but no `tools/call`: the assistant chose not to call a tool. `rejected`: wrong URL or token. |
-| Voice assistant stops after the first `working` | Known risk with some clients. Stage 4 tests exactly this. |
-| No approval in the car | Expected for Bash, Write and Edit: they run without asking. For other tools: session in auto or bypass mode, an allow rule covers the tool, or it is a trust or consent dialog, which is not relayed. Start the session with `scripts/start-controller.sh`. |
+| Voice assistant answers itself instead of asking | Say "Ask Claude Code …" explicitly. |
+| Voice assistant says the connector does not work | Look at `.logs/gateway.log`. No `voice initialize`: the request never arrived (URL, tunnel or proxy, DNS). `voice 401`: the client has to sign in again. `initialize` and `tools/list` but no `tools/call`: the assistant chose not to call a tool. |
+| No approval in the car | Expected for Bash, Write and Edit: they run without asking. For other tools: the session runs in auto or bypass mode, an allow rule covers the tool, or it is a trust or consent dialog, which is not relayed. Start the session with `scripts/start-controller.sh`. |
 
 Claude Code's debug log is at `~/.claude/debug/<session-id>.txt`.
 
@@ -254,34 +331,41 @@ Claude Code's debug log is at `~/.claude/debug/<session-id>.txt`.
 src/
   gateway.mjs        entry point: wires both sides, exits with the session
   channel.mjs        stdio side: channel, reply tool, permission relay
-  voice.mjs          HTTP side: MCP tools for the voice assistant, secret check
+  voice.mjs          HTTP side: MCP tools for the voice assistant
+  oauth.mjs          sign-in: OAuth metadata, registration, sign-in page, tokens
+  admin.mjs          Unix socket for pair.mjs and fake-voice
   store.mjs          requests, approvals, waiting for changes
-  config.mjs         environment variables, secret
+  http.mjs           small HTTP helpers
+  config.mjs         environment variables
   log.mjs            log to stderr and file, never to stdout
 controller/
   .mcp.json          starts the gateway as server "voice"
   .claude/settings.json   allow and deny rules, confine hook
   .claude/hooks/confine.mjs   file tools inside controller/ (writes: playground/), Bash allowlist
   CLAUDE.md          rules for the controller session
-  playground/        working folder for test requests
+  playground/        working folder for requests
 scripts/
   start-controller.sh   start the controller with the development channel
-  funnel.sh          start or stop Tailscale Funnel, print the URL
+  funnel.sh          publish the endpoint with Tailscale Funnel, print the connector URL
+  check-public.mjs   check the endpoint through Funnel's public relays
+  pair.mjs           pairing codes, list and revoke connections
   fake-voice.mjs     play the voice assistant at the desk
-  token.mjs          show or create the secret
 test/
-  e2e.test.mjs       end-to-end test without Claude Code
+  e2e.test.mjs       both sides end to end, without Claude Code
+  oauth.test.mjs     the sign-in as Claude's connector goes through it
   controller.test.mjs   launcher flags, controller settings, confine hook
-docs/*.drawio.svg    diagrams: an image on GitHub, editable in draw.io
+docs/
+  *.drawio.svg       diagrams: an image on GitHub, editable in draw.io
+  workers-plan.md    plan for worker sessions
 ```
 
 ## Limits and next steps
 
-- One controller session only, no workers yet. Next step: a small channel with its own port per
-  worker, plus controller tools such as `list_workers`, `dispatch` and `worker_status`.
+- One controller session only, no workers yet. Next step: one headless worker per repository,
+  see [docs/workers-plan.md](docs/workers-plan.md).
 - While the controller is busy, new events arrive together in its next turn. Real parallelism
   needs separate sessions ([channels reference][ref]).
-- State lives in memory only; a restart forgets open requests.
+- Open requests live in memory only; a restart forgets them. Connections survive restarts.
 - During the research preview, custom channels only run with the development flag. Flag syntax and
   protocol may change ([channels][channels]).
 
@@ -289,18 +373,20 @@ docs/*.drawio.svg    diagrams: an image on GitHub, editable in draw.io
 
 - [Claude Code: channels][channels]
 - [Claude Code: channels reference][ref]
-- [Claude Code: permissions, rules for MCP tools][perm]
+- [Claude Code: permissions][perm]
 - [Claude Code: sandboxing][sandbox]
-- [Tailscale: `tailscale funnel`][funnel]
-- [xAI: Grok connectors][grok]
+- [Claude: custom connectors][connectors]
 - [Claude: voice mode with connected tools][voice]
-- [talk-to-claude-code][t2cc]: model for polling, the secret in the path and voice-friendly tool results
+- [MCP: authorization][mcpauth]
+- [Tailscale: `tailscale funnel`][funnel]
+- [talk-to-claude-code][t2cc]: model for polling and voice-friendly tool results
 
 [channels]: https://code.claude.com/docs/en/channels
 [ref]: https://code.claude.com/docs/en/channels-reference
 [perm]: https://code.claude.com/docs/en/permissions
 [sandbox]: https://code.claude.com/docs/en/sandboxing
-[funnel]: https://tailscale.com/docs/reference/tailscale-cli/funnel
-[grok]: https://docs.x.ai/grok/connectors
+[connectors]: https://support.claude.com/en/articles/11175166-getting-started-with-custom-connectors-using-remote-mcp
 [voice]: https://support.claude.com/en/articles/11101966-use-voice-mode
+[mcpauth]: https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization
+[funnel]: https://tailscale.com/docs/reference/tailscale-cli/funnel
 [t2cc]: https://github.com/osaighi/talk-to-claude-code

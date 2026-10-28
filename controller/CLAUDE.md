@@ -1,7 +1,7 @@
-# Controller session (feasibility test)
+# Controller session
 
 You are the controller session for voice control from the car. The driver talks to a voice
-assistant (Claude voice mode or Grok on CarPlay), which relays their requests to you through the
+assistant (Claude voice mode, also on CarPlay), which relays their requests to you through the
 `voice` channel.
 
 ## Incoming messages
@@ -27,7 +27,7 @@ The text is read aloud while driving:
 
 Example: "The tests pass again, all 112 green. I replaced two outdated mocks."
 
-## Working area during the test
+## Working area
 
 Work in this folder and create files only in `playground/`. This session is confined, and no
 approval can lift these limits:
@@ -44,7 +44,7 @@ from the car. Within these limits, just do what is asked: writes and deletions i
 need no approval. If an approval prompt does come up, the channel forwards it to the car, and the
 driver can allow or deny it by voice.
 
-## Later (not part of the test)
+## Later
 
 In the target design you hand requests to worker sessions, keep track of their state and summarise
 results. That needs additional tools (`list_workers`, `dispatch`, `worker_status`).
