@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>cc-voice-gateway setup</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<header>
+  <h1>cc-voice-gateway setup</h1>
+  <p id="where" class="sub"></p>
+  <p id="clock" class="sub"></p>
+</header>
+
+<div id="https" class="notice warn" hidden>
+  <strong>No HTTPS.</strong> This page and everything you type in it travel unencrypted. Use it only in
+  your own network, or through an SSH tunnel: <code>ssh -L 8790:localhost:8790 &lt;server&gt;</code>, then open
+  the link with <code>localhost</code>.
+</div>
+
+<main>
+
+<section id="s-checks">
+  <h2>1. This computer</h2>
+  <p class="guide">What the gateway needs. Red items marked "needed" must be fixed before the controller can run.</p>
+  <table id="checks"></table>
+  <p id="overridden" class="notice warn" hidden></p>
+</section>
+
+<section id="s-gateway">
+  <h2>2. Gateway</h2>
+  <div class="grid">
+    <label>Local port <input data-setting="VOICE_GW_PORT" inputmode="numeric"></label>
+    <p class="guide">The voice endpoint listens on 127.0.0.1 at this port; the tunnel or proxy forwards to it.</p>
+    <label>Repositories folder <input data-setting="VOICE_GW_WORKER_ROOT"></label>
+    <p class="guide">Every git repository directly in this folder gets a worker (on this computer, without Docker).</p>
+    <label>Runs at a time <input data-setting="VOICE_GW_MAX_WORKERS" inputmode="numeric"></label>
+    <p class="guide">How many workers may run at once.</p>
+    <label>Time limit per run (minutes) <input data-setting="VOICE_GW_WORKER_TIMEOUT" inputmode="numeric"></label>
+    <p class="guide">A run is stopped after this.</p>
+    <label>Approvals by voice
+      <select data-setting="VOICE_GW_PERMISSION_RELAY"><option value="1">on</option><option value="0">off, only at the terminal</option></select>
+    </label>
+    <p class="guide">The rare approval the controller needs is read out in the car.</p>
+  </div>
+</section>
+
+<section id="s-models">
+  <h2>3. Models</h2>
+  <p class="guide">
+    The controller answers by voice, so speed counts: a smaller model or a lower effort answers sooner.
+    Workers do the actual work in your repositories: a larger model and a higher effort pay off there.
+    "Default" keeps Claude Code's own choice. <a href="https://code.claude.com/docs/en/model-config" target="_blank" rel="noreferrer noopener">Models and effort levels</a>
+  </p>
+  <div class="grid">
+    <label>Controller model <select id="controller-model" data-model="VOICE_GW_CONTROLLER_MODEL"></select>
+      <input id="controller-model-other" placeholder="full model name" hidden></label>
+    <label>Controller effort <select data-setting="VOICE_GW_CONTROLLER_EFFORT" data-efforts></select></label>
+    <p class="guide wide">Passed as <code>--model</code> and <code>--effort</code> by <code>scripts/start-controller.sh</code>.</p>
+    <label>Worker model <select id="worker-model" data-model="VOICE_GW_WORKER_MODEL"></select>
+      <input id="worker-model-other" placeholder="full model name" hidden></label>
+    <label>Worker effort <select data-setting="VOICE_GW_WORKER_EFFORT" data-efforts></select></label>
+    <p class="guide wide">Every worker run gets them, on this computer and in Docker.</p>
+  </div>
+</section>
+
+<section id="s-telegram">
+  <h2>4. Telegram <span class="opt">optional</span></h2>
+  <p class="guide">
+    Results, questions and approvals reach your phone once voice mode has ended, and <code>/stop</code> locks
+    the kill switch. Create a bot: in Telegram, write <code>/newbot</code> to
+    <a href="https://t.me/BotFather" target="_blank" rel="noreferrer noopener">@BotFather</a>
+    (<a href="https://core.telegram.org/bots/features#botfather" target="_blank" rel="noreferrer noopener">how</a>)
+    and copy the token it gives you.
+  </p>
+  <div class="row">
+    <input id="telegram-token" type="password" autocomplete="off" spellcheck="false" placeholder="bot token">
+    <button id="telegram-check">Check token</button>
+    <span id="telegram-token-state" class="state"></span>
+  </div>
+  <p class="guide">Then open your bot in Telegram, tap Start and send any message, for example "Hallo".</p>
+  <div class="row">
+    <button id="telegram-find">Find my chat</button>
+    <span id="telegram-chats"></span>
+  </div>
+  <div class="row">
+    <button id="telegram-test">Send a test message</button>
+    <span id="telegram-test-state" class="state"></span>
+  </div>
+  <div class="grid">
+    <label><input type="checkbox" id="telegram-on"> Turn the Telegram fallback on</label>
+    <p class="guide">Unticked, a saved bot token and chat ID are deleted when you write the setup.</p>
+    <label>Silence before Telegram (seconds) <input data-setting="VOICE_GW_TELEGRAM_AFTER" inputmode="numeric"></label>
+    <p class="guide">After this long without a voice call, voice mode counts as ended.</p>
+  </div>
+</section>
+
+<section id="s-docker">
+  <h2>5. Workers in Docker <span class="opt">optional</span></h2>
+  <p class="guide">The workers run in a container that sees only one folder of clones, with the access the GitHub token gives them.</p>
+  <label><input type="checkbox" id="docker-on"> Run the workers in a Docker container</label>
+  <div id="docker" hidden>
+    <div class="grid">
+      <label>Container <input data-setting="VOICE_GW_DOCKER" id="docker-name"></label>
+      <p class="guide">Its name, for example voice-workers.</p>
+      <label>Folder for its clones <input data-setting="VOICE_GW_DOCKER_FOLDER"></label>
+      <p class="guide">Mounted as /repos. Not your own checkouts: git on this computer never runs in it.</p>
+      <label>Image <input data-setting="VOICE_GW_DOCKER_IMAGE"></label>
+      <p class="guide">Built from <code>docker/</code> for your user id.</p>
+    </div>
+
+    <h3>Claude Code's login in the container</h3>
+    <p class="guide">
+      On this computer run <code>claude setup-token</code>, sign in, and paste the long-lived token it prints
+      (it starts with <code>sk-ant-</code>). <a href="https://code.claude.com/docs/en/authentication" target="_blank" rel="noreferrer noopener">About setup-token</a>
+    </p>
+    <div class="row">
+      <input id="claude-token" type="password" autocomplete="off" spellcheck="false" placeholder="token from claude setup-token">
+      <button id="claude-check">Take token</button>
+      <span id="claude-token-state" class="state"></span>
+    </div>
+
+    <h3>GitHub token: it sets what workers may do</h3>
+    <ul class="guide">
+      <li><strong>read-only</strong>, nothing leaves the container: no token for public repositories; for private ones a
+        <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noreferrer noopener">fine-grained token</a>
+        with only the chosen repositories and Contents: Read-only. Not a classic token: its <code>repo</code> scope can also write.</li>
+      <li><strong>pr</strong>, draft pull requests: a
+        <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noreferrer noopener">fine-grained token</a>
+        with Contents and Pull requests: Read and write (Workflows only if workers should change workflow files), and the default branch protected by a
+        <a href="https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/creating-rulesets-for-a-repository" target="_blank" rel="noreferrer noopener">ruleset</a>
+        that requires pull requests, with an empty bypass list. A
+        <a href="https://github.com/settings/tokens/new?scopes=repo&amp;description=cc-voice-gateway" target="_blank" rel="noreferrer noopener">classic token</a>
+        with <code>repo</code> works too, for all your repositories at once.</li>
+      <li><strong>full</strong>, a direct push when you ask: the same token, and a default branch without such protection.</li>
+    </ul>
+    <p class="guide"><a href="https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens" target="_blank" rel="noreferrer noopener">About personal access tokens</a>. An organisation may have to approve a fine-grained token first.</p>
+    <div class="row">
+      <input id="github-token" type="password" autocomplete="off" spellcheck="false" placeholder="GitHub token (optional)">
+      <button id="github-check">Check token</button>
+      <span id="github-token-state" class="state"></span>
+    </div>
+
+    <h3>Repositories in the container</h3>
+    <p class="guide">They are cloned inside the container, over HTTPS. Already in the folder: <span id="docker-existing">none</span>.</p>
+    <div id="repo-list" class="checks"></div>
+    <div class="row">
+      <input id="repo-add" placeholder="owner/name" spellcheck="false">
+      <button id="repo-add-button">Add</button>
+    </div>
+    <div class="grid">
+      <label>Access level
+        <select data-setting="VOICE_GW_ACCESS" id="access-forced">
+          <option value="">detect per repository from the token</option>
+          <option value="read-only">read-only for all</option>
+          <option value="pr">pr for all</option>
+          <option value="full">full for all</option>
+        </select>
+      </label>
+      <p class="guide">Forcing a lower level than the token allows is a rule for the workers, not a limit of the token.</p>
+    </div>
+    <div class="row"><button id="levels-check">Check access levels</button><span id="levels-state" class="state"></span></div>
+    <table id="levels"></table>
+
+    <h3>Who commits in the container</h3>
+    <div class="grid">
+      <label>Name <input id="git-name"></label><span></span>
+      <label>Email <input id="git-email"></label><span></span>
+    </div>
+
+    <h3>The image</h3>
+    <div class="row"><button id="docker-build">Build the image now</button><span id="build-state" class="state"></span></div>
+    <pre id="build-log" class="log" hidden></pre>
+    <p class="guide">Otherwise it is built when you finish, if it is not there yet. Finishing starts the container and clones the repositories.</p>
+  </div>
+</section>
+
+<section id="s-watchdog">
+  <h2>6. Keeping the controller running</h2>
+  <p class="guide">
+    <code>scripts/start-controller.sh</code> runs the controller under a watchdog that starts it again after a
+    crash, in a tmux session. On its first start Claude Code asks a few questions at the terminal:
+    attach with <code>tmux attach -t voice</code> and answer them.
+  </p>
+  <p>Now: <span id="watchdog-status"></span></p>
+  <label><input type="checkbox" id="watchdog-autostart"> Start it at login <span id="watchdog-unit" class="sub"></span></label>
+  <label><input type="checkbox" id="watchdog-now"> Start it now in the tmux session "voice"</label>
+</section>
+
+<section id="s-plugin">
+  <h2>7. The channel as a plugin</h2>
+  <p id="plugin-status"></p>
+  <div id="plugin-register-box" hidden>
+    <label><input type="checkbox" id="plugin-register" checked> Register this repository as the marketplace now</label>
+  </div>
+  <div id="plugin-admin" hidden>
+    <p class="guide">
+      Without it, Claude Code asks at every start of the controller whether to load the development channel,
+      and a restart waits for Enter at the terminal. An Owner of your organisation on claude.ai can put the plugin on the
+      channel allowlist:
+    </p>
+    <ol class="guide">
+      <li>Open <a href="https://claude.ai/admin-settings/claude-code" target="_blank" rel="noreferrer noopener">Organization settings → Claude Code → Managed settings</a>.</li>
+      <li>Keep what is there and add:
+        <pre id="plugin-json" class="log"></pre></li>
+      <li><strong>Before saving:</strong> this list replaces Anthropic's default list of channel plugins for the whole
+        organisation. Telegram, Discord, iMessage and fakechat from <code>claude-plugins-official</code> stop working as
+        channels for every member unless the list names them too.</li>
+      <li>Save. The next start of the controller uses the plugin by itself.</li>
+    </ol>
+  </div>
+</section>
+
+<section id="s-finish">
+  <h2>8. Write the setup</h2>
+  <p class="guide">Writes the settings and the secrets into <code>.secrets</code> (folder 0700, files 0600), then sets up what you chose above. The assistant ends by itself afterwards.</p>
+  <div class="row">
+    <button id="finish" class="primary">Write the setup</button>
+    <button id="cancel">Cancel without writing</button>
+    <span id="finish-state" class="state"></span>
+  </div>
+  <pre id="finish-log" class="log" hidden></pre>
+  <div id="next" hidden>
+    <h3>What is left</h3>
+    <ol class="guide">
+      <li>Publish the endpoint at a public HTTPS address, for example <code>scripts/funnel.sh start</code> with Tailscale Funnel.</li>
+      <li>In the Claude app, add a custom connector with that address followed by <code>/mcp</code>, and sign in.</li>
+      <li>On this computer, with the controller running: <code>node scripts/pair.mjs</code>, and enter the code on the sign-in page.</li>
+      <li>Allow the connector's tools, then try it in voice mode: "Ask Claude Code whether the gateway is up."</li>
+    </ol>
+  </div>
+</section>
+
+</main>
+<footer><p id="ended" class="notice" hidden>The setup assistant has ended. Start it again with <code>node scripts/setup.mjs</code> for a new link.</p></footer>
+<script src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,559 @@
+// The setup assistant (scripts/setup.mjs, src/setup/): its guard (the
+// one-time token, the session, the rate limit, the origin check and the
+// timeouts), and its steps with stand-ins: one local HTTP server answers as
+// the Telegram Bot API and as the GitHub API, and fake docker, tmux,
+// systemctl, gh and claude commands record what they are asked to do. At the
+// end: the files in .secrets and their modes, and that no secret reaches a
+// log line, the terminal or a response.
+
+import { test, before, after } from 'node:test'
+import assert from 'node:assert/strict'
+import { execFileSync, spawn, spawnSync } from 'node:child_process'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { createServer } from 'node:http'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const ROOT = fileURLToPath(new URL('..', import.meta.url)).replace(/\/$/, '')
+const TMP = mkdtempSync(join(tmpdir(), 'voice-gw-setup-'))
+// Whatever the modules here log goes to a file of this test, never the real log.
+process.env.VOICE_GW_LOG_FILE = join(TMP, 'gateway.log')
+const { createSetup } = await import('../src/setup/actions.mjs')
+const { COOKIE, newToken, sameSecret, startSetupServer } = await import('../src/setup/server.mjs')
+const { formatSettings, readSettings } = await import('../src/settings.mjs')
+
+const BIN = join(TMP, 'bin')
+const SECRETS = join(TMP, 'secrets')
+const FOLDER = join(TMP, 'docker-developer') // the container's clones, /repos in it
+const DEV = join(TMP, 'dev') // the checkouts on this computer
+const HOME = join(TMP, 'home')
+const CALLS = join(TMP, 'calls.jsonl') // what the fake commands were asked to do
+const ECHO = join(TMP, 'echo') // a line the fake docker build prints, to test redaction
+
+const TELEGRAM_TOKEN = '987654321:TEST-telegram-token-never-shown-xyz12'
+const GITHUB_TOKEN = 'github_pat_TEST_setup_token_never_shown_0123456789'
+const CLAUDE_TOKEN = 'sk-ant-oat01-TEST-claude-token-never-shown-abcdef'
+const CHAT_ID = '4242'
+const SECRET_VALUES = [TELEGRAM_TOKEN, GITHUB_TOKEN, CLAUDE_TOKEN]
+
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
+
+// --- one stand-in for the Telegram Bot API and the GitHub API ---------------------
+
+const api = { server: null, url: '', sent: [], updates: [], requests: [] }
+const REPOS = {
+  'acme/guarded': { contents: true, pulls: true, protected: false, rules: [{ type: 'pull_request' }] },
+  'acme/open': { contents: true, pulls: true, protected: false, rules: [] },
+  'acme/readonly': { contents: false, pulls: false },
+}
+
+function answer(req, res, body) {
+  const send = (status, data, headers = {}) => {
+    res.writeHead(status, { 'content-type': 'application/json', ...headers })
+    res.end(JSON.stringify(data))
+  }
+  api.requests.push(`${req.method} ${req.url.replace(TELEGRAM_TOKEN, '<token>')}`)
+  const telegram = /^\/bot([^/]+)\/(\w+)$/.exec(req.url)
+  if (telegram) {
+    if (telegram[1] !== TELEGRAM_TOKEN) return send(401, { ok: false, error_code: 401, description: 'Unauthorized' })
+    if (telegram[2] === 'getMe') return send(200, { ok: true, result: { id: 1, is_bot: true, username: 'voice_test_bot', first_name: 'Voice' } })
+    if (telegram[2] === 'getUpdates') return send(200, { ok: true, result: api.updates })
+    if (telegram[2] === 'sendMessage') {
+      api.sent.push(JSON.parse(body))
+      return send(200, { ok: true, result: {} })
+    }
+    return send(404, { ok: false, description: 'Not Found' })
+  }
+  if (req.headers.authorization !== `Bearer ${GITHUB_TOKEN}`) return send(401, { message: 'Bad credentials' })
+  if (req.url === '/user') {
+    return send(200, { login: 'driver' }, { 'github-authentication-token-expiration': '2027-01-31 00:00:00 UTC' })
+  }
+  const match = /^\/repos\/([^/]+\/[^/]+)(\/.*)?$/.exec(req.url)
+  const repo = match && REPOS[match[1]]
+  if (!repo) return send(404, { message: 'Not Found' })
+  const route = `${req.method} ${match[2] ?? ''}`
+  if (route === 'GET ') return send(200, { visibility: 'private', private: true, default_branch: 'main', permissions: { push: true } })
+  if (route === 'POST /git/refs') return send(repo.contents ? 422 : 403, {})
+  if (route === 'POST /pulls') return send(repo.pulls ? 422 : 403, {})
+  if (route === 'GET /branches/main') return send(200, { name: 'main', protected: repo.protected })
+  if (route === 'GET /rules/branches/main') return send(200, repo.rules)
+  send(404, { message: 'Not Found' })
+}
+
+// --- fake commands -----------------------------------------------------------------
+
+const FAKE = name => `#!/usr/bin/env node
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+const argv = process.argv.slice(2)
+appendFileSync(${JSON.stringify(CALLS)}, JSON.stringify({ command: ${JSON.stringify(name)}, argv }) + '\\n')
+const out = text => process.stdout.write(text + '\\n')
+const BUILT = ${JSON.stringify(join(TMP, 'image-built'))}
+switch (${JSON.stringify(name)}) {
+  case 'claude':
+    if (argv[0] === '--version') out('2.1.310 (Claude Code)')
+    break
+  case 'gh':
+    break
+  case 'tmux':
+    if (argv[0] === '-V') out('tmux 3.4')
+    if (argv[0] === 'has-session') process.exit(1)
+    break
+  case 'systemctl':
+    break
+  case 'docker':
+    if (argv[0] === 'version') out('29.0.0')
+    if (argv[0] === 'image') process.exit(existsSync(BUILT) ? 0 : 1)
+    if (argv[0] === 'build') {
+      out('#1 [internal] load build definition from Dockerfile')
+      if (existsSync(${JSON.stringify(ECHO)})) out('#2 ' + readFileSync(${JSON.stringify(ECHO)}, 'utf8'))
+      out('#9 naming to docker.io/library/' + argv[argv.indexOf('-t') + 1])
+      writeFileSync(BUILT, '')
+    }
+    if (argv[0] === 'exec' && argv[2] === 'git' && argv[3] === 'clone') {
+      mkdirSync(argv[5], { recursive: true })
+      out("Cloning into '" + argv[5] + "'...")
+    }
+    break
+}
+`
+
+const calls = () =>
+  existsSync(CALLS)
+    ? readFileSync(CALLS, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line))
+    : []
+
+function makeRepo(name, origin) {
+  const dir = join(DEV, name)
+  mkdirSync(dir, { recursive: true })
+  execFileSync('git', ['init', '-q', '-b', 'main', dir])
+  execFileSync('git', ['-C', dir, 'remote', 'add', 'origin', origin])
+}
+
+// The environment the setup gets: every command a fake, every API the stand-in.
+const setupEnv = () => ({
+  ...process.env,
+  VOICE_GW_CLAUDE_BIN: join(BIN, 'claude'),
+  VOICE_GW_DOCKER_BIN: join(BIN, 'docker'),
+  VOICE_GW_GH_BIN: join(BIN, 'gh'),
+  VOICE_SETUP_TMUX_BIN: join(BIN, 'tmux'),
+  VOICE_SETUP_SYSTEMCTL_BIN: join(BIN, 'systemctl'),
+  VOICE_SETUP_TAILSCALE_BIN: join(BIN, 'no-tailscale'),
+  VOICE_GW_TELEGRAM_API: api.url,
+  VOICE_GW_GITHUB_API: api.url,
+  VOICE_GW_DOCKER_REPOS: FOLDER,
+  VOICE_GW_STATE_DIR: join(TMP, 'state'),
+  VOICE_GW_LOG_FILE: join(TMP, 'gateway.log'),
+  CLAUDE_CONFIG_DIR: join(TMP, 'claude-config'),
+  VOICE_GW_MANAGED_SETTINGS: join(TMP, 'no-managed-settings.json'),
+  GIT_CONFIG_GLOBAL: join(TMP, 'gitconfig'),
+})
+
+// A browser: opens the link once, then sends the cookie and its origin.
+async function browser(server, { token = server.token } = {}) {
+  const base = `http://127.0.0.1:${server.port}`
+  const first = await fetch(`${base}/?t=${token}`, { redirect: 'manual' })
+  const cookie = first.headers.get('set-cookie')?.split(';')[0] ?? ''
+  const responses = []
+  async function call(path, body, headers = {}) {
+    const init =
+      body === undefined
+        ? { headers: { cookie, ...headers } }
+        : {
+            method: 'POST',
+            headers: { cookie, origin: base, 'content-type': 'application/json', ...headers },
+            body: JSON.stringify(body),
+          }
+    const response = await fetch(base + path, init)
+    const text = await response.text()
+    responses.push(text)
+    let data
+    try {
+      data = JSON.parse(text)
+    } catch {
+      data = text
+    }
+    return { status: response.status, data }
+  }
+  return { base, first, cookie, call, responses }
+}
+
+const terminal = [] // what the setup and its server print
+const say = line => terminal.push(line)
+
+before(async () => {
+  mkdirSync(BIN, { recursive: true })
+  for (const name of ['claude', 'gh', 'tmux', 'systemctl', 'docker']) {
+    writeFileSync(join(BIN, name), FAKE(name))
+    chmodSync(join(BIN, name), 0o755)
+  }
+  mkdirSync(HOME, { recursive: true })
+  writeFileSync(join(TMP, 'gitconfig'), '[user]\n\tname = Test Driver\n\temail = driver@example.com\n')
+  makeRepo('alpha', 'git@github.com:acme/guarded.git')
+  makeRepo('beta', 'https://github.com/acme/open.git')
+  api.server = createServer((req, res) => {
+    let body = ''
+    req.on('data', chunk => (body += chunk))
+    req.on('end', () => answer(req, res, body))
+  })
+  await new Promise(resolve => api.server.listen(0, '127.0.0.1', resolve))
+  api.url = `http://127.0.0.1:${api.server.address().port}`
+})
+
+after(() => {
+  api.server?.close()
+  rmSync(TMP, { recursive: true, force: true })
+})
+
+// --- the guard -------------------------------------------------------------------------
+
+const ping = { 'GET /api/ping': () => ({ pong: true }), 'POST /api/echo': ({ body }) => ({ echo: body.text }) }
+const guarded = options => startSetupServer({ host: '127.0.0.1', port: 0, api: ping, say, ...options })
+
+test('the token: long and random, compared in constant time, whatever the length', () => {
+  const token = newToken()
+  assert.ok(token.length >= 43, 'at least 256 bits')
+  assert.match(token, /^[A-Za-z0-9_-]+$/)
+  assert.notEqual(token, newToken())
+  assert.ok(sameSecret(token, token))
+  assert.ok(!sameSecret(token.slice(0, -1), token), 'a shorter guess is just wrong, not an error')
+  assert.ok(!sameSecret('', token))
+})
+
+test('the session: the first use binds the setup to that browser, and the link alone stops working', async () => {
+  const server = await guarded({})
+  try {
+    const page = await browser(server)
+    assert.equal(page.first.status, 303)
+    assert.equal(page.first.headers.get('location'), '/', 'the token leaves the address bar')
+    const cookie = page.first.headers.get('set-cookie')
+    assert.match(cookie, new RegExp(`^${COOKIE}=[A-Za-z0-9_-]{43}; HttpOnly; SameSite=Strict; Path=/$`))
+    assert.ok(!cookie.includes(server.token), 'the session is not the token')
+
+    const html = await fetch(`${page.base}/`, { headers: { cookie: page.cookie } })
+    assert.equal(html.status, 200)
+    assert.match(await html.text(), /<title>cc-voice-gateway setup<\/title>/)
+    assert.match(html.headers.get('content-security-policy'), /script-src 'self'/)
+    assert.equal(html.headers.get('referrer-policy'), 'no-referrer')
+    assert.equal(html.headers.get('cache-control'), 'no-store')
+    assert.deepEqual((await page.call('/api/ping')).data, { pong: true })
+
+    // The same link in another browser, or again without the cookie.
+    const again = await fetch(`${page.base}/?t=${server.token}`, { redirect: 'manual' })
+    assert.equal(again.status, 403)
+    assert.equal(again.headers.get('set-cookie'), null)
+    assert.equal((await fetch(`${page.base}/api/ping`)).status, 401)
+    assert.equal((await fetch(`${page.base}/`)).status, 401)
+    const forged = await fetch(`${page.base}/api/ping`, { headers: { cookie: `${COOKIE}=${'A'.repeat(43)}` } })
+    assert.equal(forged.status, 401)
+  } finally {
+    await server.stop('test over')
+  }
+})
+
+test('wrong tokens are rate-limited per address: then even the right one waits', async () => {
+  const server = await guarded({})
+  try {
+    const base = `http://127.0.0.1:${server.port}`
+    for (let i = 0; i < 5; i++) {
+      const wrong = await fetch(`${base}/?t=${newToken()}`, { redirect: 'manual' })
+      assert.equal(wrong.status, 403, `wrong token ${i + 1}`)
+    }
+    const right = await fetch(`${base}/?t=${server.token}`, { redirect: 'manual' })
+    assert.equal(right.status, 429)
+    assert.equal(right.headers.get('set-cookie'), null)
+    assert.ok(terminal.some(line => /a wrong or used link from 127\.0\.0\.1/.test(line)))
+  } finally {
+    await server.stop('test over')
+  }
+})
+
+test('write requests need the page\'s own origin and JSON', async () => {
+  const server = await guarded({})
+  try {
+    const page = await browser(server)
+    const post = headers => page.call('/api/echo', { text: 'hi' }, headers)
+    assert.equal((await post({ origin: 'http://evil.example' })).status, 403)
+    assert.equal((await post({ origin: '' })).status, 403, 'no origin at all')
+    assert.equal((await post({ 'content-type': 'text/plain' })).status, 415)
+    assert.deepEqual((await post({})).data, { echo: 'hi' })
+    assert.equal((await page.call('/api/nothing', {})).status, 404)
+  } finally {
+    await server.stop('test over')
+  }
+})
+
+test('timeouts: the server ends by itself when idle, and at its overall limit despite activity', async () => {
+  const idle = await guarded({ idleMs: 300 })
+  assert.match(await idle.done, /no activity/)
+  assert.equal(await fetch(`http://127.0.0.1:${idle.port}/`).catch(() => 'closed'), 'closed')
+
+  const busy = await guarded({ idleMs: 400, timeoutMs: 900 })
+  const page = await browser(busy)
+  const started = Date.now()
+  let ended = null
+  busy.done.then(reason => (ended = reason))
+  while (!ended && Date.now() - started < 3000) {
+    await page.call('/api/ping').catch(() => {})
+    await sleep(100)
+  }
+  assert.match(ended, /time limit/)
+  assert.ok(Date.now() - started < 1500, 'activity does not extend the overall limit')
+
+  // Wrong tokens do not count as activity.
+  const ignored = await guarded({ idleMs: 400 })
+  const knock = setInterval(() => fetch(`http://127.0.0.1:${ignored.port}/?t=x`).catch(() => {}), 100)
+  assert.match(await ignored.done, /no activity/)
+  clearInterval(knock)
+})
+
+test('the command shows its link only on a terminal, never in a pipe', () => {
+  const cli = spawnSync(process.execPath, [join(ROOT, 'scripts', 'setup.mjs'), '--host', '127.0.0.1', '--port', '0'], {
+    encoding: 'utf8',
+    env: { ...process.env, VOICE_GW_SECRETS_DIR: SECRETS },
+    timeout: 10000,
+    detached: true, // no controlling terminal
+  })
+  assert.equal(cli.status, 1)
+  assert.match(cli.stderr, /needs a terminal to show its one-time link/)
+  assert.doesNotMatch(cli.stdout + cli.stderr, /\?t=/)
+})
+
+test('the command on a terminal: one link per address, and it ends by itself', { skip: process.platform !== 'linux' || spawnSync('script', ['--version']).status !== 0 }, async () => {
+  const command = `${process.execPath} ${join(ROOT, 'scripts', 'setup.mjs')} --host 127.0.0.1 --port 0 --idle 0.02`
+  const child = spawn('script', ['-qec', command, '/dev/null'], { env: { ...process.env, VOICE_GW_SECRETS_DIR: SECRETS } })
+  let out = ''
+  child.stdout.on('data', chunk => (out += chunk))
+  child.stderr.on('data', chunk => (out += chunk))
+  const code = await new Promise(resolve => child.on('close', resolve))
+  assert.equal(code, 0)
+  const links = out.match(/http:\/\/127\.0\.0\.1:\d+\/\?t=[A-Za-z0-9_-]{43}/g) ?? []
+  assert.equal(links.length, 1, 'one address when bound to one')
+  assert.match(out, /use it only in your own network/)
+  assert.match(out, /setup assistant ended: no activity/)
+})
+
+// --- the steps, with the stand-ins ----------------------------------------------------
+
+const flow = {}
+
+async function follow(page, id) {
+  for (let i = 0; i < 200; i++) {
+    const { data } = await page.call(`/api/jobs/${id}`)
+    if (data.state !== 'running') return data
+    await sleep(50)
+  }
+  throw new Error('job did not end')
+}
+
+test('the start: checks, current settings, repositories and the plugin, without secrets', async () => {
+  const setup = createSetup({ root: ROOT, secretsDir: SECRETS, env: setupEnv(), home: HOME, platform: 'linux', say })
+  flow.server = await startSetupServer({ host: '127.0.0.1', port: 0, api: setup.api, redact: setup.redact, say })
+  flow.page = await browser(flow.server)
+  const { status, data } = await flow.page.call('/api/state')
+  assert.equal(status, 200)
+  const check = name => data.checks.find(c => c.name === name)
+  assert.equal(check('Claude Code').detail, '2.1.310')
+  assert.ok(check('Claude Code').ok)
+  assert.equal(check('GitHub CLI').detail, 'logged in')
+  assert.equal(check('Docker').detail, 'server 29.0.0')
+  assert.equal(check('Tailscale').ok, false)
+  assert.equal(data.settings.VOICE_GW_PORT, '8787')
+  assert.deepEqual(data.secrets, { telegramToken: null, telegramChatId: null, githubToken: null, claudeToken: null })
+  assert.deepEqual(data.git, { name: 'Test Driver', email: 'driver@example.com' })
+  assert.equal(data.plugin.mode, 'development')
+  assert.deepEqual(data.plugin.allowlist, { marketplace: 'cc-voice-gateway', plugin: 'voice' })
+  assert.match(data.watchdog.unit, /systemd\/user\/cc-voice-gateway\.service$/)
+  assert.ok(data.models.includes('opus'))
+  assert.ok(data.efforts.includes('xhigh'))
+})
+
+test('Telegram: the token checked with getMe, the chat found with getUpdates, a test message sent', async () => {
+  const { call } = flow.page
+  assert.match((await call('/api/telegram/token', { token: 'nonsense' })).data.error, /does not look like a bot token/)
+  assert.match((await call('/api/telegram/token', { token: '123456789:WRONG-token-wrong-token-wrong-token-x' })).data.error, /does not know this token/)
+  const checked = await call('/api/telegram/token', { token: TELEGRAM_TOKEN })
+  assert.deepEqual(checked.data, { bot: '@voice_test_bot' })
+
+  assert.deepEqual((await call('/api/telegram/chats', {})).data, { chats: [] }, 'nobody wrote yet')
+  api.updates = [
+    { update_id: 1, message: { chat: { id: -100, type: 'group', title: 'Family' }, text: 'hi' } },
+    { update_id: 2, message: { chat: { id: Number(CHAT_ID), type: 'private', first_name: 'Gaudenz', username: 'driver' }, text: 'Hallo' } },
+    { update_id: 3, message: { chat: { id: Number(CHAT_ID), type: 'private', first_name: 'Gaudenz', username: 'driver' }, text: 'again' } },
+  ]
+  assert.deepEqual((await call('/api/telegram/chats', {})).data, { chats: [{ id: CHAT_ID, name: 'Gaudenz (@driver)' }] })
+
+  assert.deepEqual((await call('/api/telegram/test', { chatId: CHAT_ID })).data, { sent: true })
+  assert.equal(api.sent.at(-1).chat_id, CHAT_ID)
+  assert.match(api.sent.at(-1).text, /test message from the setup assistant/)
+  const state = (await call('/api/state')).data
+  assert.equal(state.secrets.telegramToken, 'new')
+  assert.equal(state.secrets.telegramChatId, 'new')
+})
+
+test('GitHub: the token checked, and the access level per repository from the gateway\'s detection', async () => {
+  const { call } = flow.page
+  assert.match((await call('/api/github/token', { token: 'github_pat_WRONG_wrong_wrong_wrong_0000' })).data.error, /rejected the token/)
+  const user = (await call('/api/github/token', { token: GITHUB_TOKEN })).data
+  assert.deepEqual(user, { login: 'driver', kind: 'fine-grained', scopes: null, expires: '2027-01-31 00:00:00 UTC' })
+
+  const levels = (await call('/api/github/levels', { repos: ['acme/guarded', 'acme/open', 'acme/readonly', 'acme/missing'] })).data.levels
+  assert.deepEqual(
+    levels.map(({ slug, level }) => `${slug} ${level}`),
+    ['acme/guarded pr', 'acme/open full', 'acme/readonly read-only', 'acme/missing read-only'],
+  )
+  assert.match(levels[0].reason, /main is protected by a ruleset/)
+  assert.match(levels[3].reason, /cannot see the repository \(404\)/)
+  const forced = (await call('/api/github/levels', { repos: ['acme/open'], forced: 'pr' })).data.levels
+  assert.equal(forced[0].level, 'pr')
+  assert.equal((await call('/api/github/levels', { repos: ['not a slug'] })).status, 400)
+})
+
+test('Docker: the image is built with progress on the page, and nothing secret in it', async () => {
+  const { call } = flow.page
+  assert.match((await call('/api/claude/token', { token: 'nope' })).data.error, /starts with sk-ant-/)
+  assert.deepEqual((await call('/api/claude/token', { token: CLAUDE_TOKEN })).data, { claudeToken: 'new' })
+
+  writeFileSync(ECHO, `GH_TOKEN=${GITHUB_TOKEN} CLAUDE=${CLAUDE_TOKEN}`) // as if a build printed them
+  const { job } = (await call('/api/docker/build', { image: 'cc-voice-worker' })).data
+  const done = await follow(flow.page, job)
+  rmSync(ECHO)
+  assert.equal(done.state, 'done')
+  assert.match(done.lines.join('\n'), /naming to docker\.io\/library\/cc-voice-worker/)
+  assert.match(done.lines.join('\n'), /GH_TOKEN=‹secret› CLAUDE=‹secret›/)
+  const build = calls().find(c => c.command === 'docker' && c.argv[0] === 'build')
+  assert.deepEqual(build.argv.slice(0, 2), ['build', '-t'])
+  assert.ok(build.argv.includes(`UID=${process.getuid()}`))
+  assert.equal(build.argv.at(-1), join(ROOT, 'docker'))
+})
+
+test('finishing: invalid input is refused before anything is written', async () => {
+  const { call } = flow.page
+  const refused = await call('/api/finish', { settings: { VOICE_GW_PORT: '80', VOICE_GW_WORKER_MODEL: 'x; rm -rf /', NOPE: '1' } })
+  assert.equal(refused.status, 400)
+  assert.match(refused.data.error, /VOICE_GW_PORT: not a valid value/)
+  assert.match(refused.data.error, /VOICE_GW_WORKER_MODEL: not a valid value/)
+  assert.match(refused.data.error, /unknown setting NOPE/)
+  assert.ok(!existsSync(SECRETS), 'nothing written')
+})
+
+test('finishing: the files in .secrets with mode 0600 in folders of 0700, the container, the watchdog, then the server ends', async () => {
+  const { call } = flow.page
+  const { status, data } = await call('/api/finish', {
+    settings: {
+      VOICE_GW_PORT: '8791',
+      VOICE_GW_WORKER_ROOT: DEV,
+      VOICE_GW_MAX_WORKERS: '2', // the default: left out
+      VOICE_GW_DOCKER: 'voice-workers',
+      VOICE_GW_DOCKER_FOLDER: FOLDER,
+      VOICE_GW_DOCKER_IMAGE: 'cc-voice-worker',
+      VOICE_GW_ACCESS: '',
+      VOICE_GW_CONTROLLER_MODEL: 'sonnet',
+      VOICE_GW_CONTROLLER_EFFORT: 'low',
+      VOICE_GW_WORKER_MODEL: 'opus',
+      VOICE_GW_WORKER_EFFORT: 'high',
+    },
+    telegram: { enabled: true },
+    docker: { enabled: true, repos: ['acme/guarded', 'acme/open'], gitName: 'Test Driver', gitEmail: 'driver@example.com' },
+    watchdog: { autostart: true, startNow: true },
+    plugin: { register: true },
+  })
+  assert.equal(status, 200)
+  const done = await follow(flow.page, data.job)
+  assert.equal(done.state, 'done', done.lines.join('\n'))
+
+  const mode = path => statSync(path).mode & 0o777
+  assert.equal(mode(SECRETS), 0o700)
+  assert.equal(mode(join(SECRETS, 'worker')), 0o700)
+  const files = {
+    telegram_token: TELEGRAM_TOKEN,
+    telegram_chat_id: CHAT_ID,
+    'worker/claude_token': CLAUDE_TOKEN,
+    'worker/github_token': GITHUB_TOKEN,
+  }
+  for (const [name, value] of Object.entries(files)) {
+    assert.equal(readFileSync(join(SECRETS, name), 'utf8'), value, name)
+    assert.equal(mode(join(SECRETS, name)), 0o600, `${name} is 0600`)
+  }
+  assert.equal(mode(join(SECRETS, 'gateway.env')), 0o600)
+  assert.deepEqual(readSettings(join(SECRETS, 'gateway.env')), {
+    VOICE_GW_PORT: '8791',
+    VOICE_GW_WORKER_ROOT: DEV,
+    VOICE_GW_DOCKER: 'voice-workers',
+    VOICE_GW_DOCKER_FOLDER: FOLDER,
+    VOICE_GW_CONTROLLER_MODEL: 'sonnet',
+    VOICE_GW_CONTROLLER_EFFORT: 'low',
+    VOICE_GW_WORKER_MODEL: 'opus',
+    VOICE_GW_WORKER_EFFORT: 'high',
+  })
+  for (const value of SECRET_VALUES) assert.ok(!readFileSync(join(SECRETS, 'gateway.env'), 'utf8').includes(value))
+
+  // The container: started by the start script, then git's identity and the clones, inside it.
+  const docker = calls().filter(c => c.command === 'docker').map(c => c.argv)
+  const run = docker.find(argv => argv[0] === 'run')
+  assert.ok(run.includes(`${FOLDER}:/repos:rw`))
+  assert.ok(run.includes(`${join(SECRETS, 'worker')}:/run/secrets/voice:ro`))
+  assert.ok(docker.some(argv => argv.join(' ') === 'exec voice-workers git config --global user.name Test Driver'))
+  assert.ok(docker.some(argv => argv.join(' ') === `exec voice-workers git clone https://github.com/acme/guarded.git ${FOLDER}/guarded`))
+  assert.ok(existsSync(join(FOLDER, 'open')))
+
+  // The watchdog: a systemd user service, enabled, and started now in tmux.
+  const unit = readFileSync(join(HOME, '.config', 'systemd', 'user', 'cc-voice-gateway.service'), 'utf8')
+  assert.match(unit, /^ExecStart=".*\/tmux" new-session -d -s voice ".*\/scripts\/start-controller\.sh"$/m)
+  assert.match(unit, /^ExecStop=".*\/scripts\/start-controller\.sh" --stop$/m)
+  const systemctl = calls().filter(c => c.command === 'systemctl').map(c => c.argv.join(' '))
+  assert.deepEqual(systemctl, ['--user daemon-reload', '--user enable cc-voice-gateway.service'])
+  assert.ok(calls().some(c => c.command === 'tmux' && c.argv.slice(0, 4).join(' ') === 'new-session -d -s voice'))
+  assert.ok(!calls().some(c => c.command === 'claude' && c.argv[0] === 'plugin'), 'not on the allowlist: nothing to register')
+
+  // The page has seen the result: the server ends by itself.
+  assert.equal(await flow.server.done, 'the setup is written')
+  assert.equal(await fetch(`${flow.page.base}/api/state`).catch(() => 'closed'), 'closed')
+})
+
+test('no secret reaches a log line, the terminal, a response or a command line', () => {
+  const places = {
+    terminal: terminal.join('\n'),
+    responses: flow.page.responses.join('\n'),
+    commands: existsSync(CALLS) ? readFileSync(CALLS, 'utf8') : '',
+    'gateway log': existsSync(join(TMP, 'gateway.log')) ? readFileSync(join(TMP, 'gateway.log'), 'utf8') : '',
+    'API requests': api.requests.join('\n'),
+  }
+  for (const [place, text] of Object.entries(places)) {
+    for (const value of [...SECRET_VALUES, flow.server.token]) {
+      assert.ok(!text.includes(value), `a secret in ${place}`)
+    }
+  }
+  assert.ok(places.responses.includes('‹secret›'), 'redacted where a command printed one')
+  assert.ok(terminal.some(line => /setup: written .*telegram_token.*gateway\.env/.test(line)), 'file names only')
+})
+
+test('finishing with Telegram turned off removes its saved files, and keeps everything else', async () => {
+  const secrets = join(TMP, 'secrets-off')
+  mkdirSync(join(secrets, 'worker'), { recursive: true })
+  writeFileSync(join(secrets, 'telegram_token'), TELEGRAM_TOKEN)
+  writeFileSync(join(secrets, 'telegram_chat_id'), CHAT_ID)
+  writeFileSync(join(secrets, 'worker', 'github_token'), GITHUB_TOKEN, { mode: 0o644 })
+  writeFileSync(join(secrets, 'gateway.env'), 'VOICE_GW_KILL_MAX_EDITS=900\nVOICE_GW_DOCKER=old-workers\n')
+  const setup = createSetup({ root: ROOT, secretsDir: secrets, env: setupEnv(), home: HOME, platform: 'linux', say })
+  const { job } = await setup.api['POST /api/finish']({
+    body: { settings: { VOICE_GW_PORT: '8787', VOICE_GW_DOCKER: '' }, telegram: { enabled: false }, docker: { enabled: false } },
+  })
+  let state
+  for (let i = 0; i < 100 && (state = setup.api['GET /api/jobs/:id']({ id: job })).state === 'running'; i++) await sleep(20)
+  assert.equal(state.state, 'done', state.lines.join('\n'))
+  assert.match(state.lines.join('\n'), /Telegram turned off: removed telegram_token, telegram_chat_id/)
+  assert.ok(!existsSync(join(secrets, 'telegram_token')))
+  assert.ok(!existsSync(join(secrets, 'telegram_chat_id')))
+  assert.equal(statSync(join(secrets, 'worker', 'github_token')).mode & 0o777, 0o600, 'a saved secret gets mode 0600')
+  assert.deepEqual(readSettings(join(secrets, 'gateway.env')), { VOICE_GW_KILL_MAX_EDITS: '900' }, 'other settings stay; Docker is off')
+})
+
+test('the settings file: one line per setting, read without running anything', () => {
+  assert.throws(() => formatSettings({ VOICE_GW_PORT: '1\nVOICE_GW_DOCKER=x' }), /one line only/)
+  assert.throws(() => formatSettings({ PATH: '/bin' }), /not a setting/)
+  const file = join(TMP, 'settings-test.env')
+  writeFileSync(file, formatSettings({ VOICE_GW_PORT: '8788', VOICE_GW_DOCKER: '' }, ['a comment']) + 'PATH=/nope\nVOICE_GW_X=$(touch y)\n')
+  assert.deepEqual(readSettings(file), { VOICE_GW_PORT: '8788', VOICE_GW_X: '$(touch y)' })
+  assert.deepEqual(readSettings(join(TMP, 'missing.env')), {})
+})

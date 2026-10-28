@@ -102,8 +102,8 @@ results, questions and approval requests to your Telegram chat as well. See
 - The Claude app on a paid plan, for custom connectors. The connector's Claude account does not
   have to be the one that runs Claude Code.
 - For workers: git, and the GitHub CLI `gh`, logged in, for pushing and pull requests.
-- Optional, for the [Telegram fallback](#telegram-fallback): a Telegram account and a bot, and `jq`
-  to read the chat ID.
+- Optional, for the [Telegram fallback](#telegram-fallback): a Telegram account and a bot. The setup
+  assistant reads the chat ID; by hand, `jq` helps.
 - Optional, for [workers in Docker](#workers-in-docker): Docker. The container brings its own
   git, `gh` and Claude Code.
 
@@ -118,25 +118,38 @@ results, questions and approval requests to your Telegram chat as well. See
    npm test
    ```
 
-2. **Start the controller.**
+2. **Run the setup assistant** on the computer that runs the gateway, also over SSH on a
+   headless server:
 
    ```bash
-   scripts/start-controller.sh
+   node scripts/setup.mjs
    ```
 
-   On the first start Claude Code asks in the terminal three times: trust for the folder, a
-   warning about the development channel, and consent for the MCP server from `.mcp.json`.
-   Confirm all three; the warning comes again at every start, until the channel loads as a plugin
-   on the organisation's allowlist ([The channel as a plugin](#the-channel-as-a-plugin-without-the-warning)).
-   For an always-on setup run it inside tmux: `tmux new -s voice scripts/start-controller.sh`. A
-   watchdog in the script starts the session again after a crash
+   It prints a one-time link for each address of the computer. Open one in a browser on any
+   device in your network. The page goes through everything in order, with a short guide and a
+   link to where each key comes from: the gateway's settings, the models, Telegram, workers in
+   Docker, the watchdog and the plugin. At the end it writes everything into `.secrets/` and ends
+   by itself. See [The setup assistant](#the-setup-assistant).
+
+3. **Start the controller**, unless the assistant already started it in tmux:
+
+   ```bash
+   tmux new -s voice scripts/start-controller.sh
+   ```
+
+   On the first start Claude Code asks in the terminal: trust for the folder, a warning about the
+   development channel, and consent for the MCP server from `.mcp.json`. Confirm all three (if the
+   assistant started it, attach first with `tmux attach -t voice`). The warning comes again at
+   every start, until the channel loads as a plugin on the organisation's allowlist
+   ([The channel as a plugin](#the-channel-as-a-plugin-without-the-warning)). A watchdog in the
+   script starts the session again after a crash
    ([Keeping the controller running](#keeping-the-controller-running)).
 
-3. **Publish the endpoint** at a public HTTPS address, as described in
+4. **Publish the endpoint** at a public HTTPS address, as described in
    [Publishing the endpoint](#publishing-the-endpoint). With Tailscale Funnel that is
    `scripts/funnel.sh start`. The connector URL is that address followed by `/mcp`.
 
-4. **Add the connector** in the Claude app under Customize → Connectors → add a custom connector.
+5. **Add the connector** in the Claude app under Customize → Connectors → add a custom connector.
    Labels vary between app versions.
    - URL: `https://<your public host>/mcp`.
    - Authentication: sign in.
@@ -151,14 +164,78 @@ results, questions and approval requests to your Telegram chat as well. See
 
    Enter the eight-digit code it prints. It is valid for five minutes and for one sign-in.
 
-5. **Allow the tools.** The Claude app asks before every call to a new connector's tools. Choose
+6. **Allow the tools.** The Claude app asks before every call to a new connector's tools. Choose
    **Always allow**, or set it per tool in the connector's settings. Otherwise voice mode stops for
    a confirmation at every step, including every `get_reply` during a long task.
 
-6. **Try it** in voice mode: "Ask Claude Code whether the gateway is up."
+7. **Try it** in voice mode: "Ask Claude Code whether the gateway is up."
 
-7. **Optional: Telegram.** To get results, questions and approval requests as Telegram messages
-   once a voice conversation has ended, set up the [Telegram fallback](#telegram-fallback).
+### The setup assistant
+
+![Setup assistant](docs/setup.drawio.svg)
+
+`node scripts/setup.mjs` serves one page, which you open with the link from the terminal. It
+automates what it can, and for every key it needs says in a sentence where to get it, with a link.
+
+| Step | What the assistant does | What you give it |
+|---|---|---|
+| This computer | Checks Node.js, `npm install`, Claude Code (2.1.80 or later), git, the `gh` login, Docker, tmux and Tailscale | Fixes for what is marked as needed |
+| Gateway | Port, repositories folder, runs at a time, time limit, approvals by voice | Your choices |
+| Models | Model and effort for the controller (`--model`, `--effort` from `start-controller.sh`) and for every worker run, on this computer and in Docker | Your choices, or Claude Code's defaults |
+| Telegram | Checks the bot token (`getMe`), finds your private chat with `getUpdates` once you wrote to the bot, sends a test message | A token from [@BotFather](https://t.me/BotFather), one message to the bot |
+| Workers in Docker | Checks the GitHub token and shows the access level per repository, with the gateway's own detection; builds the image with its progress on the page; starts the container, sets git's name and email in it and clones the chosen repositories inside it | A token from `claude setup-token`; a GitHub token if needed ([fine-grained or classic, per level](#github-tokens-for-each-level)); the repositories |
+| Watchdog | On Linux, writes a systemd user service that starts the controller in the tmux session `voice` at login, and enables it; or starts it now in tmux | Your choice; `loginctl enable-linger` for a start at boot without a login |
+| Plugin | Shows whether `voice@cc-voice-gateway` is on the organisation's channel allowlist; if it is, registers this repository as the marketplace; if not, shows the admin's steps | The admin, on claude.ai |
+
+On macOS the assistant writes a LaunchAgent and shows the `launchctl bootstrap` command that turns
+it on, without running it.
+
+**What it writes**, when you press "Write the setup":
+
+| File | Content |
+|---|---|
+| `.secrets/gateway.env` | The settings, one `VOICE_GW_…=value` per line; values equal to their default are left out, others already in the file stay |
+| `.secrets/telegram_token`, `.secrets/telegram_chat_id` | The bot, if the Telegram fallback is on; turned off on the page, both are deleted |
+| `.secrets/worker/claude_token`, `.secrets/worker/github_token` | The container's logins, with Docker |
+
+The folders get mode 0700 and the files 0600. Each file is written fresh with mode 0600 and then
+moved into place, so it is never readable for others. Secrets you saved before stay as they are
+unless you enter new ones; the page only shows them as `••••••••`. The gateway,
+`start-controller.sh`, `start-workers-container.sh` and `funnel.sh` read `gateway.env` at their
+next start, line by line, without running anything in it. A variable set in the environment or in
+`controller/.mcp.json` wins. Run the assistant again to change something; it starts from the
+current settings.
+
+**How it is guarded.** It listens on every interface by default, so that a headless server can be
+set up from a laptop.
+
+- **One-time link:** the token in it is 256 random bits, shown only in the terminal and compared in
+  constant time. With its output in a pipe or a file the assistant does not start, so the link
+  never ends up in a log.
+- **One browser:** the first use spends the token and binds the setup to that browser with an
+  HttpOnly, SameSite=Strict session cookie. The token leaves the address bar. The same link in
+  another browser is refused.
+- **Wrong links:** after five from one address within ten minutes, or 30 in total, every attempt is
+  refused for a while, the right one too.
+- **Write requests** must come from the page's own origin, as JSON. The page has a strict Content
+  Security Policy, sends no referrer, and nothing is cached.
+- **It ends by itself:** after 10 minutes without a request from the page, after 30 minutes at most,
+  after writing the setup, and on Cancel. Wrong links do not count as activity.
+- **No HTTPS:** the page says so. Use it only in your own network, or through an SSH tunnel:
+  `ssh -L 8790:localhost:8790 <server>`, then open the link with `localhost`.
+- **No secret leaves it:** none goes to a log, to the terminal or back to the browser. Output of the
+  commands it runs, such as `docker build`, shows a known secret as `‹secret›`.
+
+Options: `--host` (the bind address, `0.0.0.0`), `--port` (`8790`), `--timeout` and `--idle` (in
+minutes, `30` and `10`), or `VOICE_SETUP_HOST`, `VOICE_SETUP_PORT`, `VOICE_SETUP_TIMEOUT` and
+`VOICE_SETUP_IDLE`.
+
+Everything it does is also described step by step for doing it by hand:
+- [Telegram fallback](#telegram-fallback)
+- [Workers in Docker](#set-it-up)
+- [Keeping the controller running](#keeping-the-controller-running)
+- [The channel as a plugin](#the-channel-as-a-plugin-without-the-warning)
+- [Configuration](#configuration)
 
 ## Publishing the endpoint
 
@@ -318,8 +395,9 @@ top of the voice path, not instead of it: when you open voice mode again, the as
 hears everything it has not picked up. You cannot answer by Telegram. Answer questions and
 approvals in voice mode, naming the id or code, or at the terminal.
 
-**Setup.** The fallback is on only when `.secrets/telegram_token` and `.secrets/telegram_chat_id`
-both exist and are not empty. Without them the gateway logs one line,
+**Setup.** The [setup assistant](#the-setup-assistant) does all of this: it checks the token, finds
+your chat and sends a test message. By hand: the fallback is on only when `.secrets/telegram_token`
+and `.secrets/telegram_chat_id` both exist and are not empty. Without them the gateway logs one line,
 `telegram fallback off: telegram_token and telegram_chat_id not both set`, and works as before.
 
 1. **Create a bot.** In Telegram, write `/newbot` to [@BotFather](https://t.me/BotFather) and copy
@@ -564,6 +642,10 @@ instead.
 
 ### Set it up
 
+The [setup assistant](#the-setup-assistant) does steps 1 to 6: it builds the image, stores the
+tokens, starts the container, clones the repositories you choose and points the gateway at the
+container. By hand:
+
 1. **Choose the folder** for the container's repositories. It must not hold your own checkouts,
    and this computer's git will never run in it. Docker installed as a snap cannot mount folders
    from `/tmp`; a folder in your home is fine.
@@ -631,10 +713,11 @@ instead.
    Use `https://` addresses; the container has no SSH keys. Private repositories need a token
    that can read them, even at level `read-only`.
 
-6. **Point the gateway at the container** in `controller/.mcp.json`, then restart the controller:
+6. **Point the gateway at the container** in `.secrets/gateway.env`, or in `controller/.mcp.json`,
+   then restart the controller:
 
-   ```json
-   "env": { "VOICE_GW_DOCKER": "voice-workers" }
+   ```bash
+   (umask 077; echo 'VOICE_GW_DOCKER=voice-workers' >> .secrets/gateway.env)
    ```
 
    The log shows `worker container voice-workers: repositories from host folder …, running as
@@ -831,6 +914,9 @@ again afterwards: `scripts/start-workers-container.sh`.
 - **Only signed-in clients get in.** Signing in needs a pairing code from this computer: eight
   digits, valid for five minutes and for one sign-in, burnt after five wrong attempts. Return
   addresses are limited to Claude's hosts (`claude.ai`, `claude.com`) and loopback.
+- **The setup assistant** listens on every interface while it runs, behind a one-time link, a
+  session cookie for one browser, a rate limit and an origin check, and ends by itself; without
+  HTTPS only in your own network ([how it is guarded](#the-setup-assistant)).
 - **Tokens are stored as hashes only,** in `.secrets/oauth.json`. `pair.mjs` reaches the gateway
   through the Unix socket `.secrets/admin.sock`. Both are mode 0600, in a folder that is mode 0700.
 - **Whoever is signed in can have any command run as you.** Workers run without approvals and
@@ -913,7 +999,10 @@ again afterwards: `scripts/start-workers-container.sh`.
 
 ## Configuration
 
-Claude Code starts the gateway, so environment variables go into `controller/.mcp.json`:
+The [setup assistant](#the-setup-assistant) writes the settings into `.secrets/gateway.env`, one
+`VOICE_GW_…=value` per line, which the gateway and the start scripts read at their next start
+(`src/settings.mjs`, `scripts/settings.sh`). Environment variables win over the file. Claude Code
+starts the gateway, so they go into `controller/.mcp.json`:
 
 ```json
 {
@@ -942,6 +1031,10 @@ Claude Code starts the gateway, so environment variables go into `controller/.mc
 | `VOICE_GW_WORKER_ROOT` | the folder holding this repository | every git repository directly in it has a worker |
 | `VOICE_GW_MAX_WORKERS` | `2` | runs at the same time |
 | `VOICE_GW_WORKER_TIMEOUT` | `60` | minutes before a run is stopped |
+| `VOICE_GW_WORKER_MODEL` | empty | `--model` for every worker run, on this computer and in Docker, for example `opus`; empty: Claude Code's default |
+| `VOICE_GW_WORKER_EFFORT` | empty | `--effort` for every worker run: `low`, `medium`, `high`, `xhigh` or `max` |
+| `VOICE_GW_CONTROLLER_MODEL` | empty | for `scripts/start-controller.sh`: `--model` for the controller session; options given to the script win |
+| `VOICE_GW_CONTROLLER_EFFORT` | empty | for `scripts/start-controller.sh`: `--effort` for the controller session |
 | `VOICE_GW_PR_POLL` | `60` | seconds between looks at a [watched pull request](#pull-requests-and-reviews); five times as long after 15 looks |
 | `VOICE_GW_PR_WATCH_HOURS` | `24` | hours after which the gateway stops watching a pull request |
 | `VOICE_GW_DOCKER` | empty | name of the [worker container](#workers-in-docker); empty: workers run on this computer |
@@ -1002,6 +1095,11 @@ The [watchdog](#keeping-the-controller-running) reads its settings from the envi
 | A worker fails at once | `could not start claude`: Claude Code is not on the gateway's `PATH`; set `VOICE_GW_CLAUDE_BIN`. Otherwise read `.state/tasks/<task>.err`. |
 | What did a worker do? | `.state/tasks/<task>.jsonl` holds the whole run. `claude --resume <session>` in the repository opens the session; `.state/workers.json` lists the session ids. |
 | A private repository is handled like a public one | `gh` is not logged in or not on the `PATH`, so the visibility is unknown, and the worker asks before pushing to be safe. |
+| The setup link says it is not valid or already used | The link works once, in one browser. Go on in that browser, or start `node scripts/setup.mjs` again for a new link. |
+| The setup page says "Too many wrong links" | Five wrong links from one address within ten minutes, or 30 in total, block every attempt for a while. Wait, or start the assistant again. |
+| The setup assistant does not start | `needs a terminal`: it shows its link only on a terminal, so run it directly, not with its output redirected. `cannot listen on …: EADDRINUSE`: choose another `--port`. |
+| The setup page cannot be reached from another computer | A firewall blocks the port, or `--host` names one address only. Or use the SSH tunnel the terminal shows. |
+| "Find my chat" finds nothing | Write to the bot after checking the token; Telegram keeps messages for 24 hours. A running gateway that polls the same bot takes them away: quit the controller first. |
 | No Telegram message | Messages go out only after `VOICE_GW_TELEGRAM_AFTER` seconds without a voice call, and only for what the voice assistant has not picked up. `telegram fallback off` in the log: a file was missing or empty when the gateway started; fix it and restart the controller. `telegram send failed: 400 Bad Request: chat not found`: wrong chat ID, or you never wrote to the bot. `401 Unauthorized`: wrong token. |
 | `The worker container voice-workers does not answer` | The container is stopped or was removed: `docker start voice-workers`, or start it as in [Workers in Docker](#workers-in-docker). |
 | `access read-only (no GitHub token)` although there is one | It must be `.secrets/worker/github_token`, readable for the gateway. A new token counts at the next check, within ten minutes. |
@@ -1045,7 +1143,9 @@ src/
   admin.mjs          Unix socket for pair.mjs and fake-voice
   store.mjs          requests, approvals, waiting for changes
   http.mjs           small HTTP helpers
-  config.mjs         environment variables
+  config.mjs         environment variables and .secrets/gateway.env
+  settings.mjs       reads and writes .secrets/gateway.env
+  setup/             the setup assistant: server.mjs (link, session, limits), actions.mjs (the steps), ui/ (the page)
   log.mjs            log to stderr and file, never to stdout
 docker/
   Dockerfile         the worker container: Claude Code, git and gh, as your user id
@@ -1056,12 +1156,14 @@ docker/
   marketplace.json   this repository as the marketplace cc-voice-gateway
   plugin.json        the plugin voice: the gateway as an MCP server, and its channel
 controller/
-  .mcp.json          starts the gateway as server "voice"; its env block holds the gateway's settings
+  .mcp.json          starts the gateway as server "voice"; settings in its env block win over .secrets/gateway.env
   .claude/settings.json   allow and deny rules, confine hook
   .claude/hooks/confine.mjs   file tools inside controller/ (writes: playground/), Bash allowlist, read-only gh
   CLAUDE.md          rules for the controller session
   playground/        working folder for requests
 scripts/
+  setup.mjs          the setup assistant: a temporary page that sets everything up
+  settings.sh        .secrets/gateway.env for the shell scripts, read without running it
   start-controller.sh   start the controller with its channel, under a watchdog
   channel-mode.mjs   plugin or development flag: is the plugin on the organisation's allowlist?
   telegram-notify.mjs   one Telegram message, for the watchdog and the gateway
@@ -1083,6 +1185,7 @@ test/
   controller.test.mjs   launcher flags, controller settings, confine hook
   watchdog.test.mjs  the watchdog, with stand-ins for claude and Telegram
   restart.test.mjs   the channel as a plugin, restarting by voice, requests across restarts
+  setup.test.mjs     the setup assistant: link, session, limits, timeouts, file modes, no secret in any output, with stand-ins for Telegram, GitHub and Docker
 docs/
   *.drawio.svg       diagrams: an image on GitHub, editable in draw.io
   workers-plan.md    how workers came about, and what is next

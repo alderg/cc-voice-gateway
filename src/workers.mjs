@@ -135,7 +135,7 @@ function duration(ms) {
   return plural(Math.round(seconds / 60), 'minute')
 }
 
-function githubSlug(url) {
+export function githubSlug(url) {
   const match = /github\.com[:/]([^/\s]+\/[^/\s]+?)(?:\.git)?\/?$/.exec(url ?? '')
   return match ? match[1] : null
 }
@@ -179,6 +179,8 @@ export class Workers extends EventEmitter {
     stateDir,
     claudeBin = 'claude',
     ghBin = 'gh',
+    model = '',
+    effort = '',
     maxRuns = 2,
     timeoutMinutes = 60,
   }) {
@@ -191,6 +193,8 @@ export class Workers extends EventEmitter {
     this.tasksDir = join(stateDir, 'tasks')
     this.claudeBin = claudeBin
     this.ghBin = ghBin
+    this.model = model // claude --model for every run; empty: Claude Code's default
+    this.effort = effort // claude --effort
     this.maxRuns = maxRuns
     this.timeoutMs = timeoutMinutes * 60 * 1000
     this.visibilities = new Map() // owner/repo -> public | private | internal
@@ -342,6 +346,8 @@ export class Workers extends EventEmitter {
       '--strict-mcp-config',
       '--settings', JSON.stringify({ permissions: { deny: WORKER_DENY } }),
       '--append-system-prompt', workerRules(facts.access?.level),
+      ...(this.model ? ['--model', this.model] : []),
+      ...(this.effort ? ['--effort', this.effort] : []),
       ...(previous ? ['--resume', sessionId] : ['--session-id', sessionId]),
     ]
     let child

@@ -29,8 +29,10 @@ const BLOCKING_RULES = ['pull_request', 'update', 'required_status_checks', 'mer
 const fingerprint = token => createHash('sha256').update(token).digest('hex').slice(0, 12)
 
 export class GitHubAccess {
-  constructor({ tokenFile, apiBase = 'https://api.github.com', forced = '' }) {
+  // token: a fixed token instead of the file, for the setup assistant.
+  constructor({ tokenFile, token = null, apiBase = 'https://api.github.com', forced = '' }) {
     this.tokenFile = tokenFile
+    this.fixedToken = token
     this.apiBase = apiBase.replace(/\/+$/, '')
     this.forced = ACCESS_LEVELS.includes(forced) ? forced : ''
     this.cache = new Map() // "owner/repo fingerprint" -> { at, ttl, result }
@@ -38,6 +40,7 @@ export class GitHubAccess {
 
   // Read at every check, so that a new token counts without a restart.
   token() {
+    if (this.fixedToken !== null) return this.fixedToken
     try {
       return readFileSync(this.tokenFile, 'utf8').trim()
     } catch {

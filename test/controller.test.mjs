@@ -9,9 +9,9 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync, spawnSync } from 'node:child_process'
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const SCRIPT = fileURLToPath(new URL('../scripts/start-controller.sh', import.meta.url))
@@ -66,6 +66,27 @@ test('start-controller.sh runs claude in controller/ with the channel in manual 
   assert.ok(!argv.includes('--setting-sources'), 'user settings must stay loaded')
   assert.equal(argv.at(-1), '--debug', 'extra arguments are passed through')
   assert.match(log, /channel: the development flag, since voice@cc-voice-gateway is not on the organisation's channel allowlist \(allowedChannelPlugins\) yet; the warning at the start needs Enter at the terminal/)
+})
+
+test('start-controller.sh takes the model and effort from .secrets/gateway.env, and never runs its lines', () => {
+  const outside = mkdtempSync(join(tmpdir(), 'voice-gw-marker-'))
+  const marker = join(outside, 'ran')
+  try {
+    const { argv } = runWithStub(['--model', 'haiku'], config => {
+      const secrets = join(dirname(config), 'secrets')
+      mkdirSync(secrets)
+      writeFileSync(
+        join(secrets, 'gateway.env'),
+        `VOICE_GW_CONTROLLER_MODEL=opus\nVOICE_GW_CONTROLLER_EFFORT=high\nVOICE_GW_NOTE=$(touch ${marker})\n`,
+      )
+    })
+    assert.equal(valueOf(argv, '--model'), 'opus')
+    assert.equal(valueOf(argv, '--effort'), 'high')
+    assert.deepEqual(argv.slice(-2), ['--model', 'haiku'], 'options given to the script come last, so they win')
+    assert.ok(!existsSync(marker), 'a line of the settings file is never executed')
+  } finally {
+    rmSync(outside, { recursive: true, force: true })
+  }
 })
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url)).replace(/\/$/, '')
