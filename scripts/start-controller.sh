@@ -31,6 +31,12 @@
 # settings with --setting-sources: then Claude Code reports channels as not
 # enabled for the organisation.)
 #
+# VOICE_GW_CONTROLLER_LEVEL sets how far the session may go: confined (the
+# default), clone-delete or unrestricted. The deny rules, or at unrestricted
+# the allow rules, come with --settings (scripts/controller-settings.mjs); the
+# confine hook reads the level too. A new level counts from the next start of
+# this script: --stop, then start it again.
+#
 # A watchdog keeps the session running: when it crashes, or its gateway stops
 # answering, it starts it again, with a growing pause in between and at most
 # VOICE_GW_WATCHDOG_MAX_RESTARTS restarts within VOICE_GW_WATCHDOG_WINDOW
@@ -176,8 +182,7 @@ choose_channel() {
     fi
   fi
   if [ "$channel_mode" = plugin ]; then
-    claude_args=(--permission-mode manual --channels "plugin:$PLUGIN@$MARKETPLACE"
-      --settings "{\"enabledPlugins\":{\"$PLUGIN@$MARKETPLACE\":true},\"disabledMcpjsonServers\":[\"voice\"]}")
+    claude_args=(--permission-mode manual --channels "plugin:$PLUGIN@$MARKETPLACE")
     log "channel: the plugin $PLUGIN@$MARKETPLACE, on the organisation's channel allowlist; no confirmation at the start"
   else
     channel_mode=development
@@ -185,6 +190,23 @@ choose_channel() {
       --dangerously-load-development-channels server:voice)
     log "channel: the development flag, since ${line#development }; the warning at the start needs Enter at the terminal"
   fi
+  # What the session may do: its level and the settings for it, with the
+  # plugin's (scripts/controller-settings.mjs).
+  local out level
+  if ! out=$(node "$ROOT/scripts/controller-settings.mjs" "$channel_mode") || [ -z "$out" ]; then
+    log "the controller's settings could not be built (scripts/controller-settings.mjs): not starting"
+    exit 1
+  fi
+  level=${out%%$'\n'*}
+  claude_args+=(--settings "${out#*$'\n'}")
+  # The session's hook and gateway go by the same level, until the next start.
+  export VOICE_GW_CONTROLLER_LEVEL=$level
+  case $level in
+    clone-delete)
+      log "controller level clone-delete: by voice, the controller clones repositories into the repositories folder and deletes files and folders there, each deletion after an approval by voice" ;;
+    unrestricted)
+      log "controller level unrestricted: the confinement is off. By voice, the controller can run any command as $(id -un), read and change any file, .secrets/ included, and use the web" ;;
+  esac
   # The session's model and effort from the settings; options given to this
   # script come later and win.
   if [ -n "${VOICE_GW_CONTROLLER_MODEL:-}" ]; then claude_args+=(--model "$VOICE_GW_CONTROLLER_MODEL"); fi
@@ -207,7 +229,7 @@ port=${VOICE_GW_PORT:-$(node -e '
 
 healthy() {
   node -e 'fetch(process.argv[1], { signal: AbortSignal.timeout(5000) }).then(r => process.exit(r.ok ? 0 : 1), () => process.exit(1))' \
-    "http://127.0.0.1:$port/healthz" 2>/dev/null
+    "http://127.0.0.1:$port/healthz" </dev/null >/dev/null 2>&1
 }
 
 # Runs next to the session: once the gateway has answered, enough failed
@@ -218,7 +240,9 @@ monitor() {
   # not release the lock.
   trap - INT TERM HUP EXIT
   local fails=0 seen=0 pid
-  while num sleep "$(seconds "$interval_ms")"; do
+  # Without the terminal: a sleep left over when the session ends must not
+  # keep the watchdog's output open.
+  while num sleep "$(seconds "$interval_ms")" </dev/null >/dev/null 2>&1; do
     pid=$(cat "$LOCK/claude.pid" 2>/dev/null || true)
     [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || exit 0
     if healthy; then

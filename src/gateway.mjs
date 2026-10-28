@@ -10,9 +10,11 @@
 // workers: headless Claude Code runs in the repositories next to this one, or
 // in a Docker container with its own clones, a watch on the pull requests they
 // open, for checks and reviews, and optionally Telegram, for news after the
-// voice mode ended. Over all of it, the kill switch (killswitch.mjs).
+// voice mode ended. At the controller levels clone-delete and unrestricted,
+// also cloning and deleting in the worker root (folders.mjs). Over all of it,
+// the kill switch (killswitch.mjs).
 
-import { EFFORTS, config } from './config.mjs'
+import { CONTROLLER_LEVELS, EFFORTS, config } from './config.mjs'
 import { log } from './log.mjs'
 import { Store } from './store.mjs'
 import { Auth } from './oauth.mjs'
@@ -28,6 +30,7 @@ import { RunGuard } from './guard.mjs'
 import { hostname } from 'node:os'
 import { DockerRunner, HostRunner } from './runners.mjs'
 import { ACCESS_LEVELS, GitHubAccess } from './access.mjs'
+import { FolderTools, clonedText } from './folders.mjs'
 
 const store = new Store({ permissionTtlSeconds: config.permissionTtlSeconds, file: config.requestsFile })
 const killswitch = new KillSwitch({ file: config.killSwitchFile })
@@ -86,6 +89,17 @@ const guard = new RunGuard({
 })
 for (const task of workers.running()) guard.started(task) // runs from before this gateway
 
+// What the controller may do; see config.mjs and the confine hook.
+if (config.controllerLevelSetting && !CONTROLLER_LEVELS.includes(config.controllerLevelSetting)) {
+  log(`VOICE_GW_CONTROLLER_LEVEL=${config.controllerLevelSetting} is not one of ${CONTROLLER_LEVELS.join(', ')}; confined instead`)
+}
+log(`controller level ${config.controllerLevel}`)
+let folders = null
+if (config.controllerLevel !== 'confined') {
+  if (config.docker) log('clone_repo and delete_path: not with workers in Docker')
+  else folders = new FolderTools({ root: config.workerRoot, workers, killswitch, ghBin: config.ghBin })
+}
+
 const pulls = new PullWatcher({
   ghBin: config.ghBin,
   stateFile: config.pullsStateFile,
@@ -119,6 +133,8 @@ const channel = await startChannel(store, {
   workers,
   restarter,
   killswitch,
+  folders,
+  level: config.controllerLevel,
   onClose: () => shutdown('stdio closed'),
 })
 
@@ -148,6 +164,19 @@ workers.on('finished', async task => {
     log('worker result not delivered:', error.message)
   } finally {
     reporting.delete(task.id)
+  }
+})
+
+// A clone's result reaches the controller the same way.
+folders?.on('cloned', async event => {
+  try {
+    await channel.ready
+    const request = store.createRequest(clonedText(event), { origin: 'worker' })
+    // trusted="no": a failure quotes git and GitHub.
+    request.meta = { kind: 'clone', repo: event.slug, folder: event.name, outcome: event.ok ? 'done' : 'failed', trusted: 'no' }
+    await channel.push(request, request.meta)
+  } catch (error) {
+    log('clone result not delivered:', error.message)
   }
 })
 
@@ -195,6 +224,7 @@ async function lockdown(why) {
     // The runs got their signal before the state was to be saved.
     log('kill switch: worker runs stopped, but their state was not saved:', error.message)
   }
+  folders?.stopAll()
   for (const permission of store.openPermissions()) {
     store.resolvePermission(permission.code, 'deny')
     channel.sendVerdict(permission.code, 'deny').catch(() => {})

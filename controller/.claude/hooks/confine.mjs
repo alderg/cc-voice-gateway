@@ -1,6 +1,11 @@
 #!/usr/bin/env node
 // PreToolUse hook: confines the controller session. It sees every tool call
 // and lets through only the tools on its list; everything else is blocked.
+// That holds at the controller levels confined and clone-delete
+// (VOICE_GW_CONTROLLER_LEVEL, src/config.mjs); at clone-delete the gateway
+// offers clone_repo and delete_path in addition. At unrestricted the hook
+// lets every tool through, and only keeps its two approval prompts, for
+// gh pr merge and for a confirmed delete_path.
 //
 //   the gateway's tools        mcp__voice__<tool> and mcp__plugin_voice_voice__<tool>
 //   ToolSearch, the to-do list TodoWrite, TaskCreate, TaskGet, TaskList, TaskUpdate
@@ -35,7 +40,8 @@
 // checks; every subcommand, flag and value of them is on an allowlist too.
 // A merge is the one write: for it the hook answers "ask" instead of letting
 // it run, which overrides the settings' allow rule for Bash, so Claude Code
-// opens an approval prompt that the channel relays to the car.
+// opens an approval prompt that the channel relays to the car. A confirmed
+// delete_path gets the same prompt.
 //
 // Fails closed: anything unexpected blocks the call.
 
@@ -43,6 +49,7 @@ import { realpathSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { config } from '../../../src/config.mjs'
 
 const CONTROLLER = realpathSync(resolve(dirname(fileURLToPath(import.meta.url)), '..', '..'))
 const PLAYGROUND = join(CONTROLLER, 'playground')
@@ -53,8 +60,20 @@ const WRITE_TOOLS = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit'])
 // The gateway's own tools, by the name of the server in .mcp.json and as the
 // plugin's server (mcp__plugin_<plugin>_<server>__<tool>). Full names, not a
 // prefix: a server called "voice__x" would also start with mcp__voice__.
-const GATEWAY_TOOLS = ['reply', 'list_workers', 'dispatch', 'worker_status', 'stop_worker', 'restart_controller', 'raise_alarm']
-const VOICE_TOOLS = new Set(GATEWAY_TOOLS.flatMap(name => [`mcp__voice__${name}`, `mcp__plugin_voice_voice__${name}`]))
+const GATEWAY_TOOLS = [
+  'reply',
+  'list_workers',
+  'dispatch',
+  'worker_status',
+  'stop_worker',
+  'restart_controller',
+  'raise_alarm',
+  'clone_repo',
+  'delete_path',
+]
+const gatewayNames = name => [`mcp__voice__${name}`, `mcp__plugin_voice_voice__${name}`]
+const VOICE_TOOLS = new Set(GATEWAY_TOOLS.flatMap(gatewayNames))
+const DELETE_TOOLS = new Set(gatewayNames('delete_path'))
 
 // Built-in tools that reach nothing outside the session: ToolSearch loads the
 // schemas of deferred tools, the gateway's among them; the rest keep the
@@ -356,6 +375,17 @@ try {
 const tool = event?.tool_name
 const base = event?.cwd || CONTROLLER
 
+// A deletion only after an approval prompt, at every level.
+if (DELETE_TOOLS.has(tool) && event.tool_input?.confirm === true) {
+  const path = String(event.tool_input?.path ?? '')
+  ask(`Delete ${path} in the repositories folder? It cannot be undone. Every deletion needs the driver's approval.`)
+}
+if (config.controllerLevel === 'unrestricted') {
+  // No limits; a merge in the form above still asks.
+  const decision = tool === 'Bash' ? checkShell(event.tool_input?.command, base) : null
+  if (decision && decision !== 'allow') ask(decision)
+  process.exit(0)
+}
 if (VOICE_TOOLS.has(tool) || SESSION_TOOLS.has(tool)) process.exit(0)
 if (tool === 'Bash') {
   const decision = checkShell(event.tool_input?.command, base)

@@ -15,6 +15,13 @@ export const VERSION = '0.1.0'
 // Effort levels of claude --effort.
 export const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max']
 
+// What the controller session may do (VOICE_GW_CONTROLLER_LEVEL), from the
+// least: confined (the default) answers, dispatches workers and reads pull
+// request status; clone-delete also clones repositories into the worker root
+// and deletes files and folders there (folders.mjs); unrestricted lifts the
+// confinement (controller/.claude/hooks/confine.mjs).
+export const CONTROLLER_LEVELS = ['confined', 'clone-delete', 'unrestricted']
+
 const secretsDir = process.env.VOICE_GW_SECRETS_DIR || join(ROOT, '.secrets')
 const settingsFile = join(secretsDir, SETTINGS_FILE_NAME)
 const env = { ...readSettings(settingsFile), ...process.env }
@@ -70,6 +77,9 @@ export const config = {
   // could change the gateway, the confine hook and controller/CLAUDE.md.
   // VOICE_GW_WORKER_SELF=1 lists it all the same.
   workerSelf: env.VOICE_GW_WORKER_SELF === '1',
+  // An unknown value counts as confined; the gateway says so in its log.
+  controllerLevel: CONTROLLER_LEVELS.includes(env.VOICE_GW_CONTROLLER_LEVEL) ? env.VOICE_GW_CONTROLLER_LEVEL : 'confined',
+  controllerLevelSetting: env.VOICE_GW_CONTROLLER_LEVEL ?? '',
   // A dispatch starts a run only with the driver's own words from a voice
   // request of the last this many minutes (channel.mjs).
   dispatchWindowMinutes: num(env.VOICE_GW_DISPATCH_WINDOW, 30),

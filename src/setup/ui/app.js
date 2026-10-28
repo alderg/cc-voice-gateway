@@ -142,11 +142,33 @@ function addRepo(slug, checked) {
   $('#repo-list').append(label)
 }
 
+// Shown for the levels above confined, so that it is clear what can happen.
+const LEVEL_WARNINGS = {
+  'clone-delete':
+    'Warning: whoever can talk to the connector can then have GitHub repositories cloned into the repositories ' +
+    'folder, and files and folders there deleted, whole repositories included, with uncommitted work and ' +
+    'commits that are on no remote. Every deletion needs an approval by voice, but whoever can call the ' +
+    'connector can give it too. A deletion cannot be undone. The gateway\'s own checkout is never deleted.',
+  unrestricted:
+    'Warning: the controller session is then no longer confined. Whoever can talk to the connector can have any ' +
+    'command run as your user, read and change any file (.secrets/, SSH keys and logins included), reach the ' +
+    'web, and use your MCP servers and connectors after an approval by voice. Text a worker brings back or a ' +
+    'web page the controller reads can steer a session that can do everything, and the kill switch\'s rules ' +
+    'only watch the workers, not the controller. Use it only on a computer or VM you can afford to lose.',
+}
+
+function showLevelWarning() {
+  const text = LEVEL_WARNINGS[$('#controller-level').value]
+  $('#level-warning').textContent = text ?? ''
+  $('#level-warning').hidden = !text
+}
+
 function fillSettings() {
   for (const element of $$('[data-setting]')) {
     const value = state.settings[element.dataset.setting]
     if (value !== undefined) element.value = value
   }
+  showLevelWarning()
   $('#docker-on').checked = Boolean(state.settings.VOICE_GW_DOCKER)
   $('#docker').hidden = !$('#docker-on').checked
   if (!$('#docker-name').value) $('#docker-name').value = 'voice-workers'
@@ -288,6 +310,7 @@ action('#docker-build', '#build-state', async () => {
 })
 
 $('#docker-on').addEventListener('change', () => ($('#docker').hidden = !$('#docker-on').checked))
+$('#controller-level').addEventListener('change', showLevelWarning)
 
 function collect() {
   const settings = {}

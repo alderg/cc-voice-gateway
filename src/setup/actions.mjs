@@ -15,7 +15,7 @@ import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync
 import { homedir, hostname, platform as osPlatform } from 'node:os'
 import { dirname, isAbsolute, join } from 'node:path'
 import { ACCESS_LEVELS, GitHubAccess } from '../access.mjs'
-import { EFFORTS } from '../config.mjs'
+import { CONTROLLER_LEVELS, EFFORTS } from '../config.mjs'
 import { HostRunner } from '../runners.mjs'
 import { SETTINGS_FILE_NAME, formatSettings, readSettings } from '../settings.mjs'
 import { Telegram } from '../telegram.mjs'
@@ -44,6 +44,7 @@ export function fields(root) {
     VOICE_GW_MAX_WORKERS: { default: '2', valid: INT(1, 10) },
     VOICE_GW_WORKER_TIMEOUT: { default: '60', valid: INT(5, 1440) },
     VOICE_GW_PERMISSION_RELAY: { default: '1', valid: ONE_OF('1', '0') },
+    VOICE_GW_CONTROLLER_LEVEL: { default: 'confined', valid: ONE_OF(...CONTROLLER_LEVELS) },
     VOICE_GW_TELEGRAM_AFTER: { default: '60', valid: INT(10, 3600) },
     VOICE_GW_DOCKER: { default: '', valid: NAME },
     VOICE_GW_DOCKER_FOLDER: { default: join(homedir(), 'docker-developer'), valid: PATH },

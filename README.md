@@ -120,8 +120,9 @@ Claude app, and Claude Code on your computer. It is one Node.js process with two
   your computer.
 - **Towards Claude Code:** a [channel][channels], an MCP server that pushes each voice request into
   a running Claude Code session, the **controller**. The controller answers through the channel's
-  `reply` tool. It may read its own folder and the status of pull requests; it does no repository
-  work itself.
+  `reply` tool. By default it may read its own folder and the status of pull requests, and does no
+  repository work itself; two higher [levels](#53-the-controllers-confinement) let it also clone
+  and delete, or do everything.
 
 Work in a repository goes to a **worker**: a headless `claude -p` run in that repository, started
 by the gateway when the controller calls `dispatch`. One worker per repository, two at a time by
@@ -318,7 +319,9 @@ to a lost phone or a leaked token.
 |---|---|---|
 | Anyone on the internet | Reach the sign-in page | Call a tool without a token; get a token without a pairing code from your computer |
 | A signed-in voice client | Send requests, read answers, answer approvals, lock the kill switch | Unlock the kill switch; reach the controller's tools directly |
-| The controller | Read `controller/`, write `controller/playground/`, read pull request and CI status, merge after an approval, dispatch workers with your words from a recent voice request, raise the alarm | Start a worker on words that only a worker result or a pull request brought in (see 5.4); anything else (see 5.3) |
+| The controller, level `confined` (default) | Read `controller/`, write `controller/playground/`, read pull request and CI status, merge after an approval, dispatch workers with your words from a recent voice request, raise the alarm | Start a worker on words that only a worker result or a pull request brought in (see 5.4); anything else (see 5.3) |
+| The controller at `clone-delete` | As at `confined`; also clone GitHub repositories into the worker root and delete files and folders there, each deletion after its plan, your words and an approval | Delete outside the worker root, the gateway's own checkout, or in a repository while its worker runs |
+| The controller at `unrestricted` | Everything your user can: any command, any file, `.secrets/` included, the web, subagents; your MCP servers and connectors after an approval | Nothing is blocked; a merge in the strict form and a confirmed `delete_path` still ask (see 5.3) |
 | A worker on this computer | Everything your user can, without approvals | Nothing is blocked; rules only observe (see 5.9) |
 | A worker in Docker | The mounted folder, the container's tokens, the network | Your other files, SSH keys, `gh` login; more on GitHub than its token allows |
 | Others on GitHub | Comment on a watched pull request: the news names them; the text of the repository's owner, members and collaborators reaches the controller, marked `trusted="no"` | Get anyone else's text to the controller through the watch; have a fork or someone else's pull request watched (see 8.4) |
@@ -347,7 +350,37 @@ to a lost phone or a leaked token.
 
 ### 5.3 The controller's confinement
 
-The controller runs without approvals for its few tools, since whoever can reach it could answer
+`VOICE_GW_CONTROLLER_LEVEL` sets how far the controller may go. The setup assistant offers it, with
+a warning for the two levels above the default:
+
+| Level | What the controller can do | Warning |
+|---|---|---|
+| `confined` (default) | What the rest of this section describes: answer, dispatch workers, read pull request status, merge after an approval | – |
+| `clone-delete` | The same, plus `clone_repo` and `delete_path` (below) | Whoever can talk to the connector can have repositories cloned, and files and folders in the worker root deleted, whole repositories with work that exists nowhere else included. Whoever can call the connector also gives the approval for each deletion. A deletion cannot be undone |
+| `unrestricted` | Everything your user can: the hook lets every tool through, and the start script passes allow rules instead of deny rules. Tools of other MCP servers and claude.ai connectors still ask, by voice | Whoever can talk to the connector can run any command as you, read and change any file (`.secrets/`, SSH keys and logins included) and reach the web. Text that a worker result or a web page brings in can steer a session that can do everything, and the kill switch's rules watch only the workers. Only on a computer or VM you can afford to lose |
+
+The level counts from the next start of `scripts/start-controller.sh` (`--stop`, then start
+again); an unknown value counts as `confined`. At no level does the session run in bypass mode or
+with `--dangerously-skip-permissions`.
+
+**Cloning and deleting** (`src/folders.mjs`), at `clone-delete` and `unrestricted`, with workers
+on this computer only:
+
+- **`clone_repo`** runs `gh repo clone` with your `gh` login, for `owner/name` or a name of your
+  own, into the worker root, in the background. The result arrives as a channel event, and you
+  hear it as news. A failed clone leaves nothing behind; the kill switch ends one that is going.
+- **`delete_path`** takes a path relative to the worker root. Without `confirm` it deletes nothing
+  and says what would be lost: files, size, uncommitted changes, commits on no remote, stashes.
+  With `confirm` it deletes only a path planned in the last 15 minutes, and the confine hook
+  answers "ask": Claude Code raises an approval that the channel relays. So, as for a merge, a
+  spoken yes and then the approval.
+- **Never:** outside the worker root (the folder a path sits in is resolved through symlinks; a
+  link is deleted, not its target), the gateway's own checkout or a folder that holds it, a
+  repository while its worker runs or a clone is going.
+- **Both** need your words from a recent voice request, as `dispatch` does
+  ([5.4](#54-approvals-by-voice)), and do nothing while the kill switch is locked.
+
+At the levels `confined` and `clone-delete`: the controller runs without approvals for its few tools, since whoever can reach it could answer
 approvals anyway. Its limits are enforced by a PreToolUse hook, `controller/.claude/hooks/confine.mjs`.
 A hook that exits with code 2 blocks a call before any permission rule or prompt. The hook sees
 every tool call (matcher `*`) and blocks every tool that is not on its list. It resolves symlinks
@@ -355,7 +388,7 @@ and fails closed.
 
 | Tool | Allowed |
 |---|---|
-| The gateway's tools | `reply`, `list_workers`, `dispatch`, `worker_status`, `stop_worker`, `restart_controller`, `raise_alarm`, as `mcp__voice__…` and `mcp__plugin_voice_voice__…` |
+| The gateway's tools | `reply`, `list_workers`, `dispatch`, `worker_status`, `stop_worker`, `restart_controller`, `raise_alarm`, and above `confined` `clone_repo` and `delete_path` (a confirmed one gets "ask"), as `mcp__voice__…` and `mcp__plugin_voice_voice__…` |
 | ToolSearch, TodoWrite, TaskCreate, TaskGet, TaskList, TaskUpdate | Always. They load deferred tools and keep the to-do list |
 | Read, Glob, Grep | Inside `controller/` |
 | Write, Edit, MultiEdit, NotebookEdit | Inside `controller/playground/` |
@@ -391,9 +424,11 @@ and fails closed.
   it, the merge waits for the approval.
 - **Two confirmations per merge.** `controller/CLAUDE.md` makes the controller ask you first, so
   every merge needs a spoken yes and then the approval.
-- **Denied in `controller/.claude/settings.json`:** claude.ai connectors (`mcp__claude_ai_*`), web
-  fetch and search, messages to other sessions, remote and scheduled agents, artifacts, Monitor,
-  workflows and worktrees. Bypass and auto mode cannot be turned on.
+- **Denied below `unrestricted`:** claude.ai connectors (`mcp__claude_ai_*`), web fetch and
+  search, messages to other sessions, remote and scheduled agents, artifacts, Monitor, workflows
+  and worktrees. The start script passes these deny rules with `--settings`
+  (`scripts/controller-settings.mjs`): in `controller/.claude/settings.json` they would hold at
+  every level. Bypass and auto mode cannot be turned on there, at any level.
 - **Manual mode.** `scripts/start-controller.sh` starts the session with `--permission-mode manual`,
   whatever the user settings say. Never start the controller with
   `--dangerously-skip-permissions`.
@@ -431,6 +466,7 @@ and its instructions call that text data, never instructions. The gateway checks
 - **Every dispatch.** With `direct` and `allow_dirty` too. Otherwise `dispatch=needs_driver`:
   nothing starts, and the controller is told to ask you by voice. `list_workers`,
   `worker_status` and `stop_worker` are not checked.
+- **Cloning and deleting.** `clone_repo` and a confirmed `delete_path` are checked the same way.
 - **What it guarantees:** text in a repository, a run's result or a pull request cannot start a
   worker by itself.
 - **What it does not:** the controller still reads that text, and it writes the `task` itself. A
@@ -645,7 +681,8 @@ pull requests turned off are exempt, as for pushes.
 - **No new work:** `dispatch` answers `locked`, also a dispatch whose checks were still running
   when the switch tripped; `send` and `ask` hand nothing over.
 - **Approvals:** open ones are denied, new ones are denied automatically.
-- **Workers:** every run stops. With Docker the container stops and loses its restart policy.
+- **Workers:** every run stops, and so does a clone that is going. With Docker the container stops
+  and loses its restart policy.
   While locked, `scripts/start-workers-container.sh` mounts the folder read-only, and the gateway
   stops a container with a writable `/repos` within `VOICE_GW_KILL_CHECK` seconds.
 - **Alarm:** to Telegram at once, to every voice chat with its next call (`[ALARM]`), and to the
@@ -743,6 +780,9 @@ is guarded as follows:
   it asking you.
 - **The endpoint is public.** The pairing code protects the sign-in; nothing limits the request
   rate, and nothing protects the availability.
+- **Above `confined`, more rests on the sign-in.** At `clone-delete`, a deletion needs words and
+  an approval that whoever can call the connector can give. At `unrestricted`, nothing in this
+  design limits the controller, and the kill switch's rules do not watch it.
 - **Run it on a computer or VM you can afford to lose,** and when in doubt:
   `node scripts/pair.mjs revoke all`.
 
@@ -819,7 +859,7 @@ the `localhost` link).
 | Step | What the assistant does | What you give it |
 |---|---|---|
 | This computer | Checks Node.js, `npm install`, Claude Code (2.1.80+), git, the `gh` login, Docker, tmux, Tailscale | Fixes for what is marked as needed |
-| Gateway | Port, repositories folder, runs at a time, time limit, approvals by voice | Choices |
+| Gateway | Port, repositories folder, runs at a time, time limit, approvals by voice, what the controller may do (with a warning above `confined`) | Choices |
 | Models | Model and effort for the controller (`--model`, `--effort` from `start-controller.sh`) and for every worker run, on the host and in Docker | Choices, or Claude Code's defaults |
 | Telegram | Checks the token (`getMe`), finds your private chat with `getUpdates` once you wrote to the bot, sends a test message | A token from [@BotFather](https://t.me/BotFather), one message to the bot |
 | Workers in Docker | Checks the GitHub token and shows the level per repository with the gateway's detection. Builds the image with its progress shown. Starts the container, sets git's name and email in it, and clones the chosen repositories inside it | A token from `claude setup-token`, optionally a GitHub token ([5.6](#56-access-levels-and-their-detection)), the repositories |
@@ -1053,6 +1093,9 @@ at most three short sentences, without code, paths or lists.
 | "Tell it to add a test for that too." | A follow-up in the same worker session, on the same branch |
 | "What is the alpha worker doing?" | `worker_status` |
 | "Stop the alpha worker." | `stop_worker` |
+| "Clone drawio-mcp from alderg." | Above `confined`: `clone_repo`; you hear when it is there |
+| "Delete the folder old-experiment." | Above `confined`: `delete_path` says what would be lost, the controller asks; you say yes, then confirm the approval |
+| "Look up the release notes of the latest Claude Code." | Only at `unrestricted`: the controller uses the web itself |
 | "Is anyone reviewing pull request 12 in alpha?" / "Did the last CI run on main pass?" | The controller answers itself with read-only `gh` |
 | "Request a review for pull request 12 in alpha." | Only on your word: the worker reviews the diff and posts a review, or adds the person you name as reviewer |
 | "Fix the review comments on pull request 12." | Only on your word: the worker fixes them, runs the tests, pushes to the same branch, replies on each thread, and says what is left open |
@@ -1133,6 +1176,7 @@ gateway reads them at its start: restart the controller after a change.
 | `VOICE_GW_HINT_AFTER` | `20` | Seconds without a reaction from the controller before a diagnostic hint |
 | `VOICE_GW_WORKER_ROOT` | The folder holding this repository | Every git repository directly in it has a worker |
 | `VOICE_GW_WORKER_SELF` | off | `1`: this repository's own checkout is a worker on this computer too |
+| `VOICE_GW_CONTROLLER_LEVEL` | `confined` | `clone-delete` or `unrestricted` ([5.3](#53-the-controllers-confinement)); the gateway, the confine hook and the start script read it |
 | `VOICE_GW_DISPATCH_WINDOW` | `30` | Minutes a voice request counts for `dispatch`: only words from requests this recent start a run |
 | `VOICE_GW_MAX_WORKERS` | `2` | Runs at the same time |
 | `VOICE_GW_WORKER_TIMEOUT` | `60` | Minutes before a run is stopped |
@@ -1221,6 +1265,8 @@ do not set them.
 | Voice assistant answers itself instead of asking | Say "Ask Claude Code …" explicitly. |
 | Voice assistant says the connector does not work | Look at `.logs/gateway.log`. No `voice initialize`: the request never arrived (URL, tunnel or proxy, DNS). `voice 401`: the client has to sign in again. `initialize` and `tools/list` but no `tools/call`: the assistant chose not to call a tool. |
 | A repository is missing from `list_workers` | Only folders directly in the worker root with a `.git` count. Check `VOICE_GW_WORKER_ROOT`. |
+| The controller says it cannot clone or delete | The level is `confined`, or workers run in Docker; the log line `controller level …` says which. A new level counts from the next start of the start script: `--stop`, then start it again. |
+| `delete=unplanned` | A deletion needs a plan of the same path from the last 15 minutes: the controller calls `delete_path` without `confirm` first. |
 | A worker fails at once | `could not start claude`: Claude Code is not on the gateway's `PATH`; set `VOICE_GW_CLAUDE_BIN`. Otherwise read `.state/tasks/<task>.err`. |
 | What did a worker do? | `.state/tasks/<task>.jsonl` holds the whole run. `claude --resume <session>` in the repository opens the session; `.state/workers.json` lists the session ids. |
 | A private repository is handled like a public one | `gh` is not logged in or not on the `PATH`, so the visibility is unknown, and the worker asks before pushing to be safe. |
@@ -1275,6 +1321,7 @@ src/
   restart.mjs        restarting the controller by voice, through the watchdog
   plugin.mjs         the gateway as the MCP server of the plugin voice@cc-voice-gateway
   store.mjs          requests and approvals, persisted across restarts
+  folders.mjs        cloning and deleting in the worker root, above the level confined
   admin.mjs          Unix socket for pair.mjs, unlock.mjs and fake-voice
   config.mjs         settings from the environment and .secrets/gateway.env
   settings.mjs       reads and writes .secrets/gateway.env
@@ -1292,6 +1339,7 @@ scripts/
   setup.mjs                    the setup assistant
   start-controller.sh          controller with its channel, under the watchdog
   channel-mode.mjs             plugin or development flag
+  controller-settings.mjs      the session's --settings for its level
   settings.sh                  .secrets/gateway.env for the shell scripts
   start-workers-container.sh   the worker container; read-only while locked
   fetch-from-container.sh      a branch from the container into a clean clone, as a bundle

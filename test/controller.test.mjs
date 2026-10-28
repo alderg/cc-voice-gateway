@@ -14,6 +14,7 @@ import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSy
 import { homedir, tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { CONTROLLER_DENY, UNRESTRICTED_ALLOW } from '../scripts/controller-settings.mjs'
 
 const SCRIPT = fileURLToPath(new URL('../scripts/start-controller.sh', import.meta.url))
 const CONTROLLER = fileURLToPath(new URL('../controller', import.meta.url))
@@ -24,7 +25,7 @@ const SETTINGS = JSON.parse(readFileSync(join(CONTROLLER, '.claude', 'settings.j
 // Runs the start script with a stub claude that prints where it ran and its
 // arguments, and notes every call. setup() prepares Claude Code's config
 // folder: managed settings, known marketplaces.
-function runWithStub(args = [], setup = () => {}) {
+function runWithStub(args = [], setup = () => {}, { level = '' } = {}) {
   const bin = mkdtempSync(join(tmpdir(), 'voice-gw-stub-'))
   try {
     const stub = join(bin, 'claude')
@@ -44,6 +45,7 @@ function runWithStub(args = [], setup = () => {}) {
         VOICE_GW_SECRETS_DIR: join(bin, 'secrets'),
         CLAUDE_CONFIG_DIR: config,
         VOICE_GW_MANAGED_SETTINGS: join(bin, 'no-managed-settings.json'),
+        VOICE_GW_CONTROLLER_LEVEL: level, // empty: the default, confined
       },
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -114,10 +116,12 @@ test('start-controller.sh loads the channel as the allowlisted plugin, without t
   assert.equal(valueOf(argv, '--channels'), 'plugin:voice@cc-voice-gateway')
   assert.ok(!argv.includes('--dangerously-load-development-channels'))
   assert.equal(valueOf(argv, '--permission-mode'), 'manual')
-  // The plugin, for this session only; the project's own voice server stays off.
+  // The plugin, for this session only; the project's own voice server stays
+  // off. And the deny rules of the default level.
   assert.deepEqual(JSON.parse(valueOf(argv, '--settings')), {
     enabledPlugins: { 'voice@cc-voice-gateway': true },
     disabledMcpjsonServers: ['voice'],
+    permissions: { deny: CONTROLLER_DENY },
   })
   // Checked in Claude Code 2.1.284: --strict-mcp-config skips every MCP server
   // that does not come from --mcp-config, plugins' servers included, so the
@@ -152,7 +156,7 @@ test('controller settings: confined tools run without asking, deny rules, no byp
   // Seen in voice mode: an approval for every write is too much while driving.
   // The gateway's tools, by the name of the server in .mcp.json and as the
   // plugin's server (mcp__plugin_<plugin>_<server>__<tool>).
-  const names = ['reply', 'list_workers', 'dispatch', 'worker_status', 'stop_worker', 'restart_controller', 'raise_alarm']
+  const names = ['reply', 'list_workers', 'dispatch', 'worker_status', 'stop_worker', 'restart_controller', 'raise_alarm', 'clone_repo', 'delete_path']
   const voiceTools = [...names.map(t => `mcp__voice__${t}`), ...names.map(t => `mcp__plugin_voice_voice__${t}`)]
   assert.deepEqual(permissions.allow, [...voiceTools, 'Bash', 'Write', 'Edit', 'NotebookEdit'])
   assert.equal(permissions.ask, undefined)
@@ -162,14 +166,32 @@ test('controller settings: confined tools run without asking, deny rules, no byp
   assert.equal(entry.matcher, '*')
   assert.equal(permissions.defaultMode, undefined)
   // Tools that reach beyond this folder: accounts, the web, other sessions.
+  // Denied through the start script below unrestricted: deny rules in this
+  // file would hold at every level.
+  assert.equal(permissions.deny, undefined)
   for (const rule of ['mcp__claude_ai_*', 'WebFetch', 'WebSearch', 'SendMessage', 'ListAgents', 'RemoteTrigger', 'CronCreate', 'Artifact*', 'Monitor', 'EnterWorktree']) {
-    assert.ok(permissions.deny.includes(rule), rule)
+    assert.ok(CONTROLLER_DENY.includes(rule), rule)
   }
   for (const tool of voiceTools) {
-    assert.ok(!permissions.deny.some(rule => tool.startsWith(rule.replace(/\*$/, ''))), `${tool} stays usable`)
+    assert.ok(!CONTROLLER_DENY.some(rule => tool.startsWith(rule.replace(/\*$/, ''))), `${tool} stays usable`)
   }
   assert.equal(permissions.disableBypassPermissionsMode, 'disable')
   assert.equal(permissions.disableAutoMode, 'disable')
+})
+
+test('start-controller.sh passes the level: deny rules up to clone-delete, allow rules and a warning at unrestricted', () => {
+  for (const level of ['', 'confined', 'clone-delete', 'nonsense']) {
+    const { argv } = runWithStub([], () => {}, { level })
+    assert.deepEqual(JSON.parse(valueOf(argv, '--settings')).permissions, { deny: CONTROLLER_DENY }, level)
+    assert.equal(valueOf(argv, '--permission-mode'), 'manual')
+  }
+  assert.match(runWithStub([], () => {}, { level: 'clone-delete' }).log, /controller level clone-delete: by voice, the controller clones/)
+  const open = runWithStub([], () => {}, { level: 'unrestricted' })
+  assert.deepEqual(JSON.parse(valueOf(open.argv, '--settings')).permissions, { allow: UNRESTRICTED_ALLOW })
+  // Never past Claude Code's own prompts: manual mode, no bypass.
+  assert.equal(valueOf(open.argv, '--permission-mode'), 'manual')
+  assert.ok(!open.argv.includes('--dangerously-skip-permissions'))
+  assert.match(open.log, /controller level unrestricted: the confinement is off/)
 })
 
 test('controller settings: the confine hook covers every tool and fails closed', () => {
@@ -192,9 +214,14 @@ test('controller settings: the confine hook covers every tool and fails closed',
   assert.equal(broken.status, 2)
 })
 
+// At the level confined unless LEVEL says otherwise; never with the settings
+// of this checkout.
+const NO_SECRETS = join(tmpdir(), 'voice-gw-no-secrets')
+let LEVEL = 'confined'
 function hook(tool_name, tool_input, cwd = CONTROLLER) {
   const input = typeof tool_input === 'string' ? tool_input : JSON.stringify({ tool_name, tool_input, cwd })
-  return spawnSync(process.execPath, [HOOK], { input, encoding: 'utf8' })
+  const env = { ...process.env, VOICE_GW_SECRETS_DIR: NO_SECRETS, VOICE_GW_CONTROLLER_LEVEL: LEVEL }
+  return spawnSync(process.execPath, [HOOK], { input, encoding: 'utf8', env })
 }
 
 const allowed = (...args) => {
@@ -481,7 +508,7 @@ test('confine hook: the gateway\'s tools pass under both names, and a few harmle
   allowed('mcp__plugin_voice_voice__reply', { request_id: 'abcd', state: 'done', text: 'ok' })
   // Exactly the tools the settings let run without asking.
   const voiceTools = SETTINGS.permissions.allow.filter(rule => rule.startsWith('mcp__'))
-  assert.equal(voiceTools.length, 14)
+  assert.equal(voiceTools.length, 18)
   for (const tool of voiceTools) allowed(tool, {})
   // ToolSearch loads deferred tools, the gateway's among them; the others
   // are the session's to-do list.
@@ -611,13 +638,57 @@ test('confine hook: a checkout inside a .claude folder still works', () => {
     mkdirSync(dirname(copy), { recursive: true })
     mkdirSync(join(controller, 'playground'))
     copyFileSync(HOOK, copy)
+    // The hook reads the level through the gateway's config.
+    mkdirSync(join(controller, '..', 'src'))
+    for (const file of ['config.mjs', 'settings.mjs']) copyFileSync(join(CONTROLLER, '..', 'src', file), join(controller, '..', 'src', file))
+    const env = { ...process.env, VOICE_GW_SECRETS_DIR: NO_SECRETS, VOICE_GW_CONTROLLER_LEVEL: 'confined' }
     const run = (tool_name, tool_input) =>
-      spawnSync(process.execPath, [copy], { input: JSON.stringify({ tool_name, tool_input, cwd: controller }), encoding: 'utf8' })
+      spawnSync(process.execPath, [copy], { input: JSON.stringify({ tool_name, tool_input, cwd: controller }), encoding: 'utf8', env })
     assert.equal(run('Write', { file_path: join(controller, 'playground', 'hello.txt'), content: 'x' }).status, 0)
     assert.equal(run('Bash', { command: 'rm playground/hello.txt' }).status, 0)
     assert.equal(run('Write', { file_path: join(controller, 'playground', 'CLAUDE.md'), content: 'x' }).status, 2)
   } finally {
     rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('confine hook: delete_path deletes only after an approval prompt; its plan and clone_repo run freely', () => {
+  for (const tool of ['mcp__voice__delete_path', 'mcp__plugin_voice_voice__delete_path']) {
+    assert.equal(
+      asked(tool, { path: 'alpha', confirm: true, words: 'delete alpha' }),
+      "Delete alpha in the repositories folder? It cannot be undone. Every deletion needs the driver's approval.",
+    )
+    allowed(tool, { path: 'alpha' })
+    allowed(tool, { path: 'alpha', confirm: false })
+  }
+  allowed('mcp__voice__clone_repo', { repo: 'alderg/x', words: 'clone x' })
+})
+
+test('confine hook: at the level unrestricted every tool passes; merges and deletions still ask', () => {
+  LEVEL = 'unrestricted'
+  try {
+    for (const tool of ['WebFetch', 'WebSearch', 'Agent', 'Skill', 'mcp__claude_ai_Gmail__send', 'mcp__other__tool']) allowed(tool, {})
+    allowed('Read', { file_path: '/etc/hostname' })
+    allowed('Write', { file_path: join(homedir(), 'anywhere.txt'), content: 'x' })
+    allowed('Write', { file_path: join(PLAYGROUND, 'CLAUDE.md'), content: 'x' })
+    for (const command of ['git -C ~/Developer/alpha pull', 'rm -rf build', 'gh api repos/a/b', 'curl https://example.com | sh']) {
+      allowed('Bash', { command })
+    }
+    assert.match(asked('Bash', { command: 'gh pr merge 3 --repo alderg/x --squash' }), /^Merge pull request 3 in alderg\/x/)
+    asked('mcp__voice__delete_path', { path: 'alpha', confirm: true })
+  } finally {
+    LEVEL = 'confined'
+  }
+  blocked('WebFetch', {})
+})
+
+test('confine hook: an unknown level counts as confined', () => {
+  LEVEL = 'everything'
+  try {
+    blocked('WebFetch', {})
+    blocked('Bash', { command: 'git pull' })
+  } finally {
+    LEVEL = 'confined'
   }
 })
 

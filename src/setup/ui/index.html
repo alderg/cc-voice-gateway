@@ -45,6 +45,16 @@
       <select data-setting="VOICE_GW_PERMISSION_RELAY"><option value="1">on</option><option value="0">off, only at the terminal</option></select>
     </label>
     <p class="guide">The rare approval the controller needs is read out in the car.</p>
+    <label>What the controller may do
+      <select id="controller-level" data-setting="VOICE_GW_CONTROLLER_LEVEL">
+        <option value="confined">confined (default)</option>
+        <option value="clone-delete">also clone repositories and delete files</option>
+        <option value="unrestricted">unrestricted: everything</option>
+      </select>
+    </label>
+    <p class="guide">Confined: it answers, hands work to the workers and reads pull request status; nothing else.
+      The other two levels widen what a voice request can do on this computer.</p>
+    <p id="level-warning" class="notice wide" role="alert" hidden></p>
   </div>
 </section>
 
