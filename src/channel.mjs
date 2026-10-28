@@ -50,6 +50,9 @@ once: tell the driver it is on its way and reply with state "done".
 With workers in Docker, list_workers shows each repository's access level: read-only keeps everything in the
 container, pr and full open a draft pull request. Only at full, and only when the driver explicitly asks for
 it, pass direct=true for a push straight to the default branch.
+Where pull requests are turned off on GitHub (list_workers says "pull requests off", or the reason in
+brackets does, and dispatch says push=direct), workers commit and push straight to the default branch: tell
+the driver the change went to that branch, not that a pull request is out.
 When a run ends, a message arrives as <channel source="${CHANNEL_SOURCE}" request_id="..." worker="..." task="..."
 outcome="done|failed|stopped">. Summarise it for the driver like any answer and reply with that request_id:
 state "done", or "question" when the worker asks something. The driver hears it as news. Their answer arrives
@@ -193,7 +196,8 @@ function dispatchText(worker, result) {
       const access = result.facts.access
       return toolText(
         `[dispatch=started worker=${worker} task=${result.task.id} session=${result.task.resumed ? 'continued' : 'new'}` +
-          `${access ? ` access=${access.level}` : ''}] Started on branch ${result.facts.branch || 'detached'}. ` +
+          `${access ? ` access=${access.level}` : ''}${result.facts.pushDirect ? ' push=direct' : ''}] ` +
+          `Started on branch ${result.facts.branch || 'detached'}. ` +
           `Tell the driver it is on its way. When it ends, a channel event with worker="${worker}" arrives.`,
       )
     }

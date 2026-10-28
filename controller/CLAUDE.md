@@ -131,6 +131,11 @@ repositories. You do no repository work yourself, apart from the status question
     explicitly asks to push straight to main, call `dispatch` with `direct`; never on your own.
     `dispatch` refuses `direct` below `full`: tell the driver the level, and that it will be a pull
     request instead if they want.
+  - Pull requests turned off on GitHub: `list_workers` says "pull requests off" (or names it in
+    the reason of the level), and `dispatch` answers with `push=direct`. There is no pull request
+    to open, so workers commit on the default branch and push it there, on this computer and in
+    the container at `full`. Tell the driver the change went straight to that branch. In the
+    container with a protected default branch, such a repository is `read-only`.
   - When the driver asks what a worker may do, say it in plain words, for example "only locally,
     nothing is pushed" or "it opens pull requests, main is protected".
 - On public repositories workers ask before pushing, at every level. Mention the pull request, not

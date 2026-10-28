@@ -195,7 +195,7 @@ test('the state: locked, saved for this user only, survives a new instance, fail
 
 // --- the rules ---------------------------------------------------------------------------
 
-function guarded({ git = {}, limits, direct = false } = {}) {
+function guarded({ git = {}, limits, direct = false, pushDirect = false } = {}) {
   const workers = new EventEmitter()
   const tripped = []
   const runner = {
@@ -222,6 +222,7 @@ function guarded({ git = {}, limits, direct = false } = {}) {
     slug: 'acme/alpha',
     defaultBranch: 'main',
     direct,
+    pushDirect,
     access: direct ? 'full' : null,
     startedAt: Date.now() - 1000,
   }
@@ -285,6 +286,10 @@ test('rule: a push to the default branch or a merge, unless it was an explicit d
   direct.bash('git push origin main')
   assert.deepEqual(direct.tripped, [], 'a direct dispatch at level full may push to main')
   direct.guard.close()
+  const off = guarded({ pushDirect: true })
+  off.bash('git push origin main')
+  assert.deepEqual(off.tripped, [], 'with pull requests turned off, main is where workers push')
+  off.guard.close()
 })
 
 test('rule: the default branch moved on GitHub during the run, and the worker has the new head', async () => {

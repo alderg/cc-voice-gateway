@@ -23,6 +23,7 @@ import { log, preview } from './log.mjs'
 import { HostRunner } from './runners.mjs'
 
 const POLL_MS = 1000
+const GITHUB_CACHE_MS = 10 * 60 * 1000 // what gh says about a repository
 const MAX_STEPS = 5
 const KEEP_TASKS = 40
 const ID_ALPHABET = 'abcdefghjkmnpqrstuvwxyz23456789'
@@ -114,10 +115,25 @@ const CONTAINER_RULES = {
   },
 }
 
+// Pull requests turned off on GitHub: no voice branch and no pull request, the
+// commits go to the default branch. On this computer, or in the container at
+// level full.
+const DIRECT_RULES = {
+  Git: `- Git: pull requests are turned off on GitHub for this repository, so changes go straight to the default
+  branch (named in the task). Switch to it and update it with git pull --ff-only before you change anything,
+  and commit there. Commit only your own changes: never commit, stash, reset or discard files you did not
+  change. Never force-push, rebase pushed commits, merge other branches in or delete branches.`,
+  Publish: `- Publish: push the default branch with git push, without a pull request. If the task says the
+  repository is public or its visibility is unknown, do not push: commit, then end by asking whether to
+  publish, and push only in a follow-up after a yes. If the push is rejected, say so: do not force-push and do
+  not fork. Without a remote, only commit.`,
+}
+
 // The worker's rules: as above on this computer and at level pr, with the
-// Git and Publish rules of the level otherwise.
-export function workerRules(level) {
-  const replace = CONTAINER_RULES[level]
+// Git and Publish rules of the level otherwise, or of a direct push where
+// pull requests are turned off.
+export function workerRules(level, { pushDirect = false } = {}) {
+  const replace = pushDirect ? DIRECT_RULES : CONTAINER_RULES[level]
   if (!replace) return WORKER_RULES
   return WORKER_RULES.split('\n- ')
     .map((rule, i) => {
@@ -197,7 +213,7 @@ export class Workers extends EventEmitter {
     this.effort = effort // claude --effort
     this.maxRuns = maxRuns
     this.timeoutMs = timeoutMinutes * 60 * 1000
-    this.visibilities = new Map() // owner/repo -> public | private | internal
+    this.github = new Map() // owner/repo -> { at, info: { visibility, pulls, branch } }
     this.starting = new Set() // repositories between the checks and the start
     this.followed = new Map() // task id -> { offset, partial }
     this.state = this.load()
@@ -269,18 +285,27 @@ export class Workers extends EventEmitter {
     return this.runner.names()
   }
 
-  async visibility(slug, origin) {
-    if (!origin) return 'none'
-    if (!slug) return 'unknown'
-    if (this.visibilities.has(slug)) return this.visibilities.get(slug)
-    const answer = await new Promise(resolve => {
-      execFile(this.ghBin, ['repo', 'view', slug, '--json', 'visibility', '-q', '.visibility'], { timeout: 15000 }, (error, stdout) =>
-        resolve(error ? null : stdout.trim().toLowerCase()),
-      )
+  // What gh on this computer says about a repository: { visibility, pulls,
+  // branch }, pulls being whether pull requests are turned on. null when gh
+  // cannot tell; then it is asked again next time.
+  async githubInfo(slug) {
+    if (!slug) return null
+    const cached = this.github.get(slug)
+    if (cached && Date.now() - cached.at < GITHUB_CACHE_MS) return cached.info
+    const repo = await new Promise(resolve => {
+      execFile(this.ghBin, ['api', `repos/${slug}`], { timeout: 15000 }, (error, stdout) => {
+        try {
+          resolve(error ? null : JSON.parse(stdout))
+        } catch {
+          resolve(null)
+        }
+      })
     })
-    if (!['public', 'private', 'internal'].includes(answer)) return 'unknown'
-    this.visibilities.set(slug, answer)
-    return answer
+    const visibility = String(repo?.visibility ?? '').toLowerCase()
+    if (!['public', 'private', 'internal'].includes(visibility)) return null
+    const info = { visibility, pulls: repo.has_pull_requests !== false, branch: repo.default_branch || null }
+    this.github.set(slug, { at: Date.now(), info })
+    return info
   }
 
   async inspect(name) {
@@ -293,6 +318,8 @@ export class Workers extends EventEmitter {
     const origin = originUrl?.trim() || null
     const slug = githubSlug(origin)
     const access = this.access ? await this.access.check(slug) : null
+    // In the container the token's check knows it; otherwise gh on this computer.
+    const github = origin && !access?.visibility ? await this.githubInfo(slug) : null
     return {
       name,
       dir,
@@ -300,7 +327,11 @@ export class Workers extends EventEmitter {
       branch: branch?.trim() ?? '',
       dirty: (status ?? '').split('\n').filter(Boolean).map(line => line.slice(3)),
       origin: slug ?? origin,
-      visibility: (origin && access?.visibility) || (await this.visibility(slug, origin)),
+      visibility: !origin ? 'none' : (access?.visibility ?? github?.visibility ?? 'unknown'),
+      defaultBranch: access?.branch ?? github?.branch ?? null,
+      // Pull requests turned off on GitHub: commits go to the default branch.
+      // In the container only at level full, which the check makes sure of.
+      pushDirect: access ? access.level === 'full' && access.pulls === false : github?.pulls === false,
       access, // { level, reason, ... } in the container, null on this computer
     }
   }
@@ -319,8 +350,9 @@ export class Workers extends EventEmitter {
     this.starting.add(worker)
     try {
       const facts = await this.inspect(worker)
-      // A push to the default branch only at level full, and only when asked.
-      if (direct && facts.access?.level !== 'full') return { status: 'refused', facts }
+      // A push to the default branch only at level full, and only when asked;
+      // or where pull requests are turned off, where it is the only way.
+      if (direct && !facts.pushDirect && facts.access?.level !== 'full') return { status: 'refused', facts }
       if (facts.dirty.length && !allowDirty) return { status: 'dirty', files: facts.dirty }
       return this.start(facts, { task, words, fresh, direct })
     } finally {
@@ -345,7 +377,7 @@ export class Workers extends EventEmitter {
       '--permission-prompts', 'none',
       '--strict-mcp-config',
       '--settings', JSON.stringify({ permissions: { deny: WORKER_DENY } }),
-      '--append-system-prompt', workerRules(facts.access?.level),
+      '--append-system-prompt', workerRules(facts.access?.level, { pushDirect: facts.pushDirect }),
       ...(this.model ? ['--model', this.model] : []),
       ...(this.effort ? ['--effort', this.effort] : []),
       ...(previous ? ['--resume', sessionId] : ['--session-id', sessionId]),
@@ -368,9 +400,10 @@ export class Workers extends EventEmitter {
       resumed: Boolean(previous),
       access: facts.access?.level ?? null,
       direct,
+      pushDirect: Boolean(facts.pushDirect), // pull requests turned off: commits go to the default branch
       dir: facts.dir,
       slug: facts.slug ?? null, // owner/repo on GitHub, or null
-      defaultBranch: facts.access?.branch ?? null,
+      defaultBranch: facts.defaultBranch ?? null,
       pulls: [], // numbers of this repository's pull requests the run named
       startedAt: Date.now(),
       finishedAt: null,
@@ -535,8 +568,9 @@ export class Workers extends EventEmitter {
     for (const f of facts) {
       const where = f.origin ? `${f.origin}, ${f.visibility}` : 'no remote'
       const access = f.access ? `, access ${f.access.level} (${f.access.reason})` : ''
+      const direct = f.pushDirect && !f.access ? `, pull requests off: pushes to ${f.defaultBranch || 'the default branch'}` : ''
       const changes = f.dirty.length ? plural(f.dirty.length, 'uncommitted file') : 'clean'
-      lines.push(`${f.name}: ${where}${access}, branch ${f.branch || 'detached'}, ${changes}, ${this.stateText(f.name)}`)
+      lines.push(`${f.name}: ${where}${access}${direct}, branch ${f.branch || 'detached'}, ${changes}, ${this.stateText(f.name)}`)
     }
     if (!names.length) {
       lines.push(`No git repositories in ${this.runner.root}${container ? ` in the container ${container}` : ''}.`)
@@ -611,12 +645,16 @@ export function prompt({ task, words, facts, direct = false }) {
     `- Starting branch: ${facts.branch || 'detached HEAD'}`,
     `- Uncommitted files before you start: ${facts.dirty.length ? facts.dirty.join(', ') + ' (not yours, leave them alone)' : 'none'}`,
   ]
+  const target = facts.defaultBranch || 'the default branch'
   if (facts.access) {
-    const { level, reason, branch } = facts.access
-    lines.push(`- Access level: ${level} (${reason}). ${ACCESS_TEXT[level]}`)
-    if (direct) {
-      lines.push(`- Direct push: yes. The driver explicitly asked to push straight to ${branch || 'the default branch'}.`)
+    const { level, reason } = facts.access
+    lines.push(`- Access level: ${level} (${reason}). ${facts.pushDirect ? '' : ACCESS_TEXT[level]}`.trimEnd())
+    if (direct && !facts.pushDirect) {
+      lines.push(`- Direct push: yes. The driver explicitly asked to push straight to ${target}.`)
     }
+  }
+  if (facts.pushDirect) {
+    lines.push(`- Pull requests: turned off on GitHub. Commit on ${target} and push it there, without a pull request.`)
   }
   return lines.join('\n') + '\n'
 }

@@ -22,6 +22,7 @@ import { z } from 'zod'
 import { adminRequest } from '../src/admin.mjs'
 import { GitHubAccess } from '../src/access.mjs'
 import { DockerRunner } from '../src/runners.mjs'
+import { prompt, workerRules } from '../src/workers.mjs'
 
 const GATEWAY = fileURLToPath(new URL('../src/gateway.mjs', import.meta.url))
 // Resolved: on macOS the temporary folder is behind a symlink (/var is
@@ -54,6 +55,10 @@ const GITHUB = {
   'acme/nopr': { push: true, contents: true, pulls: false },
   'acme/viewer': { push: false },
   'acme/site': { visibility: 'public', push: true, contents: true, pulls: true, protected: false, rules: [] },
+  // pull requests turned off on GitHub; the probe for opening one fails there
+  'acme/direct': { push: true, contents: true, pulls: false, hasPulls: false, protected: false, rules: [] },
+  'acme/direct-guarded': { push: true, contents: true, pulls: false, hasPulls: false, protected: false, rules: [{ type: 'update' }] },
+  'acme/direct-readonly': { push: true, contents: false, pulls: false, hasPulls: false },
 }
 
 const api = { server: null, url: '', requests: [] }
@@ -72,7 +77,13 @@ function answer(req, res, body) {
   const route = `${req.method} ${match[2] ?? ''}`
   if (route === 'GET ') {
     const visibility = repo.visibility ?? 'private'
-    return send(200, { visibility, private: visibility !== 'public', default_branch: 'main', permissions: { push: repo.push } })
+    return send(200, {
+      visibility,
+      private: visibility !== 'public',
+      default_branch: 'main',
+      has_pull_requests: repo.hasPulls ?? true,
+      permissions: { push: repo.push },
+    })
   }
   if (route === 'POST /git/refs') return repo.contents ? send(422, { message: 'Invalid request.' }) : send(403, forbidden)
   if (route === 'POST /pulls') return repo.pulls ? send(422, { message: 'Invalid request.' }) : send(403, forbidden)
@@ -281,7 +292,7 @@ async function runOf(worker, id) {
 
 test('access: no token means read-only; no GitHub remote too; VOICE_GW_ACCESS forces a level', async () => {
   const none = new GitHubAccess({ tokenFile: join(TMP, 'no-such-file'), apiBase: api.url })
-  assert.deepEqual(await none.check('acme/open'), { level: 'read-only', reason: 'no GitHub token', visibility: null, branch: null })
+  assert.deepEqual(await none.check('acme/open'), { level: 'read-only', reason: 'no GitHub token', visibility: null, branch: null, pulls: null })
   const access = new GitHubAccess({ tokenFile: TOKEN_FILE, apiBase: api.url })
   assert.equal((await access.check(null)).reason, 'no GitHub remote')
   for (const level of ['read-only', 'pr', 'full']) {
@@ -291,6 +302,7 @@ test('access: no token means read-only; no GitHub remote too; VOICE_GW_ACCESS fo
       reason: 'set by VOICE_GW_ACCESS',
       visibility: null,
       branch: null,
+      pulls: null,
     })
   }
   const invalid = new GitHubAccess({ tokenFile: TOKEN_FILE, apiBase: api.url, forced: 'admin' })
@@ -311,6 +323,10 @@ test('access: detected per repository from what the token may do and how main is
     'acme/nopr': ['read-only', 'the token cannot open pull requests'],
     'acme/viewer': ['read-only', 'the account cannot push to it'],
     'acme/unknown': ['read-only', 'the token cannot see the repository (404)'],
+    // pull requests turned off: a direct push where main is open, nothing where it is not
+    'acme/direct': ['full', 'pull requests are turned off, main is not protected: direct push'],
+    'acme/direct-guarded': ['read-only', 'pull requests are turned off and main is protected by a ruleset'],
+    'acme/direct-readonly': ['read-only', 'the token cannot push (Contents is read-only)'],
   }
   for (const [slug, [level, reason]] of Object.entries(expected)) {
     const result = await access.check(slug)
@@ -318,11 +334,27 @@ test('access: detected per repository from what the token may do and how main is
   }
   assert.equal((await access.check('acme/site')).visibility, 'public')
   assert.equal((await access.check('acme/open')).visibility, 'private')
+  assert.equal((await access.check('acme/open')).pulls, true)
+  assert.equal((await access.check('acme/direct')).pulls, false)
+  assert.ok(!api.requests.some(r => r.method === 'POST' && r.path === '/repos/acme/direct/pulls'), 'no probe for pull requests')
 
   // The write checks carry no content, so they cannot create anything.
   const probes = api.requests.filter(r => r.method === 'POST')
   assert.ok(probes.length > 0)
   for (const probe of probes) assert.equal(probe.body, '{}', probe.path)
+})
+
+test('pull requests turned off, at level full: the rules and the prompt say to push to the default branch', () => {
+  const access = { level: 'full', reason: 'pull requests are turned off, main is not protected: direct push', branch: 'main', pulls: false }
+  const facts = { origin: 'acme/direct', visibility: 'private', branch: 'main', dirty: [], access, defaultBranch: 'main', pushDirect: true }
+  const text = prompt({ task: 'Fix the typo.', words: 'Fix the typo', facts })
+  assert.match(text, /^- Access level: full \(pull requests are turned off, main is not protected: direct push\)\.$/m)
+  assert.match(text, /^- Pull requests: turned off on GitHub\. Commit on main and push it there, without a pull request\.$/m)
+  assert.doesNotMatch(text, /draft pull request|Direct push: yes/)
+  const rules = workerRules('full', { pushDirect: true })
+  assert.match(rules, /push the default branch with git push, without a pull request/)
+  assert.doesNotMatch(rules, /gh pr create/)
+  assert.match(workerRules('full'), /gh pr create --draft/, 'with pull requests on, full stays as it was')
 })
 
 test('access: cached per repository and token; a new token is checked again; errors never show the token', async () => {

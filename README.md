@@ -371,13 +371,28 @@ with the reason, for example `access pr (main is protected by a ruleset)`.
    means `read-only`.
 3. **Can the token write?** It sends two write requests without content, `POST …/git/refs` and
    `POST …/pulls`. GitHub answers 422 when the token may write and 403 or 404 when not; neither
-   creates anything. Either one failing means `read-only`.
+   creates anything. Either one failing means `read-only`. In a repository with pull requests
+   turned off (`has_pull_requests` false), only the first is asked.
 4. **Is the default branch protected?** It looks at branch protection (`GET …/branches/{branch}`)
    and the rulesets (`GET …/rules/branches/{branch}`). Protection, or a ruleset of type
    `pull_request`, `update`, `required_status_checks` or `merge_queue`, means `pr`; otherwise
    `full`. Rulesets answering 403 or 404, for example on a private repository without GitHub Pro,
    count as none.
 5. **Whatever it cannot tell counts as the lower level.**
+
+**Pull requests turned off.** In Settings > General > Features, pull requests can be turned off for
+a repository. There is nothing to open then, so a worker commits on the default branch and pushes
+it there:
+
+- In Docker this happens at `full`, shown as `access full (pull requests are turned off, main is
+  not protected: direct push)`. With the default branch protected, nothing could be published, so
+  the repository is `read-only`.
+- On this computer, `gh api repos/{owner}/{repo}` tells; `list_workers` shows `pull requests off:
+  pushes to main`.
+- `dispatch` answers with `push=direct`, and the kill switch's rule on the default branch
+  ([5.9](#59-the-kill-switch)) lets such a run push there, as after an explicit `direct`.
+- Public repositories still need your yes before the push. With pull requests limited to
+  collaborators (`collaborators_only`), nothing changes: workers open pull requests as before.
 
 The token is read at every check, and each result is kept for ten minutes (one minute after an
 API error). `VOICE_GW_ACCESS=read-only|pr|full` sets one level for every repository instead. A
@@ -460,7 +475,7 @@ controller following instructions.
 |---|---|---|
 | Voice | "Notstopp", "Not-Stopp", "Notfallstopp", "Nothalt", "Not-Aus", "emergency stop", "kill switch"; or the tool `emergency_stop` | In `send` and `ask` before anything reaches the controller: the message starts with the phrase, or has at most six words |
 | Telegram | `/stop` or a phrase | See 5.8 |
-| Rule: default branch | A push to the default branch, or a merge, without a direct dispatch at level `full` | In the run's commands: `git push` to the default branch, `--all`, `--mirror`, `gh pr merge`. With `gh`, every `VOICE_GW_KILL_CHECK` seconds and at the end: the default branch moved on GitHub, and the worker's repository holds the new head |
+| Rule: default branch | A push to the default branch, or a merge, without a direct dispatch at level `full`, in a repository with pull requests turned on | In the run's commands: `git push` to the default branch, `--all`, `--mirror`, `gh pr merge`. With `gh`, every `VOICE_GW_KILL_CHECK` seconds and at the end: the default branch moved on GitHub, and the worker's repository holds the new head |
 | Rule: outside | Writes outside the repository, `/tmp`, `/var/tmp` (and the system's temp folder on this computer) and `VOICE_GW_KILL_ALLOW_PATHS` | The file tools by path. Shell commands by explicit targets: redirections, `tee`, `cp`, `mv`, `rm`, `mkdir`, `touch`, `ln`, `chmod`, `chown`, `truncate`, `sed -i`, `dd of=`, also after `cd`; `$HOME` and `~` are expanded |
 | Rule: many changes | More than 500 file edits in a run; at its end more than 300 files or 30,000 lines changed | Edits as they happen; at the end the commits made during the run plus what is not committed. `VOICE_GW_KILL_MAX_*` |
 | Controller | `raise_alarm` with a reason | One more signal, never the only one |
