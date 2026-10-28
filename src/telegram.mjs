@@ -12,7 +12,9 @@
 // exist and are not empty. The token is part of every API address, so it must
 // never reach a log line or an error message.
 
+import { EventEmitter } from 'node:events'
 import { readFileSync } from 'node:fs'
+import { emergencyPhrase } from './killswitch.mjs'
 import { log as defaultLog, preview } from './log.mjs'
 
 const MAX_TEXT = 4000 // Telegram takes up to 4096 characters
@@ -64,6 +66,117 @@ export class Telegram {
     if (!response.ok || body.ok !== true) {
       throw new Error(this.redact(`${response.status} ${body.description ?? response.statusText}`))
     }
+  }
+}
+
+// Updates for the bot, waiting up to `timeout` seconds for new ones. Errors
+// carry the HTTP status and never the token.
+Telegram.prototype.getUpdates = async function getUpdates({ offset, timeout = 25, signal } = {}) {
+  const limit = AbortSignal.timeout((timeout + 15) * 1000)
+  let response
+  try {
+    response = await fetch(`${this.apiBase}/bot${this.token}/getUpdates`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ offset, timeout, allowed_updates: ['message'] }),
+      signal: signal ? AbortSignal.any([signal, limit]) : limit,
+    })
+  } catch (error) {
+    const cause = error.cause?.message ?? error.cause?.code
+    throw new Error(this.redact(cause ? `${error.message} (${cause})` : error.message))
+  }
+  const body = await response.json().catch(() => ({}))
+  if (!response.ok || body.ok !== true) {
+    throw Object.assign(new Error(this.redact(`${response.status} ${body.description ?? response.statusText}`)), {
+      status: response.status,
+    })
+  }
+  return Array.isArray(body.result) ? body.result : []
+}
+
+// The one command the gateway takes from Telegram: the kill switch.
+export const isStopCommand = text =>
+  /^\/(stop|notstopp|killswitch|emergencystop)(@\w+)?$/i.test(String(text).trim()) || emergencyPhrase(text)
+
+const pause = (ms, signal) =>
+  new Promise(resolve => {
+    const timer = setTimeout(resolve, ms)
+    signal.addEventListener('abort', () => {
+      clearTimeout(timer)
+      resolve()
+    })
+  })
+
+// Inbound: polls the bot for messages and emits 'stop' for a stop command
+// from the configured private chat. Every other chat, and every other message,
+// is ignored. Messages older than maxAgeSeconds, for example from before a
+// restart, do not count.
+export class TelegramCommands extends EventEmitter {
+  constructor(telegram, { pollSeconds = 25, maxAgeSeconds = 120, log = defaultLog } = {}) {
+    super()
+    this.telegram = telegram
+    this.pollSeconds = pollSeconds
+    this.maxAgeSeconds = maxAgeSeconds
+    this.log = log
+    this.offset = undefined
+    this.closed = false
+    this.abort = new AbortController()
+    this.warned = new Set()
+  }
+
+  start() {
+    this.loop()
+    return this
+  }
+
+  close() {
+    this.closed = true
+    this.abort.abort()
+  }
+
+  warnOnce(key, text) {
+    if (this.warned.has(key)) return
+    this.warned.add(key)
+    this.log(text)
+  }
+
+  async loop() {
+    let backoff = 0
+    while (!this.closed) {
+      try {
+        const updates = await this.telegram.getUpdates({
+          offset: this.offset,
+          timeout: this.pollSeconds,
+          signal: this.abort.signal,
+        })
+        backoff = 0
+        for (const update of updates) {
+          this.offset = update.update_id + 1
+          this.handle(update)
+        }
+      } catch (error) {
+        if (this.closed) return
+        if (error.status === 409) {
+          this.warnOnce('409', 'telegram commands: a webhook or another program takes this bot\'s updates; /stop does not reach the gateway')
+        } else {
+          this.warnOnce(error.message, `telegram commands: ${error.message}`)
+        }
+        backoff = Math.min(60, backoff ? backoff * 2 : 5)
+        await pause(backoff * 1000, this.abort.signal)
+      }
+    }
+  }
+
+  handle(update) {
+    const message = update.message
+    if (!message || typeof message.text !== 'string') return
+    const chat = String(message.chat?.id)
+    if (chat !== String(this.telegram.chatId) || message.chat?.type !== 'private') {
+      this.warnOnce(`chat ${chat}`, 'telegram commands: ignored a message from another chat')
+      return
+    }
+    if (Date.now() / 1000 - Number(message.date) > this.maxAgeSeconds) return
+    if (isStopCommand(message.text)) this.emit('stop', { text: message.text })
   }
 }
 
@@ -139,6 +252,7 @@ export class TelegramFallback {
   // Everything the voice client has not received yet, except interim updates.
   flush() {
     for (const request of this.store.requests.values()) {
+      if (request.origin === 'alarm') continue // the kill switch sends its own alarm
       for (const update of request.updates.slice(request.cursor)) {
         if (update.state === 'working' || update.telegram) continue
         update.telegram = true

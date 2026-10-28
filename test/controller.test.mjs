@@ -53,7 +53,7 @@ test('start-controller.sh runs claude in controller/ with the channel in manual 
 test('controller settings: confined tools run without asking, deny rules, no bypass or auto mode', () => {
   const { permissions } = SETTINGS
   // Seen in voice mode: an approval for every write is too much while driving.
-  const voiceTools = ['reply', 'list_workers', 'dispatch', 'worker_status', 'stop_worker'].map(t => `mcp__voice__${t}`)
+  const voiceTools = ['reply', 'list_workers', 'dispatch', 'worker_status', 'stop_worker', 'raise_alarm'].map(t => `mcp__voice__${t}`)
   assert.deepEqual(permissions.allow, [...voiceTools, 'Bash', 'Write', 'Edit', 'NotebookEdit'])
   assert.equal(permissions.ask, undefined)
   const [entry] = SETTINGS.hooks.PreToolUse

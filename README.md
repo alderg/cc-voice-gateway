@@ -73,9 +73,12 @@ gateway starts `claude -p` in that checkout, without approvals:
   answer reaches you as news with the next call; once the voice mode has ended, also by
   [Telegram](#telegram-fallback) if it is set up.
 - **Restarts:** runs are detached and survive a controller restart; the new gateway picks them up.
-- **Optionally in Docker:** the workers run in a container that holds only clones of your
-  repositories and Claude Code. The GitHub token you give it sets what they may do: keep everything
+- **Optionally in Docker:** the workers run in a container that sees only one folder of your
+  repositories, and Claude Code. The GitHub token you give it sets what they may do: keep everything
   local, open pull requests, or also push to main. See [Workers in Docker](#workers-in-docker).
+- **Kill switch:** "Notstopp" by voice, `/stop` on Telegram, fixed rules on the workers' runs, or the
+  controller's alarm lock the gateway: no new tasks, every worker stops. Only a script on this
+  computer unlocks it. See [Kill switch](#kill-switch).
 
 **Telegram (optional):** voice assistants only poll, so once the conversation has ended, nobody
 hears a late result. If a Telegram bot is set up, the gateway notices the silence and sends
@@ -226,6 +229,7 @@ Name the repository as its folder is called; the controller matches loosely ("dr
 | "Tell the cc-voice-gateway worker to fix the typo in the README." | The worker commits on a `voice/` branch, pushes and opens a draft pull request |
 | "What is the cc-voice-gateway worker doing?" | `worker_status`, summarised in one or two sentences |
 | "Anything new from Claude Code?" | Results of workers that have finished since you last asked |
+| "Notstopp!" | The [kill switch](#kill-switch): the gateway locks before anything reaches the controller, every worker stops. Unlocking only at the computer |
 | "Tell it to add a test for that too." | Follow-up in the same worker session, on the same branch |
 | "Yes, publish it." | Answer to a worker's question, for example before pushing a public repository |
 | "Stop the drawio-mcp worker." | `stop_worker` |
@@ -238,9 +242,10 @@ worker runs there.
 
 ## Telegram fallback
 
-Optional and outbound only. Voice assistants only poll: once the voice conversation has ended,
-nobody picks up a late result, question or approval request. With a Telegram bot set up, the
-gateway also sends these to your Telegram chat. The dashed parts of the diagrams show it.
+Optional. Voice assistants only poll: once the voice conversation has ended, nobody picks up a
+late result, question or approval request. With a Telegram bot set up, the gateway also sends these
+to your Telegram chat. The dashed parts of the diagrams show it. The one thing it takes from
+Telegram is `/stop` for the [kill switch](#kill-switch), and only from your chat.
 
 **When it kicks in.** The gateway decides by itself. Every voice tool call (`status`, `send`,
 `ask`, `get_reply`, `approve`) shows that the voice mode is on, and so does a `get_reply` that is
@@ -428,12 +433,21 @@ instead.
 4. **Start the container**, from this folder:
 
    ```bash
+   VOICE_GW_DOCKER_FOLDER="$folder" scripts/start-workers-container.sh
+   ```
+
+   It runs, replacing a container of that name:
+
+   ```bash
    docker run -d --name voice-workers --init --restart unless-stopped \
      --user "$(id -u):$(id -g)" \
-     -v "$folder:/repos" -v voice-home:/home/worker \
+     -v "$folder:/repos:rw" -v voice-home:/home/worker \
      -v "$PWD/.secrets/worker:/run/secrets/voice:ro" \
      cc-voice-worker
    ```
+
+   While the [kill switch](#kill-switch) is locked, it mounts the folder `:ro` instead and sets no
+   restart policy.
 
    `voice-home` keeps Claude Code's settings and sessions, so that follow-ups continue, and git's
    settings. The tokens never become part of the container's configuration: the gateway's
@@ -580,6 +594,72 @@ main open. Workers still open a draft pull request unless you explicitly ask for
 `read-only` (for example by `VOICE_GW_ACCESS`) could still push; its rules forbid it. To be sure
 nothing leaves the container but through the clean clone, give it no write token.
 
+## Kill switch
+
+One switch that stops everything, in the gateway's code: it does not depend on the controller
+following instructions.
+
+![Kill switch](docs/killswitch.drawio.svg)
+
+**What locks it:**
+
+| Trigger | How | Checked |
+|---|---|---|
+| Voice | "Notstopp", "Not-Stopp", "Notfallstopp", "Nothalt", "Not-Aus", "emergency stop", "kill switch" | In `send` and `ask`, before anything reaches the controller: the message starts with the phrase, or has at most six words. "Stopp" needs its double p, so "do not stop the build" is none. Also the voice tool `emergency_stop`, which the voice assistant is told to call at once |
+| Telegram | `/stop`, `/notstopp` or one of the phrases | Only from the configured private chat, and only if sent in the last two minutes; every other chat and message is ignored. The gateway polls the bot for this |
+| Rule: default branch | A push to the default branch, or a merge, without an explicit direct dispatch at level `full` | `git push` with the default branch, `--all` or `--mirror` as target, and `gh pr merge`, in the run's commands. And with `gh`: the default branch moved on GitHub during the run, and the worker's repository holds the new head |
+| Rule: outside | Writes outside the repository and the temporary folders | The file tools by their path; shell commands by explicit targets: redirections, `tee`, `cp`, `mv`, `rm`, `mkdir`, `touch`, `ln`, `chmod`, `chown`, `truncate`, `sed -i`, `dd of=`, also after `cd` |
+| Rule: many changes | More than 500 file edits in a run; at its end more than 300 files or 30,000 lines changed | The edits as the run makes them; at the end `git log --numstat` for commits made during the run, on any branch, plus what is not committed. Thresholds: `VOICE_GW_KILL_MAX_*` |
+| Controller | `raise_alarm` with a reason | The controller may report what looks wrong; it is one more signal, never the only one |
+
+**What it does**, at once and in this order:
+
+- `dispatch` answers `locked` with the trigger and the time; `send` and `ask` hand nothing over;
+  approvals can only be denied, open ones are denied, new ones are denied automatically.
+- Every worker run stops. In the Docker setup the container stops too, and loses its restart policy.
+  While locked, `scripts/start-workers-container.sh` mounts the repositories read-only, and the
+  gateway stops a container with a writable `/repos` within `VOICE_GW_KILL_CHECK` seconds,
+  however it was started.
+- An alarm with trigger and time goes to Telegram at once, if it is set up, and to every connected
+  voice chat with its next call, once per chat (`[ALARM]`). The controller is told as well.
+- The state is saved in `.secrets/killswitch.json`, mode 0600: the controller's confine hook keeps it
+  away from `.secrets/`, and the container only has `.secrets/worker`, read-only. It survives
+  restarts of the gateway and the controller; a file that cannot be read counts as locked.
+
+**Unlocking**, only here, at the server's terminal:
+
+```bash
+node scripts/unlock.mjs            # shows what locked it, asks you to type "unlock"
+node scripts/unlock.mjs --status   # only shows it
+```
+
+It unlocks the running gateway through its admin socket, or removes the file if the gateway is not
+running. There is no way to unlock by voice, Telegram or the controller. Start the worker container
+again afterwards: `scripts/start-workers-container.sh`.
+
+**What it cannot do, rule by rule:**
+
+- **Nothing is undone.** A push, a merged pull request or a deleted branch on GitHub stays as it
+  is; so do changes already written. The switch stops what comes next.
+- **The rules observe, they do not prevent.** They read a run's commands as Claude Code reports
+  them, so the command that breaks a rule has usually run already.
+- **Default branch:** a push hidden in a script, an alias or another language is not seen in the
+  commands. The check on GitHub sees the result, but only through `gh` (logged in here, every 30
+  seconds and at the end of the run), and only if the worker's repository holds the new head; a
+  worker that fetched someone else's push during its run can look guilty, and a push the worker
+  made without keeping the commit is missed.
+- **Outside:** only explicit paths count. Targets in variables (other than `$HOME`), in scripts the
+  worker writes, in programs (`npm install` into `~/.npm`, a Python script) or behind symlinks are
+  not seen. In the Docker setup the container limits writes anyway; on this computer it matters
+  most.
+- **Many changes:** a harmful change can be small, and a large refactoring can trip it; tune the
+  thresholds. A run counts commits made during it, on any branch, so a fetched commit can count.
+- **Voice:** if the voice assistant rewrites "Notstopp" into a longer sentence, the phrase check can
+  miss it; the `emergency_stop` tool and its description are meant for that.
+- **Host workers:** without Docker, a worker runs as you and could in principle reach
+  `.secrets/`. While locked none runs, and none can start; a process a worker detached from its
+  process group could survive the stop.
+
 ## Security
 
 - **Only signed-in clients get in.** Signing in needs a pairing code from this computer: eight
@@ -609,6 +689,9 @@ nothing leaves the container but through the clean clone, give it no write token
   this computer never runs there, and changes come out only as a verified bundle into a clean
   clone (see the [threat model](#getting-changes-out-of-the-container)). Whoever controls the
   gateway can control Docker, which on Linux is as good as root.
+- **Kill switch.** Voice, Telegram, fixed rules on the workers' runs and the controller's alarm can
+  lock the gateway; only `scripts/unlock.mjs` at the server unlocks it. It stops what comes next,
+  it undoes nothing already pushed. See [Kill switch](#kill-switch) for what each rule cannot see.
 - **The endpoint is public.** Anyone on the internet can reach the sign-in page. A certificate from
   a public authority, Tailscale Funnel's included, also publishes the host name in the certificate
   transparency logs.
@@ -676,6 +759,14 @@ Claude Code starts the gateway, so environment variables go into `controller/.mc
 | `VOICE_GW_DOCKER_BIN` | `docker` | the Docker CLI |
 | `VOICE_GW_ACCESS` | empty | `read-only`, `pr` or `full` for every repository in the container; empty: [detected](#access-levels) from the token |
 | `VOICE_GW_GITHUB_API` | `https://api.github.com` | GitHub API for the level check; the tests point it at a stand-in |
+| `VOICE_GW_KILL_MAX_EDITS` | `500` | [kill switch](#kill-switch): file edits in one run |
+| `VOICE_GW_KILL_MAX_FILES` | `300` | kill switch: files changed in one run |
+| `VOICE_GW_KILL_MAX_LINES` | `30000` | kill switch: lines changed in one run |
+| `VOICE_GW_KILL_ALLOW_PATHS` | empty | kill switch: more folders, comma-separated, that workers may write to |
+| `VOICE_GW_KILL_CHECK` | `30` | kill switch: seconds between checks of the default branch on GitHub and, while locked, of the container |
+| `VOICE_GW_TELEGRAM_POLL` | `25` | seconds one poll of the Telegram bot for `/stop` waits |
+| `VOICE_GW_DOCKER_FOLDER` | `~/docker-developer` | for `scripts/start-workers-container.sh`: the repositories folder |
+| `VOICE_GW_DOCKER_IMAGE` | `cc-voice-worker` | for `scripts/start-workers-container.sh`: the image |
 | `VOICE_GW_STATE_DIR` | `.state` | worker state and the output of every run |
 | `VOICE_GW_CLAUDE_BIN` | `claude` | the Claude Code command for workers; with Docker, inside the container |
 | `VOICE_GW_GH_BIN` | `gh` | the GitHub CLI, used to tell public from private repositories |
@@ -713,6 +804,9 @@ Claude Code starts the gateway, so environment variables go into `controller/.mc
 | `worker container …: /repos is a volume, not a host folder` or `… it runs as …` | The container was started without `-v <folder>:/repos` or without `--user "$(id -u):$(id -g)"`. Remove it (`docker rm -f voice-workers`) and start it as in [Set it up](#set-it-up). |
 | `fetch-from-container: the container could not bundle …` | The branch does not exist in the container's repository, or the container is not running. The worker names its branch at the end of each run. |
 | A worker in Docker fails at once | Claude Code is not logged in: `.secrets/worker/claude_token` is missing or expired; run `claude setup-token` again. Otherwise read `.state/tasks/<task>.err`. |
+| `dispatch=locked`, `[state=locked]` or an `[ALARM]` line | The kill switch is locked; the alarm names the trigger. `node scripts/unlock.mjs --status` shows it, `node scripts/unlock.mjs` at the server unlocks it. |
+| The kill switch locked for no good reason | Read the reason. A rule that misfires: raise its `VOICE_GW_KILL_*` threshold, or add a folder to `VOICE_GW_KILL_ALLOW_PATHS`. |
+| `/stop` on Telegram does nothing | Only your configured private chat counts, and the gateway must poll the bot: the log says `telegram commands: …` if a webhook or another program takes the updates. |
 | No approval by voice | Expected for Bash, Write and Edit: they run without asking. For other tools: the session runs in auto or bypass mode, an allow rule covers the tool, or it is a trust or consent dialog, which is not relayed. Start the session with `scripts/start-controller.sh`. |
 
 Claude Code's debug log is at `~/.claude/debug/<session-id>.txt`.
@@ -726,7 +820,9 @@ src/
   voice.mjs          HTTP side: MCP tools for the voice assistant
   oauth.mjs          sign-in: OAuth metadata, registration, sign-in page, tokens
   workers.mjs        workers: find repositories, start and follow claude -p runs
-  telegram.mjs       Telegram fallback once the voice mode has ended
+  telegram.mjs       Telegram fallback once the voice mode has ended, and /stop from your chat
+  killswitch.mjs     the kill switch: state, emergency phrases, the alarm
+  guard.mjs          the kill switch's rules on the workers' runs
   runners.mjs        where workers run: this computer, or the Docker container
   access.mjs         access levels in the container, from the GitHub token
   admin.mjs          Unix socket for pair.mjs and fake-voice
@@ -752,11 +848,14 @@ scripts/
   pair.mjs           pairing codes, list and revoke connections
   fake-voice.mjs     play the voice assistant at the desk
   fetch-from-container.sh   bring a branch from the container into a clean clone, as a bundle
+  start-workers-container.sh   start the worker container, read-only while the kill switch is locked
+  unlock.mjs         unlock the kill switch, at the server only
 test/
   e2e.test.mjs       both sides end to end, without Claude Code
   oauth.test.mjs     the sign-in as Claude's connector goes through it
   workers.test.mjs   workers with a stand-in for claude and gh
   telegram.test.mjs  Telegram fallback with a stand-in Bot API
+  killswitch.test.mjs   the kill switch: every trigger, its effects, restart and unlocking
   docker.test.mjs    workers in the container, access levels and the bundle helper, with stand-ins for docker and GitHub
   controller.test.mjs   launcher flags, controller settings, confine hook
 docs/
