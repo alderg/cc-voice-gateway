@@ -143,8 +143,8 @@ as news in the voice conversation, or by Telegram once the conversation has ende
 
 ## 2. Motivation
 
-The goal: drive, talk to Claude, and have real work done in your repositories, with results and
-questions coming back by voice, without touching a screen.
+The goal: talk to Claude, for example while driving, and have real work done in your
+repositories, with results and questions coming back by voice, without touching a screen.
 
 Claude does not offer this by itself. In the Claude app, voice mode is not available for Claude
 Code; there it only has dictation ([voice mode][voice]). Claude Code Remote Control reaches a local
@@ -188,7 +188,7 @@ confirmed it.
 
 | | Voice front end | What it controls | Where the code runs | Car | Source and licence |
 |---|---|---|---|---|---|
-| **cc-voice-gateway** | Claude's voice mode in the Claude app, through a custom MCP connector | A running Claude Code session (channel), which dispatches headless workers | Your computer; workers optionally in Docker | Wherever the Claude app's voice mode runs | This repository, private |
+| **cc-voice-gateway** | Claude's voice mode in the Claude app, through a custom MCP connector | A running Claude Code session (channel), which dispatches headless workers | Your computer; workers optionally in Docker | Wherever the Claude app's voice mode runs | This repository, Apache 2.0 |
 | [carcode][carcode] | Siri: a Siri Shortcut ("Hey Siri, Jarvis") on the iPhone | The Claude Code CLI on your Mac, with your login | Your Mac, reached through a Cloudflare quick tunnel; the server can run on Linux, the Shortcut needs macOS once | CarPlay, through Siri | Open source, MIT |
 | [DashVox][dashvox] | Its own iPhone app, with CarPlay and Apple Watch | Claude Code, Claude Cowork, Codex or another CLI, over SSH on your machines | Your machines; the app's backend is DashVox Cloud or self-hosted | CarPlay | App free, with a paid tier; source code unverified |
 | [VoiceMode][voicemode] | Microphone and speakers of the computer; speech recognition and output local (Whisper.cpp, Kokoro) or through OpenAI-compatible services | Claude Code itself, as an MCP server or plugin | Your computer | None documented | Open source, MIT |
@@ -234,8 +234,11 @@ The product page is dark, so it shows a copy of the architecture diagram exporte
 dark theme. After changing the diagram, export that copy again:
 
 ```bash
-draw.io -x -f svg --theme dark -o docs/assets/architecture-dark.svg docs/architecture.drawio.svg
+drawio -x -f svg --theme dark -o docs/assets/architecture-dark.svg docs/architecture.drawio.svg
 ```
+
+`drawio` is the command line of the draw.io desktop app; on macOS it is
+`/Applications/draw.io.app/Contents/MacOS/draw.io`.
 
 ### 4.1 Architecture
 
@@ -367,7 +370,7 @@ and fails closed.
   run unconfined and without a prompt.
 - **Blocked, among others:** every other MCP server's tools, also those from plugins; subagents
   (Agent, Task), since it is not clear that the hook sees their calls; skills; web fetch and
-  search; MCP resources; `AskUserQuestion` and plan mode, since nobody can click a form in the car.
+  search; MCP resources; `AskUserQuestion` and plan mode, since nobody can click a form in a voice conversation.
 - **Only the gateway as MCP server, with the development flag.** The start script passes
   `--strict-mcp-config --mcp-config controller/.mcp.json`, so no other MCP server starts.
 - **Not with the plugin.** `--strict-mcp-config` also drops plugins' MCP servers, the gateway's
@@ -766,7 +769,7 @@ is guarded as follows:
   `cross-spawn`, `eventsource`, `eventsource-parser`, `express`, `express-rate-limit`, `hono`,
   `jose`, `json-schema-typed`, `pkce-challenge`, `raw-body`, `zod-to-json-schema`, and their
   dependencies.
-- **In total,** 92 packages in `node_modules`, pinned by `package-lock.json`. Nothing is compiled.
+- **In total,** 95 packages in `node_modules`, pinned by `package-lock.json`. Nothing is compiled.
 
 **Operating systems:**
 
@@ -787,7 +790,7 @@ differ.
 | Channel plugin without the prompt | Team and Enterprise managed setting `allowedChannelPlugins` ([channels][channels-admin]) | Owner, see [7.4](#74-admin-steps-for-team-and-enterprise) |
 | `claude setup-token` for the container | Pro, Max, Team or Enterprise ([authentication][auth]) | – |
 
-On the draw.io Team plan this means:
+On a Team plan this means:
 
 - an Owner enables channels and adds the custom connector;
 - optionally, an Owner puts the plugin on the channel allowlist;
@@ -801,8 +804,7 @@ container, not for the controller.
 ### 7.1 With the setup assistant
 
 ```bash
-git clone git@github.com:alderg/cc-voice-gateway.git
-cd cc-voice-gateway
+gh repo clone alderg/cc-voice-gateway && cd cc-voice-gateway
 npm install
 node scripts/setup.mjs
 ```
@@ -1010,7 +1012,7 @@ terminal (`tmux attach -t voice`, Enter); with the plugin it does not.
 
 ### 8.3 Restarting the controller by voice
 
-"Controller neu starten" ("restart the controller"):
+"Restart the controller":
 
 1. **The controller explains and asks.** It asks `restart_controller` what a restart would do and
    tells you, then asks: which worker runs are going, what happens to open requests, whether
@@ -1055,7 +1057,7 @@ at most three short sentences, without code, paths or lists.
 | "Merge pull request 12 in alpha." | The controller asks back with the title and the method; after your yes, `gh pr merge` raises an approval; you confirm a second time |
 | "Push it straight to main." | Only in Docker at level `full`: `dispatch` with `direct`. Otherwise the controller says why it stays a pull request |
 | "Notstopp!" / "emergency stop" | The kill switch locks before anything reaches the controller ([5.9](#59-the-kill-switch)) |
-| "Controller neu starten." | Restart through the watchdog after your yes ([8.3](#83-restarting-the-controller-by-voice)) |
+| "Restart the controller." | Restart through the watchdog after your yes ([8.3](#83-restarting-the-controller-by-voice)) |
 
 **Your words.** The controller passes your words with every dispatch. If they are not from a voice
 request of the last `VOICE_GW_DISPATCH_WINDOW` minutes, the gateway starts nothing and the
@@ -1211,7 +1213,6 @@ do not set them.
 | The connector stopped working after weeks unused | The refresh token expired after 30 days. Sign in again from the connector's settings. |
 | Claude asks before every tool call | Choose "Always allow" for the connector's tools. |
 | Startup warning that channels are not enabled for the organisation | Team and Enterprise, including a Max seat in a Team organisation: an Owner enables Organization settings → Claude Code → Channels. `claude --debug` logs "the organization is team" in that case. |
-| The start log says `the development flag, since voice@cc-voice-gateway is not on the organisation's channel allowlist` although it is | The script reads Claude Code's local copy of the managed settings (`~/.claude/remote-settings.json`), which Claude Code updates when a session starts. The first start after adding the entry still sees the old copy. Answer the warning or quit, and start again. `node scripts/channel-mode.mjs` shows what the next start will use. |
 | Channel event arrives, but no answer | The controller's turn failed, for example "Login expired". Look at the controller terminal; `/login` there. |
 | `status` reports `controller=unconfirmed`, `get_reply` shows a hint | The session runs without the channel (neither the plugin nor `--dangerously-load-development-channels server:voice`), or the organisation blocks channels. Start it with `scripts/start-controller.sh` and check `/mcp`; otherwise Claude Code drops events silently. |
 | `voice port … is in use by another process` in the log, and the same on Telegram | Another process holds `VOICE_GW_PORT`: a second controller session, or a gateway left over from an earlier session, which also answers the watchdog's `/healthz`. The new gateway ends with an error. `lsof -nP -iTCP:8787 -sTCP:LISTEN` shows the process; end it, start only one controller, then restart it. |
@@ -1246,8 +1247,8 @@ do not set them.
 | The kill switch locked for no good reason | Read the reason. A rule that misfires: raise its `VOICE_GW_KILL_*` threshold, or add a folder to `VOICE_GW_KILL_ALLOW_PATHS`. |
 | `/stop` on Telegram does nothing | Only your configured private chat counts, and the gateway must poll the bot: the log says `telegram commands: …` if a webhook or another program takes the updates. |
 | No approval by voice | Expected for Bash, Write and Edit: they run without asking. For other tools: the session runs in auto or bypass mode, an allow rule covers the tool, or it is a trust or consent dialog, which is not relayed. Start the session with `scripts/start-controller.sh`. |
-| The controller still starts with the development flag after the admin step | The log line `channel: the development flag, since …` says why. `node scripts/channel-mode.mjs` checks again; Claude Code fetches the organisation's settings at its start, so start any `claude` once (or wait an hour). `claude doctor` shows whether the managed settings arrived. |
-| "Controller neu starten" and the controller says it cannot restart itself | It was not started by `scripts/start-controller.sh` with the watchdog. Restart it at the computer. |
+| The controller still starts with the development flag after the admin step | The log line `channel: the development flag, since …` says why. The script reads Claude Code's local copy of the managed settings (`~/.claude/remote-settings.json`), which Claude Code updates when a session starts, so the first start after the admin step still sees the old copy: answer the warning or quit, and start again. `node scripts/channel-mode.mjs` shows what the next start will use; `claude doctor` shows whether the managed settings arrived. |
+| "Restart the controller" and the controller says it cannot restart itself | It was not started by `scripts/start-controller.sh` with the watchdog. Restart it at the computer. |
 | Voice requests stop arriving after a crash | The watchdog started the session again, and the development-channel warning waits: `tmux attach -t voice`, then Enter. `grep watchdog .logs/gateway.log` shows what happened. |
 | `the controller is already running (watchdog …)` | A watchdog runs already, for example in another tmux window. `scripts/start-controller.sh --status`; `--stop` ends it. |
 | `watchdog: giving up …` | The session kept crashing, for example because the login expired. Look at the controller terminal, fix the cause, and start it again. |
