@@ -311,8 +311,11 @@ test('restart_controller: first what would happen, running workers included; the
     },
   })
   try {
-    const started = await g.controller('dispatch', { worker: 'alpha', task: 'SLOW: a long task.', words: 'x' })
+    // The driver's words first: dispatch starts a run only on them.
+    const said = idOf(await g.call('send', { message: 'SLOW: a long task.' }))
+    const started = await g.controller('dispatch', { worker: 'alpha', task: 'SLOW: a long task.', words: 'SLOW: a long task.' })
     const task = /task=(t[a-z0-9]{3})/.exec(started)[1]
+    await g.controller('reply', { request_id: said, state: 'done', text: 'It is on its way.' })
     await g.call('send', { message: 'Restart the controller.' })
 
     const plan = await g.controller('restart_controller')

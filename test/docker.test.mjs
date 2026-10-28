@@ -18,6 +18,7 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import { z } from 'zod'
 import { adminRequest } from '../src/admin.mjs'
 import { GitHubAccess } from '../src/access.mjs'
@@ -200,6 +201,7 @@ before(async () => {
   writeFileSync(TOKEN_FILE, `${TOKEN}\n`, { mode: 0o600 })
 
   gw = { events: [], log: '' }
+  const port = await freePort()
   gw.claudeCode = new Client({ name: 'fake-claude-code', version: '0.0.0' })
   gw.claudeCode.setNotificationHandler(
     z.object({
@@ -213,7 +215,7 @@ before(async () => {
     args: [GATEWAY],
     env: {
       ...process.env,
-      VOICE_GW_PORT: String(await freePort()),
+      VOICE_GW_PORT: String(port),
       VOICE_GW_SECRETS_DIR: SECRETS,
       VOICE_GW_STATE_DIR: join(TMP, 'state'),
       VOICE_GW_WORKER_ROOT: HOST,
@@ -239,9 +241,25 @@ before(async () => {
   })
   stdio.stderr.on('data', chunk => (gw.log += chunk))
   await gw.claudeCode.connect(stdio)
+  // The voice client, for the driver's words that dispatch needs.
+  for (let i = 0; i < 100; i++) {
+    try {
+      if ((await fetch(`http://127.0.0.1:${port}/healthz`)).ok) break
+    } catch {
+      await sleep(50)
+    }
+  }
+  const { access_token } = await adminRequest(join(SECRETS, 'admin.sock'), 'POST', '/token', { name: 'test' })
+  gw.voice = new Client({ name: 'fake-voice', version: '0.0.0' })
+  await gw.voice.connect(
+    new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp`), {
+      requestInit: { headers: { authorization: `Bearer ${access_token}` } },
+    }),
+  )
 })
 
 after(async () => {
+  await gw?.voice?.close()
   await gw?.claudeCode.close()
   api.server?.close()
   rmSync(TMP, { recursive: true, force: true })
@@ -277,7 +295,10 @@ const dockerCalls = () => jsonLines(join(TMP, 'docker-calls.jsonl'))
 const claudeCalls = () => jsonLines(join(TMP, 'claude-calls.jsonl'))
 const arg = (call, name) => call.args[call.args.indexOf(name) + 1]
 
+// The driver says it first: dispatch starts a run only on words from a recent
+// voice request.
 async function dispatch(worker, task, extra = {}) {
+  await gw.voice.callTool({ name: 'send', arguments: { message: task } })
   const out = await controller('dispatch', { worker, task, words: task, ...extra })
   return { ...out, id: /task=(t[a-z0-9]{3})/.exec(out.text)?.[1] }
 }

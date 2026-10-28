@@ -64,6 +64,13 @@ export const config = {
   // Workers: every git repository in this folder, by default the one this
   // repository sits in (~/Developer).
   workerRoot: env.VOICE_GW_WORKER_ROOT || dirname(ROOT),
+  // This repository's own checkout is no worker on this computer: a run there
+  // could change the gateway, the confine hook and controller/CLAUDE.md.
+  // VOICE_GW_WORKER_SELF=1 lists it all the same.
+  workerSelf: env.VOICE_GW_WORKER_SELF === '1',
+  // A dispatch starts a run only with the driver's own words from a voice
+  // request of the last this many minutes (channel.mjs).
+  dispatchWindowMinutes: num(env.VOICE_GW_DISPATCH_WINDOW, 30),
   maxWorkers: num(env.VOICE_GW_MAX_WORKERS, 2),
   workerTimeoutMinutes: num(env.VOICE_GW_WORKER_TIMEOUT, 60),
   claudeBin: env.VOICE_GW_CLAUDE_BIN || 'claude',

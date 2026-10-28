@@ -3,7 +3,10 @@
 // tells the controller as news. The driver is not asked anything.
 //
 // Which pull requests: those a run names by URL for its own repository, in
-// its tool output or its result, if gh shows them open on a voice/ branch.
+// its tool output or its result, if gh shows them open on a voice/ branch,
+// opened by the account gh is logged in as, from a branch of the repository
+// itself. A fork can name its branch voice/ too, and anyone can open a pull
+// request on a public repository; those are not watched.
 // Whether results will come is not guessed from the repository's settings;
 // the watcher looks: checks on the head commit (GitHub Actions and other CI),
 // requested reviewers (CODEOWNERS, required reviewers, a person the driver
@@ -16,9 +19,13 @@
 // News: checks finished on a head commit (once per commit), new reviews with
 // their inline comments, and new comments. Reviews and comments of the account
 // gh is logged in as are what workers post on the driver's behalf; they are
-// not news. Stops when the pull request is merged or closed, or after
-// VOICE_GW_PR_WATCH_HOURS. Without a gh login it does nothing. It only reads
-// JSON from gh; no token passes through it.
+// not news. The text of a review or comment is passed on only from the
+// repository's owner, members and collaborators; of anyone else the news names
+// the author and says that the text is not forwarded. Even so it is not the
+// driver's: the gateway marks it trusted="no" for the controller. Stops when
+// the pull request is merged or closed, or after VOICE_GW_PR_WATCH_HOURS.
+// Without a gh login it does nothing. It only reads JSON from gh; no token
+// passes through it.
 
 import { execFile } from 'node:child_process'
 import { EventEmitter } from 'node:events'
@@ -31,7 +38,14 @@ const FAST_POLLS = 15 // then every SLOW_FACTOR intervals
 const SLOW_FACTOR = 5
 const AUTH_CHECK_MS = 10 * 60 * 1000
 const KEEP_STOPPED = 50
-const FIELDS = 'number,title,state,isDraft,headRefName,headRefOid,url,statusCheckRollup,reviewRequests,reviews,comments'
+const FIELDS =
+  'number,title,state,isDraft,isCrossRepository,author,headRefName,headRefOid,url,statusCheckRollup,reviewRequests,' +
+  'reviews,comments'
+
+// Whose words reach the controller: gh pr view gives authorAssociation for
+// reviews and comments, the REST API author_association for inline comments.
+const COLLABORATORS = ['OWNER', 'MEMBER', 'COLLABORATOR']
+const NOT_FORWARDED = 'not a collaborator, the text is not forwarded'
 
 const REVIEW_STATE = {
   APPROVED: 'approved',
@@ -43,6 +57,7 @@ const REVIEW_STATE = {
 const plural = (n, unit) => `${n} ${unit}${n === 1 ? '' : 's'}`
 const login = name => String(name ?? '').replace(/\[bot\]$/i, '')
 const sameLogin = (a, b) => Boolean(a && b) && login(a).toLowerCase() === login(b).toLowerCase()
+const collaborator = association => COLLABORATORS.includes(String(association ?? '').toUpperCase())
 
 // A check run (GitHub Actions, apps) or a commit status (other CI).
 const isStatus = check => check.__typename === 'StatusContext' || (!('status' in check) && 'state' in check)
@@ -143,6 +158,11 @@ export class PullWatcher extends EventEmitter {
     return this.json(['pr', 'view', String(number), '--repo', slug, '--json', FIELDS])
   }
 
+  // Opened by the gh account, from a branch of the repository itself.
+  ours(pr) {
+    return pr.isCrossRepository === false && sameLogin(pr.author?.login, this.auth?.me)
+  }
+
   // --- watching -----------------------------------------------------------
 
   // The pull requests a finished run opened or worked on, as gh shows them:
@@ -153,6 +173,11 @@ export class PullWatcher extends EventEmitter {
     for (const number of task.pulls) {
       const pr = await this.view(task.slug, number)
       if (!pr || pr.state !== 'OPEN' || !String(pr.headRefName).startsWith('voice/')) continue
+      if (!this.ours(pr)) {
+        const why = pr.isCrossRepository !== false ? 'from a fork' : `opened by ${login(pr.author?.login) || 'someone else'}`
+        this.log('not watching pull request', `${task.slug}#${pr.number}:`, why)
+        continue
+      }
       found.push({ number: pr.number, title: pr.title, isDraft: Boolean(pr.isDraft), url: pr.url })
       this.watch({ worker: task.repo, slug: task.slug, number: pr.number, title: pr.title })
     }
@@ -203,6 +228,7 @@ export class PullWatcher extends EventEmitter {
     const pr = await this.view(entry.slug, entry.number)
     if (!pr) return // gh or GitHub not reachable; again at the next poll
     if (pr.state !== 'OPEN') return this.stop(entry, pr.state === 'MERGED' ? 'merged' : 'closed')
+    if (!this.ours(pr)) return this.stop(entry, 'not opened by the gh account from this repository')
 
     const own = name => sameLogin(name, this.auth.me)
     const checks = pr.statusCheckRollup ?? []
@@ -221,17 +247,21 @@ export class PullWatcher extends EventEmitter {
       kinds.push('review')
       entry.reviews = [...entry.reviews, ...newReviews.map(r => r.id)].slice(-200)
       for (const review of newReviews) {
+        const state = REVIEW_STATE[review.state] ?? String(review.state).toLowerCase()
         const body = String(review.body ?? '').trim()
-        lines.push(
-          `Review from ${login(review.author?.login)}: ${REVIEW_STATE[review.state] ?? String(review.state).toLowerCase()}` +
-            (body ? `, "${preview(body, 200)}".` : '.'),
-        )
+        const said = !body ? '' : collaborator(review.authorAssociation) ? `, "${preview(body, 200)}"` : `; ${NOT_FORWARDED}`
+        lines.push(`Review from ${login(review.author?.login)}: ${state}${said}.`)
       }
       const inline = await this.newInline(entry, own)
       if (inline.length) {
         const shown = inline
           .slice(0, 5)
-          .map(c => `${c.path}${c.line ? `:${c.line}` : ''} "${preview(c.body, 120)}"`)
+          .map(c => {
+            const where = `${c.path}${c.line ? `:${c.line}` : ''}`
+            return collaborator(c.author_association)
+              ? `${where} "${preview(c.body, 120)}"`
+              : `${where} from ${login(c.user?.login)}, text not forwarded`
+          })
           .join('; ')
         lines.push(`${plural(inline.length, 'inline comment')}: ${shown}${inline.length > 5 ? '; …' : ''}.`)
       }
@@ -241,7 +271,8 @@ export class PullWatcher extends EventEmitter {
       kinds.push('comment')
       entry.comments = [...entry.comments, ...newComments.map(c => c.id)].slice(-200)
       for (const comment of newComments) {
-        lines.push(`Comment from ${login(comment.author?.login)}: "${preview(comment.body, 200)}".`)
+        const said = collaborator(comment.authorAssociation) ? `"${preview(comment.body, 200)}"` : NOT_FORWARDED
+        lines.push(`Comment from ${login(comment.author?.login)}: ${said}.`)
       }
     }
 
