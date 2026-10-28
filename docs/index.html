@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cc-voice-gateway: turn your commute into commits</title>
+<meta name="description" content="Talk to Claude in your car or on your phone, and a Claude Code session on your own computer does the work: versioned with git, delivered as pull requests, merged only when you say yes. A prototype, provided as-is.">
+<meta property="og:title" content="cc-voice-gateway: turn your commute into commits">
+<meta property="og:description" content="Claude's voice mode, connected to Claude Code on your own computer. A prototype, provided as-is.">
+<meta property="og:type" content="website">
+<meta property="og:image" content="https://alderg.github.io/cc-voice-gateway/assets/video-poster.png">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='9' fill='%23a78bfa'/%3E%3C/svg%3E">
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0a0f1f;
+    --bg2: #121a36;
+    --ink: #f8fafc;
+    --text: #cbd5e1;
+    --muted: #94a3b8;
+    --line: #26314f;
+    --card: #111a33;
+    --orange: #fb923c;
+    --purple: #a78bfa;
+    --blue: #60a5fa;
+    --green: #4ade80;
+    --red: #f87171;
+    --amber: #fbbf24;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body {
+    background: radial-gradient(1200px 700px at 75% -10%, var(--bg2), var(--bg) 65%) no-repeat, var(--bg);
+    color: var(--text);
+    font: 400 18px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--blue); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .wrap { max-width: 1120px; margin: 0 auto; padding: 0 24px; }
+  section { padding: 88px 0; border-top: 1px solid rgba(38, 49, 79, .6); }
+  h1, h2, h3 { color: var(--ink); letter-spacing: -.02em; }
+  h1 { font: 800 clamp(44px, 7vw, 84px)/1.04 system-ui, -apple-system, sans-serif; letter-spacing: -.035em; }
+  h2 { font: 750 clamp(30px, 4.2vw, 44px)/1.12 system-ui, -apple-system, sans-serif; margin-bottom: 18px; }
+  h3 { font: 700 21px/1.3 system-ui, -apple-system, sans-serif; margin-bottom: 8px; }
+  .lead { font-size: clamp(19px, 2.2vw, 22px); color: var(--text); max-width: 760px; }
+  .eyebrow { font: 600 14px/1 system-ui, sans-serif; letter-spacing: .08em; text-transform: uppercase; color: var(--purple); margin-bottom: 18px; }
+  .grad { background: linear-gradient(90deg, var(--amber), var(--orange) 35%, var(--purple) 70%, var(--blue)); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  code { font: 500 .9em ui-monospace, "SF Mono", Menlo, Consolas, monospace; color: var(--ink); background: rgba(148, 163, 184, .12); padding: 1px 6px; border-radius: 6px; }
+
+  nav { display: flex; align-items: center; justify-content: space-between; padding: 22px 0; gap: 16px; }
+  .brand { font: 700 18px system-ui, sans-serif; color: var(--ink); display: flex; align-items: center; gap: 10px; }
+  .brand i { width: 11px; height: 11px; border-radius: 50%; background: var(--purple); box-shadow: 0 0 14px var(--purple); }
+  nav .links { display: flex; gap: 22px; font-size: 15px; flex-wrap: wrap; justify-content: flex-end; }
+  nav .links a { color: var(--muted); }
+
+  .hero { padding: 72px 0 40px; border-top: 0; }
+  .hero h1 { margin-bottom: 26px; }
+  .actions { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 34px; }
+  .btn { display: inline-flex; align-items: center; gap: 10px; padding: 13px 22px; border-radius: 12px; font: 600 16px system-ui, sans-serif; }
+  .btn.primary { background: var(--ink); color: var(--bg); }
+  .btn.ghost { border: 1px solid var(--line); color: var(--ink); }
+  .btn:hover { text-decoration: none; filter: brightness(1.08); }
+
+  .video { margin-top: 56px; border-radius: 20px; overflow: hidden; border: 1px solid var(--line); box-shadow: 0 30px 90px rgba(0, 0, 0, .45), 0 0 120px rgba(167, 139, 250, .12); background: #000; }
+  .video video { display: block; width: 100%; height: auto; aspect-ratio: 16 / 9; }
+  .note { font-size: 14px; color: var(--muted); margin-top: 12px; }
+
+  .grid { display: grid; gap: 20px; }
+  .g3 { grid-template-columns: repeat(3, 1fr); }
+  .g2 { grid-template-columns: repeat(2, 1fr); }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 18px; padding: 28px; }
+  .card p { color: var(--muted); font-size: 16.5px; }
+  .card .icon { width: 46px; height: 46px; border-radius: 12px; display: grid; place-items: center; margin-bottom: 18px; }
+  .step { font: 700 13px ui-monospace, "SF Mono", Menlo, monospace; color: var(--muted); margin-bottom: 10px; }
+  .orange { border-color: rgba(251, 146, 60, .45); } .orange .icon { background: rgba(251, 146, 60, .14); }
+  .purple { border-color: rgba(167, 139, 250, .6); } .purple .icon { background: rgba(167, 139, 250, .16); }
+  .blue { border-color: rgba(96, 165, 250, .45); } .blue .icon { background: rgba(96, 165, 250, .14); }
+  .red { border-color: rgba(248, 113, 113, .5); } .red .icon { background: rgba(248, 113, 113, .14); }
+  .green .icon { background: rgba(74, 222, 128, .14); }
+
+  .split { display: grid; grid-template-columns: 1.05fr 1fr; gap: 56px; align-items: center; }
+  .diagram { margin-top: 44px; background: #ffffff; border-radius: 18px; padding: 28px; border: 1px solid var(--line); }
+  .diagram img { display: block; width: 100%; height: auto; color-scheme: light; }
+  .diagram + .note a { color: var(--muted); text-decoration: underline; }
+
+  .quotes { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; margin-top: 34px; }
+  .quote { display: flex; gap: 14px; align-items: flex-start; background: var(--card); border: 1px solid var(--line); border-radius: 16px; padding: 18px 20px; color: var(--ink); font-size: 18px; }
+  .quote svg { flex: none; margin-top: 4px; }
+  .quote small { display: block; color: var(--muted); font-size: 14.5px; margin-top: 4px; }
+
+  ul.checks { list-style: none; padding: 0; display: grid; gap: 18px; }
+  ul.checks li { display: grid; grid-template-columns: 28px 1fr; gap: 14px; }
+  ul.checks li b { color: var(--ink); font-weight: 650; }
+  ul.checks .dot { width: 24px; height: 24px; border-radius: 50%; display: grid; place-items: center; margin-top: 3px; font: 800 13px system-ui; }
+
+  .fine { font-size: 15px; color: var(--muted); margin-top: 26px; }
+  .needs { margin-top: 26px; display: grid; gap: 10px; padding-left: 20px; }
+  .notice { border: 1px solid rgba(251, 191, 36, .45); background: rgba(251, 191, 36, .06); border-radius: 18px; padding: 30px 32px; }
+  .notice h2 { font-size: 28px; margin-bottom: 12px; }
+
+  footer { padding: 48px 0 64px; border-top: 1px solid rgba(38, 49, 79, .6); font-size: 15px; color: var(--muted); }
+  footer .row { display: flex; justify-content: space-between; gap: 24px; flex-wrap: wrap; }
+  footer p + p { margin-top: 8px; }
+  footer a { color: var(--text); text-decoration: underline; text-decoration-color: rgba(203, 213, 225, .35); }
+
+  @media (max-width: 880px) {
+    .g3, .g2, .quotes, .split { grid-template-columns: 1fr; }
+    .split { gap: 28px; }
+    section { padding: 64px 0; }
+    nav .links a.opt { display: none; }
+    .diagram { padding: 14px; }
+  }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+  <nav>
+    <div class="brand"><i></i>cc-voice-gateway</div>
+    <div class="links">
+      <a class="opt" href="#how">How it works</a>
+      <a class="opt" href="#review">Reviews</a>
+      <a class="opt" href="#road">Safety</a>
+      <a href="https://github.com/alderg/cc-voice-gateway#readme">Technical README</a>
+    </div>
+  </nav>
+
+  <header class="hero">
+    <p class="eyebrow">A prototype · Claude voice mode × Claude Code</p>
+    <h1>Stuck in traffic?<br><span class="grad">Turn your commute into commits.</span></h1>
+    <p class="lead">Talk to Claude in your car or on your phone. A Claude Code session on your own computer
+      picks up the request and does the work in your repositories: versioned with git, delivered as pull
+      requests, merged only when you say yes.</p>
+    <div class="actions">
+      <a class="btn primary" href="#video">Watch the 90-second video</a>
+      <a class="btn ghost" href="https://github.com/alderg/cc-voice-gateway#readme">Technical README on GitHub →</a>
+    </div>
+    <div class="video" id="video">
+      <video controls preload="metadata" playsinline poster="assets/video-poster.png">
+        <source src="assets/cc-voice-gateway.mp4" type="video/mp4">
+        <a href="assets/cc-voice-gateway.mp4">Download the video (MP4)</a>
+      </video>
+    </div>
+    <p class="note">90 seconds, with voiceover and captions.</p>
+  </header>
+</div>
+
+<section>
+  <div class="wrap split">
+    <div>
+      <h2>Your ideas don't wait for your desk.</h2>
+      <p class="lead">Hours every week go to traffic. Claude's voice mode is a great partner to think out loud
+        with, but it can't reach Claude Code, the agent that does the real work in your repositories. In the
+        Claude app, Claude Code only has dictation.</p>
+    </div>
+    <div class="grid">
+      <div class="card orange">
+        <h3>Claude voice mode</h3>
+        <p>Understands you in any language, keeps the context, reads answers aloud. In the Claude app, also in CarPlay.</p>
+      </div>
+      <div class="card blue">
+        <h3>Claude Code</h3>
+        <p>Reads and changes your code, runs your tests, commits, pushes and opens pull requests. On your computer.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="how">
+  <div class="wrap">
+    <p class="eyebrow">How it works</p>
+    <h2>One bridge between the two.</h2>
+    <p class="lead">cc-voice-gateway runs on your computer. Claude's voice mode reaches it as a custom connector;
+      it hands each request to a running Claude Code session and brings back answers, questions and approvals.</p>
+    <div class="grid g3" style="margin-top:40px">
+      <div class="card orange">
+        <div class="step">01</div>
+        <div class="icon"><svg width="24" height="22" viewBox="0 0 50 44"><g fill="#fb923c"><rect x="0" y="16" width="6" height="12" rx="3"/><rect x="11" y="8" width="6" height="28" rx="3"/><rect x="22" y="0" width="6" height="44" rx="3"/><rect x="33" y="10" width="6" height="24" rx="3"/><rect x="44" y="17" width="6" height="10" rx="3"/></g></svg></div>
+        <h3>You talk</h3>
+        <p>In Claude's voice mode, in the car or on the phone. "Why did the build fail on main?"</p>
+      </div>
+      <div class="card purple">
+        <div class="step">02</div>
+        <div class="icon"><svg width="24" height="24" viewBox="0 0 52 52"><circle cx="10" cy="26" r="7" fill="#a78bfa"/><circle cx="42" cy="26" r="7" fill="#a78bfa"/><path d="M17 26 H35" stroke="#a78bfa" stroke-width="5" stroke-linecap="round"/></svg></div>
+        <h3>The gateway relays</h3>
+        <p>A Claude Code session on your computer understands the request, asks back if needed, and dispatches the work.</p>
+      </div>
+      <div class="card blue">
+        <div class="step">03</div>
+        <div class="icon"><svg width="24" height="20" viewBox="0 0 54 40"><path d="M4 6 L18 20 L4 34" fill="none" stroke="#60a5fa" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/><rect x="24" y="30" width="28" height="6" rx="3" fill="#60a5fa"/></svg></div>
+        <h3>Claude Code works</h3>
+        <p>Workers run Claude Code in your repositories, on your computer or in a Docker container. You hear the result in a sentence or two.</p>
+      </div>
+    </div>
+    <div class="diagram"><img src="architecture.drawio.svg" alt="Architecture: the Claude app's voice mode calls the gateway on your computer over HTTPS; the gateway hands requests to a Claude Code session, which dispatches workers into your repositories; Telegram is an optional second return channel; a watchdog and a kill switch guard it all." loading="lazy"></div>
+    <p class="note">The architecture. More diagrams, from a single request to the security design, are in the <a href="https://github.com/alderg/cc-voice-gateway#4-diagrams">technical README</a>.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="eyebrow">What you can say</p>
+    <h2>Ask, delegate, follow up.</h2>
+    <p class="lead">Name the repository the way its folder is called. Results come back as news, even when they take a while.</p>
+    <div class="quotes">
+      <div class="quote"><svg width="18" height="16" viewBox="0 0 50 44"><g fill="#fb923c"><rect x="0" y="16" width="6" height="12" rx="3"/><rect x="11" y="8" width="6" height="28" rx="3"/><rect x="22" y="0" width="6" height="44" rx="3"/><rect x="33" y="10" width="6" height="24" rx="3"/><rect x="44" y="17" width="6" height="10" rx="3"/></g></svg><div>"Did the last CI run on main pass?"<small>Answered right away, from GitHub.</small></div></div>
+      <div class="quote"><svg width="18" height="16" viewBox="0 0 50 44"><g fill="#fb923c"><rect x="0" y="16" width="6" height="12" rx="3"/><rect x="11" y="8" width="6" height="28" rx="3"/><rect x="22" y="0" width="6" height="44" rx="3"/><rect x="33" y="10" width="6" height="24" rx="3"/><rect x="44" y="17" width="6" height="10" rx="3"/></g></svg><div>"Tell the alpha worker to fix the typo in the README."<small>A branch, a commit and a draft pull request.</small></div></div>
+      <div class="quote"><svg width="18" height="16" viewBox="0 0 50 44"><g fill="#fb923c"><rect x="0" y="16" width="6" height="12" rx="3"/><rect x="11" y="8" width="6" height="28" rx="3"/><rect x="22" y="0" width="6" height="44" rx="3"/><rect x="33" y="10" width="6" height="24" rx="3"/><rect x="44" y="17" width="6" height="10" rx="3"/></g></svg><div>"Tell it to add a test for that too."<small>A follow-up in the same session, on the same branch.</small></div></div>
+      <div class="quote"><svg width="18" height="16" viewBox="0 0 50 44"><g fill="#fb923c"><rect x="0" y="16" width="6" height="12" rx="3"/><rect x="11" y="8" width="6" height="28" rx="3"/><rect x="22" y="0" width="6" height="44" rx="3"/><rect x="33" y="10" width="6" height="24" rx="3"/><rect x="44" y="17" width="6" height="10" rx="3"/></g></svg><div>"Request a review for pull request 12."<small>Claude reviews the diff and posts its findings.</small></div></div>
+      <div class="quote"><svg width="18" height="16" viewBox="0 0 50 44"><g fill="#fb923c"><rect x="0" y="16" width="6" height="12" rx="3"/><rect x="11" y="8" width="6" height="28" rx="3"/><rect x="22" y="0" width="6" height="44" rx="3"/><rect x="33" y="10" width="6" height="24" rx="3"/><rect x="44" y="17" width="6" height="10" rx="3"/></g></svg><div>"Fix the review comments on pull request 12."<small>Fixed, tested, pushed, and each thread answered.</small></div></div>
+      <div class="quote"><svg width="18" height="16" viewBox="0 0 50 44"><g fill="#fb923c"><rect x="0" y="16" width="6" height="12" rx="3"/><rect x="11" y="8" width="6" height="28" rx="3"/><rect x="22" y="0" width="6" height="44" rx="3"/><rect x="33" y="10" width="6" height="24" rx="3"/><rect x="44" y="17" width="6" height="10" rx="3"/></g></svg><div>"Merge pull request 12."<small>Claude asks back first; you confirm twice.</small></div></div>
+    </div>
+  </div>
+</section>
+
+<section id="review">
+  <div class="wrap split">
+    <div>
+      <p class="eyebrow">Reviewed, not rushed</p>
+      <h2>Nothing lands behind your back.</h2>
+      <p class="lead">Every change is versioned with git and arrives as a pull request. You hear about it in
+        the car, and review it at your desk like any other.</p>
+    </div>
+    <ul class="checks">
+      <li><span class="dot" style="background:rgba(167,139,250,.18);color:#a78bfa">✓</span><div><b>A branch for every change.</b> Workers commit on a <code>voice/</code> branch, push it and open a draft pull request.</div></li>
+      <li><span class="dot" style="background:rgba(74,222,128,.16);color:#4ade80">✓</span><div><b>Checks and reviews as news.</b> GitHub Actions, CODEOWNERS and review bots run as usual; their results reach you without a question.</div></li>
+      <li><span class="dot" style="background:rgba(96,165,250,.16);color:#60a5fa">✓</span><div><b>Reviews on your word.</b> "Request a review" and "fix the review comments" are voice commands, never pushed on you.</div></li>
+      <li><span class="dot" style="background:rgba(251,191,36,.16);color:#fbbf24">✓</span><div><b>Merges need your yes, twice.</b> Claude asks back with the title and the method, then Claude Code asks for an approval.</div></li>
+      <li><span class="dot" style="background:rgba(251,146,60,.16);color:#fb923c">✓</span><div><b>You decide how far it goes.</b> In Docker, the GitHub token you hand over sets the level: local commits only, draft pull requests, or also a direct push when you explicitly ask.</div></li>
+    </ul>
+  </div>
+</section>
+
+<section id="road">
+  <div class="wrap">
+    <p class="eyebrow">Built for the road</p>
+    <h2>Voice in, short answers out.</h2>
+    <div class="grid g2" style="margin-top:36px">
+      <div class="card orange">
+        <div class="icon"><svg width="24" height="22" viewBox="0 0 50 44"><g fill="#fb923c"><rect x="0" y="16" width="6" height="12" rx="3"/><rect x="11" y="8" width="6" height="28" rx="3"/><rect x="22" y="0" width="6" height="44" rx="3"/><rect x="33" y="10" width="6" height="24" rx="3"/><rect x="44" y="17" width="6" height="10" rx="3"/></g></svg></div>
+        <h3>Nothing to read</h3>
+        <p>Answers are written to be heard: at most three short sentences, the result first, no code, no file paths, no URLs.</p>
+      </div>
+      <div class="card green">
+        <div class="icon"><svg width="22" height="18" viewBox="0 0 52 40"><path d="M4 21 L18 34 L48 5" fill="none" stroke="#4ade80" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+        <h3>Approvals by voice</h3>
+        <p>When Claude Code needs permission, you hear what it wants to do and answer yes or no.</p>
+      </div>
+      <div class="card red">
+        <div class="icon"><svg width="20" height="24" viewBox="0 0 46 54"><path d="M11 24 V15 a12 12 0 0 1 24 0 V24" fill="none" stroke="#f87171" stroke-width="6"/><rect x="3" y="24" width="40" height="28" rx="7" fill="#f87171"/></svg></div>
+        <h3>An emergency stop</h3>
+        <p>Say "emergency stop" or "Notstopp", or send <code>/stop</code> on Telegram: the gateway locks in its own code, every worker stops, and only you can unlock it, at your computer.</p>
+      </div>
+      <div class="card purple">
+        <div class="icon"><svg width="24" height="24" viewBox="0 0 52 52"><circle cx="10" cy="26" r="7" fill="#a78bfa"/><circle cx="42" cy="26" r="7" fill="#a78bfa"/><path d="M17 26 H35" stroke="#a78bfa" stroke-width="5" stroke-linecap="round"/></svg></div>
+        <h3>Results after you hang up</h3>
+        <p>Work takes minutes. You hear results as news in your next conversation, or on Telegram once the call has ended.</p>
+      </div>
+    </div>
+    <p class="fine">Keep your eyes on the road. Use it only where it is safe and legal, and follow the rules on phone use while driving where you are.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap split">
+    <div>
+      <p class="eyebrow">What you need</p>
+      <h2>Your computer does the work.</h2>
+      <p class="lead">Everything runs on a computer of yours that stays on. A setup assistant walks you through
+        the keys and settings; the <a href="https://github.com/alderg/cc-voice-gateway#6-prerequisites">technical README</a>
+        has the details.</p>
+    </div>
+    <ul class="needs">
+      <li>The Claude app with voice mode and custom connectors</li>
+      <li>Claude Code, with channels, a research preview</li>
+      <li>A Mac or Linux computer that stays on, with Node.js</li>
+      <li>A public HTTPS address for it, for example with Tailscale Funnel</li>
+      <li>Optional: Docker for isolated workers, a Telegram bot, the GitHub CLI</li>
+    </ul>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <div class="notice">
+      <h2>A prototype, provided as-is.</h2>
+      <p>cc-voice-gateway is solely a prototype of an idea: a way to use Claude Code from Claude's voice mode,
+        which cannot reach Claude Code on its own. It comes without warranty and without support, and there is
+        no communication of any kind about this project: no announcements, no support, no answers to issues or
+        messages. It is not an Anthropic product.</p>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap row">
+    <div>
+      <p><a href="https://github.com/alderg/cc-voice-gateway">github.com/alderg/cc-voice-gateway</a> · <a href="https://github.com/alderg/cc-voice-gateway#readme">Technical README</a></p>
+      <p>Diagrams made with <a href="https://www.drawio.com">draw.io</a>. The <code>.drawio.svg</code> files open and edit inline in VS Code with <a href="https://github.com/hediet/vscode-drawio">vscode-drawio</a>.</p>
+    </div>
+    <div>
+      <p>Claude and Claude Code are products of Anthropic.<br>This project is not affiliated with Anthropic.</p>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>

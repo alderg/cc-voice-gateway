@@ -1,0 +1,342 @@
+<!doctype html>
+<!--
+  The video's frames, 1920 x 1080. build.mjs opens this page once per spoken line,
+  with #s=<scene>&b=<build step>&c=<caption>&p=<progress 0..1>, and takes a screenshot.
+  Colors follow the diagrams: orange the Claude app, purple the gateway, blue Claude Code.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>cc-voice-gateway video frame</title>
+<style>
+  :root {
+    --bg: #0a0f1f;
+    --bg2: #121a36;
+    --ink: #f8fafc;
+    --muted: #94a3b8;
+    --line: #26314f;
+    --card: #131c38;
+    --orange: #fb923c;
+    --purple: #a78bfa;
+    --blue: #60a5fa;
+    --green: #4ade80;
+    --red: #f87171;
+    --amber: #fbbf24;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  html, body { width: 1920px; height: 1080px; overflow: hidden; }
+  body {
+    background: radial-gradient(1400px 900px at 70% 20%, var(--bg2), var(--bg) 70%);
+    color: var(--ink);
+    font-family: system-ui, -apple-system, "Helvetica Neue", Helvetica, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  section { position: absolute; inset: 0; display: none; }
+  section.on { display: block; }
+  [data-b] { transition: none; }
+  .hidden { opacity: 0; }
+  .dim { opacity: .35; }
+
+  .brand { position: absolute; left: 120px; top: 72px; font: 600 28px system-ui; color: var(--muted); letter-spacing: .01em; }
+  .brand i { display: inline-block; width: 14px; height: 14px; border-radius: 50%; background: var(--purple); margin-right: 12px; box-shadow: 0 0 18px var(--purple); }
+  .caption {
+    position: absolute; left: 50%; bottom: 84px; transform: translateX(-50%);
+    max-width: 1560px; padding: 18px 34px; border-radius: 16px;
+    background: rgba(2, 6, 23, .72); border: 1px solid rgba(148, 163, 184, .18);
+    font: 500 38px/1.3 system-ui; color: #e2e8f0; text-align: center; white-space: nowrap;
+  }
+  .progress { position: absolute; left: 0; bottom: 0; height: 6px; background: linear-gradient(90deg, var(--orange), var(--purple), var(--blue)); }
+
+  h1 { font: 750 84px/1.08 system-ui; letter-spacing: -.025em; }
+  h2 { font: 700 64px/1.1 system-ui; letter-spacing: -.02em; }
+  .sub { font: 450 42px/1.35 system-ui; color: #cbd5e1; }
+  .center { text-align: center; }
+
+  /* scene: traffic */
+  #traffic .text { position: absolute; left: 120px; top: 300px; width: 820px; }
+  #traffic .text .sub { margin-top: 44px; }
+  #traffic svg { position: absolute; right: 80px; top: 150px; }
+
+  /* cards */
+  .card {
+    position: absolute; width: 560px; padding: 44px 46px; border-radius: 28px;
+    background: var(--card); border: 2px solid var(--line);
+  }
+  .card .icon { width: 84px; height: 84px; border-radius: 22px; display: grid; place-items: center; margin-bottom: 30px; }
+  .card .title { font: 700 46px/1.15 system-ui; }
+  .card .desc { font: 450 32px/1.35 system-ui; color: var(--muted); margin-top: 14px; }
+  .card.orange { border-color: rgba(251, 146, 60, .55); }
+  .card.orange .icon { background: rgba(251, 146, 60, .14); }
+  .card.blue { border-color: rgba(96, 165, 250, .55); }
+  .card.blue .icon { background: rgba(96, 165, 250, .14); }
+  .card.purple { border-color: rgba(167, 139, 250, .8); box-shadow: 0 0 80px rgba(167, 139, 250, .25); }
+  .card.purple .icon { background: rgba(167, 139, 250, .16); }
+
+  /* scene: gap */
+  #gap h2 { position: absolute; top: 200px; width: 100%; }
+  #gap .left { left: 230px; top: 400px; }
+  #gap .right { right: 230px; top: 400px; }
+  #gap .broken { position: absolute; left: 790px; top: 560px; width: 340px; }
+
+  /* scene: bridge */
+  #bridge h2 { position: absolute; top: 200px; width: 100%; }
+  #bridge .card { width: 480px; top: 420px; }
+  #bridge .left { left: 120px; }
+  #bridge .mid { left: 720px; }
+  #bridge .right { left: 1320px; }
+  #bridge .card { height: 330px; }
+  #bridge .card .title { font-size: 40px; white-space: nowrap; }
+  #bridge .link { position: absolute; top: 560px; height: 6px; width: 120px; border-radius: 3px; }
+  #bridge .l1 { left: 600px; background: linear-gradient(90deg, var(--orange), var(--purple)); }
+  #bridge .l2 { left: 1200px; background: linear-gradient(90deg, var(--purple), var(--blue)); }
+
+  /* scene: dialog */
+  #dialog .talk { position: absolute; left: 120px; top: 190px; width: 900px; }
+  .bubble { display: flex; gap: 22px; align-items: flex-start; margin-bottom: 30px; }
+  .bubble .who { flex: none; width: 92px; height: 76px; border-radius: 38px; display: grid; place-items: center; font: 700 22px system-ui; }
+  .bubble .says { padding: 22px 30px; border-radius: 24px; font: 500 36px/1.35 system-ui; background: #1b2546; }
+  .bubble.you .who { background: #334155; color: #e2e8f0; }
+  .bubble.claude .who { background: rgba(251, 146, 60, .18); color: var(--orange); border: 2px solid rgba(251, 146, 60, .6); }
+  .bubble.claude .says { background: rgba(251, 146, 60, .10); border: 1px solid rgba(251, 146, 60, .35); }
+  #dialog .worker {
+    position: absolute; right: 120px; top: 210px; width: 720px; padding: 34px 38px; border-radius: 24px;
+    background: #0b1228; border: 2px solid rgba(96, 165, 250, .55);
+    font: 500 29px/1.75 ui-monospace, "SF Mono", Menlo, monospace; color: #cbd5e1;
+  }
+  #dialog .worker .head { font: 700 30px system-ui; color: var(--blue); margin-bottom: 18px; }
+  .ok { color: var(--green); }
+  .hl { color: var(--ink); }
+
+  /* scene: review */
+  #review h2 { position: absolute; top: 140px; width: 100%; }
+  #review .pr {
+    position: absolute; left: 380px; top: 255px; width: 1160px; padding: 38px 52px; border-radius: 28px;
+    background: var(--card); border: 2px solid var(--line);
+  }
+  #review .pr .t { font: 700 46px/1.2 system-ui; }
+  #review .pr .t span { color: var(--muted); font-weight: 500; }
+  #review .pr .branch { margin-top: 16px; font: 500 28px ui-monospace, "SF Mono", Menlo, monospace; color: var(--purple); }
+  #review .row { display: flex; gap: 22px; align-items: center; font: 500 33px/1.3 system-ui; margin-top: 20px; }
+  #review .row .dot { flex: none; width: 46px; height: 46px; border-radius: 50%; display: grid; place-items: center; font: 800 26px system-ui; }
+  #review .commits { margin-top: 30px; padding-top: 6px; border-top: 1px solid var(--line); }
+  #review .commits .row { color: #cbd5e1; font-size: 31px; }
+  #review .commits .sha { font: 500 27px ui-monospace, "SF Mono", Menlo, monospace; color: var(--muted); width: 140px; }
+  #review .checks { margin-top: 26px; padding-top: 6px; border-top: 1px solid var(--line); }
+
+  /* scene: road */
+  #road h2 { position: absolute; top: 200px; width: 100%; }
+  #road .tile { position: absolute; top: 380px; width: 500px; height: 380px; padding: 46px; border-radius: 28px; background: var(--card); border: 2px solid var(--line); }
+  #road .tile .icon { width: 96px; height: 96px; border-radius: 24px; display: grid; place-items: center; margin-bottom: 34px; }
+  #road .tile .title { font: 700 44px/1.15 system-ui; }
+  #road .tile .desc { font: 450 32px/1.35 system-ui; color: var(--muted); margin-top: 14px; }
+  #road .t1 { left: 140px; } #road .t2 { left: 710px; } #road .t3 { left: 1280px; }
+  #road .t3 { border-color: rgba(248, 113, 113, .6); box-shadow: 0 0 70px rgba(248, 113, 113, .18); }
+  #road .fine { position: absolute; top: 800px; width: 100%; font: 450 28px system-ui; color: var(--muted); }
+
+  /* scene: payoff */
+  #payoff .q { position: absolute; top: 250px; width: 100%; font: 750 92px system-ui; letter-spacing: -.025em; color: #cbd5e1; }
+  #payoff .a { position: absolute; top: 400px; width: 100%; font: 800 112px/1.05 system-ui; letter-spacing: -.03em;
+    background: linear-gradient(90deg, var(--amber), var(--orange) 35%, var(--purple) 70%, var(--blue)); -webkit-background-clip: text; color: transparent; }
+  #payoff svg { position: absolute; left: 260px; top: 610px; }
+
+  .play { position: absolute; left: 50%; top: 880px; width: 170px; height: 170px; margin: -85px 0 0 -85px; border-radius: 50%;
+    background: rgba(2, 6, 23, .55); border: 4px solid rgba(248, 250, 252, .85); display: none; place-items: center;
+    box-shadow: 0 0 120px rgba(167, 139, 250, .45); }
+  .play svg { margin-left: 14px; }
+
+  /* scene: end */
+  #end .mark { position: absolute; top: 300px; width: 100%; font: 800 120px system-ui; letter-spacing: -.035em; }
+  #end .mark i { display: inline-block; width: 40px; height: 40px; border-radius: 50%; background: var(--purple); margin-right: 34px; vertical-align: 14px; box-shadow: 0 0 50px var(--purple); }
+  #end .tag { position: absolute; top: 470px; width: 100%; font: 500 46px system-ui; color: #cbd5e1; }
+  #end .url { position: absolute; top: 600px; left: 50%; transform: translateX(-50%); padding: 20px 40px; border-radius: 999px;
+    border: 2px solid rgba(167, 139, 250, .6); font: 600 38px ui-monospace, "SF Mono", Menlo, monospace; color: var(--ink); white-space: nowrap; }
+  #end .notice { position: absolute; top: 790px; width: 100%; font: 450 30px/1.5 system-ui; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<div class="brand" id="brand"><i></i>cc-voice-gateway</div>
+
+<section id="traffic">
+  <div class="text">
+    <h1 data-b="0">Hours every week,<br>stuck in traffic.</h1>
+    <p class="sub" data-b="1">Your ideas keep coming.<br>Your computer is back at home.</p>
+  </div>
+  <svg id="road" width="860" height="700" viewBox="0 0 860 700"></svg>
+</section>
+
+<section id="gap">
+  <h2 class="center" data-b="1">Two great tools. No way between them.</h2>
+  <div class="card orange left" data-b="0">
+    <div class="icon"><svg width="50" height="44" viewBox="0 0 50 44"><g fill="#fb923c"><rect x="0" y="16" width="6" height="12" rx="3"/><rect x="11" y="8" width="6" height="28" rx="3"/><rect x="22" y="0" width="6" height="44" rx="3"/><rect x="33" y="10" width="6" height="24" rx="3"/><rect x="44" y="17" width="6" height="10" rx="3"/></g></svg></div>
+    <div class="title">Claude voice mode</div>
+    <div class="desc">In the Claude app,<br>on your phone or in your car</div>
+  </div>
+  <svg class="broken" data-b="1" width="340" height="80" viewBox="0 0 340 80">
+    <line x1="0" y1="40" x2="125" y2="40" stroke="#475569" stroke-width="5" stroke-dasharray="14 12" stroke-linecap="round"/>
+    <line x1="215" y1="40" x2="340" y2="40" stroke="#475569" stroke-width="5" stroke-dasharray="14 12" stroke-linecap="round"/>
+    <circle cx="170" cy="40" r="34" fill="rgba(248,113,113,.14)" stroke="#f87171" stroke-width="3"/>
+    <path d="M156 26 L184 54 M184 26 L156 54" stroke="#f87171" stroke-width="6" stroke-linecap="round"/>
+  </svg>
+  <div class="card blue right" data-b="1">
+    <div class="icon"><svg width="54" height="40" viewBox="0 0 54 40"><path d="M4 6 L18 20 L4 34" fill="none" stroke="#60a5fa" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/><rect x="24" y="30" width="28" height="6" rx="3" fill="#60a5fa"/></svg></div>
+    <div class="title">Claude Code</div>
+    <div class="desc">On your computer,<br>in your repositories</div>
+  </div>
+</section>
+
+<section id="bridge">
+  <h2 class="center" data-b="0">One bridge: cc-voice-gateway</h2>
+  <div class="card orange left" data-b="1">
+    <div class="icon"><svg width="50" height="44" viewBox="0 0 50 44"><g fill="#fb923c"><rect x="0" y="16" width="6" height="12" rx="3"/><rect x="11" y="8" width="6" height="28" rx="3"/><rect x="22" y="0" width="6" height="44" rx="3"/><rect x="33" y="10" width="6" height="24" rx="3"/><rect x="44" y="17" width="6" height="10" rx="3"/></g></svg></div>
+    <div class="title">You talk</div>
+    <div class="desc">Claude voice mode,<br>in the car or on the phone</div>
+  </div>
+  <div class="link l1" data-b="1"></div>
+  <div class="card purple mid" data-b="0">
+    <div class="icon"><svg width="52" height="52" viewBox="0 0 52 52"><circle cx="10" cy="26" r="7" fill="#a78bfa"/><circle cx="42" cy="26" r="7" fill="#a78bfa"/><path d="M17 26 H35" stroke="#a78bfa" stroke-width="5" stroke-linecap="round"/><path d="M26 6 V18 M26 34 V46" stroke="#a78bfa" stroke-width="5" stroke-linecap="round" opacity=".5"/></svg></div>
+    <div class="title">cc-voice-gateway</div>
+    <div class="desc">On your computer.<br>Relays, keeps state, guards</div>
+  </div>
+  <div class="link l2" data-b="2"></div>
+  <div class="card blue right" data-b="2">
+    <div class="icon"><svg width="54" height="40" viewBox="0 0 54 40"><path d="M4 6 L18 20 L4 34" fill="none" stroke="#60a5fa" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/><rect x="24" y="30" width="28" height="6" rx="3" fill="#60a5fa"/></svg></div>
+    <div class="title">Claude Code works</div>
+    <div class="desc">In your repositories,<br>on your own computer</div>
+  </div>
+</section>
+
+<section id="dialog">
+  <div class="talk">
+    <div class="bubble you" data-b="0"><div class="who">You</div><div class="says">Why did the build fail on main?</div></div>
+    <div class="bubble claude" data-b="1"><div class="who">Claude</div><div class="says">A date test assumes UTC.<br>Shall I fix it?</div></div>
+    <div class="bubble you" data-b="1"><div class="who">You</div><div class="says">Yes. Fix it and run the tests.</div></div>
+    <div class="bubble claude" data-b="3"><div class="who">Claude</div><div class="says">Pull request 12 is open.<br>All 128 tests pass.</div></div>
+  </div>
+  <div class="worker" data-b="2">
+    <div class="head">Worker · Claude Code in your repository</div>
+    <div>git switch -c <span class="hl">voice/fix-date-test</span></div>
+    <div>edit test/dates.test.mjs</div>
+    <div>npm test <span class="ok">✓ 128 passed</span></div>
+    <div>git commit <span class="hl">"Fix the date test"</span></div>
+    <div>pull request <span class="hl">#12</span> opened <span class="ok">✓</span></div>
+  </div>
+</section>
+
+<section id="review">
+  <h2 class="center" data-b="0">Reviewed, not rushed.</h2>
+  <div class="pr" data-b="0">
+    <div class="t">Fix the date test for time zones <span>#12</span></div>
+    <div class="branch">voice/fix-date-test → main</div>
+    <div class="commits" data-b="1">
+      <div class="row"><span class="sha">3f2a9c1</span>Make the date test independent of the time zone</div>
+      <div class="row"><span class="sha">8b41e07</span>Run the tests in UTC and in Europe/Zurich</div>
+    </div>
+    <div class="checks" data-b="2">
+      <div class="row"><span class="dot" style="background:rgba(74,222,128,.16);color:#4ade80">✓</span>All checks passed</div>
+      <div class="row"><span class="dot" style="background:rgba(167,139,250,.18);color:#a78bfa">✓</span>Reviewed by Claude: no issues found</div>
+      <div class="row"><span class="dot" style="background:rgba(251,191,36,.16);color:#fbbf24">?</span>Merge waits for your spoken yes</div>
+    </div>
+  </div>
+</section>
+
+<section id="road">
+  <h2 class="center">Built for the road.</h2>
+  <div class="tile t1" data-b="0">
+    <div class="icon" style="background:rgba(251,146,60,.14)"><svg width="56" height="48" viewBox="0 0 56 48"><g fill="#fb923c"><rect x="0" y="18" width="7" height="12" rx="3.5"/><rect x="12" y="9" width="7" height="30" rx="3.5"/><rect x="24" y="0" width="7" height="48" rx="3.5"/><rect x="36" y="11" width="7" height="26" rx="3.5"/><rect x="48" y="18" width="7" height="12" rx="3.5"/></g></svg></div>
+    <div class="title">Voice only</div>
+    <div class="desc">Short answers.<br>Nothing to read.</div>
+  </div>
+  <div class="tile t2" data-b="1">
+    <div class="icon" style="background:rgba(74,222,128,.14)"><svg width="52" height="40" viewBox="0 0 52 40"><path d="M4 21 L18 34 L48 5" fill="none" stroke="#4ade80" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+    <div class="title">Approvals by voice</div>
+    <div class="desc">Claude Code asks.<br>You say yes or no.</div>
+  </div>
+  <div class="tile t3" data-b="2">
+    <div class="icon" style="background:rgba(248,113,113,.16)"><svg width="46" height="54" viewBox="0 0 46 54"><path d="M11 24 V15 a12 12 0 0 1 24 0 V24" fill="none" stroke="#f87171" stroke-width="6"/><rect x="3" y="24" width="40" height="28" rx="7" fill="#f87171"/></svg></div>
+    <div class="title">Emergency stop</div>
+    <div class="desc">One phrase locks<br>everything at once.</div>
+  </div>
+  <div class="fine center">Keep your eyes on the road. Use it only where it is safe and legal.</div>
+</section>
+
+<section id="payoff">
+  <div class="q center" data-b="0">Stuck in traffic?</div>
+  <div class="a center" data-b="1">Turn your commute into commits.</div>
+  <svg data-b="1" width="1400" height="160" viewBox="0 0 1400 160">
+    <defs><linearGradient id="g" gradientUnits="userSpaceOnUse" x1="20" y1="0" x2="1380" y2="0"><stop offset="0" stop-color="#fbbf24"/><stop offset=".45" stop-color="#fb923c"/><stop offset=".75" stop-color="#a78bfa"/><stop offset="1" stop-color="#60a5fa"/></linearGradient></defs>
+    <path d="M20 110 H1380" stroke="url(#g)" stroke-width="8" stroke-linecap="round"/>
+    <path d="M520 110 C 600 110, 600 40, 680 40 H 940 C 1020 40, 1020 110, 1100 110" fill="none" stroke="#a78bfa" stroke-width="6" stroke-linecap="round"/>
+    <g fill="#0a0f1f" stroke-width="6">
+      <circle cx="200" cy="110" r="17" stroke="#fbbf24"/><circle cx="380" cy="110" r="17" stroke="#fb923c"/>
+      <circle cx="740" cy="40" r="17" stroke="#a78bfa"/><circle cx="880" cy="40" r="17" stroke="#a78bfa"/>
+      <circle cx="1100" cy="110" r="22" stroke="#60a5fa"/><circle cx="1260" cy="110" r="17" stroke="#60a5fa"/>
+    </g>
+  </svg>
+</section>
+
+<section id="end">
+  <div class="mark center"><i></i>cc-voice-gateway</div>
+  <div class="tag center">Talk to Claude. Claude Code does the work.</div>
+  <div class="url">github.com/alderg/cc-voice-gateway</div>
+  <div class="notice center">A prototype, provided as-is. No support, no announcements.<br>Not an Anthropic product.</div>
+</section>
+
+<div class="play" id="play"><svg width="60" height="70" viewBox="0 0 72 84"><path d="M4 6 L68 42 L4 78 Z" fill="#f8fafc" stroke="#f8fafc" stroke-width="6" stroke-linejoin="round"/></svg></div>
+<div class="caption" id="caption"></div>
+<div class="progress" id="progress"></div>
+
+<script>
+  // Traffic: rows of cars in three lanes, smaller towards the horizon.
+  const road = document.getElementById('road')
+  const ns = 'http://www.w3.org/2000/svg'
+  const add = (name, attrs) => {
+    const el = document.createElementNS(ns, name)
+    for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v)
+    road.appendChild(el)
+    return el
+  }
+  const W = 860, H = 700, horizon = 120, vx = 430
+  add('polygon', { points: `${vx - 30},${horizon} ${vx + 30},${horizon} ${W},${H} 0,${H}`, fill: '#111a33' })
+  for (const f of [-1 / 3, 1 / 3]) {
+    for (let i = 0; i < 9; i++) {
+      const t0 = i / 9 + 0.02, t1 = t0 + 0.05
+      const y = t => horizon + (H - horizon) * t * t
+      const x = t => vx + f * (30 + (W / 2 - 30) * t * t) * 1
+      add('line', { x1: x(t0), y1: y(t0), x2: x(t1), y2: y(t1), stroke: '#334155', 'stroke-width': 2 + 6 * t1, 'stroke-linecap': 'round' })
+    }
+  }
+  const rows = [0.18, 0.3, 0.44, 0.6, 0.78, 0.98]
+  for (const r of rows) {
+    const y = horizon + (H - horizon) * r * r
+    const half = 30 + (W / 2 - 30) * r * r
+    for (const lane of [-2 / 3, 0, 2 / 3]) {
+      const cx = vx + lane * half
+      const w = 26 + 150 * r * r, h = w * 0.55
+      add('rect', { x: cx - w / 2, y: y - h, width: w, height: h, rx: w * 0.14, fill: '#1e293b', stroke: '#2b3a55', 'stroke-width': 1 })
+      for (const side of [-1, 1]) {
+        const lx = cx + side * w * 0.34, ly = y - h * 0.38, lr = Math.max(2, w * 0.06)
+        add('circle', { cx: lx, cy: ly, r: lr * 2.6, fill: 'rgba(239,68,68,.18)' })
+        add('circle', { cx: lx, cy: ly, r: lr, fill: '#ef4444' })
+      }
+    }
+  }
+
+  // Which scene, how far built, the caption and the progress.
+  const params = new URLSearchParams(location.hash.slice(1))
+  const scene = params.get('s') || 'traffic'
+  const step = Number(params.get('b') || 0)
+  for (const section of document.querySelectorAll('section')) section.classList.toggle('on', section.id === scene)
+  for (const el of document.querySelectorAll(`#${scene} [data-b]`)) {
+    el.classList.toggle('hidden', Number(el.dataset.b) > step)
+  }
+  const caption = params.get('c') || ''
+  const box = document.getElementById('caption')
+  box.textContent = caption
+  box.style.display = caption ? '' : 'none'
+  document.getElementById('progress').style.width = `${Number(params.get('p') || 0) * 100}%`
+  document.getElementById('brand').style.display = scene === 'end' ? 'none' : ''
+  document.getElementById('play').style.display = params.get('play') ? 'grid' : 'none'
+</script>
+</body>
+</html>
