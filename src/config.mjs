@@ -60,6 +60,11 @@ export const config = {
   // Worker state and the output of every run.
   stateDir: process.env.VOICE_GW_STATE_DIR || join(ROOT, '.state'),
 
+  // Pull requests that workers open (pulls.mjs): how often the gateway looks
+  // at their checks and reviews, in seconds, and for how many hours at most.
+  prPollSeconds: num(process.env.VOICE_GW_PR_POLL, 60),
+  prWatchHours: num(process.env.VOICE_GW_PR_WATCH_HOURS, 24),
+
   // Telegram fallback, on when both of its files in the secrets folder are set:
   // after this many seconds without a voice tool call, the voice mode counts
   // as ended, and results, questions and approvals also go to Telegram.
@@ -93,17 +98,13 @@ export const config = {
   killCheckSeconds: num(process.env.VOICE_GW_KILL_CHECK, 30),
   // How long one poll of the Telegram bot for commands waits, in seconds.
   telegramPollSeconds: num(process.env.VOICE_GW_TELEGRAM_POLL, 25),
-
-  // Pull requests that workers open (pulls.mjs): how often the gateway looks
-  // at their checks and reviews, in seconds, and for how many hours at most.
-  prPollSeconds: num(process.env.VOICE_GW_PR_POLL, 60),
-  prWatchHours: num(process.env.VOICE_GW_PR_WATCH_HOURS, 24),
 }
 
 config.oauthStateFile = join(config.secretsDir, 'oauth.json')
 // Voice requests, so that they survive a restart of the controller session.
 config.requestsFile = join(config.stateDir, 'requests.json')
 config.adminSocket = join(config.secretsDir, 'admin.sock')
+config.pullsStateFile = join(config.stateDir, 'pulls.json')
 config.telegramTokenFile = join(config.secretsDir, 'telegram_token')
 config.telegramChatIdFile = join(config.secretsDir, 'telegram_chat_id')
 // The kill switch's state: outside controller/, and not in .secrets/worker.
@@ -111,4 +112,3 @@ config.killSwitchFile = join(config.secretsDir, 'killswitch.json')
 // The worker container's secrets, mounted read-only into it.
 config.workerSecretsDir = join(config.secretsDir, 'worker')
 config.githubTokenFile = join(config.workerSecretsDir, 'github_token')
-config.pullsStateFile = join(config.stateDir, 'pulls.json')

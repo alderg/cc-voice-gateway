@@ -40,8 +40,8 @@ in the app, runs the conversation with you.
 | Controller | `dispatch` | Hand a task to a repository's worker, returns at once |
 | Controller | `worker_status` | What a worker is doing or did last |
 | Controller | `stop_worker` | Stop a worker's run |
-| Controller | `raise_alarm` | Lock the kill switch when something looks wrong |
 | Controller | `restart_controller` | [Restart its own session](#restarting-the-controller-by-voice) through the watchdog, after your yes |
+| Controller | `raise_alarm` | Lock the kill switch when something looks wrong |
 
 ![Request flow](docs/request-flow.drawio.svg)
 
@@ -239,11 +239,11 @@ Name the repository as its folder is called; the controller matches loosely ("dr
 | "Fix the review comments on pull request 12." | Only on your word: the worker fixes them, runs the tests, pushes to the same branch, replies on each thread, and says what is left open |
 | "What is the cc-voice-gateway worker doing?" | `worker_status`, summarised in one or two sentences |
 | "Anything new from Claude Code?" | Results of workers that have finished since you last asked |
+| "Notstopp!" | The [kill switch](#kill-switch): the gateway locks before anything reaches the controller, every worker stops. Unlocking only at the computer |
+| "Controller neu starten." | The controller says what a restart would do, running workers included, and asks; after your yes it [restarts through the watchdog](#restarting-the-controller-by-voice), and Telegram tells you when it is ready again |
 | "Is anyone reviewing pull request 1 in cc-voice-gateway?" | The controller answers itself with `gh pr view` and `gh pr checks`, without a worker |
 | "Did the last CI run on main pass?" | `gh run list` and, for a failure, `gh run view --log-failed`; why it fails in the code is a task for the worker |
 | "Merge pull request 3 in cc-voice-gateway." | The controller asks back with the title and the merge method. After your yes it runs `gh pr merge`, which raises an approval: you confirm a second time, then hear the result |
-| "Notstopp!" | The [kill switch](#kill-switch): the gateway locks before anything reaches the controller, every worker stops. Unlocking only at the computer |
-| "Controller neu starten." | The controller says what a restart would do, running workers included, and asks; after your yes it [restarts through the watchdog](#restarting-the-controller-by-voice), and Telegram tells you when it is ready again |
 | "Tell it to add a test for that too." | Follow-up in the same worker session, on the same branch |
 | "Yes, publish it." | Answer to a worker's question, for example before pushing a public repository |
 | "Stop the drawio-mcp worker." | `stop_worker` |
@@ -1002,6 +1002,9 @@ The [watchdog](#keeping-the-controller-running) reads its settings from the envi
 | A worker fails at once | `could not start claude`: Claude Code is not on the gateway's `PATH`; set `VOICE_GW_CLAUDE_BIN`. Otherwise read `.state/tasks/<task>.err`. |
 | What did a worker do? | `.state/tasks/<task>.jsonl` holds the whole run. `claude --resume <session>` in the repository opens the session; `.state/workers.json` lists the session ids. |
 | A private repository is handled like a public one | `gh` is not logged in or not on the `PATH`, so the visibility is unknown, and the worker asks before pushing to be safe. |
+| No news about checks or reviews on a worker's pull request | The log says why: `gh is not logged in`, or `stopped watching pull request … : nothing automatic runs` (often a draft that bot reviewers skip), `merged`, `closed` or `time limit`. Only pull requests on `voice/` branches that a run linked to are watched. `.state/pulls.json` lists the watches. |
+| The controller cannot merge a pull request | A draft must be marked ready first (a task for the worker). Required reviews or checks, conflicts and other branch protection apply; `--admin` is blocked on purpose. With `VOICE_GW_PERMISSION_RELAY=0` the approval only appears at the terminal. |
+| The controller says a `gh` command was blocked | Only the read-only commands under [Security](#security) pass, each with `--repo owner/name` and flags as separate words. If it does not know about `gh` at all, restart the controller so that it reads the current `controller/CLAUDE.md`. |
 | No Telegram message | Messages go out only after `VOICE_GW_TELEGRAM_AFTER` seconds without a voice call, and only for what the voice assistant has not picked up. `telegram fallback off` in the log: a file was missing or empty when the gateway started; fix it and restart the controller. `telegram send failed: 400 Bad Request: chat not found`: wrong chat ID, or you never wrote to the bot. `401 Unauthorized`: wrong token. |
 | `The worker container voice-workers does not answer` | The container is stopped or was removed: `docker start voice-workers`, or start it as in [Workers in Docker](#workers-in-docker). |
 | `access read-only (no GitHub token)` although there is one | It must be `.secrets/worker/github_token`, readable for the gateway. A new token counts at the next check, within ten minutes. |
@@ -1013,9 +1016,6 @@ The [watchdog](#keeping-the-controller-running) reads its settings from the envi
 | `dispatch=locked`, `[state=locked]` or an `[ALARM]` line | The kill switch is locked; the alarm names the trigger. `node scripts/unlock.mjs --status` shows it, `node scripts/unlock.mjs` at the server unlocks it. |
 | The kill switch locked for no good reason | Read the reason. A rule that misfires: raise its `VOICE_GW_KILL_*` threshold, or add a folder to `VOICE_GW_KILL_ALLOW_PATHS`. |
 | `/stop` on Telegram does nothing | Only your configured private chat counts, and the gateway must poll the bot: the log says `telegram commands: …` if a webhook or another program takes the updates. |
-| No news about checks or reviews on a worker's pull request | The log says why: `gh is not logged in`, or `stopped watching pull request … : nothing automatic runs` (often a draft that bot reviewers skip), `merged`, `closed` or `time limit`. Only pull requests on `voice/` branches that a run linked to are watched. `.state/pulls.json` lists the watches. |
-| The controller cannot merge a pull request | A draft must be marked ready first (a task for the worker). Required reviews or checks, conflicts and other branch protection apply; `--admin` is blocked on purpose. With `VOICE_GW_PERMISSION_RELAY=0` the approval only appears at the terminal. |
-| The controller says a `gh` command was blocked | Only the read-only commands under [Security](#security) pass, each with `--repo owner/name` and flags as separate words. If it does not know about `gh` at all, restart the controller so that it reads the current `controller/CLAUDE.md`. |
 | No approval by voice | Expected for Bash, Write and Edit: they run without asking. For other tools: the session runs in auto or bypass mode, an allow rule covers the tool, or it is a trust or consent dialog, which is not relayed. Start the session with `scripts/start-controller.sh`. |
 | The controller still starts with the development flag after the admin step | The log line `channel: the development flag, since …` says why. `node scripts/channel-mode.mjs` checks again; Claude Code fetches the organisation's settings at its start, so start any `claude` once (or wait an hour). `claude doctor` shows whether the managed settings arrived. |
 | "Controller neu starten" and the controller says it cannot restart itself | It was not started by `scripts/start-controller.sh` with the watchdog. Restart it at the computer. |
@@ -1034,27 +1034,27 @@ src/
   voice.mjs          HTTP side: MCP tools for the voice assistant
   oauth.mjs          sign-in: OAuth metadata, registration, sign-in page, tokens
   workers.mjs        workers: find repositories, start and follow claude -p runs
+  plugin.mjs         the gateway as the MCP server of the plugin voice@cc-voice-gateway
+  restart.mjs        restarting the controller by voice, through the watchdog
+  pulls.mjs          watch the pull requests workers open: checks and reviews as news
   telegram.mjs       Telegram fallback once the voice mode has ended, and /stop from your chat
   killswitch.mjs     the kill switch: state, emergency phrases, the alarm
   guard.mjs          the kill switch's rules on the workers' runs
   runners.mjs        where workers run: this computer, or the Docker container
   access.mjs         access levels in the container, from the GitHub token
-  pulls.mjs          watch the pull requests workers open: checks and reviews as news
-  plugin.mjs         the gateway as the MCP server of the plugin voice@cc-voice-gateway
-  restart.mjs        restarting the controller by voice, through the watchdog
   admin.mjs          Unix socket for pair.mjs and fake-voice
   store.mjs          requests, approvals, waiting for changes
   http.mjs           small HTTP helpers
   config.mjs         environment variables
   log.mjs            log to stderr and file, never to stdout
+.claude-plugin/
+  marketplace.json   this repository as the marketplace cc-voice-gateway
+  plugin.json        the plugin voice: the gateway as an MCP server, and its channel
 docker/
   Dockerfile         the worker container: Claude Code, git and gh, as your user id
   voice-run          starts a run with its tokens, in its own process group
   voice-stop         ends a run with everything it started
   git-credential-voice   the GitHub token for git
-.claude-plugin/
-  marketplace.json   this repository as the marketplace cc-voice-gateway
-  plugin.json        the plugin voice: the gateway as an MCP server, and its channel
 controller/
   .mcp.json          starts the gateway as server "voice"; its env block holds the gateway's settings
   .claude/settings.json   allow and deny rules, confine hook
@@ -1076,10 +1076,10 @@ test/
   e2e.test.mjs       both sides end to end, without Claude Code
   oauth.test.mjs     the sign-in as Claude's connector goes through it
   workers.test.mjs   workers with a stand-in for claude and gh
+  pulls.test.mjs     watching pull requests, with a stand-in for gh
   telegram.test.mjs  Telegram fallback with a stand-in Bot API
   killswitch.test.mjs   the kill switch: every trigger, its effects, restart and unlocking
   docker.test.mjs    workers in the container, access levels and the bundle helper, with stand-ins for docker and GitHub
-  pulls.test.mjs     watching pull requests, with a stand-in for gh
   controller.test.mjs   launcher flags, controller settings, confine hook
   watchdog.test.mjs  the watchdog, with stand-ins for claude and Telegram
   restart.test.mjs   the channel as a plugin, restarting by voice, requests across restarts
