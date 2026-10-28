@@ -107,7 +107,7 @@ export class Telegram {
 
 // The one command the gateway takes from Telegram: the kill switch.
 export const isStopCommand = text =>
-  /^\/(stop|notstopp|killswitch|emergencystop)(@\w+)?$/i.test(String(text).trim()) || emergencyPhrase(text)
+  /^\/(stop|killswitch|emergencystop)(@\w+)?$/i.test(String(text).trim()) || emergencyPhrase(text)
 
 // Waits `ms`, or less if the signal aborts. The timer's abort listener goes
 // away with it, so a long run of backoffs leaves none behind.

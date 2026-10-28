@@ -4,7 +4,7 @@
 // from then on, and an alarm goes to Telegram at once and to every voice chat
 // at its next call (see gateway.mjs for the effects).
 //
-// Triggers: an emergency phrase by voice ("Notstopp") or the emergency_stop
+// Triggers: an emergency phrase by voice ("emergency stop") or the emergency_stop
 // voice tool, /stop from the configured Telegram chat, the fixed rules on the
 // workers' runs (guard.mjs), and the controller's raise_alarm tool.
 //
@@ -31,20 +31,14 @@ const normalize = text =>
     .replace(/[^a-z0-9]+/g, ' ')
     .trim()
 
-// "Stopp" with a double p is German, so "do not stop" never matches.
-const PHRASES = [
-  /\bnot ?stopp\b/,
-  /\bnotstop\b/,
-  /\bnot ?fall ?stopp?\b/,
-  /\bnothalt\b/,
-  /\bnot ?aus\b/,
-  /\bemergency ?stop\b/,
-  /\bkill ?switch\b/,
-]
+// English only. In another language Claude's voice mode calls the
+// emergency_stop tool instead, as its instructions say.
+const PHRASES = [/\bemergency ?stop\b/, /\bkill ?switch\b/]
 
 // An emergency stop when the message opens with one of the phrases, or is
 // short (at most six words) and contains one. A longer sentence that merely
-// mentions it ("what does the Notstopp do?") does not count.
+// mentions it ("what does the emergency stop in this project do?") does not
+// count.
 export function emergencyPhrase(text) {
   const words = normalize(text)
   if (!words) return false

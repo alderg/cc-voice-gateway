@@ -135,28 +135,25 @@ after(() => {
 
 // --- the emergency phrase ---------------------------------------------------------
 
-test('the emergency phrase: Notstopp and its variants; a mere mention or "do not stop" is none', () => {
+test('the emergency phrase: "emergency stop" and "kill switch"; a mere mention, "do not stop" or another language is none', () => {
   for (const phrase of [
-    'Notstopp',
-    'Notstopp!',
-    'Not-Stopp',
-    'NOTSTOPP sofort',
-    'Notstopp, alles anhalten bitte',
-    'Notfallstopp',
-    'Nothalt',
-    'Not-Aus',
     'Emergency stop',
+    'Emergency stop!',
+    'EMERGENCY STOP now',
+    'Emergency stop, halt everything please',
     'emergency-stop now',
+    'Emergencystop',
     'Kill switch!',
     'Killswitch',
-    'Bitte Notstopp',
+    'Please emergency stop',
   ]) {
     assert.equal(emergencyPhrase(phrase), true, phrase)
   }
   for (const phrase of [
     'do not stop the build',
     "Please don't stop the worker",
-    'What does the Notstopp in this project do exactly?',
+    'What does the emergency stop in this project do exactly?',
+    'Notstopp',
     'stop the worker',
     'the build is not halting',
     '',
@@ -164,7 +161,8 @@ test('the emergency phrase: Notstopp and its variants; a mere mention or "do not
     assert.equal(emergencyPhrase(phrase), false, phrase)
   }
   assert.equal(isStopCommand('/stop'), true)
-  assert.equal(isStopCommand('/notstopp@my_bot'), true)
+  assert.equal(isStopCommand('/emergencystop@my_bot'), true)
+  assert.equal(isStopCommand('/notstopp'), false)
   assert.equal(isStopCommand('stop the music'), false)
 })
 
@@ -177,7 +175,7 @@ test('the state: locked, saved for this user only, survives a new instance, fail
   assert.equal(first.locked, false)
   const events = []
   first.on('tripped', (state, event, isFirst) => events.push([event.trigger, isFirst]))
-  first.trip({ trigger: 'voice', reason: 'Notstopp' })
+  first.trip({ trigger: 'voice', reason: 'emergency stop' })
   first.trip({ trigger: 'rule', reason: 'push to the default branch' })
   assert.deepEqual(events, [['voice', true], ['rule', false]])
   assert.equal(statSync(file).mode & 0o777, 0o600)
@@ -438,7 +436,7 @@ test('a dispatch still checking the repository when the switch trips starts noth
   try {
     const pending = workers.dispatch({ worker: 'alpha', task: 'Fix it.', words: 'Fix it.' })
     await waitUntil(() => asked === 3) // branch, status and origin: inspect waits
-    killswitch.trip({ trigger: 'voice', reason: 'Notstopp' })
+    killswitch.trip({ trigger: 'voice', reason: 'emergency stop' })
     release()
     const result = await pending
     assert.equal(result.status, 'locked')
@@ -475,9 +473,9 @@ test('Telegram: /stop only from the configured private chat, and only if recent'
     telegramUpdate(mine, 'hello')
     await sleep(600)
     assert.deepEqual(stops, [])
-    telegramUpdate(mine, 'Notstopp')
+    telegramUpdate(mine, 'Emergency stop')
     await waitUntil(() => stops.length === 1)
-    assert.deepEqual(stops, ['Notstopp'])
+    assert.deepEqual(stops, ['Emergency stop'])
     assert.ok(logged.some(line => /ignored a message from another chat/.test(line)))
     assert.ok(!logged.join('\n').includes(TOKEN))
   } finally {
@@ -602,7 +600,7 @@ after(async () => {
   await gw?.close()
 })
 
-test('voice: "Notstopp" locks before anything reaches the controller; every voice chat hears the alarm once', async () => {
+test('voice: "emergency stop" locks before anything reaches the controller; every voice chat hears the alarm once', async () => {
   // An approval that is open when the switch trips gets denied.
   await gw.claudeCode.notification({
     method: 'notifications/claude/channel/permission_request',
@@ -611,9 +609,9 @@ test('voice: "Notstopp" locks before anything reaches the controller; every voic
   await sleep(100)
   const sentBefore = telegram.sent.length
 
-  const out = await gw.voice.car('send', { message: 'Notstopp!' })
-  assert.match(out, /^\[state=locked\] Emergency stop\. Kill switch locked since .* UTC, by voice: "Notstopp!" by voice\. The gateway takes no new tasks/)
-  assert.ok(!gw.events.some(e => e.content.includes('Notstopp!') && e.meta?.kind !== 'killswitch'), 'the phrase never reached the controller as a request')
+  const out = await gw.voice.car('send', { message: 'Emergency stop!' })
+  assert.match(out, /^\[state=locked\] Emergency stop\. Kill switch locked since .* UTC, by voice: "Emergency stop!" by voice\. The gateway takes no new tasks/)
+  assert.ok(!gw.events.some(e => e.content.includes('Emergency stop!') && e.meta?.kind !== 'killswitch'), 'the phrase never reached the controller as a request')
   const alarm = await waitUntil(() => gw.events.find(e => e.meta?.kind === 'killswitch'))
   assert.equal(alarm.meta.trigger, 'voice')
   await waitUntil(() => gw.verdicts.find(v => v.request_id === 'abcde'))
@@ -622,7 +620,7 @@ test('voice: "Notstopp" locks before anything reaches the controller; every voic
   await waitUntil(() => telegram.sent.length > sentBefore)
   const message = telegram.sent.at(-1)
   assert.equal(message.chat_id, CHAT)
-  assert.match(message.text, /KILL SWITCH at .* UTC, by voice: "Notstopp!" by voice\. No new tasks, workers stopped/)
+  assert.match(message.text, /KILL SWITCH at .* UTC, by voice: "Emergency stop!" by voice\. No new tasks, workers stopped/)
   assert.equal(statSync(LOCK).mode & 0o777, 0o600)
 
   assert.match(await gw.voice.car('status'), /^\[gateway=ok .* locked=yes\]\n(?!\[ALARM\])/, 'the car heard it already')
@@ -664,7 +662,7 @@ test('the lock survives a restart, and only the local script unlocks it', async 
   })
   const status = await run(['--status'])
   assert.equal(status.status, 0)
-  assert.match(status.out, /^The kill switch is locked since .*, by voice: "Notstopp!" by voice\n/)
+  assert.match(status.out, /^The kill switch is locked since .*, by voice: "Emergency stop!" by voice\n/)
   const noTerminal = await run([])
   assert.equal(noTerminal.status, 2, 'without a terminal it needs --yes')
   assert.equal((await killswitchState()).locked, true)

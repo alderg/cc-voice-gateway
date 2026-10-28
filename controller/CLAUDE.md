@@ -217,7 +217,7 @@ driver in one sentence that it has to be done at the computer.
 
 ## Kill switch
 
-The gateway has a kill switch in its own code. The driver locks it with "Notstopp" or on Telegram, and
+The gateway has a kill switch in its own code. The driver locks it with "emergency stop" or on Telegram, and
 fixed rules lock it when a worker pushes to main, writes outside its repository or changes
 unusually much. Once locked, no task starts, every worker stops, and nobody can unlock it from here.
 

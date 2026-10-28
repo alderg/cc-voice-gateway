@@ -600,9 +600,9 @@ folder, `.git` included.
   counts as ended. Results, questions and approval requests then also go to the chat, each once;
   interim `working` updates do not. The kill switch alarm goes at once, whether voice mode is on
   or not, and so does a note when the gateway ends because another process holds its port.
-- **Inbound:** only `/stop`, `/notstopp`, `/killswitch`, `/emergencystop` or an emergency phrase,
-  only from the configured private chat, only if sent in the last two minutes. Everything else is
-  ignored. You cannot answer questions or approvals by Telegram.
+- **Inbound:** only `/stop`, `/killswitch`, `/emergencystop` or an emergency phrase, only from the
+  configured private chat, only if sent in the last two minutes. Everything else is ignored. You
+  cannot answer questions or approvals by Telegram.
 - **Through Telegram's servers.** Bot chats are not end-to-end encrypted, so leave the files out
   if that is not acceptable.
 - **The token** never appears in a log line or error message.
@@ -618,7 +618,7 @@ controller following instructions.
 
 | Trigger | How | Checked |
 |---|---|---|
-| Voice | "Notstopp", "Not-Stopp", "Notfallstopp", "Nothalt", "Not-Aus", "emergency stop", "kill switch"; or the tool `emergency_stop` | In `send` and `ask` before anything reaches the controller: the message starts with the phrase, or has at most six words |
+| Voice | "emergency stop" or "kill switch"; or the tool `emergency_stop`, which the voice AI calls for the same words in any language | In `send` and `ask` before anything reaches the controller: the message starts with the phrase, or has at most six words |
 | Telegram | `/stop` or a phrase | See 5.8 |
 | Rule: default branch | A push to the default branch, or a merge, without a direct dispatch at level `full`, in a repository with pull requests turned on | In the run's commands: `git push` to the default branch, `--all`, `--mirror`, `gh pr merge`, and `gh api` calls that merge (`PUT …/pulls/<n>/merge`, `POST …/merges`, the GraphQL mutations `mergePullRequest`, `enablePullRequestAutoMerge`, `mergeBranch`). With `gh`, every `VOICE_GW_KILL_CHECK` seconds and at the end: the default branch moved on GitHub, and the worker's repository holds the new head, or the new head merged a pull request of the run (below) |
 | Rule: outside | Writes outside the repository, `/tmp`, `/var/tmp` (and the system's temp folder on this computer) and `VOICE_GW_KILL_ALLOW_PATHS` | The file tools by path. Shell commands by explicit targets: redirections, `tee`, `cp`, `mv`, `rm`, `mkdir`, `touch`, `ln`, `chmod`, `chown`, `truncate`, `sed -i`, `dd of=`, also after `cd`; `$HOME` and `~` are expanded |
@@ -737,8 +737,9 @@ is guarded as follows:
   code, but a phrase you said within `VOICE_GW_DISPATCH_WINDOW` can be reused for another task,
   and the controller writes the task itself. Merges still need your approval; its answers to you,
   `restart_controller` and `raise_alarm` are not checked.
-- **The voice AI is an instruction-follower.** If it rewrites "Notstopp" into a longer sentence,
-  the phrase check can miss it; the `emergency_stop` tool is there for that. Approvals depend on
+- **The voice AI is an instruction-follower.** If it rewrites "emergency stop" into a longer
+  sentence, the phrase check can miss it, and the check knows only English; the `emergency_stop`
+  tool is there for that. Approvals depend on
   it asking you.
 - **The endpoint is public.** The pairing code protects the sign-in; nothing limits the request
   rate, and nothing protects the availability.
@@ -1057,7 +1058,7 @@ at most three short sentences, without code, paths or lists.
 | "Fix the review comments on pull request 12." | Only on your word: the worker fixes them, runs the tests, pushes to the same branch, replies on each thread, and says what is left open |
 | "Merge pull request 12 in alpha." | The controller asks back with the title and the method; after your yes, `gh pr merge` raises an approval; you confirm a second time |
 | "Push it straight to main." | Only in Docker at level `full`: `dispatch` with `direct`. Otherwise the controller says why it stays a pull request |
-| "Notstopp!" / "emergency stop" | The kill switch locks before anything reaches the controller ([5.9](#59-the-kill-switch)) |
+| "Emergency stop!" | The kill switch locks before anything reaches the controller ([5.9](#59-the-kill-switch)) |
 | "Restart the controller." | Restart through the watchdog after your yes ([8.3](#83-restarting-the-controller-by-voice)) |
 
 **Your words.** The controller passes your words with every dispatch. If they are not from a voice

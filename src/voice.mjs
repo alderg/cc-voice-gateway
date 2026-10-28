@@ -24,8 +24,8 @@ to about 40 seconds) -> read the answer. Between polls tell the user in a few wo
 running. Relay Claude Code's answers faithfully; you may shorten them but never invent results.
 Approvals: read them out and call approve only after the user explicitly said yes or no to that action.
 News: results of work Claude Code finished in the background arrive with any call. Read them out too.
-Emergency: when the user says "Notstopp", "Not-Aus", "emergency stop" or "kill switch", call emergency_stop at
-once, without asking back. An [ALARM] line in any result is read out first.
+Emergency: when the user says "emergency stop" or "kill switch", or the same in another language, call
+emergency_stop at once, without asking back. An [ALARM] line in any result is read out first.
 `.trim()
 
 const RELAY_RULE =
@@ -238,8 +238,8 @@ function buildVoiceServer(store, channel, settings, { killswitch = null, grant =
       {
         title: 'Emergency stop',
         description:
-          'Emergency stop (kill switch). Call it at once, without asking back, when the user says "Notstopp", ' +
-          '"Not-Aus", "emergency stop" or "kill switch". Locks the gateway: no new tasks, all work on the ' +
+          'Emergency stop (kill switch). Call it at once, without asking back, when the user says "emergency ' +
+          'stop" or "kill switch", or the same in another language. Locks the gateway: no new tasks, all work on the ' +
           "user's computer stops. Only someone at the computer can unlock it.",
         inputSchema: {
           words: z.string().max(400).optional().describe("The user's words, if any."),
