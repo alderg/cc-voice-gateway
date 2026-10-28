@@ -23,6 +23,9 @@ const TMP = realpathSync(mkdtempSync(join(tmpdir(), 'vgw-folders-')))
 const BIN = join(TMP, 'bin')
 const OUTSIDE = join(TMP, 'outside')
 
+// Not into the gateway's real log.
+const quiet = () => {}
+
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 const git = (dir, ...args) =>
   execFileSync('git', ['-C', dir, '-c', 'user.name=Test', '-c', 'user.email=test@example.com', ...args], { encoding: 'utf8' })
@@ -112,7 +115,7 @@ test('parseRepo: owner/name, a plain name, GitHub URLs; nothing else', () => {
 
 test('delete: a plan first, which says what would be lost; then the deletion', async () => {
   const root = makeRoot('plan')
-  const tools = new FolderTools({ root, self: join(root, 'gateway') })
+  const tools = new FolderTools({ root, self: join(root, 'gateway'), log: quiet })
 
   const plan = await tools.plan('alpha')
   assert.equal(plan.status, 'plan')
@@ -143,7 +146,7 @@ test('delete: a plan first, which says what would be lost; then the deletion', a
 
 test('delete: never outside the worker root, never the gateway, a link only as a link', async () => {
   const root = makeRoot('limits')
-  const tools = new FolderTools({ root, self: join(root, 'gateway') })
+  const tools = new FolderTools({ root, self: join(root, 'gateway'), log: quiet })
   for (const path of ['..', '../limits-remote.git', 'plain/../../x', '.', '']) {
     assert.ok(['outside', 'invalid'].includes((await tools.plan(path)).status), path)
   }
@@ -161,7 +164,7 @@ test('delete: never outside the worker root, never the gateway, a link only as a
   assert.ok(existsSync(join(OUTSIDE, 'keep.txt')))
 
   // A root that holds the gateway cannot go as a whole either.
-  const outer = new FolderTools({ root: TMP, self: join(root, 'gateway') })
+  const outer = new FolderTools({ root: TMP, self: join(root, 'gateway'), log: quiet })
   assert.equal((await outer.plan('limits')).status, 'self')
 })
 
@@ -169,7 +172,7 @@ test('delete and clone: not while a worker runs there, not while the kill switch
   const root = makeRoot('busy')
   const workers = { running: () => [{ repo: 'plain', id: 'tq7x' }], starting: new Set(['alpha']) }
   const killswitch = { locked: false, state: null }
-  const tools = new FolderTools({ root, workers, killswitch, self: join(root, 'gateway'), ghBin: join(BIN, 'gh') })
+  const tools = new FolderTools({ root, workers, killswitch, self: join(root, 'gateway'), ghBin: join(BIN, 'gh'), log: quiet })
   assert.deepEqual(await tools.plan('plain/sub'), { status: 'busy', path: 'plain/sub', repo: 'plain', task: 'tq7x' })
   assert.equal((await tools.plan('alpha')).status, 'busy')
   await tools.plan('file.txt')
@@ -183,7 +186,7 @@ test('delete and clone: not while a worker runs there, not while the kill switch
 
 test('clone: gh repo clone in the background, the result as an event; a failure leaves nothing behind', async () => {
   const root = makeRoot('clone')
-  const tools = new FolderTools({ root, self: join(root, 'gateway'), ghBin: join(BIN, 'gh') })
+  const tools = new FolderTools({ root, self: join(root, 'gateway'), ghBin: join(BIN, 'gh'), log: quiet })
   const events = []
   tools.on('cloned', event => events.push(event))
 

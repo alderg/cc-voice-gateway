@@ -22,7 +22,7 @@ import { EventEmitter } from 'node:events'
 import { lstatSync, readdirSync, realpathSync, rmSync } from 'node:fs'
 import { basename, dirname, isAbsolute, join, normalize, relative, sep } from 'node:path'
 import { ROOT } from './config.mjs'
-import { log, preview } from './log.mjs'
+import { log as defaultLog, preview } from './log.mjs'
 
 const CLONE_TIMEOUT_MS = 30 * 60 * 1000
 const PLAN_VALID_MS = 15 * 60 * 1000 // a deletion needs a plan of the same path this recent
@@ -104,8 +104,9 @@ export function size(bytes) {
 }
 
 export class FolderTools extends EventEmitter {
-  constructor({ root, workers = null, killswitch = null, ghBin = 'gh', self = ROOT }) {
+  constructor({ root, workers = null, killswitch = null, ghBin = 'gh', self = ROOT, log = defaultLog }) {
     super()
+    this.log = log
     this.root = root
     this.workers = workers // no deletion in a repository while its worker runs
     this.killswitch = killswitch
@@ -157,7 +158,7 @@ export class FolderTools extends EventEmitter {
       // Whatever a failed clone left behind; the folder did not exist before.
       if (!ok) rmSync(dir, { recursive: true, force: true })
       const branch = ok ? (await git(dir, 'branch', '--show-current'))?.trim() || null : null
-      log(`clone of ${parsed.slug} into ${name}:`, ok ? `done, branch ${branch ?? '?'}` : `failed, ${error}`)
+      this.log(`clone of ${parsed.slug} into ${name}:`, ok ? `done, branch ${branch ?? '?'}` : `failed, ${error}`)
       this.emit('cloned', { slug: parsed.slug, name, ok, branch, error: ok ? null : error })
     }
     child.on('error', error => finish(false, `could not start ${this.ghBin} (${error.code ?? error.message})`))
@@ -165,7 +166,7 @@ export class FolderTools extends EventEmitter {
       const why = stderr.trim().split('\n').filter(Boolean).at(-1) || (signal ? `ended by ${signal}` : `exit code ${code}`)
       finish(code === 0, preview(why, 200))
     })
-    log(`clone of ${parsed.slug} into ${name} started`)
+    this.log(`clone of ${parsed.slug} into ${name} started`)
     return { status: 'started', slug: parsed.slug, name }
   }
 
@@ -263,10 +264,10 @@ export class FolderTools extends EventEmitter {
     try {
       rmSync(found.target, { recursive: true, maxRetries: 2 })
     } catch (error) {
-      log(`delete of ${found.path} failed:`, error.message)
+      this.log(`delete of ${found.path} failed:`, error.message)
       return { status: 'failed', path: found.path, why: error.code ?? error.message }
     }
-    log(`deleted ${found.path} in the repositories folder`)
+    this.log(`deleted ${found.path} in the repositories folder`)
     return { status: 'deleted', path: found.path }
   }
 }
