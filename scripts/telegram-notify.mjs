@@ -10,27 +10,21 @@
 // "telegram: not sent: <reason>" (exit code 1). The token is read here and
 // never reaches the command line, the output or a log.
 
-import { readFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { loadTelegram } from '../src/telegram.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const secrets = process.env.VOICE_GW_SECRETS_DIR || join(ROOT, '.secrets')
-const api = (process.env.VOICE_GW_TELEGRAM_API || 'https://api.telegram.org').replace(/\/+$/, '')
 
-function read(name) {
-  try {
-    return readFileSync(join(secrets, name), 'utf8').trim()
-  } catch {
-    return ''
-  }
-}
-
-const token = read('telegram_token')
-const chatId = read('telegram_chat_id')
+const telegram = loadTelegram({
+  tokenFile: join(secrets, 'telegram_token'),
+  chatIdFile: join(secrets, 'telegram_chat_id'),
+  apiBase: process.env.VOICE_GW_TELEGRAM_API || 'https://api.telegram.org',
+})
 const text = process.argv.slice(2).join(' ').trim()
 
-if (!token || !chatId) {
+if (!telegram) {
   console.log('telegram: not set up')
   process.exit(0)
 }
@@ -40,17 +34,10 @@ if (!text) {
 }
 
 try {
-  const response = await fetch(`${api}/bot${token}/sendMessage`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ chat_id: chatId, text: text.slice(0, 4000) }),
-    signal: AbortSignal.timeout(10000),
-  })
-  const body = await response.json().catch(() => ({}))
-  if (!response.ok || body.ok !== true) throw new Error(`${response.status} ${body.description ?? response.statusText}`)
+  await telegram.send(text)
   console.log('telegram: sent')
 } catch (error) {
-  const reason = error.cause?.message ? `${error.message} (${error.cause.message})` : error.message
-  console.log(`telegram: not sent: ${reason.split(token).join('<token>')}`)
+  // The shared Bot API call leaves the token out of its errors.
+  console.log(`telegram: not sent: ${error.message}`)
   process.exit(1)
 }

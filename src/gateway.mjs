@@ -96,7 +96,7 @@ const pulls = new PullWatcher({
 let http
 let admin
 let shuttingDown = false
-function shutdown(reason) {
+function shutdown(reason, code = process.exitCode ?? 0) {
   if (shuttingDown) return
   shuttingDown = true
   log('shutting down:', reason)
@@ -106,8 +106,9 @@ function shutdown(reason) {
   guard.close()
   telegramCommands?.close()
   pulls.close() // so do the watches on pull requests
+  store.save() // the requests, with what the voice client has read
   // Give pending log writes and HTTP responses a moment, then leave.
-  setTimeout(() => process.exit(0), 200).unref()
+  setTimeout(() => process.exit(code), 200).unref()
 }
 
 // Restarting the controller by voice, through the watchdog (restart.mjs).
@@ -246,8 +247,24 @@ if (config.docker) {
   }, config.killCheckSeconds * 1000).unref()
 }
 
+// Without its port the gateway is of no use, and whatever holds the port, a
+// gateway left over from an earlier session for example, answers the
+// watchdog's /healthz in its place. So the gateway ends with an error, and
+// says so on Telegram too.
+async function portBusy() {
+  process.exitCode = 1 // also if the session goes away while the message is on its way
+  await telegram
+    ?.send(
+      `cc-voice-gateway on ${hostname()}: the voice port ${config.port} is in use by another process, so the ` +
+        'gateway of the controller session ends and voice requests do not reach it. Find the process with ' +
+        `lsof -nP -iTCP:${config.port} -sTCP:LISTEN, end it, then restart the controller.`,
+    )
+    .catch(error => log('port alarm not sent by Telegram:', error.message))
+  shutdown(`voice port ${config.port} in use`, 1)
+}
+
 admin = await startAdmin(auth, config.adminSocket, { killswitch })
-http = startVoiceHttp(store, channel, auth, config, { killswitch })
+http = startVoiceHttp(store, channel, auth, config, { killswitch, onPortBusy: portBusy })
 
 // Once the session is connected: worker results the previous session never
 // answered go to this one, and after a restart by the watchdog the driver

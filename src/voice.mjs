@@ -88,7 +88,7 @@ function report(store, request, settings) {
   for (const update of fresh) lines.push(`Claude Code: ${update.text}`)
   for (const permission of permissions) lines.push(describePermission(permission))
   // After this, further answers to the request count as news.
-  if (request.state === 'done') request.closed = true
+  if (request.state === 'done') store.markClosed(request)
   const news = store.takeNews(request)
   if (news.length) lines.push(...describeNews(news))
 
@@ -210,9 +210,12 @@ function buildVoiceServer(store, channel, settings, { killswitch = null, grant =
     return null
   }
 
-  const enqueue = async (message, inReplyTo) => {
-    const textForController = inReplyTo ? `(Answer to ${inReplyTo}) ${message}` : message
+  // An answer to a question settles the question: it is no longer open, and
+  // a restart does not end it with a note.
+  const enqueue = async (message, question = null) => {
+    const textForController = question ? `(Answer to ${question.id}) ${message}` : message
     const request = store.createRequest(textForController)
+    if (question?.state === 'question') store.markAnswered(question, request.id)
     await channel.push(request)
     return request
   }
@@ -265,14 +268,29 @@ function buildVoiceServer(store, channel, settings, { killswitch = null, grant =
         in_reply_to: z
           .string()
           .optional()
-          .describe('If this answers a question from Claude Code (state=question), the id of that request.'),
+          .describe(
+            'If this answers a question from Claude Code (state=question), the id of that request. The question ' +
+              'then counts as answered; follow the answer with get_reply and the new id.',
+          ),
       },
     },
     withAlarm(async ({ message, in_reply_to }) => {
       const refused = refuse(message)
       if (refused) return refused
-      const request = await enqueue(message, in_reply_to)
-      return text(`[state=sent id=${request.id}] Handed over. Now call get_reply with id=${request.id}.`)
+      const question = in_reply_to ? store.getRequest(in_reply_to) : null
+      if (in_reply_to && !question) {
+        const shown = preview(in_reply_to, 20).replace(/[\s\]]/g, '')
+        return text(
+          `[state=unknown in_reply_to=${shown}] No request has this id, so nothing was handed over. Send the ` +
+            'answer again with the id from the question, or without in_reply_to.',
+          true,
+        )
+      }
+      const request = await enqueue(message, question)
+      return text(
+        `[state=sent id=${request.id}] Handed over${question ? ` as the answer to ${question.id}` : ''}. ` +
+          `Now call get_reply with id=${request.id}.`,
+      )
     }),
   )
 
@@ -305,8 +323,8 @@ function buildVoiceServer(store, channel, settings, { killswitch = null, grant =
         'Wait for news on a request sent with send or ask, then return what Claude Code said since the last call. ' +
         'The first line is machine-readable: [state=... id=...]. state=sent or working: tell the user briefly ' +
         'that it is still running and call get_reply again with the same id. state=question: read the question ' +
-        'and send the answer with send (in_reply_to=id). state=done: read the answer. If an approval is listed, ' +
-        'ask the user before calling approve.',
+        'and send the answer with send (in_reply_to=id), then follow the new id. state=done: read the answer. If ' +
+        'an approval is listed, ask the user before calling approve.',
       inputSchema: {
         id: z.string().min(1).describe('The id returned by send or ask.'),
         wait_seconds: z
@@ -395,7 +413,9 @@ function logCall(req, body, grant) {
   }
 }
 
-export function startVoiceHttp(store, channel, auth, settings, { killswitch = null } = {}) {
+// onPortBusy: called when another process holds the port (gateway.mjs ends
+// the gateway then); without it, that is only logged.
+export function startVoiceHttp(store, channel, auth, settings, { killswitch = null, onPortBusy = null } = {}) {
   const server = createServer(async (req, res) => {
     const url = new URL(req.url || '/', 'http://localhost')
 
@@ -466,11 +486,15 @@ export function startVoiceHttp(store, channel, auth, settings, { killswitch = nu
   })
 
   server.on('error', error => {
-    const hint =
-      error.code === 'EADDRINUSE'
-        ? ' (port busy: is another controller session or an old gateway still running?)'
-        : ''
-    log(`voice HTTP server error on ${settings.host}:${settings.port}: ${error.message}${hint}`)
+    if (error.code === 'EADDRINUSE') {
+      log(
+        `voice port ${settings.host}:${settings.port} is in use by another process: a second controller session, ` +
+          `or a gateway left over from an earlier one. lsof -nP -iTCP:${settings.port} -sTCP:LISTEN shows it.`,
+      )
+      onPortBusy?.(error)
+      return
+    }
+    log(`voice HTTP server error on ${settings.host}:${settings.port}: ${error.message}`)
   })
   server.listen(settings.port, settings.host, () => {
     log(`voice endpoint listening on http://${settings.host}:${settings.port}/mcp (OAuth sign-in)`)

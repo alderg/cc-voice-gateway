@@ -284,9 +284,26 @@ test('a question round-trip carries in_reply_to', async () => {
   assert.match(out, /^\[state=question /)
   assert.match(out, new RegExp(`in_reply_to=${id}`))
 
-  const answerId = idOf(await voiceCall('send', { message: 'No, only the files.', in_reply_to: id }))
+  const answered = await voiceCall('send', { message: 'No, only the files.', in_reply_to: id.toUpperCase() })
+  assert.match(answered, new RegExp(`^\\[state=sent id=[a-z0-9]{4}\\] Handed over as the answer to ${id}\\.`))
+  const answerId = idOf(answered)
   const event = await waitUntil(() => channelEvents.find(e => e.meta?.request_id === answerId))
   assert.equal(event.content, `(Answer to ${id}) No, only the files.`)
+
+  // The question is settled: done, and no longer among the open requests.
+  assert.match(await voiceCall('get_reply', { id, wait_seconds: 1 }), /^\[state=done [^]*Done, no new messages/)
+  const status = await voiceCall('status')
+  assert.ok(!status.includes(`${id} (`), status)
+  assert.ok(status.includes(`${answerId} (sent`), status)
+})
+
+test('in_reply_to with an unknown id hands nothing over', async () => {
+  const before = channelEvents.length
+  const result = await voice.callTool({ name: 'send', arguments: { message: 'Yes, do it.', in_reply_to: 'zzzz' } })
+  assert.equal(result.isError, true)
+  assert.match(resultText(result), /^\[state=unknown in_reply_to=zzzz\] No request has this id, so nothing was handed over/)
+  await new Promise(r => setTimeout(r, 200))
+  assert.equal(channelEvents.length, before)
 })
 
 test('permission relay: prompt -> get_reply -> approve -> verdict to Claude Code', async () => {
