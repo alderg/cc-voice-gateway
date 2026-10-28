@@ -1,0 +1,16 @@
+#!/bin/sh
+# voice-stop <task>
+#
+# Ends a run that voice-run started, with everything it started: SIGTERM to
+# its process group, SIGKILL if it is still there after five seconds.
+file="/tmp/voice-runs/$1"
+[ -s "$file" ] || exit 0
+group="-$(cat "$file")"
+if env kill -TERM -- "$group" 2>/dev/null; then
+  for _ in 1 2 3 4 5; do
+    sleep 1
+    env kill -0 -- "$group" 2>/dev/null || break
+  done
+  env kill -KILL -- "$group" 2>/dev/null || true
+fi
+rm -f "$file"
