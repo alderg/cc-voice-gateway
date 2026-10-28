@@ -8,17 +8,18 @@
 <link rel="stylesheet" href="/app.css">
 </head>
 <body>
+<div id="local-notice" class="local-notice" role="note">
+  <strong>Local setup: use it only on your own network.</strong>
+  This page has no HTTPS, so the one-time token and the keys you enter here travel unencrypted.
+  From anywhere else, use an SSH tunnel: <code>ssh -L 8790:localhost:8790 &lt;server&gt;</code>, then open
+  the link with <code>localhost</code>.
+</div>
+
 <header>
   <h1>cc-voice-gateway setup</h1>
   <p id="where" class="sub"></p>
   <p id="clock" class="sub"></p>
 </header>
-
-<div id="https" class="notice warn" hidden>
-  <strong>No HTTPS.</strong> This page and everything you type in it travel unencrypted. Use it only in
-  your own network, or through an SSH tunnel: <code>ssh -L 8790:localhost:8790 &lt;server&gt;</code>, then open
-  the link with <code>localhost</code>.
-</div>
 
 <main>
 

@@ -329,7 +329,6 @@ $('#cancel').addEventListener('click', async () => {
 // --- start ------------------------------------------------------------------------
 
 ;(async () => {
-  $('#https').hidden = location.protocol === 'https:'
   try {
     state = await api('/api/state')
   } catch (error) {

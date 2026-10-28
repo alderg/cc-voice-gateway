@@ -232,7 +232,16 @@ test('the session: the first use binds the setup to that browser, and the link a
 
     const html = await fetch(`${page.base}/`, { headers: { cookie: page.cookie } })
     assert.equal(html.status, 200)
-    assert.match(await html.text(), /<title>cc-voice-gateway setup<\/title>/)
+    const text = await html.text()
+    assert.match(text, /<title>cc-voice-gateway setup<\/title>/)
+    // Plain HTTP: a notice at the very top, above everything else, never hidden.
+    const notice = /<body>\s*<div id="local-notice"([^>]*)>([\s\S]*?)<\/div>/.exec(text)
+    assert.ok(notice, 'the notice is the first element of the page')
+    assert.doesNotMatch(notice[1], /hidden/)
+    const said = notice[2].replace(/<[^>]+>/g, '').replace(/\s+/g, ' ')
+    assert.match(said, /Local setup: use it only on your own network\./)
+    assert.match(said, /no HTTPS, so the one-time token and the keys you enter here travel unencrypted/)
+    assert.doesNotMatch(await (await fetch(`${page.base}/app.js`, { headers: { cookie: page.cookie } })).text(), /local-notice/, 'no script hides it')
     assert.match(html.headers.get('content-security-policy'), /script-src 'self'/)
     assert.equal(html.headers.get('referrer-policy'), 'no-referrer')
     assert.equal(html.headers.get('cache-control'), 'no-store')

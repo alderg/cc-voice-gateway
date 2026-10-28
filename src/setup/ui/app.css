@@ -20,6 +20,8 @@ section { border: 1px solid var(--line); border-left: 4px solid var(--own-line);
 ul.guide, ol.guide { padding-left: 20px; }
 ul.guide li, ol.guide li { margin: 4px 0; }
 .opt { font-size: 12px; font-weight: normal; color: var(--sub); border: 1px solid var(--line); border-radius: 10px; padding: 0 6px; }
+.local-notice { border: 2px solid var(--bad); background: #f8cecc; border-radius: 6px; padding: 12px 16px; margin: 0 0 16px; font-size: 15px; }
+.local-notice strong { display: block; font-size: 17px; margin-bottom: 2px; }
 .notice { border: 1px solid var(--warn-line); background: var(--warn); border-radius: 6px; padding: 10px 14px; margin: 12px 0; }
 .grid { display: grid; grid-template-columns: minmax(220px, 1fr) 1.2fr; gap: 6px 14px; align-items: center; margin: 8px 0; }
 .grid label { display: flex; flex-direction: column; gap: 2px; font-size: 14px; }

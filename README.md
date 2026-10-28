@@ -131,6 +131,11 @@ results, questions and approval requests to your Telegram chat as well. See
    Docker, the watchdog and the plugin. At the end it writes everything into `.secrets/` and ends
    by itself. See [The setup assistant](#the-setup-assistant).
 
+   **It is a local setup over plain HTTP: use it only on your own network.** Without HTTPS the
+   one-time token and the keys you enter travel unencrypted. The page says so in a notice at the
+   very top. From anywhere else, use an SSH tunnel (`ssh -L 8790:localhost:8790 <server>`, then
+   the `localhost` link).
+
 3. **Start the controller**, unless the assistant already started it in tmux:
 
    ```bash
@@ -221,7 +226,9 @@ set up from a laptop.
   Security Policy, sends no referrer, and nothing is cached.
 - **It ends by itself:** after 10 minutes without a request from the page, after 30 minutes at most,
   after writing the setup, and on Cancel. Wrong links do not count as activity.
-- **No HTTPS:** the page says so. Use it only in your own network, or through an SSH tunnel:
+- **No HTTPS, by decision:** a notice at the very top of the page, above everything else, says
+  that this is a local setup for your own network only, since the one-time token and the keys
+  travel unencrypted. It does not block anything. From elsewhere, use an SSH tunnel:
   `ssh -L 8790:localhost:8790 <server>`, then open the link with `localhost`.
 - **No secret leaves it:** none goes to a log, to the terminal or back to the browser. Output of the
   commands it runs, such as `docker build`, shows a known secret as `‹secret›`.
