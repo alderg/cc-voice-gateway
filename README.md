@@ -61,8 +61,9 @@ answer wins, whether it comes by voice or from the terminal ([channels reference
 answer arrives as a new request that refers to the original `id`.
 
 **Workers:** every git repository in the folder that holds this one (`~/Developer`) has a worker,
-named after its folder. The controller does no repository work itself. It calls `dispatch`, and the
-gateway starts `claude -p` in that checkout, without approvals:
+named after its folder. The controller does no repository work itself; it only answers status
+questions about pull requests, reviews and checks with read-only `gh` commands. For everything else
+it calls `dispatch`, and the gateway starts `claude -p` in that checkout, without approvals:
 - **Before the run** the gateway checks for uncommitted changes, a run already going in that
   repository, and the limit of two runs at a time.
 - **During the run** the worker branches `voice/<name>` off the current branch, commits only its
@@ -210,6 +211,8 @@ Name the repository as its folder is called; the controller matches loosely ("dr
 | "Tell the cc-voice-gateway worker to fix the typo in the README." | The worker commits on a `voice/` branch, pushes and opens a draft pull request |
 | "What is the cc-voice-gateway worker doing?" | `worker_status`, summarised in one or two sentences |
 | "Anything new from Claude Code?" | Results of workers that have finished since you last asked |
+| "Is anyone reviewing pull request 1 in cc-voice-gateway?" | The controller answers itself with `gh pr view` and `gh pr checks`, without a worker |
+| "Did the last CI run on main pass?" | `gh run list` and, for a failure, `gh run view --log-failed`; why it fails in the code is a task for the worker |
 | "Tell it to add a test for that too." | Follow-up in the same worker session, on the same branch |
 | "Yes, publish it." | Answer to a worker's question, for example before pushing a public repository |
 | "Stop the drawio-mcp worker." | `stop_worker` |
@@ -291,15 +294,26 @@ approval prompts) and the voice assistant, including the whole sign-in.
   could answer them anyway. These limits hold regardless:
   - File tools read only inside `controller/` and write only inside `controller/playground/`
     (PreToolUse hook `controller/.claude/hooks/confine.mjs`, resolves symlinks, fails closed).
-  - Bash runs only `ls` inside `controller/`, `sleep <seconds>` and `rm [-f]` with plain file
-    names in `playground/` (same hook). Claude Code's own Bash sandbox would allow more, but on
-    Ubuntu 24.04 and later AppArmor's `bwrap-userns-restrict` profile stops it from starting
-    ([sandboxing][sandbox]).
+  - Bash runs only `ls` inside `controller/`, `sleep <seconds>`, `rm [-f]` with plain file
+    names in `playground/`, and read-only `gh` commands (same hook). Claude Code's own Bash
+    sandbox would allow more, but on Ubuntu 24.04 and later AppArmor's `bwrap-userns-restrict`
+    profile stops it from starting ([sandboxing][sandbox]).
+  - `gh` is an allowlist as well: `gh pr view`, `list`, `checks`, `diff` and `status`, and
+    `gh run view` and `list`, each with `--repo owner/name` and only with listed read-only flags,
+    such as `--json` with a plain field list, `--state`, `--limit`, `--author`, `--branch`, and
+    `--log` or `--log-failed` for runs. Everything else is blocked, in particular `gh auth` (it
+    would print the token), `gh api` (it can write), `gh config`, `gh alias`, `gh extension`,
+    every subcommand that writes (checkout, merge, edit, comment, review, close, ready, rerun,
+    cancel, delete, download), `--web`, `--jq` and `--template`. Read-only still means: the
+    controller can read pull requests, diffs and CI logs of every repository your `gh` login can
+    see, and tell them to whoever is signed in.
   - Denied: claude.ai connectors (Gmail, Slack, Drive, …), web fetch and search, messages to
     other Claude sessions, remote and scheduled agents, artifacts, Monitor, workflows and
     worktrees. Bypass and auto mode cannot be switched on.
-  - What is left: reading `controller/`, and writing or deleting in the playground. The answers
-    go back to the voice assistant.
+  - What is left: reading `controller/`, writing or deleting in the playground, and reading the
+    state of pull requests and runs on GitHub. The answers go back to the voice assistant.
+  - Changes to the confinement, such as the `gh` commands, take effect after a controller
+    restart: the session reads `controller/CLAUDE.md` and its settings when it starts.
   - The confinement keeps the controller to its job, talking and dispatching. It does not limit
     workers.
 - The gateway binds to `127.0.0.1` only.
@@ -370,6 +384,7 @@ Claude Code starts the gateway, so environment variables go into `controller/.mc
 | A worker fails at once | `could not start claude`: Claude Code is not on the gateway's `PATH`; set `VOICE_GW_CLAUDE_BIN`. Otherwise read `.state/tasks/<task>.err`. |
 | What did a worker do? | `.state/tasks/<task>.jsonl` holds the whole run. `claude --resume <session>` in the repository opens the session; `.state/workers.json` lists the session ids. |
 | A private repository is handled like a public one | `gh` is not logged in or not on the `PATH`, so the visibility is unknown, and the worker asks before pushing to be safe. |
+| The controller says a `gh` command was blocked | Only the read-only commands under [Security](#security) pass, each with `--repo owner/name` and flags as separate words. If it does not know about `gh` at all, restart the controller so that it reads the current `controller/CLAUDE.md`. |
 | No approval by voice | Expected for Bash, Write and Edit: they run without asking. For other tools: the session runs in auto or bypass mode, an allow rule covers the tool, or it is a trust or consent dialog, which is not relayed. Start the session with `scripts/start-controller.sh`. |
 
 Claude Code's debug log is at `~/.claude/debug/<session-id>.txt`.
@@ -391,7 +406,7 @@ src/
 controller/
   .mcp.json          starts the gateway as server "voice"
   .claude/settings.json   allow and deny rules, confine hook
-  .claude/hooks/confine.mjs   file tools inside controller/ (writes: playground/), Bash allowlist
+  .claude/hooks/confine.mjs   file tools inside controller/ (writes: playground/), Bash allowlist, read-only gh
   CLAUDE.md          rules for the controller session
   playground/        working folder for requests
 scripts/

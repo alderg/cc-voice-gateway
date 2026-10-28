@@ -198,6 +198,106 @@ test('confine hook: Bash only runs ls here, sleep and rm of files in the playgro
   blocked('Bash', { description: 'no command' })
 })
 
+test('confine hook: read-only gh commands about pull requests and runs, always with --repo', () => {
+  const repo = '--repo alderg/cc-voice-gateway'
+  for (const command of [
+    `gh pr view 2 ${repo}`,
+    `gh pr view 2 -R alderg/cc-voice-gateway --json number,title,state,isDraft,reviewDecision,statusCheckRollup`,
+    `gh pr view voice/docker-workers ${repo} --comments`,
+    `gh pr list ${repo}`,
+    `gh pr list ${repo} --state all --limit 10 --author @me --json number,title,isDraft`,
+    `gh pr list -R jgraph/drawio -s open -L 5 -A app/dependabot -B main -H voice/fix -l bug --draft`,
+    `gh pr checks 1 ${repo}`,
+    `gh pr checks 1 ${repo} --required`,
+    `gh pr diff 1 ${repo} --name-only`,
+    `gh pr diff 1 ${repo} --patch`,
+    `gh pr status ${repo} --conflict-status`,
+    `gh run list ${repo} --branch main --limit 5 --json status,conclusion,workflowName`,
+    `gh run list ${repo} --status failure --workflow ci.yml --event pull_request --user alderg --commit abc1234`,
+    `gh run view 123456789 ${repo}`,
+    `gh run view 123456789 ${repo} --log-failed`,
+    `gh run view 123456789 ${repo} --log --job 987654 --attempt 2 -v --exit-status`,
+  ]) {
+    allowed('Bash', { command })
+  }
+
+  for (const command of [
+    // the token, the API, settings and extensions
+    'gh auth token',
+    'gh auth status',
+    `gh auth login --with-token`,
+    'gh api repos/alderg/cc-voice-gateway',
+    'gh api -X DELETE repos/alderg/cc-voice-gateway',
+    'gh config get git_protocol',
+    'gh alias set co pr checkout',
+    'gh extension install owner/gh-x',
+    'gh repo view alderg/cc-voice-gateway',
+    'gh secret list',
+    'gh',
+    // writes on pull requests and runs
+    `gh pr checkout 1 ${repo}`,
+    `gh pr merge 1 ${repo}`,
+    `gh pr edit 1 ${repo} --add-label x`,
+    `gh pr comment 1 ${repo} --body x`,
+    `gh pr review 1 ${repo} --approve`,
+    `gh pr close 1 ${repo}`,
+    `gh pr ready 1 ${repo}`,
+    `gh pr create ${repo}`,
+    `gh run rerun 1 ${repo}`,
+    `gh run cancel 1 ${repo}`,
+    `gh run delete 1 ${repo}`,
+    `gh run download 1 ${repo}`,
+    `gh run watch 1 ${repo}`,
+    // forbidden or unknown flags
+    `gh pr view 1 ${repo} --web`,
+    `gh pr view 1 ${repo} -w`,
+    `gh pr checks 1 ${repo} --web`,
+    `gh run view 1 ${repo} --web`,
+    `gh run list ${repo} -w ci.yml`,
+    `gh pr view 1 ${repo} --json title --jq .title`,
+    `gh pr view 1 ${repo} -q .title`,
+    `gh pr view 1 ${repo} --template x`,
+    `gh pr view 1 ${repo} -t x`,
+    `gh pr checks 1 ${repo} --watch`,
+    `gh pr list ${repo} --search is`,
+    `gh pr list ${repo} --state draft`,
+    `gh pr list ${repo} --limit 1e9`,
+    `gh pr view 1 ${repo} --verbose`,
+    `gh pr view 1 ${repo} --`,
+    `gh pr view 1 ${repo} --json`,
+    `gh pr view 1 ${repo} --json title,-x`,
+    `gh pr view 1 2 ${repo}`,
+    `gh run view abc ${repo}`,
+    `gh pr status 1 ${repo}`,
+    // --repo is required, with a plain owner/name
+    'gh pr view 1',
+    'gh pr list --state open',
+    'gh pr view 1 --repo',
+    'gh pr view 1 --repo alderg',
+    'gh pr view 1 --repo alderg/..',
+    'gh pr view 1 --repo ../etc',
+    'gh pr view 1 --repo=alderg/cc-voice-gateway',
+    'gh pr view 1 -R https://github.com/alderg/cc-voice-gateway',
+    'gh --repo alderg/cc-voice-gateway pr view 1',
+    // shell syntax stays out
+    `gh pr view 1 ${repo}; gh auth token`,
+    `gh pr view 1 ${repo} && gh auth token`,
+    `gh pr view 1 ${repo} | sh`,
+    `gh pr view 1 ${repo} > playground/pr.txt`,
+    `gh pr view $(gh auth token) ${repo}`,
+    `gh pr view "1" ${repo}`,
+    `gh pr view 1 ${repo} --json 'title'`,
+    `GH_TOKEN=x gh pr view 1 ${repo}`,
+    `gh pr view 1 ${repo}\ngh auth token`,
+    `gh pr list ${repo} --label {a,b}`,
+    // commas and @ only for gh
+    'ls playground,..',
+    'rm playground/@x',
+  ]) {
+    blocked('Bash', { command })
+  }
+})
+
 test('confine hook: other tools pass, broken input is blocked', () => {
   allowed('mcp__voice__reply', { request_id: 'abcd', state: 'done', text: 'ok' })
   blocked('Read', 'not json')

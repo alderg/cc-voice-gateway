@@ -3,8 +3,9 @@
 //
 //   Read, Glob, Grep           only inside controller/
 //   Write, Edit, NotebookEdit  only inside controller/playground/
-//   Bash                       only `ls` inside controller/, `sleep <seconds>` and
-//                              `rm [-f] <files in playground/>`
+//   Bash                       only `ls` inside controller/, `sleep <seconds>`,
+//                              `rm [-f] <files in playground/>` and read-only
+//                              `gh pr` and `gh run` commands with --repo
 //
 // Whoever knows the connector URL can also answer approval prompts, so an ask
 // rule is no protection against them; the settings let these tools run without
@@ -18,6 +19,8 @@
 // starting. The three commands cover the test tasks (look, wait, clean up);
 // everything else the controller does with the file tools. Recent Claude Code
 // versions have no Glob or Grep tool, so `ls` is the only way to list a folder.
+// The gh commands answer status questions about pull requests, reviews and
+// checks; every subcommand, flag and value of them is on an allowlist too.
 //
 // Fails closed: anything unexpected blocks the call.
 
@@ -33,9 +36,11 @@ const READ_TOOLS = new Set(['Read', 'Glob', 'Grep'])
 const WRITE_TOOLS = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit'])
 
 const SHELL_RULE =
-  'Shell commands are limited to `ls [-aAlhR1tSr] [folders here]`, `sleep <seconds>` and ' +
-  '`rm [-f] <files in playground/>`, without quotes, wildcards, pipes or other shell syntax. ' +
-  'Use ls and Read to look around.'
+  'Shell commands are limited to `ls [-aAlhR1tSr] [folders here]`, `sleep <seconds>`, ' +
+  '`rm [-f] <files in playground/>` and read-only `gh pr view|list|checks|diff|status` and ' +
+  '`gh run view|list` with `--repo owner/name`, without quotes, wildcards, pipes or other shell syntax. ' +
+  'gh takes plain flags only: no --web, --jq or --template, and `--json` with a comma-separated field ' +
+  'list. Use ls and Read to look around.'
 
 function block(reason) {
   process.stderr.write(`${reason}\n`)
@@ -98,11 +103,115 @@ function paths(tool, input) {
   }
 }
 
-// Only three command shapes, made of plain words: no quoting, variables,
-// globbing, redirection or chaining can hide in them.
+// Read-only gh commands about pull requests and workflow runs. Each one names
+// its repository with --repo (or -R), because the controller does not sit in
+// the driver's repositories. Every flag has a fixed shape for its value, or
+// takes none (FLAG); whatever is not listed, such as gh api, gh auth, --web,
+// --jq or a write subcommand, is blocked.
+const FLAG = null
+const REPO = /^[A-Za-z0-9][A-Za-z0-9-]*\/(?!\.\.?$)[A-Za-z0-9._-]+$/
+const FIELDS = /^[A-Za-z]+(,[A-Za-z]+)*$/
+const NUMBER = /^[0-9]{1,12}$/
+const LIMIT = /^[0-9]{1,4}$/
+const NAME = /^[A-Za-z0-9_][A-Za-z0-9._/-]*$/ // branch, label or workflow file, never a flag
+const LOGIN = /^(@me|(app\/)?[A-Za-z0-9][A-Za-z0-9-]*)$/
+const PR = /^([0-9]{1,9}|[A-Za-z0-9_][A-Za-z0-9._/-]*)$/ // number or branch
+const oneOf = (...values) => new RegExp(`^(${values.join('|')})$`)
+
+const REPO_FLAGS = { '--repo': REPO, '-R': REPO }
+const GH = {
+  'pr view': { arg: PR, flags: { '--json': FIELDS, '--comments': FLAG, '-c': FLAG } },
+  'pr list': {
+    flags: {
+      '--json': FIELDS,
+      '--state': oneOf('open', 'closed', 'merged', 'all'),
+      '-s': oneOf('open', 'closed', 'merged', 'all'),
+      '--limit': LIMIT,
+      '-L': LIMIT,
+      '--author': LOGIN,
+      '-A': LOGIN,
+      '--assignee': LOGIN,
+      '-a': LOGIN,
+      '--base': NAME,
+      '-B': NAME,
+      '--head': NAME,
+      '-H': NAME,
+      '--label': NAME,
+      '-l': NAME,
+      '--draft': FLAG,
+      '-d': FLAG,
+    },
+  },
+  'pr checks': { arg: PR, flags: { '--json': FIELDS, '--required': FLAG } },
+  'pr diff': { arg: PR, flags: { '--name-only': FLAG, '--patch': FLAG } },
+  'pr status': { flags: { '--json': FIELDS, '--conflict-status': FLAG, '-c': FLAG } },
+  'run view': {
+    arg: NUMBER,
+    flags: {
+      '--json': FIELDS,
+      '--log': FLAG,
+      '--log-failed': FLAG,
+      '--verbose': FLAG,
+      '-v': FLAG,
+      '--job': NUMBER,
+      '-j': NUMBER,
+      '--attempt': NUMBER,
+      '-a': NUMBER,
+      '--exit-status': FLAG,
+    },
+  },
+  'run list': {
+    flags: {
+      '--json': FIELDS,
+      '--limit': LIMIT,
+      '-L': LIMIT,
+      '--branch': NAME,
+      '-b': NAME,
+      '--status': oneOf(
+        'queued', 'completed', 'in_progress', 'requested', 'waiting', 'action_required', 'cancelled',
+        'failure', 'neutral', 'skipped', 'stale', 'startup_failure', 'success', 'timed_out',
+      ),
+      '--workflow': NAME, // not -w: that is --web elsewhere
+      '--event': /^[a-z_]+$/,
+      '-e': /^[a-z_]+$/,
+      '--user': LOGIN,
+      '-u': LOGIN,
+      '--commit': /^[0-9a-f]{7,40}$/,
+      '-c': /^[0-9a-f]{7,40}$/,
+    },
+  },
+}
+
+// words: everything after "gh".
+function checkGh(words) {
+  const spec = GH[`${words[0]} ${words[1]}`]
+  if (!spec) return false
+  const flags = { ...REPO_FLAGS, ...spec.flags }
+  let repo = false
+  let args = 0
+  for (let i = 2; i < words.length; i++) {
+    const word = words[i]
+    if (!word.startsWith('-')) {
+      if (!spec.arg || ++args > 1 || !spec.arg.test(word)) return false
+      continue
+    }
+    if (!Object.hasOwn(flags, word)) return false
+    if (flags[word] === FLAG) continue
+    const value = words[++i]
+    if (value === undefined || !flags[word].test(value)) return false
+    if (word in REPO_FLAGS) repo = true
+  }
+  return repo
+}
+
+// Four command shapes, made of plain words: no quoting, variables, globbing,
+// redirection or chaining can hide in them. Commas (field lists) and @ (@me)
+// only for gh.
 function checkShell(command, base) {
-  if (typeof command !== 'string' || !/^[A-Za-z0-9._/ -]+$/.test(command)) return false
+  if (typeof command !== 'string' || !/^[A-Za-z0-9._/ ,@-]+$/.test(command)) return false
   const words = command.trim().split(/ +/)
+  if (words[0] === 'gh') return checkGh(words.slice(1))
+  if (/[,@]/.test(command)) return false
   if (words[0] === 'sleep') return words.length === 2 && /^[0-9]{1,4}$/.test(words[1])
   if (words[0] === 'ls') {
     return words
