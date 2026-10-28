@@ -8,6 +8,10 @@
 // path stays as it is; Telegram comes on top. Interim "working" updates stay
 // off Telegram.
 //
+// Inbound, the gateway takes a few commands from the configured private chat:
+// the kill switch (/stop or an emergency phrase), and the Tailscale Funnel on
+// and off (/funnel on, /funnel off, /funnel, "keep alive"; see funnel.mjs).
+//
 // On only when .secrets/telegram_token and .secrets/telegram_chat_id both
 // exist and are not empty. The token is part of every API address, so it must
 // never reach a log line or an error message.
@@ -105,18 +109,36 @@ export class Telegram {
   }
 }
 
-// The one command the gateway takes from Telegram: the kill switch.
+// The kill switch.
 export const isStopCommand = text =>
   /^\/(stop|killswitch|emergencystop)(@\w+)?$/i.test(String(text).trim()) || emergencyPhrase(text)
+
+// The Funnel: /funnel on|off|status (plain /funnel asks for the status), the
+// same without the slash, and "keep alive", which turns it on, or keeps it on
+// for another while.
+const FUNNEL_WORDS = { 'funnel on': 'on', 'funnel off': 'off', 'funnel status': 'status', 'keep alive': 'on', keepalive: 'on' }
+
+export function funnelCommand(text) {
+  const slash = /^\/funnel(?:@\w+)?(?:\s+(on|off|status))?$/i.exec(String(text).trim())
+  if (slash) return (slash[1] ?? 'status').toLowerCase()
+  const words = String(text)
+    .toLowerCase()
+    .replace(/[^a-z\s-]+/g, ' ')
+    .replace(/[\s-]+/g, ' ')
+    .trim()
+  return FUNNEL_WORDS[words] ?? null
+}
 
 // Waits `ms`, or less if the signal aborts. The timer's abort listener goes
 // away with it, so a long run of backoffs leaves none behind.
 export const pause = (ms, signal) => delay(ms, undefined, { signal }).catch(() => {})
 
-// Inbound: polls the bot for messages and emits 'stop' for a stop command
-// from the configured private chat. Every other chat, and every other message,
-// is ignored. Messages older than maxAgeSeconds, for example from before a
-// restart, do not count.
+// Inbound: polls the bot for messages from the configured private chat and
+// emits 'stop' for a stop command and 'funnel' for a Funnel command. Every
+// other chat, and every other message, is ignored. A command older than
+// maxAgeSeconds, sent while the gateway was not listening, does not count:
+// Telegram keeps messages for a day, and yesterday's /funnel on must not open
+// the endpoint today. It emits 'stale' instead, so that the sender hears why.
 export class TelegramCommands extends EventEmitter {
   constructor(telegram, { pollSeconds = 25, maxAgeSeconds = 120, log = defaultLog } = {}) {
     super()
@@ -163,7 +185,7 @@ export class TelegramCommands extends EventEmitter {
       } catch (error) {
         if (this.closed) return
         if (error.status === 409) {
-          this.warnOnce('409', 'telegram commands: a webhook or another program takes this bot\'s updates; /stop does not reach the gateway')
+          this.warnOnce('409', 'telegram commands: a webhook or another program takes this bot\'s updates; /stop and /funnel do not reach the gateway')
         } else {
           this.warnOnce(error.message, `telegram commands: ${error.message}`)
         }
@@ -181,8 +203,17 @@ export class TelegramCommands extends EventEmitter {
       this.warnOnce(`chat ${chat}`, 'telegram commands: ignored a message from another chat')
       return
     }
-    if (Date.now() / 1000 - Number(message.date) > this.maxAgeSeconds) return
-    if (isStopCommand(message.text)) this.emit('stop', { text: message.text })
+    const stop = isStopCommand(message.text)
+    const funnel = stop ? null : funnelCommand(message.text)
+    if (!stop && !funnel) return
+    const age = Math.round(Date.now() / 1000 - Number(message.date))
+    if (age > this.maxAgeSeconds) {
+      this.log(`telegram commands: ignored "${preview(message.text, 40)}", sent ${age} s ago`)
+      this.emit('stale', { text: message.text, ageSeconds: age })
+      return
+    }
+    if (stop) this.emit('stop', { text: message.text })
+    else this.emit('funnel', { action: funnel, text: message.text })
   }
 }
 

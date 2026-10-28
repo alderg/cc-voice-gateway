@@ -31,6 +31,7 @@ import { hostname } from 'node:os'
 import { DockerRunner, HostRunner } from './runners.mjs'
 import { ACCESS_LEVELS, GitHubAccess } from './access.mjs'
 import { FolderTools, clonedText } from './folders.mjs'
+import { FunnelSwitch, staleText } from './funnel.mjs'
 
 const store = new Store({ permissionTtlSeconds: config.permissionTtlSeconds, file: config.requestsFile })
 const killswitch = new KillSwitch({ file: config.killSwitchFile })
@@ -109,6 +110,7 @@ const pulls = new PullWatcher({
 
 let http
 let admin
+let funnel = null
 let shuttingDown = false
 function shutdown(reason, code = process.exitCode ?? 0) {
   if (shuttingDown) return
@@ -119,6 +121,7 @@ function shutdown(reason, code = process.exitCode ?? 0) {
   workers.close() // runs go on; the next gateway picks them up
   guard.close()
   telegramCommands?.close()
+  funnel?.close()
   pulls.close() // so do the watches on pull requests
   store.save() // the requests, with what the voice client has read
   // Give pending log writes and HTTP responses a moment, then leave.
@@ -201,12 +204,20 @@ const telegram = loadTelegram({
   apiBase: config.telegramApi,
 })
 let telegramCommands = null
+// The Funnel on demand (funnel.mjs): from Telegram, and off by itself when idle.
+const say = text => telegram?.send(text).catch(error => log('telegram message not sent:', error.message)) ?? Promise.resolve()
+funnel = new FunnelSwitch({ script: config.funnelScript, store, idleMinutes: config.funnelIdleMinutes, say })
+if (config.funnelIdleMinutes) {
+  log(`funnel auto-off: ${config.funnelIdleMinutes} minutes after the last voice call${telegram ? '' : '; without Telegram, only at the computer on again'}`)
+}
 if (telegram) {
   new TelegramFallback(store, { send: text => telegram.send(text), afterSeconds: config.telegramAfterSeconds })
   log(`telegram fallback ready: after ${config.telegramAfterSeconds} s without a voice call`)
-  // Inbound, only the kill switch, only from the configured chat.
+  // Inbound, only the kill switch and the Funnel, only from the configured chat.
   telegramCommands = new TelegramCommands(telegram, { pollSeconds: config.telegramPollSeconds }).start()
   telegramCommands.on('stop', ({ text }) => killswitch.trip({ trigger: 'telegram', reason: `"${text}" on Telegram` }))
+  telegramCommands.on('funnel', ({ action }) => funnel.command(action))
+  telegramCommands.on('stale', stale => say(staleText(stale)))
 } else {
   log('telegram fallback off: telegram_token and telegram_chat_id not both set')
 }

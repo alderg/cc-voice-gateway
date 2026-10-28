@@ -5,6 +5,7 @@
 #   scripts/funnel.sh start    expose http://127.0.0.1:$VOICE_GW_PORT on https://<host>
 #   scripts/funnel.sh stop     remove that funnel again
 #   scripts/funnel.sh status   show Tailscale's serve/funnel config
+#   scripts/funnel.sh state    "on" while Funnel publishes the endpoint, else "off"
 #   scripts/funnel.sh url      print the connector URL only
 #
 # Funnel accepts the HTTPS ports 443, 8443 and 10000, but Claude's servers only
@@ -60,11 +61,22 @@ case "${1:-start}" in
   status)
     tailscale funnel status
     ;;
+  state)
+    tailscale funnel status --json | FUNNEL_PORT="$FUNNEL_PORT" PORT="$PORT" node -e '
+      let s = ""
+      process.stdin.on("data", d => (s += d)).on("end", () => {
+        const config = JSON.parse(s || "{}")
+        const on = Object.entries(config.AllowFunnel || {}).some(([key, allowed]) =>
+          allowed && key.endsWith(":" + process.env.FUNNEL_PORT) &&
+          config.Web?.[key]?.Handlers?.["/"]?.Proxy === "http://127.0.0.1:" + process.env.PORT)
+        console.log(on ? "on" : "off")
+      })'
+    ;;
   url)
     connector_url
     ;;
   *)
-    echo "usage: $0 start|stop|status|url" >&2
+    echo "usage: $0 start|stop|status|state|url" >&2
     exit 2
     ;;
 esac

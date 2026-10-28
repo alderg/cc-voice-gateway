@@ -325,7 +325,7 @@ to a lost phone or a leaked token.
 | A worker on this computer | Everything your user can, without approvals | Nothing is blocked; rules only observe (see 5.9) |
 | A worker in Docker | The mounted folder, the container's tokens, the network | Your other files, SSH keys, `gh` login; more on GitHub than its token allows |
 | Others on GitHub | Comment on a watched pull request: the news names them; the text of the repository's owner, members and collaborators reaches the controller, marked `trusted="no"` | Get anyone else's text to the controller through the watch; have a fork or someone else's pull request watched (see 8.4) |
-| The Telegram chat | Receive news; send `/stop` | Anything else; other chats are ignored |
+| The Telegram chat | Receive news; send `/stop`; turn the Funnel on and off | Anything else; other chats are ignored |
 
 ### 5.2 The voice endpoint and OAuth
 
@@ -638,9 +638,15 @@ folder, `.git` included.
   counts as ended. Results, questions and approval requests then also go to the chat, each once;
   interim `working` updates do not. The kill switch alarm goes at once, whether voice mode is on
   or not, and so does a note when the gateway ends because another process holds its port.
-- **Inbound:** only `/stop`, `/killswitch`, `/emergencystop` or an emergency phrase, only from the
-  configured private chat, only if sent in the last two minutes. Everything else is ignored. You
-  cannot answer questions or approvals by Telegram.
+- **Inbound:** only the kill switch (`/stop`, `/killswitch`, `/emergencystop` or an emergency
+  phrase) and the Funnel (`/funnel on`, `/funnel off`, `/funnel`, "keep alive";
+  [7.3](#73-publishing-the-endpoint)), only from the configured private chat. Everything else is
+  ignored. You cannot answer questions or approvals by Telegram.
+- **Only if recent.** A command counts only if Telegram's timestamp on it is at most two minutes
+  old when the gateway reads it. Telegram keeps messages for a day, and a `/stop` or `/funnel on`
+  sent while the gateway was not running must not act hours later. Such a command gets an answer
+  instead: "Ignored "/funnel on": it was sent 15 minutes ago, while the gateway was not
+  listening… Send it again if you still want it."
 - **Through Telegram's servers.** Bot chats are not end-to-end encrypted, so leave the files out
   if that is not acceptable.
 - **The token** never appears in a log line or error message.
@@ -861,7 +867,7 @@ the `localhost` link).
 | Step | What the assistant does | What you give it |
 |---|---|---|
 | This computer | Checks Node.js, `npm install`, Claude Code (2.1.80+), git, the `gh` login, Docker, tmux, Tailscale | Fixes for what is marked as needed |
-| Gateway | Port, repositories folder, runs at a time, time limit, approvals by voice, what the controller may do (with a warning above `confined`) | Choices |
+| Gateway | Port, repositories folder, runs at a time, time limit, approvals by voice, what the controller may do (with a warning above `confined`), the Funnel off when idle and after how many minutes | Choices |
 | Models | Model and effort for the controller (`--model`, `--effort` from `start-controller.sh`) and for every worker run, on the host and in Docker | Choices, or Claude Code's defaults |
 | Telegram | Checks the token (`getMe`), finds your private chat with `getUpdates` once you wrote to the bot, sends a test message | A token from [@BotFather](https://t.me/BotFather), one message to the bot |
 | Workers in Docker | Checks the GitHub token and shows the level per repository with the gateway's detection. Builds the image with its progress shown. Starts the container, sets git's name and email in it, and clones the chosen repositories inside it | A token from `claude setup-token`, optionally a GitHub token ([5.6](#56-access-levels-and-their-detection)), the repositories |
@@ -950,10 +956,23 @@ Claude's servers call the connector from Anthropic's cloud. Any tunnel or revers
 ```bash
 scripts/funnel.sh start    # prints https://<host>.ts.net/mcp; reports when all relays answer
 scripts/funnel.sh stop
+scripts/funnel.sh state    # on or off
 scripts/funnel.sh url
 ```
 
 The first start fetches a certificate; the name and all relays can take a few minutes.
+
+**The Funnel on demand** (`src/funnel.mjs`), so that the endpoint is public only while you use it:
+
+- **From Telegram** ([5.8](#58-the-telegram-fallback)): `/funnel on` or "keep alive" turns it
+  on, `/funnel off` off, `/funnel` says whether it is on. Every command gets an answer; a start
+  gets a second one once the public relays answer, usually within two minutes. So send it before
+  you start driving, not with the first voice request.
+- **Off by itself**, with `VOICE_GW_FUNNEL_IDLE` minutes set (the setup assistant offers it,
+  90 suggested; off by default). That long after the last voice call, or after the last
+  `/funnel on`, "keep alive" or gateway start, the gateway turns the Funnel off and says on
+  Telegram how to turn it on again. Without Telegram, it comes back on only at the computer.
+- **The gateway runs `scripts/funnel.sh`**, so the operator setting above is needed for this too.
 
 **Reverse proxy**, for example Caddy, which gets a certificate and sets the headers by default:
 
@@ -1191,6 +1210,8 @@ gateway reads them at its start: restart the controller after a change.
 | `VOICE_GW_TELEGRAM_AFTER` | `60` | Seconds without a voice call before Telegram takes over |
 | `VOICE_GW_TELEGRAM_POLL` | `25` | Seconds one poll of the bot for `/stop` waits |
 | `VOICE_GW_TELEGRAM_API` | `https://api.telegram.org` | Bot API; tests use a stand-in |
+| `VOICE_GW_FUNNEL_IDLE` | `0`, off | Minutes after the last voice call before the gateway turns the Funnel off ([7.3](#73-publishing-the-endpoint)) |
+| `VOICE_GW_FUNNEL_SCRIPT` | `scripts/funnel.sh` | What the gateway runs to switch the Funnel; tests use a stand-in |
 | `VOICE_GW_DOCKER` | empty | Worker container; empty: workers on this computer |
 | `VOICE_GW_DOCKER_REPOS` | `/repos` | The mounted folder inside the container |
 | `VOICE_GW_DOCKER_BIN` | `docker` | Docker CLI |
@@ -1296,6 +1317,9 @@ do not set them.
 | `dispatch=origin` | In the container, the repository's `origin` is no longer the GitHub repository the gateway saw first ([5.6](#56-access-levels-and-their-detection)). Check the clone at the desk; if the change is wanted, stop the controller and remove the repository's line under `origins` in `.state/workers.json`. |
 | The kill switch locked for no good reason | Read the reason. A rule that misfires: raise its `VOICE_GW_KILL_*` threshold, or add a folder to `VOICE_GW_KILL_ALLOW_PATHS`. |
 | `/stop` on Telegram does nothing | Only your configured private chat counts, and the gateway must poll the bot: the log says `telegram commands: …` if a webhook or another program takes the updates. |
+| `/funnel on` answers "Ignored …: it was sent … ago" | The gateway was not running when you sent it, for example during a restart or right after boot. Send it again. |
+| `/funnel on` answers "The Funnel did not come on: Access denied" | Run `sudo tailscale set --operator=$USER` once on the computer. |
+| The Funnel goes off while you still use voice mode | It goes off `VOICE_GW_FUNNEL_IDLE` minutes after the last voice call; a long silence counts. Raise the minutes, or send "keep alive". |
 | No approval by voice | Expected for Bash, Write and Edit: they run without asking. For other tools: the session runs in auto or bypass mode, an allow rule covers the tool, or it is a trust or consent dialog, which is not relayed. Start the session with `scripts/start-controller.sh`. |
 | The controller still starts with the development flag after the admin step | The log line `channel: the development flag, since …` says why. The script reads Claude Code's local copy of the managed settings (`~/.claude/remote-settings.json`), which Claude Code updates when a session starts, so the first start after the admin step still sees the old copy: answer the warning or quit, and start again. `node scripts/channel-mode.mjs` shows what the next start will use; `claude doctor` shows whether the managed settings arrived. |
 | "Restart the controller" and the controller says it cannot restart itself | It was not started by `scripts/start-controller.sh` with the watchdog. Restart it at the computer. |
@@ -1317,7 +1341,8 @@ src/
   runners.mjs        where workers run: this computer, or the Docker container
   access.mjs         access levels in the container, from the GitHub token
   pulls.mjs          the watch on pull requests that workers open
-  telegram.mjs       Telegram fallback, and /stop from your chat
+  telegram.mjs       Telegram fallback, and /stop and /funnel from your chat
+  funnel.mjs         the Funnel on and off from Telegram, and off by itself when idle
   killswitch.mjs     the kill switch: state, emergency phrases, alarm
   guard.mjs          the kill switch's rules on the workers' runs
   restart.mjs        restarting the controller by voice, through the watchdog

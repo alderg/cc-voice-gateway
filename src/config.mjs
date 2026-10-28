@@ -105,6 +105,12 @@ export const config = {
   telegramAfterSeconds: num(env.VOICE_GW_TELEGRAM_AFTER, 60),
   telegramApi: env.VOICE_GW_TELEGRAM_API || 'https://api.telegram.org',
 
+  // The Tailscale Funnel (funnel.mjs): off by itself this many minutes after
+  // the last voice call; 0 or empty, the default, leaves it on. On again with
+  // /funnel on on Telegram.
+  funnelIdleMinutes: /^\d+(\.\d+)?$/.test(env.VOICE_GW_FUNNEL_IDLE ?? '') ? Number(env.VOICE_GW_FUNNEL_IDLE) : 0,
+  funnelScript: env.VOICE_GW_FUNNEL_SCRIPT || join(ROOT, 'scripts', 'funnel.sh'),
+
   // Workers in a Docker container with its own clones (docker/): the
   // container's name. Empty: workers run in the checkouts on this computer.
   docker: env.VOICE_GW_DOCKER || '',

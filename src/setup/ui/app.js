@@ -169,6 +169,11 @@ function fillSettings() {
     if (value !== undefined) element.value = value
   }
   showLevelWarning()
+  // The Funnel's idle time: 0 means never; ticking the box suggests 90.
+  const idle = $('#funnel-idle')
+  $('#funnel-idle-on').checked = idle.value !== '' && idle.value !== '0'
+  if (!$('#funnel-idle-on').checked) idle.value = '90'
+  idle.disabled = !$('#funnel-idle-on').checked
   $('#docker-on').checked = Boolean(state.settings.VOICE_GW_DOCKER)
   $('#docker').hidden = !$('#docker-on').checked
   if (!$('#docker-name').value) $('#docker-name').value = 'voice-workers'
@@ -311,10 +316,12 @@ action('#docker-build', '#build-state', async () => {
 
 $('#docker-on').addEventListener('change', () => ($('#docker').hidden = !$('#docker-on').checked))
 $('#controller-level').addEventListener('change', showLevelWarning)
+$('#funnel-idle-on').addEventListener('change', () => ($('#funnel-idle').disabled = !$('#funnel-idle-on').checked))
 
 function collect() {
   const settings = {}
   for (const element of $$('[data-setting]')) settings[element.dataset.setting] = element.value.trim()
+  if (!$('#funnel-idle-on').checked) settings.VOICE_GW_FUNNEL_IDLE = '0'
   for (const select of $$('[data-model]')) {
     settings[select.dataset.model] = select.value === 'other' ? $(`#${select.id}-other`).value.trim() : select.value
   }

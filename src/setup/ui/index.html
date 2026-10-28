@@ -55,6 +55,12 @@
     <p class="guide">Confined: it answers, hands work to the workers and reads pull request status; nothing else.
       The other two levels widen what a voice request can do on this computer.</p>
     <p id="level-warning" class="notice wide" role="alert" hidden></p>
+    <label><input type="checkbox" id="funnel-idle-on"> Turn Tailscale Funnel off when idle</label>
+    <p class="guide">The public endpoint is then only up while you use it. The gateway says on Telegram when it
+      turned the Funnel off; <code>/funnel on</code> or "keep alive" there turns it on again, within about two
+      minutes. Without Telegram only at the computer: <code>scripts/funnel.sh start</code>.</p>
+    <label>Minutes after the last voice call <input id="funnel-idle" data-setting="VOICE_GW_FUNNEL_IDLE" inputmode="numeric"></label>
+    <p class="guide">90 covers a break in a long drive.</p>
   </div>
 </section>
 
