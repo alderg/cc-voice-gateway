@@ -138,8 +138,9 @@ Claude app, and Claude Code on your computer. It is one Node.js process with two
   and delete, or do everything.
 
 Work in a repository goes to a **worker**: a headless `claude -p` run in that repository, started
-by the gateway when the controller calls `dispatch`. One worker per repository, two at a time by
-default. Workers run in your checkouts, or in a Docker container whose GitHub token sets what they
+by the gateway when the controller calls `dispatch`. One run per repository, two at a time by
+default; with a higher limit per repository, further runs work next to the first in
+[git worktrees of their own](#several-runs-per-repository). Workers run in your checkouts, or in a Docker container whose GitHub token sets what they
 may publish: nothing, pull requests, or also a direct push to the default branch. A worker's
 result reaches the controller as a channel event; the controller summarises it, and you hear it
 as news in the voice conversation. If it asks you something after the conversation has ended,
@@ -538,9 +539,10 @@ What applies to every worker run (`src/workers.mjs`):
   token, the session id) are removed, so a worker cannot reach the controller.
 - **Before a run:** the gateway refuses a dispatch without your words from a recent voice request
   ([5.4](#54-approvals-by-voice)) and a checkout with uncommitted changes until you agree. A
-  second run in the same repository, or one more than `VOICE_GW_MAX_WORKERS` runs, waits in the
-  queue instead. A run stops after `VOICE_GW_WORKER_TIMEOUT` minutes, six hours by default
-  (`0`: no time limit).
+  second run in the same repository (more than `VOICE_GW_MAX_WORKERS_PER_REPO`, one by default),
+  or one more than `VOICE_GW_MAX_WORKERS` runs in all, waits in the queue instead
+  ([several runs per repository](#several-runs-per-repository)). A run stops after
+  `VOICE_GW_WORKER_TIMEOUT` minutes, six hours by default (`0`: no time limit).
 - **When a run has ended:** when every process of it has, not when its output shows a result.
   Claude Code can answer a turn of its own first, such as the notification of a background task
   left over in the session it resumes, write a result for it and go on with the task in the same
@@ -560,9 +562,10 @@ What applies to every worker run (`src/workers.mjs`):
   gone.
 - **The queue:** `dispatch` answers `dispatch=queued` with the task's id (`q…`), its position and
   why: `busy` (a run is going there), `queue` (tasks queued there go first) or `full` (no run
-  slot). Your words are checked when it is queued, not again. The gateway starts queued tasks by
-  itself, in their order and one repository at a time, once the repository is idle, its last result
-  has reached the controller and a slot is free; the result event names the queue id
+  slot); with several runs per repository also `limit` and `after`. Your words are checked when it
+  is queued, not again. The gateway starts queued tasks by itself, in their order and one
+  repository at a time, once the repository is idle, its last result has reached the controller
+  and a slot is free; the result event names the queue id
   (`queued="q…"`). At its turn a task goes through the same checks as any dispatch: kill switch,
   origin, `direct`, uncommitted changes. One that fails them leaves the queue, and the controller
   gets an event with `kind="queue"` and the reason, to ask you; nothing is dropped silently. The
@@ -638,6 +641,76 @@ What applies to every worker run (`src/workers.mjs`):
 - **Docker itself:** whoever controls the gateway can control Docker, which on Linux is as good as
   root.
 
+#### Several runs per repository
+
+By default a repository has one run at a time, and the rest of its tasks wait in the queue.
+`VOICE_GW_MAX_WORKERS_PER_REPO` (`1`), or "Runs per repository" in the setup assistant, allows more.
+`VOICE_GW_MAX_WORKERS` stays the limit over all of them: every run of a repository counts, so it
+still protects your subscription.
+
+- **Where they run.** The first run of a repository works in its checkout, as always. Every
+  further one works in a git worktree of its own, in
+  `<VOICE_GW_WORKER_ROOT>/.voice-worktrees/<repository>/<task id>`: outside every checkout, and
+  not listed as a repository because of the dot. In Docker the same, in the container's clones
+  under `/repos/.voice-worktrees`, every git command through `docker exec`.
+- **How a worktree is made.** The gateway fetches the branch the checkout's run would start from
+  (`origin/<branch>`, usually the default branch) and adds the worktree there, on a detached
+  HEAD. Submodules come from the checkout's own modules, a local clone that downloads nothing, also
+  for a shallow one such as `drawio` in traffic; only a commit the checkout's module lacks comes
+  from the submodule's URL, as one shallow commit. Where the checkout has not initialised a
+  submodule, it is a shallow clone from its URL. The URL goes with `-c`, so the checkout's config
+  stays as it was. A submodule that fails is named in the worker's prompt, and the run starts all
+  the same.
+- **Its own session and rules.** A run in a worktree has a Claude session of its own, not the
+  repository's, and the same options, denied tools, environment, marks and time limit as any run.
+  For the kill switch's rule on writes, its worktree is its repository; the checkout is outside.
+  Its prompt says how it works there: create its `voice/` branch there and stay on it; before
+  pushing, `git fetch origin`, rebase onto the branch its pull request goes to (or the default
+  branch, where pull requests are off or with `direct`), run the tests, resolve conflicts itself
+  and run the tests again; push only when they pass, a branch of its own that was pushed before
+  with `--force-with-lease`; where pull requests are off, `git push origin HEAD:<default branch>`.
+- **Who waits for whom.** The controller decides per task, without asking you: `parallel` when
+  it needs none of the other tasks' results and works on other files, `after` with the ids of
+  runs or queued tasks it must wait for, or neither, which keeps it behind everything the
+  repository had when it came. `dispatch=queued` lists the runs and queued tasks there with their
+  texts; `order_queue` changes how a queued task waits later, without your words, as it changes
+  only the order, not what is done. Its confirmation says in a few words whether it runs in
+  parallel or what it waits for, and why. A task waits until a run slot and a slot in its
+  repository are free and what it waits for has ended.
+- **Follow-ups and answers.** A follow-up for a run in a worktree goes there (`continues`), and
+  your answer to a run's result goes there by itself: the same worktree and session. A worktree
+  removed meanwhile is made again at the same path, on the branch its run ended on, so that the
+  session continues.
+- **After a run.** The gateway's git check looks at the worktree: the commits its HEAD has and its
+  files; a run in the checkout is not blamed for the commits of runs in worktrees. With nothing
+  uncommitted, nothing unpushed and no commit only its HEAD has, the worktree is removed;
+  otherwise it is kept, and the push decision names it. A decision about a worktree holds only the
+  tasks for that worktree. `list_workers` and `worker_status` show every run and the kept
+  worktrees; the result event says `worktree="…"`. Kept worktrees that nothing needs any more are
+  looked at again every ten minutes, and removed once nothing would be lost.
+- **Interrupted runs.** A run in a worktree that a restart of the gateway or the computer, the time
+  limit, a crash or `stop_worker` interrupts goes back to the queue with its worktree, in front for
+  its repository, at most three times. At its turn it resumes there, in its session where that can
+  be continued, finishes, rebases, tests and pushes, and only then is the worktree removed. Its
+  result event says so (`requeued="q…"`). `stop_worker` with the run's own id in `drop` stops it
+  for good. The kill switch is the exception: it empties the queue as always and stops every run,
+  but keeps their worktrees, each as an open decision that holds nothing; after the unlock,
+  `dispatch` with `continues` finishes one there.
+- **A changed limit.** The queue remembers the limit it was planned for (`.state/workers.json`).
+  Raised, at a start or in the settings file while the gateway runs, the controller gets an event
+  with `kind="plan"` that lists the queued tasks that could now run next to others, with their
+  texts, and marks them with `order_queue`. Lowered, the tasks run one after the other again by
+  themselves. Runs going always run to the end, also above a lower limit: nothing new starts in
+  that repository until it is below.
+
+| | Run in the checkout | Run in a worktree |
+|---|---|---|
+| Folder | `VOICE_GW_WORKER_ROOT/<repository>` | `VOICE_GW_WORKER_ROOT/.voice-worktrees/<repository>/<id>` |
+| Starts from | The branch the checkout is on | That branch as `origin` has it, fetched just now |
+| Session | The repository's | Its own, kept for follow-ups there |
+| At the end | Back on its starting branch | On its own branch; rebased, tested, pushed |
+| Interrupted | Ends; its result says so | Back in the queue, in front, with its worktree |
+
 #### Work folders
 
 Off by default; `VOICE_GW_SCRATCH=1`, or the setup assistant, turns them on. A task that needs no
@@ -655,8 +728,8 @@ worker run like any other, with the same options, denied tools and environment a
   used work folders; `worker_status` and `stop_worker` take their names. `direct`, `draft` and
   `allow_dirty` have no effect there, and `dispatch` says so.
 - **Runs at a time.** New ones take any free slot of `VOICE_GW_MAX_WORKERS` and count against it,
-  as many as there are slots; in each folder one run at a time. The rest waits in the queue, as
-  for repositories.
+  as many as there are slots; in each folder one run at a time, whatever
+  `VOICE_GW_MAX_WORKERS_PER_REPO` says. The rest waits in the queue, as for repositories.
 - **The same safety.** Only on your words from a recent voice request
   ([5.4](#54-approvals-by-voice)); the kill switch stops their runs, empties their queue and makes no
   new folder while locked; the queue, the folders and their sessions survive restarts in
@@ -863,7 +936,7 @@ at every start.
 | Voice | "emergency stop" or "kill switch"; or the tool `emergency_stop`, which the voice AI calls for the same words in any language | In `send` and `ask` before anything reaches the controller: the message starts with the phrase, or has at most six words |
 | Telegram | `/stop` or a phrase | See 5.8 |
 | Rule: default branch | A push to the default branch, or a merge, without a direct dispatch at level `full`, in a repository with pull requests turned on | In the run's commands: `git push` to the default branch, `--all`, `--mirror`, `gh pr merge`, and `gh api` calls that merge (`PUT …/pulls/<n>/merge`, `POST …/merges`, the GraphQL mutations `mergePullRequest`, `enablePullRequestAutoMerge`, `mergeBranch`). With `gh`, every `VOICE_GW_KILL_CHECK` seconds and at the end: the default branch moved on GitHub, and the worker's repository holds the new head, or the new head merged a pull request of the run (below) |
-| Rule: outside | Writes outside the repository, `/tmp`, `/var/tmp` (and the system's temp folder on this computer), the run's own Claude Code memory folder (`~/.claude/projects/<repository path with - for every other character>/memory`, where auto memory writes; another project's is outside) and `VOICE_GW_KILL_ALLOW_PATHS`; for a run in a [work folder](#work-folders), writes outside that folder, those temporary folders and its memory folder; writing to `/dev/null`, the standard streams, a terminal or `/dev/fd/N` is none | The file tools by path. Shell commands by explicit targets: redirections, `tee`, `cp`, `mv`, `rm`, `mkdir`, `touch`, `ln`, `chmod`, `chown`, `truncate`, `sed -i`, `dd of=`, also after `cd`; `$HOME` and `~` are expanded. The command line is read as a shell reads it: quoted text, comments, here-strings and heredoc bodies are data, so a `>` or `;` in a pattern, a commit message or a script written to a file is none; the commands in `$(…)`, backticks, `<(…)`, `>(…)`, `sh -c`, `eval` and a heredoc a shell reads are checked like any other, and so is a script written from a heredoc that the same call runs |
+| Rule: outside | Writes outside the repository (for a run in a [worktree](#several-runs-per-repository), outside its worktree), `/tmp`, `/var/tmp` (and the system's temp folder on this computer), the run's own Claude Code memory folder (`~/.claude/projects/<repository path with - for every other character>/memory`, where auto memory writes; another project's is outside) and `VOICE_GW_KILL_ALLOW_PATHS`; for a run in a [work folder](#work-folders), writes outside that folder, those temporary folders and its memory folder; writing to `/dev/null`, the standard streams, a terminal or `/dev/fd/N` is none | The file tools by path. Shell commands by explicit targets: redirections, `tee`, `cp`, `mv`, `rm`, `mkdir`, `touch`, `ln`, `chmod`, `chown`, `truncate`, `sed -i`, `dd of=`, also after `cd`; `$HOME` and `~` are expanded. The command line is read as a shell reads it: quoted text, comments, here-strings and heredoc bodies are data, so a `>` or `;` in a pattern, a commit message or a script written to a file is none; the commands in `$(…)`, backticks, `<(…)`, `>(…)`, `sh -c`, `eval` and a heredoc a shell reads are checked like any other, and so is a script written from a heredoc that the same call runs |
 | Rule: many changes | More than 500 file edits in a run; at its end more than 300 files or 30,000 lines changed; in a work folder, more than 300 files in it | Edits as they happen; at the end the commits made during the run plus what is not committed, or the files in the work folder. `VOICE_GW_KILL_MAX_*` |
 | Controller | `raise_alarm` with a reason | One more signal, never the only one |
 
@@ -888,9 +961,11 @@ pull requests turned off are exempt, as for pushes.
   when the switch tripped; `send` and `ask` hand nothing over. The queue is emptied, and the
   controller's alarm names its tasks: they do not start after the unlock by themselves.
 - **Approvals:** open ones are denied, new ones are denied automatically.
-- **Workers:** every run stops, with every process it started, also a run that is ending, and so do
-  worker processes that no run accounts for and a clone that is going. With Docker the container
-  stops and loses its restart policy, and so does the work folders' container.
+- **Workers:** every run stops, with every process it started, also a run that is ending or
+  making its worktree, and so do worker processes that no run accounts for and a clone that is
+  going. A run in a worktree does not go back to the queue: its worktree is kept, as an open
+  decision that holds nothing. With Docker the container stops and loses its restart policy, and
+  so does the work folders' container.
   While locked, `scripts/start-workers-container.sh` mounts the folder read-only, and the gateway
   stops a container with a writable `/repos`, or a work folders' container with a writable
   folder, within `VOICE_GW_KILL_CHECK` seconds.
@@ -923,7 +998,8 @@ unlock by voice, Telegram or the controller.
 | `.secrets/killswitch.json` | Kill switch state, present while locked | 0600 |
 | `.secrets/worker/claude_token`, `.secrets/worker/github_token` | The container's logins, mounted read-only into it; into the work folders' container only `claude_token` | 0600, folder 0700 |
 | `.state/` | Worker state, run output, open requests and decisions, watched pull requests, the watchdog's lock | 0700 when the gateway creates it |
-| `.state/tasks/`, `.state/workers.json` | Each run's output with every tool input and result; the workers' state, with the queue and the work folders | 0600, folder 0700 |
+| `.state/tasks/`, `.state/workers.json` | Each run's output with every tool input and result; the workers' state, with the queue, the worktrees, the limit per repository the queue was planned for, and the work folders | 0600, folder 0700 |
+| `VOICE_GW_WORKER_ROOT/.voice-worktrees/<repository>/<id>` | The worktrees of further runs of a repository ([several runs per repository](#several-runs-per-repository)), while something is left in them | As git makes them |
 | `~/voice-scratch/<date>-<id>` (`VOICE_GW_SCRATCH_ROOT`) | The work folders, with what their runs made | 0700, and the root too when the gateway or the start script makes it |
 | `.state/requests.json` | Voice requests and the answers, with what the voice client has read | 0600 |
 | `.state/jobs.json` | Open decisions, with the driver's answers, and the last 100 closed ones for a week | 0600 |
@@ -983,6 +1059,12 @@ is guarded as follows:
   only leaves the group and the tree. **Only Docker isolates.** The same holds for
   [work folders](#work-folders) on this computer: their rule on writes is stricter, but a run there
   can read and do everything your user can; in their container it reaches only the work folders.
+- **Several runs in one repository share its git.** Their worktrees share its objects and refs.
+  The rule on the default branch cannot tell whose commit a new head is while another run there
+  may push straight to it (`direct` at `full`), so it lets that go; and the count of changes at
+  the end leaves out the branches other runs pushed and their worktrees' commits only as far as
+  this gateway saw them. Whether two tasks touch the same files is the controller's judgement,
+  from their texts; a conflict is resolved by the run that pushes second, when it rebases.
 - **The container's scripts come with the image.** `voice-run` and `voice-stop` are copied into
   it when it is built; rebuild it (`docker build`, see `docker/Dockerfile`) for a newer version.
 - **In Docker,** the container can do what its token allows on GitHub, and reaches the network.
@@ -1100,7 +1182,7 @@ the `localhost` link).
 | Step | What the assistant does | What you give it |
 |---|---|---|
 | This computer | Checks Node.js, `npm install`, Claude Code (2.1.80+), git, the `gh` login, Docker, tmux, Tailscale | Fixes for what is marked as needed |
-| Gateway | Port, repositories folder, runs at a time, time limit, approvals by voice, Remote Control for the controller (off by default), what the controller may do (with a warning above `confined`), what locks the kill switch (with a warning below `auto`), the Funnel off when idle and after how many minutes | Choices |
+| Gateway | Port, repositories folder, runs at a time and per repository (both apply at once in a running gateway), time limit, approvals by voice, Remote Control for the controller (off by default), what the controller may do (with a warning above `confined`), what locks the kill switch (with a warning below `auto`), the Funnel off when idle and after how many minutes | Choices |
 | Models | Model and effort for the controller (`--model`, `--effort` from `start-controller.sh`) and for every worker run, on the host and in Docker | Choices, or Claude Code's defaults |
 | Telegram | Checks the token (`getMe`), finds your private chat with `getUpdates` once you wrote to the bot, sends a test message | A token from [@BotFather](https://t.me/BotFather), one message to the bot |
 | Workers in Docker | Checks the GitHub token and shows the level per repository with the gateway's detection. Builds the image with its progress shown. Starts the container, sets git's name and email in it, and clones the chosen repositories inside it | A token from `claude setup-token`, optionally a GitHub token ([5.6](#56-access-levels-and-their-detection)), the repositories |
@@ -1456,7 +1538,8 @@ at most three short sentences, without code, paths or lists.
 | "Tell the alpha worker to fix the typo in the README." | The worker commits on a `voice/` branch, pushes and opens a pull request (in Docker: depends on the level); you hear that it is out |
 | "Open it as a draft." / "Ja" to "Es folgt noch die Übersetzung, als Draft öffnen?" | `dispatch` with `draft`: that one pull request opens as a draft. The controller asks only when more tasks for the same pull request are queued or named; the last of them marks it ready |
 | "Tell it to add a test for that too." | A follow-up in the same worker session, on the same branch |
-| "Then also update the changelog in alpha." (while alpha works) | `dispatch=queued`: it starts by itself after the run, and you hear its result |
+| "Then also update the changelog in alpha." (while alpha works) | `dispatch=queued`: it starts by itself after the run, and you hear its result. With several runs per repository, the controller lets it run next to the other in a worktree of its own when it needs nothing from it, and says so: "It runs in parallel to the test fix." |
+| "Stop the second alpha run." / "Stop it for good." | `stop_worker` with that task; a run in a worktree goes back to the queue and resumes, unless you say to stop it for good |
 | "What is the alpha worker doing?" | `worker_status`, with the queue there |
 | "Stop the alpha worker." | `stop_worker`; the next queued task there starts |
 | "Forget the changelog task." / "Stop alpha and drop the rest." | `stop_worker` with `drop` and the task's id, or with `"all"` |
@@ -1588,6 +1671,17 @@ gateway reads them at its start: restart the controller after a change. Under th
 start reads `.secrets/gateway.env` again, and the log line `watchdog: settings from …` shows each
 setting with where it came from.
 
+**The worker limits apply at once.** The gateway watches `.secrets/gateway.env` (`src/live.mjs`).
+Once a change has settled for a second or two, it reads the file again and applies
+`VOICE_GW_MAX_WORKERS` and `VOICE_GW_MAX_WORKERS_PER_REPO` without a restart, as it would at a
+start: raised per repository, the controller hears which queued tasks could now run next to
+others; lowered, runs going run to the end and nothing new starts above the limit. Every other
+changed setting is logged as counting from the next start. A value set in the environment still
+wins over the file, and the log says so. A file that cannot be read, is gone or looks half written
+(its last line without an end) keeps the limits as they are; a value that is no whole number from
+1 to 100 is ignored, with a log line. The setup assistant says when a running gateway takes its
+limits at once.
+
 **Gateway** (`src/config.mjs`):
 
 | Variable | Default | Meaning |
@@ -1611,7 +1705,8 @@ setting with where it came from.
 | `VOICE_GW_WORKER_SELF` | off | `1`: this repository's own checkout is a worker on this computer too |
 | `VOICE_GW_CONTROLLER_LEVEL` | `confined` | `clone-delete` or `unrestricted` ([5.3](#53-the-controllers-confinement)); the gateway, the confine hook and the start script read it |
 | `VOICE_GW_DISPATCH_WINDOW` | `30` | Minutes a voice request counts for `dispatch`: only words from requests this recent start a run |
-| `VOICE_GW_MAX_WORKERS` | `2` | Runs at the same time |
+| `VOICE_GW_MAX_WORKERS` | `2` | Runs at the same time, in all; every run of a repository counts. Applies at once when the settings file changes, without a restart |
+| `VOICE_GW_MAX_WORKERS_PER_REPO` | `1` | Runs at the same time in one repository; further runs work in git worktrees of their own ([several runs per repository](#several-runs-per-repository)). Applies at once when the settings file changes |
 | `VOICE_GW_WORKER_TIMEOUT` | `360` | Minutes before a run is stopped; `0`: no time limit |
 | `VOICE_GW_WORKER_MODEL` | Claude Code's default | `--model` for every worker run, host and Docker |
 | `VOICE_GW_WORKER_EFFORT` | Claude Code's default | `--effort`: `low`, `medium`, `high`, `xhigh`, `max` |
@@ -1722,7 +1817,8 @@ do not set them.
 | The controller says it cannot clone or delete | The level is `confined`, or workers run in Docker; the log line `controller level …` says which. A new level counts from the next start of the start script: `--stop`, then start it again. |
 | `delete=unplanned` | A deletion needs a plan of the same path from the last 15 minutes: the controller calls `delete_path` without `confirm` first. |
 | A worker fails at once | `could not start claude`: Claude Code is not on the gateway's `PATH`; set `VOICE_GW_CLAUDE_BIN`. Otherwise read `.state/tasks/<task>.err`. |
-| A queued task does not start | It waits while a run goes on in its repository, while that run's result has not reached the controller (is the session connected?), while every `VOICE_GW_MAX_WORKERS` slot is taken, and while the kill switch is locked; behind a worker container that does not answer it tries again every 30 s. `list_workers` shows the queue, `.state/workers.json` holds it under `queue`. |
+| A queued task does not start | It waits while a run goes on in its repository (or as many as `VOICE_GW_MAX_WORKERS_PER_REPO` allows, or one it waits for with `after`), while that run's result has not reached the controller (is the session connected?), while every `VOICE_GW_MAX_WORKERS` slot is taken, and while the kill switch is locked; behind a worker container that does not answer it tries again every 30 s. `list_workers` shows the queue, `.state/workers.json` holds it under `queue`. |
+| A worktree stays in `.voice-worktrees` | Something in it is not committed or not pushed, a queued task resumes there, or a decision refers to it: `worker_status` names it. Push or drop the work there at the desk (`git worktree remove`), or have the run finished with `dispatch` and `continues`. |
 | An event with `kind="queue"` | A queued task could not start at its turn and left the queue: uncommitted changes, the origin changed in the container, a `direct` push not allowed, or the repository is gone. It is an open decision now; the controller asks you, and dispatched again, it starts from the beginning. |
 | `dispatch=queued … reason=decision`, and nothing starts | An open decision about the repository holds its tasks, for example unpushed commits after the last run. Answer it, or tell the controller to leave it: `resolve_decision` closes it with your words, and the tasks start. `open_items` lists what holds what. |
 | The controller says a reply was "Not sent: decision … was never asked" | The gateway raised a decision on that request, and the controller has to put it to you before it may reply "done". It is meant to ask with state "question"; nothing is lost in between. |
@@ -1785,6 +1881,8 @@ src/
   ipguard.mjs        the door: access log, /mcp only from Anthropic's addresses, alerts on Telegram
   workers.mjs        workers: repositories, claude -p runs, the queue, the check after a run, results
   workspaces.mjs     where a run works: a repository, or a work folder, with its rules and check
+  worktrees.mjs      the worktrees of further runs of a repository: made, with submodules, removed
+  live.mjs           the worker limits from the settings file while the gateway runs
   ledger.mjs         open decisions for the driver, and the open items
   runners.mjs        where workers run: this computer, or the Docker container; a run's processes
   access.mjs         access levels in the container, from the GitHub token
