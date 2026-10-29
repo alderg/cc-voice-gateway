@@ -679,6 +679,28 @@ test('Claude in Chrome: marked as seen, a restart needs no confirmation; if it c
   ])
 })
 
+test('Claude in Chrome: each start logs whether a desktop session of the user and a Chrome run, the log only', async () => {
+  const user = process.env.USER ?? process.env.LOGNAME
+  // Stand-ins: loginctl with or without the user's graphical session, pgrep with or without a Chrome.
+  const fakes = (name, { display, chrome }) => {
+    const dir = join(TMP, name)
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, 'loginctl'), `#!/bin/sh\ncase "$*" in\n  *show-user*) echo "${display}" ;;\n  *show-session*) echo x11 ;;\nesac\n`)
+    writeFileSync(join(dir, 'pgrep'), `#!/bin/sh\nexit ${chrome ? 0 : 1}\n`)
+    chmodSync(join(dir, 'loginctl'), 0o755)
+    chmodSync(join(dir, 'pgrep'), 0o755)
+    return `${dir}:${BIN}:${process.env.PATH}`
+  }
+  const before = telegram.messages.length
+  const none = setup([{ exit: 0 }], { env: { VOICE_GW_CONTROLLER_CHROME: '1', PATH: fakes('chrome-none', { display: '', chrome: false }) } })
+  assert.equal((await run(none)).status, 0)
+  assert.match(none.log(), new RegExp(`watchdog: chrome desktop: no desktop session of ${user}, and no Chrome of the user runs: until someone is signed in at the desktop, or in a remote desktop session that stays, with Chrome open and the Claude extension signed in, Claude in Chrome's tools answer that the extension is not connected`))
+  const both = setup([{ exit: 0 }], { env: { VOICE_GW_CONTROLLER_CHROME: '1', PATH: fakes('chrome-both', { display: 'c2', chrome: true }) } })
+  assert.equal((await run(both)).status, 0)
+  assert.match(both.log(), new RegExp(`watchdog: chrome desktop: a desktop session of ${user} \\(session c2, x11\\), and a Chrome of the user runs; Claude in Chrome works if its extension is signed in to the same claude\\.ai account`))
+  assert.equal(telegram.messages.length, before, 'no message')
+})
+
 // --- restarts on purpose: one message as each begins -----------------------------
 
 // systemctl as the autostart's systemd sees it: the service's invocation and

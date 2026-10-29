@@ -108,6 +108,14 @@
     <label>Claude in Chrome <select id="controller-chrome" data-setting="VOICE_GW_CONTROLLER_CHROME"><option value="0">off</option><option value="1">on, with the Claude extension in your Chrome</option></select></label>
     <p class="guide wide">Passed as <code>--model</code> and <code>--effort</code> by <code>scripts/start-controller.sh</code>.</p>
     <p id="chrome-notice" class="notice wide" hidden></p>
+    <p id="chrome-guide" class="guide wide" hidden>Claude in Chrome works only while someone is signed in at this
+      computer's desktop, or in a remote desktop session that stays when you disconnect, with Chrome open and the
+      Claude extension signed in to the same claude.ai account; otherwise the controller's browser tools answer that
+      the extension is not connected. Keep a Chrome window of your own open, not only the one Claude opens for its tab
+      group: if Claude Code closes the last window or tab, Chrome quits, and the browser tools stop until someone
+      starts it again at the desktop. The confine hook lets them through only at the level unrestricted.</p>
+    <p id="chrome-security" class="notice wide" hidden>Security risk: the controller can use every login of that
+      Chrome profile, and a password manager in it. Use a profile only for Claude: README, "Claude in Chrome".</p>
     <label>Worker model <select id="worker-model" data-model="VOICE_GW_WORKER_MODEL"></select>
       <input id="worker-model-other" placeholder="full model name" hidden></label>
     <label>Worker effort <select data-setting="VOICE_GW_WORKER_EFFORT" data-efforts></select></label>

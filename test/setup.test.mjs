@@ -939,13 +939,19 @@ async function page(settings, chrome) {
   })
   vm.runInContext(readFileSync(join(ROOT, 'src', 'setup', 'ui', 'app.js'), 'utf8'), context)
   await sleep(50) // its start reads /api/state
-  return { notice: $('#chrome-notice'), select }
+  return { notice: $('#chrome-notice'), guide: $('#chrome-guide'), security: $('#chrome-security'), select }
 }
 
 test('Claude in Chrome on the page: a warning with what to do at the terminal, unless its notice is confirmed already', async () => {
   const html = readFileSync(join(ROOT, 'src', 'setup', 'ui', 'index.html'), 'utf8')
   assert.match(html, /<select id="controller-chrome" data-setting="VOICE_GW_CONTROLLER_CHROME">/)
   assert.match(html, /<p id="chrome-notice" class="notice wide" hidden><\/p>/)
+  // What it needs while the gateway runs, and its risk, in the page itself.
+  const guide = /<p id="chrome-guide" class="guide wide" hidden>([^<]*)<\/p>/.exec(html)?.[1].replace(/\s+/g, ' ')
+  assert.match(guide, /^Claude in Chrome works only while someone is signed in at this computer's desktop, or in a remote desktop session that stays when you disconnect, with Chrome open and the Claude extension signed in to the same claude\.ai account; otherwise the controller's browser tools answer that the extension is not connected\./)
+  assert.match(guide, /Keep a Chrome window of your own open, not only the one Claude opens for its tab group: if Claude Code closes the last window or tab, Chrome quits, and the browser tools stop until someone starts it again at the desktop\./)
+  const security = /<p id="chrome-security" class="notice wide" hidden>([^<]*)<\/p>/.exec(html)?.[1].replace(/\s+/g, ' ')
+  assert.match(security, /^Security risk: the controller can use every login of that Chrome profile, and a password manager in it\. Use a profile only for Claude: README, "Claude in Chrome"\.$/)
 
   for (const noticeSeen of [false, null]) {
     const { notice, select } = await page({ VOICE_GW_CONTROLLER_CHROME: '1' }, { noticeSeen })
@@ -959,6 +965,10 @@ test('Claude in Chrome on the page: a warning with what to do at the terminal, u
     for (const listener of select.listeners.change) listener()
     assert.equal(notice.hidden, true)
   }
+  const shown = await page({ VOICE_GW_CONTROLLER_CHROME: '1' }, { noticeSeen: true })
+  assert.deepEqual([shown.guide.hidden, shown.security.hidden], [false, false], 'with it on, what it needs and the risk')
+  const hidden = await page({ VOICE_GW_CONTROLLER_CHROME: '0' }, { noticeSeen: true })
+  assert.deepEqual([hidden.guide.hidden, hidden.security.hidden], [true, true])
 
   const confirmed = await page({ VOICE_GW_CONTROLLER_CHROME: '1' }, { noticeSeen: true })
   assert.equal(confirmed.notice.hidden, false)
@@ -993,7 +1003,9 @@ test('finishing with Claude in Chrome on: a line with what to do at the terminal
     /Claude in Chrome: before relying on unattended restarts, start Claude Code once at the terminal as this user with claude --chrome, confirm the Claude in Chrome notice with Enter and leave with \/exit; otherwise a restart can hang on that notice/,
   )
   writeFileSync(join(config, '.claude.json'), JSON.stringify({ hasCompletedClaudeInChromeOnboarding: true }))
-  assert.match(await finish('seen', '1'), /Claude in Chrome: its notice for the first start is confirmed already for this user; restarts do not wait for it/)
+  const seen = await finish('seen', '1')
+  assert.match(seen, /Claude in Chrome: its notice for the first start is confirmed already for this user; restarts do not wait for it/)
+  assert.match(seen, /Claude in Chrome: it works only while someone is signed in at the desktop, or in a remote desktop session that stays when disconnected, with Chrome open in a window of its own and the Claude extension signed in to the same claude\.ai account; the controller can use every login of that Chrome profile, so give Claude a profile of its own \(README, "Claude in Chrome"\)/)
   assert.doesNotMatch(await finish('off', '0'), /Claude in Chrome/)
 })
 

@@ -343,6 +343,7 @@ to a lost phone or a leaked token.
 | The controller, level `confined` (default) | Read `controller/`, write `controller/playground/`, read pull request and CI status, merge after an approval, dispatch workers with your words from a recent voice request, raise the alarm | Start a worker on words that only a worker result or a pull request brought in (see 5.4); anything else (see 5.3) |
 | The controller at `clone-delete` | As at `confined`; also clone GitHub repositories into the worker root and delete files and folders there, each deletion after its plan, your words and an approval | Delete outside the worker root, the gateway's own checkout, or in a repository while its worker runs |
 | The controller at `unrestricted` | Everything your user can: any command, any file, `.secrets/` included, the web, subagents; your MCP servers and connectors after an approval | Nothing is blocked; a merge in the strict form and a confirmed `delete_path` still ask (see 5.3) |
+| The controller with Claude in Chrome (only at `unrestricted`) | Everything the Chrome profile is signed in to: open sessions and logins on any site, and what a password manager in that profile fills in ([the warning](#claude-in-chrome)) | Nothing more is blocked by the gateway |
 | Whoever is signed in to your claude.ai account, with Remote Control on | Follow the controller in the Claude app or at claude.ai/code, type to it, answer its approvals, stop its turn, switch it between Manual, Accept edits and Plan ([Remote Control](#remote-control-from-the-claude-app)) | Start a worker, clone or delete by typing (see 5.4); lift the confinement; see or steer the workers' runs |
 | A worker on this computer | Everything your user can, without approvals | Nothing is blocked; rules only observe (see 5.9) |
 | A worker in Docker | The mounted folder, the container's tokens, the network | Your other files, SSH keys, `gh` login; more on GitHub than its token allows |
@@ -402,6 +403,11 @@ a warning for the two levels above the default:
 | `confined` (default) | What the rest of this section describes: answer, dispatch workers, read pull request status, merge after an approval | – |
 | `clone-delete` | The same, plus `clone_repo` and `delete_path` (below) | Whoever can talk to the connector can have repositories cloned, and files and folders in the worker root deleted, whole repositories with work that exists nowhere else included. Whoever can call the connector also gives the approval for each deletion. A deletion cannot be undone |
 | `unrestricted` | Everything your user can: the hook lets every tool through, and the start script passes allow rules instead of deny rules. Tools of other MCP servers and claude.ai connectors still ask, by voice | Whoever can talk to the connector can run any command as you, read and change any file (`.secrets/`, SSH keys and logins included) and reach the web. Text that a worker result or a web page brings in can steer a session that can do everything, and the kill switch's rules watch only the workers. Only on a computer or VM you can afford to lose |
+
+**Claude in Chrome** (`VOICE_GW_CONTROLLER_CHROME=1`) gives the controller a browser, and with it
+whatever that browser profile is signed in to. Its tools pass the confine hook only at
+`unrestricted`; below it, `--chrome` loads them and the hook blocks them. Read
+[the warning](#claude-in-chrome) before turning it on.
 
 Above `confined`, the start script also tells the session its level with
 `--append-system-prompt`, since `controller/CLAUDE.md` describes the confined working area. The
@@ -1195,7 +1201,33 @@ the `localhost` link).
 | Plugin | Shows whether `voice@cc-voice-gateway` is on the organisation's channel allowlist; registers the marketplace if it is; otherwise shows the admin steps | The admin |
 | Finish | Writes `.secrets/` (5.10) and ends | – |
 
-**Claude in Chrome.** At its first start with Claude in Chrome, Claude Code shows a notice about it
+#### Claude in Chrome
+
+> [!WARNING]
+> **A real security risk.** While Chrome stays open for the controller, the controller can use
+> everything that browser profile is signed in to: active logins and sessions on any site, and
+> extensions such as password managers (1Password and the like) that fill in credentials. Anyone
+> who can steer the controller can reach that too: by voice, through Remote Control in the Claude
+> app, and at the level `unrestricted`, where the browser tools pass the confine hook, with
+> everything else your user can do. Take care. Use a separate Chrome profile only for Claude, or a
+> separate user of the computer, with the Claude extension and nothing else: no password manager,
+> no private or work logins, signed in only to what the controller is meant to use; close or sign
+> out of what it no longer needs.
+
+**What it needs while the gateway runs.** Claude in Chrome works only while someone is signed in
+at the desktop of the user the controller runs as, or in a remote desktop session that stays when
+you disconnect, with Chrome open and the Claude extension signed in to the same claude.ai account.
+Without that, the controller's browser tools answer that the extension is not connected, and the
+controller tells you so in a sentence. Keep a Chrome window of your own open, not only the window
+Claude opens for its tab group: if Claude Code closes its last window or tab and no other Chrome
+window is open, Chrome quits entirely, and the browser tools stop working until someone starts it
+again at the desktop. The controller's instructions therefore never close the last tab of its tab
+group nor a window (`controller/CLAUDE.md`). At each start with Chrome on, the log says whether a
+desktop session of the user and a Chrome run (`watchdog: chrome desktop: …`). Workers get no Chrome: they
+run headless (`claude -p`) without `--chrome`, with `--strict-mcp-config`, so no rule is needed for
+them.
+
+**Its notice for the first start.** At its first start with Claude in Chrome, Claude Code shows a notice about it
 and waits for Enter at the terminal, so a restart by the watchdog or the autostart can hang there.
 The start script marks it as seen before each start ([8.1](#81-starting-and-stopping)), but cannot
 always. With Claude in Chrome on, the assistant therefore shows a warning, and repeats it when it
@@ -1204,7 +1236,8 @@ the user the controller runs as, with `claude --chrome`, confirm the Claude in C
 Enter and leave with `/exit`. If Claude Code's config (`~/.claude.json`, or
 `$CLAUDE_CONFIG_DIR/.claude.json`) says that the notice is confirmed already
 (`hasCompletedClaudeInChromeOnboarding`), it says so instead; it only reads that file. If it cannot
-tell, it warns.
+tell, it warns. Next to the option, the page also says what Claude in Chrome needs while the gateway
+runs, and points to the warning above in one line; the finish log repeats both.
 
 Values equal to their default are left out of `.secrets/gateway.env`, and other settings already in
 it stay. Unticking Telegram deletes its two files. Options: `--host` (`0.0.0.0`), `--port` (`8790`),
@@ -1432,7 +1465,8 @@ either case.
   notice. Only that key, only when it is missing, under Claude Code's own lock on the file. If it
   cannot (no such file yet, not valid JSON, locked for 5 s), the log line `watchdog: chrome: …` says
   that the start may wait for Enter at the terminal, and so does the next restart's Telegram message
-  ([8.2](#82-the-watchdog)).
+  ([8.2](#82-the-watchdog)). A second line says whether a desktop session of the user and a Chrome
+  run, which Claude in Chrome needs ([Claude in Chrome](#claude-in-chrome)); the log only.
 - **The channel,** chosen by `scripts/channel-mode.mjs` before every start:
   - **plugin**, when the organisation's managed settings (`~/.claude/remote-settings.json`, or the
     managed settings file on this computer) name `voice@cc-voice-gateway` in
@@ -1922,7 +1956,7 @@ limits at once.
 |---|---|---|
 | `VOICE_GW_CONTROLLER_MODEL` | Claude Code's default | `--model` for the controller |
 | `VOICE_GW_CONTROLLER_EFFORT` | Claude Code's default | `--effort` for the controller |
-| `VOICE_GW_CONTROLLER_CHROME` | `0` | `1`: `--chrome` for the controller, so it can use Claude in Chrome: a Chrome with the Claude extension, signed in, open on a desktop of the same user (a remote desktop session that stays when you disconnect works). Before each start the script marks Claude in Chrome's notice for the first start as seen, so that the session does not wait at the terminal ([8.1](#81-starting-and-stopping)); to be sure, confirm it once at the terminal with `claude --chrome` ([7.1](#71-with-the-setup-assistant)) |
+| `VOICE_GW_CONTROLLER_CHROME` | `0` | `1`: `--chrome` for the controller, so it can use Claude in Chrome, at the level `unrestricted` only: a Chrome with the Claude extension, signed in, open in a window of its own on a desktop of the same user (a remote desktop session that stays when you disconnect works). A security risk: read [the warning](#claude-in-chrome) first. Before each start the script marks Claude in Chrome's notice for the first start as seen, so that the session does not wait at the terminal ([8.1](#81-starting-and-stopping)); to be sure, confirm it once at the terminal with `claude --chrome` ([7.1](#71-with-the-setup-assistant)) |
 | `VOICE_GW_REMOTE_CONTROL` | `0` | `1`: `--remote-control "Voice controller"` for the controller, to follow and steer it at claude.ai/code and in the Claude app ([Remote Control](#remote-control-from-the-claude-app)); not the workers, whose headless runs Remote Control does not connect. Any other value counts as `0`. The gateway reads it too, to say so in its log |
 | `VOICE_GW_WATCHDOG` | `1` | `0`: start without the watchdog |
 | `VOICE_GW_WATCHDOG_INTERVAL` | `30` | Seconds between health checks |

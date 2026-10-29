@@ -191,9 +191,12 @@ const CHROME_WARNING =
   'this user: claude --chrome, confirm the Claude in Chrome notice with Enter, and leave with /exit.'
 const CHROME_CONFIRMED = 'Claude in Chrome\'s notice for the first start is confirmed already for this user: restarts do not wait for it.'
 
+// With it on, also what it needs (a desktop, Chrome open) and the risk.
 function showChromeNotice() {
   const box = $('#chrome-notice')
   box.hidden = $('#controller-chrome').value !== '1'
+  $('#chrome-guide').hidden = box.hidden
+  $('#chrome-security').hidden = box.hidden
   const confirmed = state.chrome?.noticeSeen === true
   box.className = confirmed ? 'guide wide' : 'notice wide'
   if (confirmed) box.removeAttribute('role')

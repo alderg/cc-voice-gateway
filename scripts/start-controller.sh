@@ -30,7 +30,9 @@
 # before every start with it, scripts/chrome-onboarding.mjs marks that notice
 # as seen in Claude Code's own config (~/.claude.json), where Claude Code notes
 # it too. If that fails, the log says that the start may wait for Enter at the
-# terminal, and so does the next restart's Telegram message.
+# terminal, and so does the next restart's Telegram message. Claude in Chrome
+# also needs a desktop of this user with Chrome open: the log says at each
+# start whether there is one (chrome_desktop), with no message.
 #
 # The session runs in manual mode, whatever defaultMode the user settings set.
 # controller/.claude/settings.json lets Bash, Write and Edit run without asking,
@@ -481,6 +483,36 @@ chrome_onboarding() {
   esac
 }
 
+# Claude in Chrome needs a desktop of this user: someone signed in at it, or a
+# remote desktop session that stays when disconnected, with Chrome open and
+# the Claude extension signed in. Otherwise its tools answer that the
+# extension is not connected. At each start with it on, the log says what
+# there is: the user's graphical session (loginctl's Display on Linux, the
+# console's owner on macOS) and whether a Chrome of the user runs. The log
+# only, no message.
+chrome_desktop() {
+  local user display kind desktop= chrome=0 said
+  user=$(id -un)
+  if [ "$(uname -s 2>/dev/null)" = Darwin ]; then
+    [ "$(stat -f %Su /dev/console 2>/dev/null)" = "$user" ] && desktop='the console'
+    pgrep -x 'Google Chrome' >/dev/null 2>&1 && chrome=1
+  else
+    display=$(loginctl show-user "$(id -u)" -p Display --value 2>/dev/null || true)
+    if [ -n "$display" ]; then
+      kind=$(loginctl show-session "$display" -p Type --value 2>/dev/null || true)
+      desktop="session $display${kind:+, $kind}"
+    fi
+    pgrep -u "$(id -u)" -x 'chrome|chromium|chromium-browse|google-chrome' >/dev/null 2>&1 && chrome=1
+  fi
+  said="${desktop:+a desktop session of $user ($desktop)}"
+  said="${said:-no desktop session of $user}, and $([ "$chrome" = 1 ] && echo 'a Chrome of the user runs' || echo 'no Chrome of the user runs')"
+  if [ -n "$desktop" ] && [ "$chrome" = 1 ]; then
+    log "chrome desktop: $said; Claude in Chrome works if its extension is signed in to the same claude.ai account"
+  else
+    log "chrome desktop: $said: until someone is signed in at the desktop, or in a remote desktop session that stays, with Chrome open and the Claude extension signed in, Claude in Chrome's tools answer that the extension is not connected"
+  fi
+}
+
 # Sets claude_args and channel_mode for the next start, and says why.
 choose_channel() {
   local line
@@ -530,6 +562,7 @@ choose_channel() {
   if [ "${VOICE_GW_CONTROLLER_CHROME:-0}" = 1 ]; then
     claude_args+=(--chrome)
     chrome_onboarding
+    chrome_desktop
   else
     chrome_confirm=0
   fi

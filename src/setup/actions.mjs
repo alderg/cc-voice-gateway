@@ -859,6 +859,13 @@ export function createSetup({
     return ok
   }
 
+  // What Claude in Chrome needs while the gateway runs, and its risk.
+  const CHROME_DESKTOP =
+    'Claude in Chrome: it works only while someone is signed in at the desktop, or in a remote desktop session that ' +
+    'stays when disconnected, with Chrome open in a window of its own and the Claude extension signed in to the same ' +
+    'claude.ai account; the controller can use every login of that Chrome profile, so give Claude a profile of its ' +
+    'own (README, "Claude in Chrome")'
+
   // With Claude in Chrome on: its notice for the first start waits for Enter
   // at the terminal. The start script marks it as seen before each start, but
   // cannot always; confirmed once by hand, no restart waits for it.
@@ -880,7 +887,10 @@ export function createSetup({
       if (docker) ok = (await setUpDocker(values, docker, line)) && ok
       if (scratchDocker) ok = (await setUpScratchDocker(values, line)) && ok
       if (body.watchdog?.autostart || body.watchdog?.startNow) ok = (await setUpWatchdog(body.watchdog, line)) && ok
-      if (settings.after.VOICE_GW_CONTROLLER_CHROME === '1') line(chromeNote())
+      if (settings.after.VOICE_GW_CONTROLLER_CHROME === '1') {
+        line(chromeNote())
+        line(CHROME_DESKTOP)
+      }
       if (body.plugin?.register && channelMode({ env, root }).mode === 'plugin-register') {
         const code = await runCommand(bin.claude, ['plugin', 'marketplace', 'add', root], { env, onLine: line, timeoutMs: 60000 })
         line(code === 0 ? `registered this repository as the marketplace ${MARKETPLACE}` : 'registering the marketplace failed; the start script tries again')
