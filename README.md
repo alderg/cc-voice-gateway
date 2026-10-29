@@ -1481,7 +1481,8 @@ either case.
   - **development** otherwise: `--dangerously-load-development-channels server:voice`, with
     `--strict-mcp-config --mcp-config controller/.mcp.json`. So the gateway is the only MCP server.
     Claude Code asks at every start; answer at the terminal. With a personal account this is the only
-    way, and no start runs unattended ([known issues](#810-known-issues)).
+    official way, and no start runs unattended; an unofficial workaround is in the
+    [known issues](#810-known-issues).
     `VOICE_GW_CHANNEL=plugin|development` overrides the choice; `node scripts/channel-mode.mjs` shows
     it.
 
@@ -2101,9 +2102,34 @@ tmux attach -t voice   # then Enter; leave tmux again with Ctrl+B, then D
 ```
 
 Until then voice requests do not arrive. The Telegram message that a restart begins says when the
-start waits for it ([8.2](#82-the-watchdog)). Fully automatic, unattended operation is currently
+start waits for it ([8.2](#82-the-watchdog)). Officially, fully automatic, unattended operation is
 only possible with a Team or Enterprise account whose Owner has put the plugin on the channel
 allowlist ([8.1](#81-starting-and-stopping), plugin mode).
+
+**Workaround, unofficial: the allowlist in the managed settings file on this computer.** The
+setting of [7.4](#74-admin-steps-for-team-and-enterprise), put into the managed settings file on
+this computer instead of the organisation's, also works with a personal account. Tested with a Max
+account and Claude Code 2.1.312: the controller starts in plugin mode, without the confirmation. As
+root:
+
+```bash
+sudo mkdir -p /etc/claude-code
+sudo tee /etc/claude-code/managed-settings.json <<'EOF'
+{
+  "channelsEnabled": true,
+  "allowedChannelPlugins": [
+    { "marketplace": "cc-voice-gateway", "plugin": "voice" }
+  ]
+}
+EOF
+```
+
+On macOS the file is `/Library/Application Support/ClaudeCode/managed-settings.json`; if it exists
+already, add the two keys to it. The start script reads the file and chooses the plugin at the next
+start. As in 7.4, the list replaces the default list of channel plugins, here for every user of this
+computer. Anthropic documents the allowlist for organisations only, so this is unofficial and may
+break with any update of Claude Code: if a start waits for the confirmation again, confirm it as
+above and check whether the workaround still holds.
 
 ## 9. Repository layout
 
