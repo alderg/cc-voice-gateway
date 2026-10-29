@@ -919,7 +919,9 @@ Everything the assistant does can be done with files and commands.
 **Settings:** `.secrets/gateway.env`, one `VOICE_GW_NAME=value` per line, mode 0600. The values
 are in [8.7](#87-configuration). The gateway (`src/settings.mjs`) and the shell scripts
 (`scripts/settings.sh`) read it line by line and never execute it. Variables set in the
-environment or in `controller/.mcp.json` win.
+environment or in `controller/.mcp.json` win. The watchdog reads it again before every start of the
+session, so a restart, also one by voice, takes a change; only the controller level waits for the
+next start of the start script (8.2).
 
 ```bash
 mkdir -p -m 700 .secrets
@@ -1101,7 +1103,8 @@ tool that is not on its list ([confinement](#53-the-controllers-confinement)).
 | A run this long starts the pause over | 600 s | `VOICE_GW_WATCHDOG_STABLE` |
 | Gives up after this many restarts within the window | 5 in 1800 s | `VOICE_GW_WATCHDOG_MAX_RESTARTS`, `VOICE_GW_WATCHDOG_WINDOW` |
 | One watchdog at a time | lock in `.state/controller.lock` | – |
-| Log | `watchdog:` lines in `.logs/gateway.log` | – |
+| Settings read again before every start, so a restart takes a change; the controller level, `VOICE_GW_SECRETS_DIR`, `VOICE_GW_STATE_DIR`, `VOICE_GW_LOG_FILE` and the watchdog's own settings stay until the start script starts again | – | `.secrets/gateway.env` |
+| Log | `watchdog:` lines in `.logs/gateway.log`: who started and who stopped it (the autostart's service, or user, process and terminal), and each start's settings with where they came from | – |
 | Telegram on each restart and when it gives up | if the two Telegram files exist | – |
 
 With the development flag, a restarted session waits for the channel warning to be answered at the
@@ -1213,7 +1216,9 @@ by itself; the clean clone still works for trying a branch here first.
 
 Settings come from the environment, then from `.secrets/gateway.env`. Claude Code starts the
 gateway, so environment variables for it go into the `env` block of `controller/.mcp.json`. The
-gateway reads them at its start: restart the controller after a change.
+gateway reads them at its start: restart the controller after a change. Under the watchdog, every
+start reads `.secrets/gateway.env` again, and the log line `watchdog: settings from …` shows each
+setting with where it came from.
 
 **Gateway** (`src/config.mjs`):
 

@@ -47,7 +47,11 @@
 # With the development flag, a restart waits for the warning to be answered at
 # the terminal; see the README, "The watchdog". The
 # controller can also ask for a restart (restart_controller, src/restart.mjs):
-# that one starts again at once and does not count as a crash.
+# that one starts again at once and does not count as a crash. Before every
+# start the watchdog reads .secrets/gateway.env again, so that a restart takes
+# changed settings; only the level and the folders this script took at its own
+# start stay until it starts again. The log says who started and stopped it,
+# and which settings each start got from where.
 #
 #   scripts/start-controller.sh [claude options]   start, with the watchdog
 #   scripts/start-controller.sh --stop             stop the watchdog and the session
@@ -102,6 +106,33 @@ log() {
   if [ "$quiet" = 0 ] || [ -z "$LOG" ]; then printf '%s\n' "$line" >&2; fi
 }
 
+# Who started or stopped this script, for the log: the autostart's service, or
+# the user, process and terminal it came from. The service's own processes
+# only: its ExecStart's tmux, or systemd for ExecStop; the session and workers
+# below it inherit its INVOCATION_ID too.
+invoker() {
+  local unit=cc-voice-gateway.service parent tty
+  if [ -n "${INVOCATION_ID:-}" ] &&
+    [ "$(systemctl --user show -p InvocationID --value "$unit" 2>/dev/null)" = "$INVOCATION_ID" ] &&
+    { [ "$(systemctl --user show -p MainPID --value "$unit" 2>/dev/null)" = "$PPID" ] ||
+      [ "$(ps -o comm= -p "$PPID" 2>/dev/null)" = systemd ]; }; then
+    echo "the service $unit"
+    return
+  fi
+  parent=$(ps -o args= -p "$PPID" 2>/dev/null | cut -c1-80 || true)
+  tty=$(ps -o tty= -p $$ 2>/dev/null | tr -d ' ' || true)
+  [ "$tty" != '?' ] || tty=
+  echo "$(id -un) from ${parent:-process $PPID}${tty:+ on $tty}"
+}
+
+# Each setting with where it came from; the environment wins over the file.
+settings_line() {
+  local name file=() outside=()
+  for name in "${settings_from_file[@]+"${settings_from_file[@]}"}"; do file+=("$name=${!name-}"); done
+  for name in "${settings_outside[@]+"${settings_outside[@]}"}"; do outside+=("$name=${!name-}"); done
+  echo "settings from ${settings_path/#"$ROOT"\//}: ${file[*]:-none}; from the environment, which wins: ${outside[*]:-none}; gateway port $port"
+}
+
 # A Telegram message, if the Telegram secrets exist; never shows the token.
 notify() {
   local result
@@ -153,7 +184,9 @@ if [ "${1:-}" = --status ] || [ "${1:-}" = --stop ]; then
     echo "start-controller: running (watchdog $pid, session ${session:-starting})"
     exit 0
   fi
-  touch "$STOP"
+  by=$(invoker)
+  log "stop requested by $by"
+  echo "$by" >"$STOP"
   [ -n "$session" ] && kill -TERM "$session" 2>/dev/null || true
   kill -TERM "$pid" 2>/dev/null || true # in case it is pausing between two runs
   for _ in $(seq 1 100); do
@@ -224,11 +257,14 @@ fi
 
 # --- the gateway's health ---------------------------------------------------
 
-port=${VOICE_GW_PORT:-$(node -e '
-  try {
-    const config = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))
-    process.stdout.write(String(config.mcpServers?.voice?.env?.VOICE_GW_PORT ?? 8787))
-  } catch { process.stdout.write("8787") }' "$CONTROLLER/.mcp.json")}
+# Before every start: the settings may have changed it.
+gateway_port() {
+  port=${VOICE_GW_PORT:-$(node -e '
+    try {
+      const config = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))
+      process.stdout.write(String(config.mcpServers?.voice?.env?.VOICE_GW_PORT ?? 8787))
+    } catch { process.stdout.write("8787") }' "$CONTROLLER/.mcp.json")}
+}
 
 healthy() {
   node -e 'fetch(process.argv[1], { signal: AbortSignal.timeout(5000) }).then(r => process.exit(r.ok ? 0 : 1), () => process.exit(1))' \
@@ -276,14 +312,20 @@ trap '[ -n "$monitor_pid" ] && kill "$monitor_pid" 2>/dev/null; release_lock' EX
 
 restarts=() # times of the restarts within the window
 pause_ms=$backoff_ms
-next="starting the controller session (watchdog $$)"
+next="starting the controller session (watchdog $$, started by $(invoker))"
 host=$(hostname 2>/dev/null || echo 'this computer')
 export VOICE_GW_WATCHDOG_LOCK=$LOCK # for the gateway: restart requests, readiness
 
 while :; do
   rm -f "$LOCK/unhealthy" "$LOCK/claude.pid" "$LOCK/restart"
-  choose_channel
   log "$next"
+  # The settings file again (scripts/settings.sh), so that a restart takes
+  # what changed meanwhile. The level stays until this script starts again
+  # (see the top), and so do the folders it took at its start.
+  reload_settings VOICE_GW_CONTROLLER_LEVEL VOICE_GW_SECRETS_DIR VOICE_GW_STATE_DIR VOICE_GW_LOG_FILE
+  gateway_port
+  log "$(settings_line)"
+  choose_channel
   started=$(date +%s)
   quiet=1
   monitor &
@@ -299,7 +341,8 @@ while :; do
   lasted=$(($(date +%s) - started))
 
   if [ "$stopping" = 1 ] || [ -e "$STOP" ]; then
-    log "the controller session was stopped (exit code $status): not restarting"
+    by=$(cat "$STOP" 2>/dev/null || true)
+    log "the controller session was stopped${by:+ by $by} (exit code $status): not restarting"
     exit 0
   fi
   if [ -e "$LOCK/restart" ]; then
@@ -347,7 +390,8 @@ while :; do
   num sleep "$(seconds "$pause_ms")" &
   wait $! || true
   if [ "$stopping" = 1 ] || [ -e "$STOP" ]; then
-    log "stopped while waiting to restart"
+    by=$(cat "$STOP" 2>/dev/null || true)
+    log "stopped${by:+ by $by} while waiting to restart"
     exit 0
   fi
   pause_ms=$((pause_ms * 2))

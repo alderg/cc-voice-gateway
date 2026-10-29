@@ -31,10 +31,14 @@ const step = plan.shift() ?? { exit: 0 }
 writeFileSync(planFile, JSON.stringify(plan))
 const lock = process.env.VOICE_GW_WATCHDOG_LOCK
 const restarted = lock && existsSync(lock + '/restarted') ? readFileSync(lock + '/restarted', 'utf8').trim() : null
+const settings = Object.fromEntries(Object.entries(process.env)
+  .filter(([name]) => name.startsWith('VOICE_GW_TEST_') || name === 'VOICE_GW_CONTROLLER_LEVEL'))
 const note = event => appendFileSync(process.env.FAKE_CLAUDE_LOG, JSON.stringify({
-  pid: process.pid, event, step, lock: lock ?? null, mode: process.env.VOICE_GW_CHANNEL_MODE ?? null, restarted,
+  pid: process.pid, event, step, lock: lock ?? null, mode: process.env.VOICE_GW_CHANNEL_MODE ?? null, restarted, settings,
 }) + '\\n')
 note('start')
+// what the setup assistant does meanwhile: new settings, for the next start
+if ('settings' in step) writeFileSync(process.env.VOICE_GW_SECRETS_DIR + '/gateway.env', step.settings)
 process.on('SIGTERM', () => { note('SIGTERM'); process.exit(143) })
 if (step.restart) {
   // what the gateway does for restart_controller: a note for the watchdog, then SIGTERM
@@ -101,7 +105,8 @@ function setup(plan, { secrets = true, env = {} } = {}) {
         ? readFileSync(join(dir, 'claude.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line))
         : [],
     env: {
-      ...process.env,
+      // Not the settings of a gateway that runs this test, from its own environment.
+      ...Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith('VOICE_GW_') && name !== 'INVOCATION_ID')),
       PATH: `${BIN}:${process.env.PATH}`,
       VOICE_GW_STATE_DIR: join(dir, 'state'),
       VOICE_GW_LOG_FILE: log,
@@ -213,7 +218,10 @@ test('one watchdog at a time; --status and --stop, after which nothing restarts'
   assert.match(stop.stdout, /stopped/)
   assert.equal(await done, 0)
   assert.equal(c.starts().length, 1, 'not restarted')
-  assert.match(c.log(), /the controller session was stopped \(exit code 143\): not restarting/)
+  const user = process.env.USER ?? process.env.LOGNAME
+  assert.match(c.log(), new RegExp(`watchdog: starting the controller session \\(watchdog ${first.pid}, started by ${user} from .*\\)`))
+  assert.match(c.log(), new RegExp(`watchdog: stop requested by ${user} from \\S*node`), 'who stopped it')
+  assert.match(c.log(), new RegExp(`the controller session was stopped by ${user} from \\S*node.* \\(exit code 143\\): not restarting`))
   assert.ok(!existsSync(join(c.dir, 'state', 'controller.lock')), 'the lock is gone')
   assert.match((await run(c, ['--status'])).stdout, /not running/)
 })
@@ -238,6 +246,26 @@ test('a restart the controller asked for starts again at once, does not count, a
   assert.match(log, /starting the controller session again \(requested restart\)/)
   assert.doesNotMatch(log, /ended unexpectedly|giving up/)
   assert.equal(telegram.messages.length, before, 'no crash message')
+})
+
+test('every start reads the settings file again; the environment still wins, and the level stays', async () => {
+  const c = setup([
+    { restart: true, settings: 'VOICE_GW_TEST_A=2\nVOICE_GW_TEST_C=file\nVOICE_GW_CONTROLLER_LEVEL=unrestricted\n' },
+    { exit: 1, settings: 'VOICE_GW_TEST_C=file\n' },
+    { exit: 0 },
+  ], { env: { VOICE_GW_TEST_C: 'outside' } })
+  writeFileSync(join(c.dir, 'secrets', 'gateway.env'), 'VOICE_GW_TEST_A=1\nVOICE_GW_TEST_B=1\nVOICE_GW_CONTROLLER_LEVEL=clone-delete\n')
+  const out = await run(c)
+  assert.equal(out.status, 0, out.stderr)
+  assert.deepEqual(c.starts().map(s => s.settings), [
+    { VOICE_GW_TEST_A: '1', VOICE_GW_TEST_B: '1', VOICE_GW_TEST_C: 'outside', VOICE_GW_CONTROLLER_LEVEL: 'clone-delete' },
+    { VOICE_GW_TEST_A: '2', VOICE_GW_TEST_C: 'outside', VOICE_GW_CONTROLLER_LEVEL: 'clone-delete' },
+    { VOICE_GW_TEST_C: 'outside', VOICE_GW_CONTROLLER_LEVEL: 'clone-delete' },
+  ], 'changed and removed lines count from the next start, a requested restart or a crash')
+  const lines = c.log().split('\n').filter(line => / watchdog: settings from /.test(line))
+  assert.equal(lines.length, 3, 'one line per start')
+  assert.match(lines[0], /settings from \S*gateway\.env: VOICE_GW_CONTROLLER_LEVEL=clone-delete VOICE_GW_TEST_A=1 VOICE_GW_TEST_B=1; from the environment, which wins: .*VOICE_GW_TEST_C=outside.*; gateway port 1$/)
+  assert.match(lines[2], /settings from \S*gateway\.env: VOICE_GW_CONTROLLER_LEVEL=clone-delete; from the environment/)
 })
 
 test('after a crash the next session finds a note with the reason', async () => {
