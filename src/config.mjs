@@ -5,6 +5,7 @@
 // the settings file the setup assistant writes, .secrets/gateway.env
 // (settings.mjs). The environment wins.
 
+import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { SETTINGS_FILE_NAME, readSettings } from './settings.mjs'
@@ -118,6 +119,15 @@ export const config = {
   // Minutes after which a decision the driver was asked about and has not
   // answered gets a reminder, at most three times (ledger.mjs).
   remindMinutes: num(env.VOICE_GW_REMIND_MINUTES, 30),
+
+  // Work folders (workspaces.mjs): a new empty folder per task under this
+  // root, for tasks that need no repository. Off unless VOICE_GW_SCRATCH=1.
+  // The root must lie outside every git repository and this checkout; the
+  // gateway checks it at its start. A work folder is removed this many days
+  // after its last run.
+  scratch: env.VOICE_GW_SCRATCH === '1',
+  scratchRoot: env.VOICE_GW_SCRATCH_ROOT || join(homedir(), 'voice-scratch'),
+  scratchDays: num(env.VOICE_GW_SCRATCH_DAYS, 7),
 
   // Pull requests that workers open: ready for review by default, so that
   // automatic reviews start at once; as drafts with VOICE_GW_PR_DRAFT=1

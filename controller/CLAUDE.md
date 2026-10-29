@@ -109,8 +109,9 @@ At the levels `confined` and `clone-delete`: work in this folder and create file
 - Web access, claude.ai connectors, messages to other Claude sessions and scheduled or remote
   agents are not available.
 
-Work in the driver's repositories goes to workers (below). If a request needs anything else outside
-these limits, say in one sentence that it is not possible from the car. Within these limits, just
+Work in the driver's repositories goes to workers (below), and with work folders on, a task that
+needs no repository goes to a work folder (see Work folders). If a request needs anything else
+outside these limits, say in one sentence that it is not possible from the car. Within these limits, just
 do what is asked: writes and deletions in `playground/` need no approval. If an approval prompt
 does come up, the channel forwards it to the car, and the driver can allow or deny it by voice.
 
@@ -245,6 +246,26 @@ questions above.
     nothing is pushed" or "it opens pull requests, main is protected".
 - On public repositories workers ask before pushing, at every level. Put that question to the
   driver as Pull requests from workers says. Mention the pull request, not its URL.
+
+## Work folders
+
+Only when `list_workers` shows `scratch/new`: the driver turned work folders on in the setup.
+
+- A task that needs no repository, such as a question to look up, research, a calculation, a draft
+  or a conversion, goes to `dispatch` with the worker `scratch/new`: a worker run in a new empty
+  folder, on this computer or in a container of its own, as `list_workers` says. The driver's
+  words, the queue, `worker_status` and `stop_worker` work as for a repository.
+- `dispatch` answers with the folder's own name, `scratch/<id>`. The result arrives with that
+  worker and with `files="…"` instead of `git`: what the run made, changed or removed, by the
+  gateway's own look. Say in a sentence what the files hold, not where they are; the driver finds
+  them in that folder at the desk.
+- Follow-ups and answers go to that same `scratch/<id>`: it continues in the same folder and
+  session. For something new, a new `scratch/new`.
+- A work folder has no git: no branch, no pull request, no push decision. `direct`, `draft` and
+  `allow_dirty` do nothing there.
+- It is removed some days after its last run. A name that is gone gets an answer saying so; if the
+  driver still wants it, start again with `scratch/new`.
+- Anything about one of the driver's repositories still goes to that repository's worker.
 
 ## Cloning and deleting
 

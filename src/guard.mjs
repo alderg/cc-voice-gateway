@@ -21,11 +21,14 @@
 //                   quoted text, comments and heredocs are data; commands in
 //                   $(…), `…`, <(…), >(…), sh -c, eval, a shell's heredoc and
 //                   a script written from a heredoc that the same call runs
-//                   are commands. Devices such as /dev/null are no write.
+//                   are commands. Devices such as /dev/null are no write. A
+//                   run in a work folder (workspaces.mjs) may write only
+//                   there and in its memory folder.
 //   many changes    more file edits in a run than maxEdits; at the end, more
 //                   files or lines changed than maxFiles or maxLines, counting
 //                   commits made during the run on any branch and what is not
-//                   committed.
+//                   committed; in a work folder, more files in it than
+//                   maxFiles.
 //
 // The rules observe the run; they cannot stop its first step. What they miss
 // is in the README ("Limits"): targets hidden in variables, scripts or
@@ -490,17 +493,21 @@ export class RunGuard {
   }
 
   // Also for runs that were going when the gateway started. The runner of
-  // the run's workspace, as Workers knows it.
+  // the run's workspace, as Workers knows it. A run in a work folder may
+  // write only there and in its memory folder: not even in the temporary
+  // folders or VOICE_GW_KILL_ALLOW_PATHS.
   started(task) {
     if (this.runs.has(task.id)) return
     const runner = this.workers.runnerOf?.(task) ?? this.runner
     const { home, claudeConfig, roots } = this.places(runner)
+    const scratch = task.kind === 'scratch'
     const run = {
       id: task.id,
       repo: task.repo,
+      scratch,
       runner,
       home,
-      roots, // where it may write besides its workspace and its memory folder
+      roots: scratch ? [] : roots, // where it may write besides its workspace and its memory folder
       dir: task.dir ?? runner.dir(task.repo),
       memory: null,
       slug: task.slug ?? null,
@@ -748,6 +755,7 @@ export class RunGuard {
   // --- size ---------------------------------------------------------------------
 
   async checkSize(run) {
+    if (run.scratch) return this.checkFiles(run)
     const since = Math.floor(run.startedAt / 1000)
     const [committed, pending, untracked] = await Promise.all([
       run.runner.git(run.dir, 'log', '--all', `--since=@${since}`, '--numstat', '--format='),
@@ -765,6 +773,16 @@ export class RunGuard {
     for (const path of (untracked ?? '').split('\n')) if (path) files.add(path)
     if (files.size > this.maxFiles || lines > this.maxLines) {
       this.violation(run, 'many changes', `${files.size} files and ${lines} lines changed in one run (limits ${this.maxFiles} files, ${this.maxLines} lines)`)
+    }
+  }
+
+  // A work folder has no git: the files in it at the end count.
+  async checkFiles(run) {
+    const files = await Promise.resolve()
+      .then(() => run.runner.files?.(run.dir, this.maxFiles))
+      .catch(() => null)
+    if (files && files.length > this.maxFiles) {
+      this.violation(run, 'many changes', `more than ${this.maxFiles} files in the work folder after one run`)
     }
   }
 }

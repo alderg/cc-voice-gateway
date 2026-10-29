@@ -45,10 +45,22 @@ import { execFile } from 'node:child_process'
 import { randomInt, randomUUID } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { chmodSync, closeSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, renameSync, rmSync, writeFileSync } from 'node:fs'
-import { join, relative } from 'node:path'
+import { dirname, join, posix, relative } from 'node:path'
 import { log, preview } from './log.mjs'
-import { HostRunner, MARK, alive, startOf } from './runners.mjs'
-import { Repositories, kindOf } from './workspaces.mjs'
+import { DockerRunner, HostRunner, MARK, MAX_FILES, alive, startOf } from './runners.mjs'
+import {
+  Repositories,
+  SCRATCH_NEW,
+  SCRATCH_RULES,
+  age,
+  fileChanges,
+  filesSummary,
+  filesText,
+  kindOf,
+  scratchEntries,
+  scratchId,
+  scratchPrompt,
+} from './workspaces.mjs'
 
 const POLL_MS = 1000
 // A run that gave its result and has not ended after this long without
@@ -60,6 +72,9 @@ const MAX_STEPS = 5
 const KEEP_TASKS = 40
 const MAX_UNPUSHED = 200 // commits on no remote that the audit lists
 const PAUSE_MS = 30 * 1000 // the queue waits this long when the worker container does not answer
+const SWEEP_MS = 10 * 60 * 1000 // how often old work folders are looked for
+const DAY_MS = 24 * 60 * 60 * 1000
+const SCRATCH_SHOWN = 10 // work folders list_workers names, the last used first
 const ID_ALPHABET = 'abcdefghjkmnpqrstuvwxyz23456789'
 
 // Claude Code sets these for its own child processes, the gateway included. A
@@ -210,6 +225,7 @@ export function workerRules(level, { pushDirect = false, draft = false } = {}) {
 }
 
 const plural = (n, unit) => `${n} ${unit}${n === 1 ? '' : 's'}`
+const randomId = length => Array.from({ length }, () => ID_ALPHABET[randomInt(ID_ALPHABET.length)]).join('')
 const originName = slug => slug ?? 'no GitHub remote'
 
 // Queued tasks in a list, first the next: q2ab ("Run the tests."), …; with
@@ -233,10 +249,13 @@ export function parkedText(entry, why, status, decision = null) {
   return (
     `The queued task ${entry.id} for ${entry.worker} did not start: ${why}. It has left the queue. ` +
     `Task: "${preview(entry.task, 200)}". Tell the driver and ask what to do. ${hint}${draft}` +
-    (decision
+    (decision?.repo
       ? ` It is open decision ${decision.id} now, and other tasks for ${entry.worker} wait until it is closed: ` +
         'the follow-up for the answer closes it, or resolve_decision.'
-      : '')
+      : decision
+        ? ` It is open decision ${decision.id} now, which holds nothing: the follow-up for the answer closes it, or ` +
+          'resolve_decision.'
+        : '')
   )
 }
 
@@ -379,6 +398,9 @@ export class Workers extends EventEmitter {
   constructor({
     root,
     runner = new HostRunner(root),
+    scratch = null,
+    dockerBin = 'docker',
+    sweepMs = SWEEP_MS,
     access = null,
     killswitch = null,
     ledger = null,
@@ -395,8 +417,15 @@ export class Workers extends EventEmitter {
   }) {
     super()
     this.runner = runner // the repositories'
-    // The kinds of workspace, by name (workspaces.mjs).
+    // The kinds of workspace, by name (workspaces.mjs); work folders only
+    // when they are on.
     this.kinds = { repo: new Repositories(runner) }
+    this.scratch = scratch // ScratchFolders, or null
+    this.dockerBin = dockerBin // for a run in a container its kind no longer uses (runnerOf)
+    this.elsewhere = new Map() // container or '' -> the runner for such runs
+    this.sweepMs = sweepMs
+    this.sweptAt = 0
+    this.sweeping = null // old work folders being removed
     this.access = access // GitHubAccess in the container, null on this computer
     this.killswitch = killswitch // while it is locked, nothing starts
     this.ledger = ledger // open decisions: they hold a repository's queue
@@ -422,6 +451,10 @@ export class Workers extends EventEmitter {
     this.cleaning = new Map() // repository -> what the runner still clears up after a run there (the container)
     this.swept = false // the first poll looks for strays
     this.state = this.load()
+    if (scratch) {
+      scratch.entries = this.state.scratch // kept and saved with the rest
+      this.kinds.scratch = scratch
+    }
     // Also a folder an older version left with the default mode.
     try {
       chmodSync(this.tasksDir, 0o700)
@@ -442,16 +475,18 @@ export class Workers extends EventEmitter {
 
   // origins: in the container, the GitHub slug the gateway saw first per
   // repository (pinOrigin), without a prototype, as the names are folder names.
-  // queue: the tasks waiting for their turn, in order.
+  // queue: the tasks waiting for their turn, in order. scratch: the work
+  // folders (workspaces.mjs), also while they are turned off, so that they
+  // are known again when turned on.
   load() {
     const origins = data => Object.assign(Object.create(null), data?.origins)
     try {
       const data = JSON.parse(readFileSync(this.stateFile, 'utf8'))
       const queue = (Array.isArray(data.queue) ? data.queue : []).filter(queuable)
-      return { repos: data.repos ?? {}, tasks: data.tasks ?? [], origins: origins(data), queue }
+      return { repos: data.repos ?? {}, tasks: data.tasks ?? [], origins: origins(data), queue, scratch: scratchEntries(data.scratch) }
     } catch (error) {
       if (error.code !== 'ENOENT') log('worker state unreadable, starting empty:', error.message)
-      return { repos: {}, tasks: [], origins: origins(null), queue: [] }
+      return { repos: {}, tasks: [], origins: origins(null), queue: [], scratch: scratchEntries(null) }
     }
   }
 
@@ -475,8 +510,7 @@ export class Workers extends EventEmitter {
 
   newTaskId(prefix = 't') {
     for (;;) {
-      let id = prefix
-      for (let i = 0; i < 3; i++) id += ID_ALPHABET[randomInt(ID_ALPHABET.length)]
+      const id = prefix + randomId(3)
       if (!this.state.tasks.some(t => t.id === id) && !this.state.queue.some(q => q.id === id)) return id
     }
   }
@@ -507,9 +541,20 @@ export class Workers extends EventEmitter {
     return Object.values(this.kinds).find(kind => kind.owns(name)) ?? null
   }
 
-  // The runner that reaches a run's workspace: of its kind, by its record.
+  // The runner that reaches a run's workspace: of its kind, by its record. A
+  // run that began where its kind no longer runs, turned off since, or moved
+  // to or from a container, is reached where it runs, as its record says.
   runnerOf(task) {
-    return this.kinds[kindOf(task)]?.runner ?? this.runner
+    const runner = this.kinds[kindOf(task)]?.runner
+    const where = task?.container
+    if (runner && (where === undefined || where === (runner.container ?? null))) return runner
+    if (!runner && where === undefined) return this.runner // nothing says otherwise
+    const key = where ?? ''
+    if (!this.elsewhere.has(key)) {
+      const root = task.dir ? (where ? posix.dirname(task.dir) : dirname(task.dir)) : '/'
+      this.elsewhere.set(key, where ? new DockerRunner({ container: where, root, dockerBin: this.dockerBin }) : new HostRunner(root))
+    }
+    return this.elsewhere.get(key)
   }
 
   dirOf(name) {
@@ -649,6 +694,7 @@ export class Workers extends EventEmitter {
   // The checks before a run, and the start: for a dispatch, and for a queued
   // task when it is its turn (entry).
   async launch({ worker, task, words, fresh = false, allowDirty = false, direct = false, draft = false, answers = null }, entry = null) {
+    if (this.workspace(worker)?.kind === 'scratch') return this.launchScratch({ worker, task, words, fresh, answers }, entry)
     this.starting.add(worker)
     try {
       const facts = await this.inspect(worker)
@@ -677,6 +723,50 @@ export class Workers extends EventEmitter {
     }
   }
 
+  // A task in a work folder: a new one for scratch/new, made now, or the one
+  // it names, for a follow-up. There is no git to check; the files there now
+  // are kept, so that the look after the run tells what it made. Any number
+  // of new ones may start at once, within the run slots: each is a starting
+  // of its own. A new folder whose run did not start goes again.
+  async launchScratch({ worker, task, words, fresh = false, answers = null }, entry = null) {
+    const isNew = worker === SCRATCH_NEW
+    const key = isNew ? Symbol(worker) : worker
+    this.starting.add(key)
+    let made = null
+    try {
+      if (this.killswitch?.locked) return { status: 'locked', state: this.killswitch.state }
+      if (entry && !this.state.queue.some(waiting => waiting.id === entry.id)) return { status: 'dropped' }
+      if (isNew) {
+        made = await this.scratch.make(() => randomId(4))
+        this.save()
+      }
+      const name = made?.name ?? worker
+      const dir = made?.dir ?? this.dirOf(name)
+      const files = made ? [] : await this.scratch.runner.files(dir)
+      if (!files) return { status: 'gone', why: 'its folder cannot be read; it may have been removed at the desk' }
+      if (this.stopStrays({ dir, why: 'found before a new run there' }).length) return { status: 'busy', strays: true }
+      const facts = { kind: 'scratch', name, dir, hostDir: this.scratch.hostDir(name), files, made: Boolean(made), where: this.scratch.where() }
+      const result = this.start(facts, { task, words, fresh, answers }, entry)
+      if (result.status === 'started') made = null
+      return result
+    } finally {
+      this.starting.delete(key)
+      if (made) this.dropScratch(made.name)
+    }
+  }
+
+  // A work folder away again, with its entry.
+  dropScratch(name) {
+    this.scratch
+      .remove(name)
+      .then(removed => {
+        if (!removed) return
+        delete this.state.repos[name]
+        this.save()
+      })
+      .catch(error => log('work folder not removed:', name, error.message))
+  }
+
   git(dir, ...args) {
     return this.runner.git(dir, ...args)
   }
@@ -688,6 +778,8 @@ export class Workers extends EventEmitter {
     return state ? state.unpushed.map(commit => commit.hash) : null
   }
 
+  // facts: what launch found, of a repository (inspect) or of a work folder
+  // (launchScratch, of kind scratch), which has its own rules and prompt.
   start(facts, { task, words, fresh, direct = false, draft = false, answers = null }, entry = null) {
     if (this.killswitch?.locked) return { status: 'locked', state: this.killswitch.state }
     if (entry && !this.state.queue.some(waiting => waiting.id === entry.id)) return { status: 'dropped' }
@@ -696,7 +788,10 @@ export class Workers extends EventEmitter {
     const id = this.newTaskId()
     const mark = randomUUID() // VOICE_GW_RUN of every process of the run
     const kind = kindOf(facts)
+    const scratch = kind === 'scratch'
+    if (scratch) direct = draft = false // nothing to push in a work folder
     const runner = this.runnerOf({ kind })
+    const rules = scratch ? SCRATCH_RULES : workerRules(facts.access?.level, { pushDirect: facts.pushDirect, draft: this.prDraft })
     mkdirSync(this.tasksDir, { recursive: true, mode: 0o700 })
     const file = join(this.tasksDir, `${id}.jsonl`)
     const errFile = join(this.tasksDir, `${id}.err`)
@@ -710,7 +805,7 @@ export class Workers extends EventEmitter {
       '--permission-prompts', 'none',
       '--strict-mcp-config',
       '--settings', JSON.stringify({ permissions: { deny: WORKER_DENY } }),
-      '--append-system-prompt', workerRules(facts.access?.level, { pushDirect: facts.pushDirect, draft: this.prDraft }),
+      '--append-system-prompt', rules,
       ...(this.model ? ['--model', this.model] : []),
       ...(this.effort ? ['--effort', this.effort] : []),
       ...(previous ? ['--resume', sessionId] : ['--session-id', sessionId]),
@@ -760,6 +855,13 @@ export class Workers extends EventEmitter {
       reported: false,
     }
     if (entry) record.queued = entry.id // it waited in the queue as this
+    if (scratch) {
+      // For the look at the end: the files as the run found them.
+      record.hostDir = facts.hostDir ?? null // the folder on this computer
+      record.startFiles = facts.files
+      const used = this.scratch.entry(facts.name)
+      if (used) used.usedAt = record.startedAt
+    }
     // The follow-up for the driver's answer: the decisions it answers close
     // now, and what they were about counts again in this run's audit, so a
     // follow-up that was to push and did not is caught. Only those still open
@@ -772,7 +874,7 @@ export class Workers extends EventEmitter {
     }
     child.on('error', error => this.finish(record, 'failed', `could not start ${error.path || this.claudeBin}: ${error.message}`))
     child.stdin.on('error', () => {}) // the run may end before it read everything
-    child.stdin.end(prompt({ task, words, facts, direct, draft, prDraft: this.prDraft }))
+    child.stdin.end(scratch ? scratchPrompt({ task, words, facts }) : prompt({ task, words, facts, direct, draft, prDraft: this.prDraft }))
     child.unref()
     this.state.tasks.push(record)
     this.state.repos[facts.name] = { sessionId }
@@ -933,7 +1035,14 @@ export class Workers extends EventEmitter {
     }
     // Meanwhile a dispatch may have taken the slot, or the controller dropped it.
     if (!this.queued(entry.worker).includes(entry) || this.slotsFull() || this.waiting(entry.worker, entry.answers)) return
-    if (!names.includes(entry.worker)) return this.park(entry, 'the repository is gone')
+    if (!names.includes(entry.worker)) {
+      const gone = !entry.worker.includes('/')
+        ? 'the repository is gone'
+        : this.scratch
+          ? 'its work folder is gone'
+          : 'work folders are turned off'
+      return this.park(entry, gone)
+    }
     let result
     try {
       result = await this.launch(entry, entry)
@@ -947,12 +1056,14 @@ export class Workers extends EventEmitter {
       origin: 'the origin of the repository changed in the container; it needs a look at the desk',
       refused: 'a direct push needs access level full, and the repository is not at full',
       dirty: `the checkout has ${plural(result.files?.length ?? 0, 'uncommitted file')}`,
+      gone: result.why,
     }[result.status]
     this.park(entry, why ?? `it could not start (${result.status})`, result.status)
   }
 
   // Takes a queued task out of the queue because it cannot start; it becomes
-  // an open decision, which holds the repository's other tasks.
+  // an open decision, which holds the repository's other tasks. One for a
+  // new work folder holds nothing: the next new one has a folder of its own.
   park(entry, why, status = 'gone') {
     this.state.queue = this.state.queue.filter(waiting => waiting.id !== entry.id)
     try {
@@ -961,7 +1072,8 @@ export class Workers extends EventEmitter {
       log('worker state not saved:', error.message)
     }
     log('queued task left the queue', entry.worker, entry.id, why)
-    const decision = this.ledger?.add({ kind: 'other', repo: entry.worker, text: parkedDecision(entry, why), details: { queued: entry } }) ?? null
+    const repo = entry.worker === SCRATCH_NEW ? null : entry.worker
+    const decision = this.ledger?.add({ kind: 'other', repo, text: parkedDecision(entry, why), details: { queued: entry } }) ?? null
     this.emit('parked', entry, why, status, decision)
   }
 
@@ -1014,6 +1126,36 @@ export class Workers extends EventEmitter {
     this.checkStrays()
     for (const task of this.unreported()) this.emit('finished', task)
     this.pump()
+    this.sweep()
+  }
+
+  // Work folders whose last run is more than their days ago are removed,
+  // with their session, once nothing runs, waits or is open there; at most
+  // every sweepMs. Folders the gateway did not make are left alone, and so
+  // are all of them while work folders are turned off.
+  sweep(now = Date.now()) {
+    if (!this.scratch || this.sweeping || now - this.sweptAt < this.sweepMs) return this.sweeping
+    this.sweptAt = now
+    const old = this.scratch.names().filter(name => {
+      const entry = this.scratch.entry(name)
+      if (!entry) return false // scratch/new
+      const last = Math.max(entry.usedAt ?? 0, entry.createdAt, this.lastTask(name)?.finishedAt ?? 0)
+      return now - last > this.scratch.days * DAY_MS && !this.waiting(name) && !this.queued(name).length
+    })
+    if (!old.length) return null
+    this.sweeping = (async () => {
+      for (const name of old) {
+        try {
+          if (!(await this.scratch.remove(name))) continue
+          delete this.state.repos[name]
+          this.save()
+          log('work folder removed,', `${this.scratch.days} days after its last run:`, name)
+        } catch (error) {
+          log('work folder not removed:', name, error.message) // tried again at the next sweep
+        }
+      }
+    })().finally(() => (this.sweeping = null))
+    return this.sweeping
   }
 
   // Whether the run's own process is still there.
@@ -1258,6 +1400,7 @@ export class Workers extends EventEmitter {
   // decision (decide).
   async audit(task) {
     if (task.audit) return task.audit
+    if (kindOf(task) === 'scratch') return this.auditScratch(task)
     // Until it is done, the next queued task there waits.
     this.auditing.add(task.repo)
     const now = await gitState((...args) => this.git(...args), task.dir ?? this.dirOf(task.repo))
@@ -1289,6 +1432,26 @@ export class Workers extends EventEmitter {
       this.save()
     } catch (error) {
       log('worker state not saved:', error.message) // the audit holds in this gateway
+    }
+    return task.audit
+  }
+
+  // The look at a work folder once its run has ended, whatever the worker
+  // wrote: the files it made, changed and removed. There is no git, so there
+  // is no push decision. { ok: false } when the folder cannot be read.
+  async auditScratch(task) {
+    this.auditing.add(task.repo)
+    const now = await Promise.resolve()
+      .then(() => this.runnerOf(task).files(task.dir))
+      .catch(() => null)
+      .finally(() => this.auditing.delete(task.repo))
+    task.audit = now ? { ok: true, at: Date.now(), ...fileChanges(task.startFiles ?? [], now, MAX_FILES) } : { ok: false, at: Date.now() }
+    task.decision = null
+    log('worker check', task.repo, task.id, filesSummary(task.audit))
+    try {
+      this.save()
+    } catch (error) {
+      log('worker state not saved:', error.message)
     }
     return task.audit
   }
@@ -1327,6 +1490,33 @@ export class Workers extends EventEmitter {
 
   // --- texts for the controller -------------------------------------------
 
+  // The gateway's look after a run as a line, by its kind: git for a
+  // repository, the files for a work folder.
+  checkText(task) {
+    return kindOf(task) === 'scratch' ? filesText(task.audit) : auditText(task.audit)
+  }
+
+  // The same in a few words, as the attribute of the result event: git for
+  // a repository, files for a work folder.
+  checkMeta(task) {
+    return kindOf(task) === 'scratch' ? { files: filesSummary(task.audit) } : { git: auditSummary(task.audit) }
+  }
+
+  // The lines of list_workers for the work folders: scratch/new, then the
+  // last used.
+  scratchLines(now = Date.now()) {
+    const [fresh, ...names] = this.scratch.names()
+    const lines = [
+      `${fresh}: a new empty work folder for a task without a repository (a question, research, a calculation, a draft, ` +
+        `a conversion), ${this.scratch.where()}; ${this.stateText(fresh)}`,
+    ]
+    for (const name of names.slice(0, SCRATCH_SHOWN)) {
+      lines.push(`${name}: work folder made ${age(now - this.scratch.entry(name).createdAt)} ago, ${this.stateText(name)}`)
+    }
+    if (names.length > SCRATCH_SHOWN) lines.push(`${names.length - SCRATCH_SHOWN} older work folders.`)
+    return lines
+  }
+
   async listText() {
     const names = await this.repos()
     const facts = await Promise.all(names.map(name => this.inspect(name)))
@@ -1334,7 +1524,7 @@ export class Workers extends EventEmitter {
     const queued = this.queued().length
     const lines = [
       `[workers=${names.length} running=${this.running().length}${queued ? ` queued=${queued}` : ''} max=${this.maxRuns}` +
-        `${container ? ` docker=${container}` : ''}]`,
+        `${container ? ` docker=${container}` : ''}${this.scratch ? ' scratch=on' : ''}]`,
     ]
     for (const f of facts) {
       const where = f.moved
@@ -1351,6 +1541,7 @@ export class Workers extends EventEmitter {
     if (!names.length) {
       lines.push(`No git repositories in ${this.runner.root}${container ? ` in the container ${container}` : ''}.`)
     }
+    if (this.scratch) lines.push(...this.scratchLines())
     return lines.join('\n')
   }
 
@@ -1388,7 +1579,7 @@ export class Workers extends EventEmitter {
     }
     lines.push(`Task: ${preview(task.task, 200)}`)
     if (task.steps.length) lines.push(`Last steps: ${task.steps.join('; ')}`)
-    if (task.audit) lines.push(auditText(task.audit))
+    if (task.audit) lines.push(this.checkText(task))
     if (task.state === 'running' && task.lastText) lines.push(`Last message: ${task.lastText}`)
     if (task.result) lines.push(`Result: ${task.result}`)
     if (task.error && task.error !== task.result) lines.push(`Problem: ${task.error}`)
@@ -1406,7 +1597,14 @@ export class Workers extends EventEmitter {
       `Worker ${task.repo} finished task ${task.id}: ${task.state} after ${duration(task.finishedAt - task.startedAt)}.`,
       `Task: ${preview(task.task, 200)}`,
     ]
-    if (task.audit) lines.push(auditText(task.audit))
+    if (task.audit) lines.push(this.checkText(task))
+    if (kindOf(task) === 'scratch') {
+      const mounted = task.container ? `, mounted in the container ${task.container}` : ''
+      lines.push(
+        `The work folder: ${task.hostDir ?? task.dir} on this computer${mounted}. Follow-ups and answers go to worker ` +
+          `${task.repo}.`,
+      )
+    }
     if (task.decision) {
       lines.push(
         `The gateway made it open decision ${task.decision}: ask the driver whether to push (state "question"); ` +

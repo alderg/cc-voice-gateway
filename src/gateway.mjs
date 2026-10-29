@@ -9,7 +9,8 @@
 //             addresses (ipguard.mjs)
 // plus a Unix socket for scripts/pair.mjs (pairing codes, connections), the
 // workers: headless Claude Code runs in the repositories next to this one, or
-// in a Docker container with its own clones, a watch on the pull requests they
+// in a Docker container with its own clones, and with VOICE_GW_SCRATCH=1 in
+// work folders for tasks without a repository, a watch on the pull requests they
 // open, for checks and reviews, and optionally Telegram, for questions and
 // approvals after the voice mode ended, and for alarms. At the controller
 // levels clone-delete and unrestricted, also cloning and deleting in the
@@ -25,7 +26,7 @@ import { Auth } from './oauth.mjs'
 import { startAdmin } from './admin.mjs'
 import { startChannel } from './channel.mjs'
 import { startVoiceHttp } from './voice.mjs'
-import { Workers, auditSummary, gitState, hostGit, parkedText, queueList } from './workers.mjs'
+import { Workers, gitState, hostGit, parkedText, queueList } from './workers.mjs'
 import { Restarter } from './restart.mjs'
 import { PullWatcher } from './pulls.mjs'
 import { TelegramCommands, TelegramFallback, loadTelegram } from './telegram.mjs'
@@ -38,6 +39,7 @@ import { FolderTools, clonedText } from './folders.mjs'
 import { FunnelSwitch, staleText } from './funnel.mjs'
 import { Alerts, IpGuard } from './ipguard.mjs'
 import { Ledger, openItems, reminderText, startupText } from './ledger.mjs'
+import { ScratchFolders, scratchProblem } from './workspaces.mjs'
 
 // The first line of every start: which code runs, so the log tells after a
 // restart whether the new commit is in.
@@ -108,8 +110,23 @@ if (config.docker) {
     for (const warning of warnings) log(`worker container ${config.docker}: ${warning}`)
   })
 }
+// Work folders for tasks without a repository (workspaces.mjs): off unless
+// VOICE_GW_SCRATCH=1, and off with a log line where the root is no place
+// for them.
+let scratch = null
+if (config.scratch) {
+  const problem = scratchProblem(config.scratchRoot, { gateway: ROOT, workerRoot: config.docker ? null : config.workerRoot })
+  if (problem) {
+    log(`work folders off: VOICE_GW_SCRATCH_ROOT=${config.scratchRoot} ${problem}`)
+  } else {
+    scratch = new ScratchFolders({ runner: new HostRunner(config.scratchRoot), root: config.scratchRoot, days: config.scratchDays })
+    log(`work folders on: a new folder per task in ${config.scratchRoot}, ${scratch.where()}, removed ${config.scratchDays} days after their last run`)
+  }
+}
 const workers = new Workers({
   runner,
+  scratch,
+  dockerBin: config.dockerBin,
   access: config.docker
     ? new GitHubAccess({ tokenFile: config.githubTokenFile, apiBase: config.githubApi, forced: config.access })
     : null,
@@ -243,8 +260,9 @@ workers.on('finished', async task => {
       worker: { repo: task.repo, task: task.id },
     })
     // trusted="no": the result carries whatever the run read (channel.mjs).
-    // git: the audit in the gateway's words, without the run's.
-    request.meta = { worker: task.repo, task: task.id, outcome: task.state, git: auditSummary(task.audit), trusted: 'no' } // for sending it again
+    // git, or files for a work folder: the gateway's look, in its words,
+    // without the run's.
+    request.meta = { worker: task.repo, task: task.id, outcome: task.state, ...workers.checkMeta(task), trusted: 'no' } // for sending it again
     if (opened.length) request.meta.pull_request = opened.map(pull => pull.number).join(',')
     if (task.queued) request.meta.queued = task.queued // the id it had in the queue
     // What the audit found is an open decision; it belongs to this result.

@@ -10,10 +10,14 @@
 // clone here as a bundle (scripts/fetch-from-container.sh).
 
 import { execFile, execFileSync, spawn } from 'node:child_process'
-import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
-import { join, posix } from 'node:path'
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs'
+import { dirname, join, posix } from 'node:path'
 import { ROOT, config } from './config.mjs'
 import { log } from './log.mjs'
+
+// The most files a look into a work folder lists (files()); one more tells
+// that there are more.
+export const MAX_FILES = 2000
 
 function run(command, args, timeout) {
   return new Promise(resolve => {
@@ -280,6 +284,53 @@ export class HostRunner {
 
   stopStray(stray, name = 'SIGTERM') {
     signalAll(stray.pids, name)
+  }
+
+  // --- the folders of work folders (workspaces.mjs) ---------------------------
+
+  // A new folder, for this user only, in a root made if need be; false when
+  // it is there already.
+  async makeDir(dir) {
+    mkdirSync(dirname(dir), { recursive: true, mode: 0o700 })
+    try {
+      mkdirSync(dir, { mode: 0o700 })
+      return true
+    } catch (error) {
+      if (error.code === 'EEXIST') return false
+      throw error
+    }
+  }
+
+  // What is in a folder and below it, but folders: [{ path, bytes, mtime }],
+  // path relative to it, mtime in milliseconds; at most max + 1 entries.
+  // Symbolic links count as they are, never followed. null when the folder
+  // cannot be read.
+  async files(dir, max = MAX_FILES) {
+    const found = []
+    const walk = rel => {
+      for (const entry of readdirSync(join(dir, rel), { withFileTypes: true })) {
+        if (found.length > max) return
+        const path = rel ? `${rel}/${entry.name}` : entry.name
+        if (entry.isDirectory()) {
+          walk(path)
+        } else {
+          const stat = lstatSync(join(dir, path), { throwIfNoEntry: false })
+          if (stat) found.push({ path, bytes: stat.size, mtime: Math.round(stat.mtimeMs) })
+        }
+      }
+    }
+    try {
+      walk('')
+    } catch {
+      return null
+    }
+    return found.slice(0, max + 1)
+  }
+
+  // A folder with everything in it; symbolic links are removed, not followed.
+  async remove(dir) {
+    rmSync(dir, { recursive: true, force: true })
+    return true
   }
 }
 
