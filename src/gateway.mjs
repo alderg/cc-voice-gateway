@@ -15,8 +15,9 @@
 // also cloning and deleting in the worker root (folders.mjs). Over all of it,
 // the kill switch (killswitch.mjs).
 
-import { CONTROLLER_LEVELS, EFFORTS, config } from './config.mjs'
+import { CONTROLLER_LEVELS, EFFORTS, ROOT, VERSION, config } from './config.mjs'
 import { log } from './log.mjs'
+import { execFileSync } from 'node:child_process'
 import { Store } from './store.mjs'
 import { Auth } from './oauth.mjs'
 import { startAdmin } from './admin.mjs'
@@ -35,7 +36,21 @@ import { FolderTools, clonedText } from './folders.mjs'
 import { FunnelSwitch, staleText } from './funnel.mjs'
 import { Alerts, IpGuard } from './ipguard.mjs'
 
-const store = new Store({ permissionTtlSeconds: config.permissionTtlSeconds, file: config.requestsFile })
+// The first line of every start: which code runs, so the log tells after a
+// restart whether the new commit is in.
+function commit() {
+  const git = (...args) =>
+    execFileSync('git', ['-C', ROOT, ...args], { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] }).trim()
+  try {
+    const head = git('rev-parse', '--short', 'HEAD')
+    return git('status', '--porcelain', '--untracked-files=no') ? `${head} with uncommitted changes` : head
+  } catch {
+    return 'unknown (not a git checkout)'
+  }
+}
+log(`cc-voice-gateway ${VERSION} starting, commit ${commit()}, pid ${process.pid}, node ${process.version}`)
+
+const store =new Store({ permissionTtlSeconds: config.permissionTtlSeconds, file: config.requestsFile })
 const killswitch = new KillSwitch({ file: config.killSwitchFile })
 if (killswitch.locked) {
   log(`kill switch is locked since ${killswitch.state.at} by ${killswitch.state.trigger}: ${killswitch.state.reason}`)
