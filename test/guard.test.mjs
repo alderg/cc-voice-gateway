@@ -303,6 +303,16 @@ test('the sweep: real writes outside the repository and the temporary folders st
   }
 })
 
+test("the run's own Claude Code memory folder is allowed, another project's is not", () => {
+  const own = `${homedir()}/.claude/projects/-work-alpha/memory`
+  assert.deepEqual(trips(`${own}/feedback-pr-ready.md`, 'Write'), [])
+  assert.deepEqual(trips(`${own}/MEMORY.md`, 'Edit'), [])
+  assert.deepEqual(trips(`cat >> ~/.claude/projects/-work-alpha/memory/MEMORY.md <<'EOF'\n- note\nEOF`), [])
+  assert.match(trips(`${homedir()}/.claude/projects/-work-beta/memory/x.md`, 'Write')[0], /-work-beta\/memory\/x\.md/)
+  assert.match(trips(`${homedir()}/.claude/projects/-work-alpha/other.jsonl`, 'Write')[0], /-work-alpha\/other\.jsonl/)
+  assert.match(trips(`echo x > ~/.claude/settings.json`)[0], /\.claude\/settings\.json/)
+})
+
 test('devices are no write outside: /dev/null, the standard streams, /dev/fd/N; a disk is', () => {
   for (const path of ['/dev/null', '/dev/stdout', '/dev/stderr', '/dev/tty', '/dev/fd/2', '/dev/fd/12', '/proc/self/fd/1']) {
     assert.ok(isDevice(path), path)

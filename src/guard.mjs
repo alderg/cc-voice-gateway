@@ -12,7 +12,8 @@
 //                   the default branch moved during the run, and the worker's
 //                   repository holds the new head, or the new head merged a
 //                   pull request of the run (mergedPull).
-//   outside         writes outside the repository and the temporary folders:
+//   outside         writes outside the repository, the temporary folders and
+//                   the run's own Claude Code memory folder (memoryFolder):
 //                   the file tools by their path, shell commands by explicit
 //                   targets (redirections, tee, cp, mv, rm, mkdir, touch, ln,
 //                   chmod, chown, truncate, sed -i, dd of=), after cd. The
@@ -37,6 +38,14 @@ import { homedir } from 'node:os'
 import { posix } from 'node:path'
 import { log as defaultLog, preview } from './log.mjs'
 import { tempFolders } from './platform.mjs'
+
+// The Claude Code memory folder of a session in the given folder, where its
+// auto memory writes: <config>/projects/<folder with every character but
+// letters and digits as ->/memory. Only the run's own, never another
+// project's.
+export function memoryFolder(config, dir) {
+  return `${config}/projects/${dir.replace(/[^A-Za-z0-9]/g, '-')}/memory`
+}
 
 const FILE_TOOLS = { Write: 'file_path', Edit: 'file_path', MultiEdit: 'file_path', NotebookEdit: 'notebook_path' }
 const WRAPPERS = new Set(['sudo', 'command', 'exec', 'nohup', 'time', 'env', 'nice'])
@@ -445,6 +454,7 @@ export class RunGuard {
     this.log = log
     const docker = Boolean(runner.container)
     this.home = docker ? '/home/worker' : homedir()
+    this.claudeConfig = (!docker && process.env.CLAUDE_CONFIG_DIR) || `${this.home}/.claude`
     // On macOS also /private/tmp and the per-user /var/folders/…/T (platform.mjs).
     this.allowedRoots = [...new Set([...(docker ? ['/tmp', '/var/tmp'] : tempFolders()), ...allowed])]
     this.runs = new Map() // task id -> what the rules know about the run
@@ -475,6 +485,7 @@ export class RunGuard {
       id: task.id,
       repo: task.repo,
       dir: task.dir ?? this.runner.dir(task.repo),
+      memory: null,
       slug: task.slug ?? null,
       branch: task.defaultBranch ?? null,
       direct: (Boolean(task.direct) && task.access === 'full') || Boolean(task.pushDirect),
@@ -486,6 +497,7 @@ export class RunGuard {
       tripped: new Set(),
       checking: null,
     }
+    run.memory = memoryFolder(this.claudeConfig, run.dir)
     this.runs.set(task.id, run)
     run.ready = this.baseline(run)
   }
@@ -712,7 +724,7 @@ export class RunGuard {
 
   allowed(run, path) {
     if (isDevice(path)) return true
-    return [run.dir, ...this.allowedRoots].some(root => path === root || path.startsWith(root.replace(/\/$/, '') + '/'))
+    return [run.dir, run.memory, ...this.allowedRoots].some(root => path === root || path.startsWith(root.replace(/\/$/, '') + '/'))
   }
 
   // --- size ---------------------------------------------------------------------
