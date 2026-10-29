@@ -339,7 +339,7 @@ test('after a restart: what the voice client heard is not sent, even when it rea
   after.close()
 })
 
-test("after a restart: a voice request's question is not sent; the restart ended the request", async () => {
+test("after a restart: a voice request's question stays open and still reaches Telegram, once", async () => {
   const file = join(TMP, 'voice-question', 'requests.json')
   const first = new Store({ file, log: () => {} })
   first.voiceCallStarted()
@@ -351,10 +351,12 @@ test("after a restart: a voice request's question is not sent; the restart ended
   const second = new Store({ file, log: () => {} })
   const sent = []
   const after = new TelegramFallback(second, { afterSeconds: AFTER, log: () => {}, send: async text => sent.push(text) })
-  await sleep(AFTER * 1000 + 150)
+  await waitFor(() => sent.length === 1)
   second.changed()
-  assert.equal(second.getRequest(request.id).state, 'done')
-  assert.deepEqual(sent, [], 'the voice client hears the restart note instead')
+  await sleep(150)
+  assert.equal(second.getRequest(request.id).state, 'question', 'the question survives the restart (ledger.mjs)')
+  assert.equal(sent.length, 1)
+  assert.match(sent[0], /Delete the old notes\?/)
   after.close()
 })
 
