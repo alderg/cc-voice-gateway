@@ -664,8 +664,8 @@ worker run like any other, with the same options, denied tools and environment a
   made, changed and removed. There is no git, so there is no push decision. The result event
   carries `files="2 files made, 1 changed"` instead of `git`, and a line with the names and where
   the folder is.
-- **Removed** `VOICE_GW_SCRATCH_DAYS` (7) days after its last run, with its session, unless a run
-  goes, a task waits or a decision is open there. Folders in the root that the gateway did not make
+- **Removed** `VOICE_GW_SCRATCH_DAYS` (60) days after its last run, with its session, unless a run
+  goes, a task waits or a decision is open there; with `0`, never. Folders in the root that the gateway did not make
   stay, and so does everything while work folders are turned off. A run that began before they
   were turned off is still followed where it runs.
 
@@ -1418,8 +1418,8 @@ that needs no repository:
 - **While it runs:** "What is the work folder doing?" and "Stop the work folder." work as for a
   repository. When every run slot is taken, it waits in the queue.
 - **The result** comes as news: what the files hold, not where. At the desk they are in
-  `~/voice-scratch/<date>-<id>` (`VOICE_GW_SCRATCH_ROOT`), for seven days after the last run
-  (`VOICE_GW_SCRATCH_DAYS`); copy out what you want to keep. There is no git, so no branch, no pull
+  `~/voice-scratch/<date>-<id>` (`VOICE_GW_SCRATCH_ROOT`), for 60 days after the last run
+  (`VOICE_GW_SCRATCH_DAYS`, `0` for good); copy out what you want to keep. There is no git, so no branch, no pull
   request and no question about pushing.
 
 **Your words.** The controller passes your words with every dispatch. If they are not from a voice
@@ -1549,7 +1549,7 @@ setting with where it came from.
 | `VOICE_GW_PR_DRAFT` | `0` | `1`: workers open their pull requests as drafts; `0`: ready for review |
 | `VOICE_GW_SCRATCH` | `0` | `1`: [work folders](#work-folders) for tasks without a repository; any other value counts as `0` |
 | `VOICE_GW_SCRATCH_ROOT` | `~/voice-scratch` | Where the work folders are made, on this computer; outside every git repository, this checkout and the repositories folder |
-| `VOICE_GW_SCRATCH_DAYS` | `7` | Days after its last run before a work folder is removed |
+| `VOICE_GW_SCRATCH_DAYS` | `60` | Days after its last run before a work folder is removed, up to 365; `0`: never |
 | `VOICE_GW_SCRATCH_DOCKER` | empty | The work folders' container; empty: their runs run on this computer |
 | `VOICE_GW_DOCKER_SCRATCH` | `/scratch` | Where that container mounts `VOICE_GW_SCRATCH_ROOT` |
 | `VOICE_GW_PR_POLL` | `60` | Seconds between looks at a watched pull request |

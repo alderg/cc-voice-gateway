@@ -47,7 +47,7 @@ export function fields(root) {
     VOICE_GW_PR_DRAFT: { default: '0', valid: ONE_OF('0', '1') },
     VOICE_GW_SCRATCH: { default: '0', valid: ONE_OF('0', '1') },
     VOICE_GW_SCRATCH_ROOT: { default: join(homedir(), 'voice-scratch'), valid: PATH },
-    VOICE_GW_SCRATCH_DAYS: { default: '7', valid: INT(1, 365) },
+    VOICE_GW_SCRATCH_DAYS: { default: '60', valid: value => value === '0' || INT(1, 365)(value) },
     VOICE_GW_SCRATCH_DOCKER: { default: '', valid: NAME },
     VOICE_GW_PERMISSION_RELAY: { default: '1', valid: ONE_OF('1', '0') },
     VOICE_GW_CONTROLLER_LEVEL: { default: 'confined', valid: ONE_OF(...CONTROLLER_LEVELS) },

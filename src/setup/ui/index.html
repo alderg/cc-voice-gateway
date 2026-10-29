@@ -227,7 +227,7 @@
       <label>Folder <input data-setting="VOICE_GW_SCRATCH_ROOT"></label>
       <p class="guide">A new folder in it per task. Outside every git repository, this checkout and the repositories folder.</p>
       <label>Kept for (days) <input data-setting="VOICE_GW_SCRATCH_DAYS" inputmode="numeric"></label>
-      <p class="guide">A work folder is removed this long after its last run.</p>
+      <p class="guide">A work folder is removed this long after its last run, up to 365 days. 0: kept for good.</p>
     </div>
     <label><input type="checkbox" id="scratch-docker-on"> Run them in a container of their own</label>
     <p class="guide">A protected environment: a container from the worker image that sees only the work folders, with

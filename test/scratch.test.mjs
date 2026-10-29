@@ -305,6 +305,24 @@ test('old work folders go after their days, not while something runs, waits or i
   }
 })
 
+test('with days 0 old work folders stay', async () => {
+  const { workers, dispatch } = setup({ days: 0 })
+  try {
+    const old = (await dispatch(SCRATCH_NEW, 'MAKE: an old report.')).task
+    await ended(old)
+    const yearsAgo = Date.now() - 3 * 365 * 24 * 60 * 60 * 1000
+    Object.assign(workers.scratch.entry(old.repo), { createdAt: yearsAgo, usedAt: yearsAgo })
+    old.finishedAt = yearsAgo
+    workers.sweptAt = 0
+    await workers.sweep()
+    assert.ok(existsSync(old.dir), 'kept')
+    assert.ok(workers.scratch.entry(old.repo))
+    assert.ok((await workers.known(SCRATCH_NEW)).includes(old.repo))
+  } finally {
+    workers.close()
+  }
+})
+
 test('the kill switch: no new work folder while locked, and a run in one stops like any other', async () => {
   const base = join(TMP, `case${++count}`)
   const killswitch = new KillSwitch({ file: join(base, 'killswitch.json'), log: () => {} })
@@ -650,6 +668,19 @@ test('the gateway with VOICE_GW_SCRATCH=1: scratch/new in the tools, the instruc
   }
 })
 
+test('the gateway with VOICE_GW_SCRATCH_DAYS=0: work folders are kept for good', async () => {
+  const gw = await startGateway({ VOICE_GW_SCRATCH: '1', VOICE_GW_SCRATCH_DAYS: '0' })
+  try {
+    assert.match(gw.log(), /work folders on: a new folder per task in .*voice-scratch, on this computer, kept for good/)
+    assert.match(gw.claudeCode.getInstructions(), /The driver keeps work folders for good: none is removed\./)
+    assert.doesNotMatch(gw.claudeCode.getInstructions(), /It is removed/)
+    const unknown = await gw.controller('dispatch', { worker: 'scratch/zzzz', task: 'x', words: 'x y' })
+    assert.match(unknown.text, /^No work folder "scratch\/zzzz": it was never made, or removed before work folders were kept for good\. Known: scratch\/new\./)
+  } finally {
+    await gw.close()
+  }
+})
+
 test('the gateway with work folders off, the default: tools, instructions and list_workers as before', async () => {
   const gw = await startGateway()
   try {
@@ -707,7 +738,7 @@ test('VOICE_GW_SCRATCH_DOCKER: made, run and looked at through docker exec in th
     FAKE_DOCKER_RUNS: join(TMP, 'runs'),
   })
   try {
-    assert.match(gw.log(), new RegExp(`work folders on: a new folder per task in ${mount}, in the container voice-scratch, which sees only the work folders, removed 7 days`))
+    assert.match(gw.log(), new RegExp(`work folders on: a new folder per task in ${mount}, in the container voice-scratch, which sees only the work folders, removed 60 days`))
     await until(() => /work folder container voice-scratch: work folders from host folder/.test(gw.log()))
     assert.match(gw.log(), new RegExp(`work folder container voice-scratch: work folders from host folder ${mount}, running as ${uid}\\n`))
     assert.doesNotMatch(gw.log(), /work folder container voice-scratch: (no host folder|it mounts)/)

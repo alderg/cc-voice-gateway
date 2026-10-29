@@ -263,7 +263,8 @@ Only when `list_workers` shows `scratch/new`: the driver turned work folders on 
   session. For something new, a new `scratch/new`.
 - A work folder has no git: no branch, no pull request, no push decision. `direct`, `draft` and
   `allow_dirty` do nothing there.
-- It is removed some days after its last run. A name that is gone gets an answer saying so; if the
+- It is removed some days after its last run, unless the driver keeps work folders for good; the
+  voice channel's instructions say which. A name that is gone gets an answer saying so; if the
   driver still wants it, start again with `scratch/new`.
 - Anything about one of the driver's repositories still goes to that repository's worker.
 

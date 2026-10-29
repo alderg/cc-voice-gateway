@@ -129,7 +129,8 @@ if (config.scratch) {
       ? new DockerRunner({ container: config.scratchDocker, root: config.dockerScratch, dockerBin: config.dockerBin })
       : new HostRunner(config.scratchRoot)
     scratch = new ScratchFolders({ runner: scratchRunner, root: config.scratchRoot, days: config.scratchDays })
-    log(`work folders on: a new folder per task in ${config.scratchRoot}, ${scratch.where()}, removed ${config.scratchDays} days after their last run`)
+    const kept = config.scratchDays ? `removed ${config.scratchDays} days after their last run` : 'kept for good'
+    log(`work folders on: a new folder per task in ${config.scratchRoot}, ${scratch.where()}, ${kept}`)
   }
 }
 if (scratch?.runner.container) {

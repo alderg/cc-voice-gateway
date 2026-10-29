@@ -1131,9 +1131,9 @@ export class Workers extends EventEmitter {
   // Work folders whose last run is more than their days ago are removed,
   // with their session, once nothing runs, waits or is open there; at most
   // every sweepMs. Folders the gateway did not make are left alone, and so
-  // are all of them while work folders are turned off.
+  // are all of them while work folders are turned off or kept for good (days 0).
   sweep(now = Date.now()) {
-    if (!this.scratch || this.sweeping || now - this.sweptAt < this.sweepMs) return this.sweeping
+    if (!this.scratch?.days || this.sweeping || now - this.sweptAt < this.sweepMs) return this.sweeping
     this.sweptAt = now
     const old = this.scratch.names().filter(name => {
       const entry = this.scratch.entry(name)

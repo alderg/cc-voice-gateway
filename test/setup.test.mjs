@@ -403,7 +403,7 @@ test('the start: checks, current settings, repositories and the plugin, without 
   assert.equal(data.settings.VOICE_GW_PR_DRAFT, '0', 'pull requests ready for review, by default')
   assert.equal(data.settings.VOICE_GW_SCRATCH, '0', 'work folders off, by default')
   assert.equal(data.settings.VOICE_GW_SCRATCH_DOCKER, '', 'and on this computer when turned on')
-  assert.equal(data.settings.VOICE_GW_SCRATCH_DAYS, '7')
+  assert.equal(data.settings.VOICE_GW_SCRATCH_DAYS, '60')
   assert.deepEqual(data.secrets, { telegramToken: null, telegramChatId: null, githubToken: null, claudeToken: null })
   assert.deepEqual(data.git, { name: 'Test Driver', email: 'driver@example.com' })
   assert.equal(data.plugin.mode, 'development')
@@ -482,7 +482,7 @@ test('finishing: invalid input is refused before anything is written', async () 
       VOICE_GW_KILLSWITCH: 'sometimes',
       VOICE_GW_PR_DRAFT: 'yes',
       VOICE_GW_SCRATCH: 'yes',
-      VOICE_GW_SCRATCH_DAYS: '0',
+      VOICE_GW_SCRATCH_DAYS: '366',
       VOICE_GW_SCRATCH_DOCKER: 'a b',
       NOPE: '1',
     },
@@ -659,7 +659,7 @@ test("finishing with work folders: their folder checked; in a container of their
   await fresh().api['POST /api/claude/token']({ body: { token: CLAUDE_TOKEN } })
   const { job } = await setup.api['POST /api/finish']({
     body: {
-      settings: { VOICE_GW_SCRATCH: '1', VOICE_GW_SCRATCH_ROOT: folder, VOICE_GW_SCRATCH_DAYS: '3', VOICE_GW_SCRATCH_DOCKER: 'voice-scratch', VOICE_GW_DOCKER: '' },
+      settings: { VOICE_GW_SCRATCH: '1', VOICE_GW_SCRATCH_ROOT: folder, VOICE_GW_SCRATCH_DAYS: '0', VOICE_GW_SCRATCH_DOCKER: 'voice-scratch', VOICE_GW_DOCKER: '' },
       telegram: { enabled: false },
       docker: { enabled: false },
     },
@@ -671,7 +671,7 @@ test("finishing with work folders: their folder checked; in a container of their
   assert.deepEqual(readSettings(join(secrets, 'gateway.env')), {
     VOICE_GW_SCRATCH: '1',
     VOICE_GW_SCRATCH_ROOT: folder,
-    VOICE_GW_SCRATCH_DAYS: '3',
+    VOICE_GW_SCRATCH_DAYS: '0',
     VOICE_GW_SCRATCH_DOCKER: 'voice-scratch',
   })
   assert.equal(readFileSync(join(secrets, 'worker', 'claude_token'), 'utf8'), CLAUDE_TOKEN)

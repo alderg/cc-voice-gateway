@@ -125,10 +125,10 @@ export const config = {
   // root, for tasks that need no repository. Off unless VOICE_GW_SCRATCH=1.
   // The root must lie outside every git repository and this checkout; the
   // gateway checks it at its start. A work folder is removed this many days
-  // after its last run.
+  // after its last run; 0: never.
   scratch: env.VOICE_GW_SCRATCH === '1',
   scratchRoot: env.VOICE_GW_SCRATCH_ROOT || join(homedir(), 'voice-scratch'),
-  scratchDays: num(env.VOICE_GW_SCRATCH_DAYS, 7),
+  scratchDays: env.VOICE_GW_SCRATCH_DAYS?.trim() === '0' ? 0 : num(env.VOICE_GW_SCRATCH_DAYS, 60),
   // Their runs in a container of their own (docker/, started with
   // scripts/start-workers-container.sh --scratch), which sees only the root,
   // mounted at VOICE_GW_DOCKER_SCRATCH, and no GitHub token: its name.

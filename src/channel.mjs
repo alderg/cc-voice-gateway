@@ -154,8 +154,9 @@ calculation, a draft or a conversion, goes to dispatch with worker "scratch/new"
 Words, queue and stop work as for a repository. Its result arrives like any other, with worker="scratch/<id>" and
 files="..." instead of git: the files the run made, which the driver finds in that folder at the desk; say only what
 they hold, not where. Pass follow-ups and answers to that same scratch/<id>. A work folder has no git: no branch, no pull
-request, no push decision, and direct, draft and allow_dirty do nothing there. It is removed ${days} days after its last
-run. Anything about a repository still goes to the repository's worker.
+request, no push decision, and direct, draft and allow_dirty do nothing there. ${
+    days ? `It is removed ${days} days after its last run.` : 'The driver keeps work folders for good: none is removed.'
+  } Anything about a repository still goes to the repository's worker.
 `.trim()
 
 // Only at the controller level unrestricted.
@@ -604,7 +605,11 @@ async function workerTool(workers, name, args, spoken) {
   if (!names.includes(worker)) {
     if (scratch) {
       return toolText(
-        `No work folder "${worker}": it was removed ${workers.scratch.days} days after its last run, or never made. ` +
+        `No work folder "${worker}": ${
+          workers.scratch.days
+            ? `it was removed ${workers.scratch.days} days after its last run, or never made`
+            : 'it was never made, or removed before work folders were kept for good'
+        }. ` +
           `Known: ${names.join(', ')}. For a new one, worker "scratch/new".`,
         true,
       )

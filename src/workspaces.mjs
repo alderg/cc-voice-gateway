@@ -18,7 +18,7 @@
 //            New ones take any free run slot. No git, so no push decision:
 //            after a run the gateway lists the files it made. The folder is
 //            the run's only place to write (guard.mjs). Removed
-//            VOICE_GW_SCRATCH_DAYS after its last run.
+//            VOICE_GW_SCRATCH_DAYS after its last run, never with 0.
 //
 // Task records and queue entries name their workspace in `repo` and `worker`,
 // as before. A task record's `kind` says which kind it is; one without, from
@@ -123,8 +123,8 @@ export function scratchProblem(root, { gateway, workerRoot = null, home = homedi
 export class ScratchFolders {
   // runner: on this computer a HostRunner on the root, in a container a
   // DockerRunner on the root's mount there; root: the folder on this
-  // computer; days: how long one is kept after its last run.
-  constructor({ runner, root, days = 7 }) {
+  // computer; days: how long one is kept after its last run, 0: for good.
+  constructor({ runner, root, days = 60 }) {
     this.kind = 'scratch'
     this.runner = runner
     this.root = root
