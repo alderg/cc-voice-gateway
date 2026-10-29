@@ -398,6 +398,7 @@ test('pull requests ready for review by default; VOICE_GW_PR_DRAFT=1 brings back
   assert.match(await description(), /pr and full open a pull request ready for review\. /)
   assert.doesNotMatch(await description(), /draft/)
   assert.match(gw.claudeCode.getInstructions(), /pr and full open a pull request ready for review\. /)
+  assert.match(gw.claudeCode.getInstructions(), /ask only whether to open the pull request, without mentioning drafts\./)
   const ready = await dispatch('alpha', 'Fix the typo in the changelog.')
   await workerEvent('alpha', ready.id)
   assert.match(rules(), /open a pull request ready for review against the starting branch with\n  gh pr create, not as a draft\. /)
@@ -410,6 +411,9 @@ test('pull requests ready for review by default; VOICE_GW_PR_DRAFT=1 brings back
     assert.match(await description(), /pr and full open a draft pull request\. /)
     assert.doesNotMatch(await description(), /ready for review/)
     assert.match(gw.claudeCode.getInstructions(), /pr and full open a draft pull request\. /)
+    assert.doesNotMatch(gw.claudeCode.getInstructions(), /without mentioning drafts/, 'no question about drafts')
+    const schema = (await gw.claudeCode.listTools()).tools.find(tool => tool.name === 'dispatch').inputSchema
+    assert.match(schema.properties.draft.description, /every pull request is a draft anyway/)
     const draft = await dispatch('alpha', 'Fix the other typo in the changelog.')
     await workerEvent('alpha', draft.id)
     assert.match(rules(), /- Publish: push the branch and open a draft pull request against the starting branch with\n  gh pr create --draft\. If the task says/)
@@ -423,6 +427,64 @@ test('pull requests ready for review by default; VOICE_GW_PR_DRAFT=1 brings back
 })
 
 const queuedId = text => /queued=(q[a-z0-9]{3})/.exec(text)?.[1]
+
+test('draft: that task opens its pull request as a draft, also after waiting in the queue; no effect where none opens', async () => {
+  const schema = (await gw.claudeCode.listTools()).tools.find(tool => tool.name === 'dispatch').inputSchema
+  assert.equal(schema.properties.draft.type, 'boolean')
+  assert.equal(
+    schema.properties.draft.description,
+    'Open the pull request as a draft, for this task only; without it, it opens ready for review, and its reviews ' +
+      'start at once. Only when the driver explicitly asked for a draft, or said yes to your question whether to ' +
+      'open it as a draft because more tasks for the same pull request follow. No effect at access level ' +
+      'read-only, where pull requests are turned off, or with direct.',
+  )
+  const instructions = gw.claudeCode.getInstructions()
+  assert.match(instructions, /later pushes to the same pull\s+request run them again by themselves/)
+  assert.match(instructions, /then ask just that \("X follows, open it as a draft\?"\), and after a yes pass draft=true to dispatch/)
+
+  const line = /^- Draft pull request: yes\. The driver asked to open the pull request as a draft, with gh pr create --draft; one that is open already stays as it is\.$/m
+  const asked = await dispatch('alpha', 'Fix the typo and open it as a draft.', { draft: true })
+  assert.match(asked.text, /^\[dispatch=started worker=alpha task=t[a-z0-9]{3} session=\w+ draft=yes\] Started on branch main\. Tell/)
+  await workerEvent('alpha', asked.id)
+  assert.match(lastCall().input, line)
+  assert.match(
+    arg(lastCall(), '--append-system-prompt'),
+    /gh pr create, not as a draft\. Only if the task says "Draft pull request: yes", the driver asked for a draft:\n  open it as a draft then, and leave it one until a task says to mark it ready\./,
+  )
+
+  // Without it, the next task's pull request is ready for review again.
+  const next = await dispatch('alpha', 'Now fix the other typo.')
+  assert.doesNotMatch(next.text, /draft/)
+  await workerEvent('alpha', next.id)
+  assert.doesNotMatch(lastCall().input, /Draft pull request/)
+
+  // A queued task keeps it for its start; the one behind it, without, does not get it.
+  const slow = await dispatch('alpha', 'SLOW: read the README once more.')
+  assert.match(slow.text, /dispatch=started/)
+  const queued = await dispatch('alpha', 'After that, add a line and open it as a draft.', { draft: true })
+  assert.match(queued.text, /^\[dispatch=queued worker=alpha queued=q[a-z0-9]{3} position=1 reason=busy draft=yes\] Queued, because /)
+  const plain = await dispatch('alpha', 'After that, count the lines.')
+  assert.match(plain.text, /^\[dispatch=queued worker=alpha queued=q[a-z0-9]{3} position=2 reason=busy\] /)
+  await controller('stop_worker', { worker: 'alpha' })
+  await waitUntil(() => gw.events.find(e => e.meta?.queued === queuedId(queued.text)))
+  assert.match(calls().find(call => call.input.startsWith('After that, add a line')).input, line)
+  await waitUntil(() => gw.events.find(e => e.meta?.queued === queuedId(plain.text)))
+  assert.doesNotMatch(calls().find(call => call.input.startsWith('After that, count')).input, /Draft pull request/)
+
+  // No pull request opens: it starts all the same, and the answer says so.
+  const off = await dispatch('delta', 'Fix the typo there as a draft.', { draft: true })
+  assert.match(
+    off.text,
+    /^\[dispatch=started worker=delta task=t[a-z0-9]{3} session=\w+ push=direct\] Started on branch main\. A draft has no effect here: pull requests are turned off on GitHub, the change goes straight to main\. If the driver asked for one, tell them\. Tell the driver/,
+  )
+  await workerEvent('delta', off.id)
+  assert.doesNotMatch(lastCall().input, /draft pull request/i)
+  const local = await dispatch('gamma', 'Fix the typo there as a draft.', { draft: true })
+  assert.match(local.text, /^\[dispatch=started worker=gamma [^\]]*\] .*A draft has no effect here: the repository has no remote, so nothing is pushed\./)
+  assert.doesNotMatch(local.text, /draft=yes/)
+  await workerEvent('gamma', local.id)
+  assert.doesNotMatch(lastCall().input, /draft pull request/i)
+})
 
 test('one run per repository, two at a time; the rest waits in the queue; stop ends a run without an event', async () => {
   const slow = await dispatch('alpha', 'SLOW: run everything.')

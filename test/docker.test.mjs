@@ -23,7 +23,7 @@ import { z } from 'zod'
 import { adminRequest } from '../src/admin.mjs'
 import { GitHubAccess } from '../src/access.mjs'
 import { DockerRunner } from '../src/runners.mjs'
-import { prompt, workerRules } from '../src/workers.mjs'
+import { draftIgnored, prompt, workerRules } from '../src/workers.mjs'
 
 const GATEWAY = fileURLToPath(new URL('../src/gateway.mjs', import.meta.url))
 // Resolved: on macOS the temporary folder is behind a symlink (/var is
@@ -423,6 +423,36 @@ test('VOICE_GW_PR_DRAFT: pull requests ready for review by default; with 1, draf
   assert.equal(access('read-only', true), '- Access level: read-only (r). Nothing leaves this container: no push, no pull request.')
 })
 
+test("dispatch's draft: a line in that task's prompt, which the Publish rule refers to, only where a pull request opens", () => {
+  const line = '- Draft pull request: yes. The driver asked to open the pull request as a draft, with gh pr create --draft; one that is open already stays as it is.'
+  const facts = (level, extra = {}) => ({ origin: 'acme/open', visibility: 'private', branch: 'main', dirty: [], access: level ? { level, reason: 'r' } : null, defaultBranch: 'main', ...extra })
+  const lines = (f, options = {}) => prompt({ task: 'Fix the typo.', words: 'Fix the typo', facts: f, ...options }).split('\n')
+  for (const level of [null, 'pr', 'full']) {
+    assert.ok(lines(facts(level), { draft: true }).includes(line), `${level ?? 'this computer'}: with draft`)
+    assert.ok(!lines(facts(level)).some(l => /draft/i.test(l)), `${level ?? 'this computer'}: without it, no draft`)
+    assert.match(workerRules(level ?? undefined), /Only if the task says "Draft pull request: yes", the driver asked for a draft:\n  open it as a draft then, and leave it one until a task says to mark it ready\. /)
+  }
+  // The setting alone makes the access line say draft, without the line.
+  const setting = lines(facts('pr'), { prDraft: true })
+  assert.ok(setting.includes('- Access level: pr (r). Push a voice/ branch and open a draft pull request.'))
+  assert.ok(!setting.includes(line))
+  // No pull request to open: no line, and the reason for the controller.
+  const none = [
+    [facts('read-only'), false, 'nothing leaves the container at access level read-only'],
+    [facts('full', { access: { level: 'full', reason: 'r', pulls: false }, pushDirect: true }), false, 'pull requests are turned off on GitHub, the change goes straight to main'],
+    [facts(null, { pushDirect: true }), false, 'pull requests are turned off on GitHub, the change goes straight to main'],
+    [facts('full'), true, 'a direct push opens no pull request'],
+    [facts(null, { origin: null, visibility: 'none' }), false, 'the repository has no remote, so nothing is pushed'],
+  ]
+  for (const [f, direct, why] of none) {
+    assert.equal(draftIgnored(f, direct), why)
+    assert.ok(!lines(f, { draft: true, direct }).some(l => /draft pull request/i.test(l)), why)
+  }
+  assert.equal(draftIgnored(facts('pr')), null)
+  // The Publish rule with the setting stays word for word as before: the draft line changes nothing there.
+  assert.ok(workerRules('pr', { draft: true }).includes(DRAFT_PUBLISH))
+})
+
 test('access: cached per repository and token; a new token is checked again; errors never show the token', async () => {
   const file = join(TMP, 'token-cache')
   writeFileSync(file, TOKEN)
@@ -503,6 +533,25 @@ test('Docker: a direct push only at level full, and only when asked', async () =
   const siteCall = await runOf('site', site.id)
   assert.match(siteCall.input, /Repository: acme\/site \(public\)/)
   assert.match(arg(siteCall, '--append-system-prompt'), /If the task says the repository is public\n  or its visibility is unknown, do not push/)
+})
+
+test('Docker: a draft at pr; at read-only and with a direct push it has no effect, and the answer says so', async () => {
+  const guarded = await dispatch('guarded', 'Fix the typo, as a draft.', { draft: true })
+  assert.match(guarded.text, /^\[dispatch=started worker=guarded task=t[a-z0-9]{3} session=\w+ access=pr draft=yes\] Started on branch main\. Tell/)
+  let call = await runOf('guarded', guarded.id)
+  assert.match(call.input, /^- Access level: pr \(main is protected by a ruleset\)\. Push a voice\/ branch and open a draft pull request\.$/m)
+  assert.match(call.input, /^- Draft pull request: yes\. /m)
+
+  const readonly = await dispatch('readonly', 'Fix the typo, as a draft.', { draft: true })
+  assert.match(readonly.text, /^\[dispatch=started worker=readonly task=t[a-z0-9]{3} session=\w+ access=read-only\] Started on branch main\. A draft has no effect here: nothing leaves the container at access level read-only\. If the driver asked for one, tell them\./)
+  call = await runOf('readonly', readonly.id)
+  assert.doesNotMatch(call.input, /draft pull request/i)
+
+  const direct = await dispatch('open', 'Push the fix straight to main, as a draft.', { direct: true, draft: true })
+  assert.match(direct.text, /access=full\] Started on branch main\. A draft has no effect here: a direct push opens no pull request\./)
+  call = await runOf('open', direct.id)
+  assert.match(call.input, /^- Direct push: yes\./m)
+  assert.doesNotMatch(call.input, /draft pull request/i)
 })
 
 test('Docker: a clone whose origin changed in the container gets no run until it is checked at the desk', async () => {

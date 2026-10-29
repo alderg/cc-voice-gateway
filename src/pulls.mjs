@@ -14,7 +14,11 @@
 // Claude app, people). If none of that shows up within the first polls,
 // nothing automatic runs, often because bot reviewers skip drafts, and it
 // stops quietly. A later run that names the pull request again, for example
-// one that requests a review, starts watching anew.
+// one that requests a review, starts watching anew. So does a later run that
+// pushed to it or marked it ready without naming it: at the end of a run the
+// watcher looks again at the last pull requests it watched for that
+// repository, and one whose head commit or draft state changed while the run
+// went counts as the run's, as automatic reviews and checks run again then.
 //
 // News: checks finished on a head commit (once per commit), new reviews with
 // their inline comments, and new comments. Reviews and comments of the account
@@ -38,6 +42,9 @@ const FAST_POLLS = 15 // then every SLOW_FACTOR intervals
 const SLOW_FACTOR = 5
 const AUTH_CHECK_MS = 10 * 60 * 1000
 const KEEP_STOPPED = 50
+const RECHECK = 3 // earlier watches of a repository looked at again when a run there ends
+const FOREIGN = 'not opened by the gh account from this repository'
+const ENDED = ['merged', 'closed', FOREIGN] // no later push can matter
 const FIELDS =
   'number,title,state,isDraft,isCrossRepository,author,headRefName,headRefOid,url,statusCheckRollup,reviewRequests,' +
   'reviews,comments'
@@ -166,11 +173,21 @@ export class PullWatcher extends EventEmitter {
   // --- watching -----------------------------------------------------------
 
   // The pull requests a finished run opened or worked on, as gh shows them:
-  // [{ number, title, isDraft, url }]. Starts watching each of them.
+  // [{ number, title, isDraft, url }]. Starts watching each of them: those it
+  // names by URL, and earlier ones of its repository that changed while it
+  // went (earlier).
   async fromRun(task) {
-    if (!task.slug || !task.pulls?.length || !(await this.ready())) return []
+    if (!task.slug) return []
+    const named = task.pulls ?? []
+    const earlier = this.earlier(task, named)
+    if ((!named.length && !earlier.length) || !(await this.ready())) return []
+    const since = task.startedAt ?? Date.now()
     const found = []
-    for (const number of task.pulls) {
+    const add = pr => {
+      found.push({ number: pr.number, title: pr.title, isDraft: Boolean(pr.isDraft), url: pr.url })
+      this.note(this.watch({ worker: task.repo, slug: task.slug, number: pr.number, title: pr.title }), pr)
+    }
+    for (const number of named) {
       const pr = await this.view(task.slug, number)
       if (!pr || pr.state !== 'OPEN' || !String(pr.headRefName).startsWith('voice/')) continue
       if (!this.ours(pr)) {
@@ -178,11 +195,37 @@ export class PullWatcher extends EventEmitter {
         this.log('not watching pull request', `${task.slug}#${pr.number}:`, why)
         continue
       }
-      found.push({ number: pr.number, title: pr.title, isDraft: Boolean(pr.isDraft), url: pr.url })
-      this.watch({ worker: task.repo, slug: task.slug, number: pr.number, title: pr.title })
+      add(pr)
     }
-    if (found.length) this.save()
+    // A push or "ready for review" the run did not name.
+    const views = await Promise.all(earlier.map(entry => this.view(entry.slug, entry.number)))
+    earlier.forEach((entry, i) => {
+      const pr = views[i]
+      if (!pr) return
+      if (pr.state !== 'OPEN') return this.stop(entry, pr.state === 'MERGED' ? 'merged' : 'closed')
+      if (!this.ours(pr)) return this.stop(entry, FOREIGN)
+      this.note(entry, pr)
+      if (entry.changedAt >= since) add(pr)
+    })
+    if (found.length || earlier.length) this.save()
     return found
+  }
+
+  // The last pull requests watched for the run's repository and worker that
+  // it did not name, unless merged, closed or someone else's.
+  earlier(task, named) {
+    const slug = task.slug.toLowerCase()
+    return this.watches
+      .filter(w => w.slug.toLowerCase() === slug && w.worker === task.repo && !named.includes(w.number) && !ENDED.includes(w.stopped))
+      .slice(-RECHECK)
+  }
+
+  // The head commit and draft state as last seen, and when either changed.
+  note(entry, pr) {
+    const draft = Boolean(pr.isDraft)
+    if (entry.head && (entry.head !== pr.headRefOid || entry.draft !== draft)) entry.changedAt = Date.now()
+    entry.head = pr.headRefOid
+    entry.draft = draft
   }
 
   watch({ worker, slug, number, title }) {
@@ -195,6 +238,7 @@ export class PullWatcher extends EventEmitter {
     const now = Date.now()
     Object.assign(entry, { worker, title, active: true, stopped: null, until: now + this.watchMs, polls: 0, quiet: 0, nextAt: now })
     this.log('watching pull request', key, `for ${worker}`)
+    return entry
   }
 
   stop(entry, reason) {
@@ -228,7 +272,8 @@ export class PullWatcher extends EventEmitter {
     const pr = await this.view(entry.slug, entry.number)
     if (!pr) return // gh or GitHub not reachable; again at the next poll
     if (pr.state !== 'OPEN') return this.stop(entry, pr.state === 'MERGED' ? 'merged' : 'closed')
-    if (!this.ours(pr)) return this.stop(entry, 'not opened by the gh account from this repository')
+    if (!this.ours(pr)) return this.stop(entry, FOREIGN)
+    this.note(entry, pr)
 
     const own = name => sameLogin(name, this.auth.me)
     const checks = pr.statusCheckRollup ?? []

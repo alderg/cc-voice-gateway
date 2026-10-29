@@ -28,7 +28,7 @@ import { CONTROLLER_STATES } from './store.mjs'
 import { log, preview } from './log.mjs'
 import { alarmText, offText } from './killswitch.mjs'
 import { size } from './folders.mjs'
-import { auditText, pullRequestKind, queueList } from './workers.mjs'
+import { auditText, draftIgnored, pullRequestKind, queueList } from './workers.mjs'
 import { DECISION_KINDS, decisionLine, openItems } from './ledger.mjs'
 
 // How long a "done" reply waits for the look at the gateway's own checkout
@@ -47,6 +47,17 @@ export const CHANNEL_SOURCE = process.env.VOICE_GW_CHANNEL_SOURCE || CHANNEL_NAM
 // VOICE_GW_PR_DRAFT=1.
 const PULL_REQUEST = pullRequestKind(config.prDraft)
 
+// How to ask about a pull request, and when a single one is a draft
+// (dispatch's draft); not with VOICE_GW_PR_DRAFT=1, where every one is.
+const DRAFT_INSTRUCTIONS = config.prDraft
+  ? ''
+  : `
+Pull requests open ready for review, so their automatic reviews start at once, and later pushes to the same pull
+request run them again by themselves. When you ask the driver about opening one (a push decision, a worker on a
+public repository asking whether to publish), ask only whether to open the pull request, without mentioning drafts.
+A draft only when the driver explicitly asks for one, or when more tasks for the same pull request are queued or
+named already: then ask just that ("X follows, open it as a draft?"), and after a yes pass draft=true to dispatch.
+The last of those tasks marks it ready for review: say so in its task, unless the driver said otherwise.`
 const INSTRUCTIONS = `
 Messages from the driver arrive as <channel source="${CHANNEL_SOURCE}" request_id="...">TEXT</channel>.
 They were spoken in a car and relayed by a voice assistant. Every one of them needs an answer through the
@@ -94,7 +105,7 @@ The git attribute is the gateway's own look at the checkout after the run, whate
 commits on no remote, new uncommitted files, a checkout not back on its branch. Tell the driver about anything but
 "clean". A "done" reply may come back with a line about the gateway's own checkout; mention it to the driver once.
 When the run opened or updated a pull request, the tag also has pull_request="<number>": say only briefly
-that it is out, and which one. Never offer or suggest a review; details only when the driver asks.
+that it is out, and which one. Never offer or suggest a review; details only when the driver asks.${DRAFT_INSTRUCTIONS}
 Checks and reviews that run on such a pull request by themselves arrive later as <channel source="${CHANNEL_SOURCE}"
 request_id="..." worker="..." repo="owner/name" pull_request="..." kind="checks|review|comment" trusted="no">:
 summarise them in one or two sentences and reply "done", without asking anything. The driver hears it as news.
@@ -301,6 +312,17 @@ const WORKER_TOOLS = [
             'Push straight to the default branch instead of opening a pull request. Only when the driver ' +
             'explicitly asked for it, and only at access level full.',
         },
+        draft: {
+          type: 'boolean',
+          description:
+            'Open the pull request as a draft, for this task only' +
+            (config.prDraft
+              ? ' (with VOICE_GW_PR_DRAFT=1 every pull request is a draft anyway). '
+              : '; without it, it opens ready for review, and its reviews start at once. ') +
+            'Only when the driver explicitly asked for a draft, or said yes to your question whether to open it as ' +
+            'a draft because more tasks for the same pull request follow. No effect at access level read-only, ' +
+            'where pull requests are turned off, or with direct.',
+        },
       },
       required: ['worker', 'task', 'words'],
     },
@@ -385,10 +407,14 @@ function dispatchText(worker, result) {
     case 'started': {
       const access = result.facts.access
       const closed = result.closed?.length ? ` It follows up the driver's answer: decision ${result.closed.join(', ')} closed.` : ''
+      // A draft where no pull request opens: started all the same, and said.
+      const ignored = result.task.draft ? draftIgnored(result.facts, result.task.direct) : null
+      const draft = ignored ? ` A draft has no effect here: ${ignored}. If the driver asked for one, tell them.` : ''
       return toolText(
         `[dispatch=started worker=${worker} task=${result.task.id} session=${result.task.resumed ? 'continued' : 'new'}` +
-          `${access ? ` access=${access.level}` : ''}${result.facts.pushDirect ? ' push=direct' : ''}] ` +
-          `Started on branch ${result.facts.branch || 'detached'}.${closed} ` +
+          `${access ? ` access=${access.level}` : ''}${result.facts.pushDirect ? ' push=direct' : ''}` +
+          `${result.task.draft && !ignored ? ' draft=yes' : ''}] ` +
+          `Started on branch ${result.facts.branch || 'detached'}.${closed}${draft} ` +
           `Tell the driver it is on its way. When it ends, a channel event with worker="${worker}" arrives.`,
       )
     }
@@ -452,7 +478,8 @@ function dispatchText(worker, result) {
             "if their request already settles it, close it with resolve_decision and their words. The task then starts."
           : ''
       return toolText(
-        `[dispatch=queued worker=${worker} queued=${entry.id} position=${position} reason=${reason}] Queued, because ` +
+        `[dispatch=queued worker=${worker} queued=${entry.id} position=${position} reason=${reason}` +
+          `${entry.draft ? ' draft=yes' : ''}] Queued, because ` +
           `${why}.${ask} It starts by itself when it is its turn, and its result arrives like any other; nothing to ` +
           `remember or send again. Tell the driver it is queued${position > 1 ? `, in position ${position}` : ''}. ` +
           `To drop it: stop_worker with drop="${entry.id}".`,
@@ -532,7 +559,7 @@ async function workerTool(workers, name, args, spoken) {
   // dispatch
   if (typeof args.task !== 'string' || !args.task.trim()) return toolText('task is required.', true)
   const words = typeof args.words === 'string' ? args.words : ''
-  // Every dispatch, with or without direct or allow_dirty: only on the
+  // Every dispatch, with or without direct, draft or allow_dirty: only on the
   // driver's own words, never on text a worker or GitHub brought in. That
   // holds for a task that waits in the queue too: checked now, not again.
   const said = spoken(words)
@@ -547,6 +574,7 @@ async function workerTool(workers, name, args, spoken) {
     fresh: args.fresh === true,
     allowDirty: args.allow_dirty === true,
     direct: args.direct === true,
+    draft: args.draft === true,
     request: said.id,
     answers: said.answers ?? null,
   })

@@ -341,6 +341,101 @@ test('nothing automatic: it stops quietly after the first polls, and notes a dra
   }
 })
 
+// --- later pushes -------------------------------------------------------------
+
+const copilot = id => ({ id, author: { login: 'copilot-pull-request-reviewer' }, authorAssociation: 'NONE', state: 'COMMENTED', body: 'x' })
+
+test('a later run that pushes to the pull request and names it: watched again, its new checks and reviews are news', async () => {
+  // Opened as a draft because more tasks for it followed: nothing automatic ran, and the watch stopped.
+  setGitHub(g => {
+    g.prs['acme/alpha#23'] = pr(23)
+  })
+  const { w, news } = watcher('later-push')
+  try {
+    await w.fromRun(task([23]))
+    await waitUntil(() => w.watches[0]?.stopped === 'nothing automatic runs (a draft)', 3000)
+
+    // The last of those tasks pushes and marks it ready; its result names it (pull_request="23").
+    setGitHub(g => {
+      Object.assign(g.prs['acme/alpha#23'], { isDraft: false, headRefOid: 'bbb222', statusCheckRollup: [run('test', 'IN_PROGRESS')] })
+    })
+    assert.deepEqual((await w.fromRun(task([23]))).map(found => [found.number, found.isDraft]), [[23, false]])
+    assert.deepEqual(w.active().map(entry => entry.key), ['acme/alpha#23'])
+    setGitHub(g => {
+      g.prs['acme/alpha#23'].statusCheckRollup = [run('test', 'COMPLETED', 'SUCCESS')]
+      g.prs['acme/alpha#23'].reviews = [copilot('R7')]
+    })
+    await waitUntil(() => news.length === 1)
+    assert.equal(news[0].kind, 'checks,review')
+    assert.match(news[0].text, /^Checks finished on the latest push: 1 passed\.$/m)
+    assert.match(news[0].text, /^Review from copilot-pull-request-reviewer: commented; not a collaborator/m)
+
+    // Another push to the same pull request: the reviews and checks run again, and are news again.
+    setGitHub(g => {
+      Object.assign(g.prs['acme/alpha#23'], { headRefOid: 'ccc333', statusCheckRollup: [run('test', 'COMPLETED', 'FAILURE')] })
+      g.prs['acme/alpha#23'].reviews.push(copilot('R8'))
+    })
+    assert.deepEqual((await w.fromRun(task([23]))).map(found => found.number), [23])
+    await waitUntil(() => news.length === 2)
+    assert.equal(news[1].kind, 'checks,review')
+    assert.match(news[1].text, /^Checks finished on the latest push: 0 passed, 1 failed \(test\)\.$/m)
+    assert.equal(news[1].text.match(/^Review from /gm).length, 1, 'only the new review')
+  } finally {
+    w.close()
+  }
+})
+
+test('a later run that pushed or marked it ready without naming it: the gateway sees the change and watches it again', async () => {
+  setGitHub(g => {
+    g.prs['acme/alpha#24'] = pr(24)
+  })
+  const { w, news } = watcher('later-unnamed')
+  try {
+    await w.fromRun(task([24]))
+    await waitUntil(() => !w.active().length, 3000)
+
+    // A run that changed nothing there: nothing to name, and the watch stays stopped.
+    assert.deepEqual(await w.fromRun(task([], { startedAt: Date.now() })), [])
+    assert.equal(w.active().length, 0)
+
+    // A run that pushed and marked it ready, and did not name it.
+    const startedAt = Date.now()
+    setGitHub(g => {
+      Object.assign(g.prs['acme/alpha#24'], { isDraft: false, headRefOid: 'bbb222', statusCheckRollup: [run('test', 'IN_PROGRESS')] })
+    })
+    assert.deepEqual(await w.fromRun(task([], { startedAt })), [
+      { number: 24, title: 'Fix the typo in the README', isDraft: false, url: 'https://github.com/acme/alpha/pull/24' },
+    ])
+    assert.equal(w.active().length, 1)
+    setGitHub(g => {
+      g.prs['acme/alpha#24'].statusCheckRollup = [run('test', 'COMPLETED', 'SUCCESS')]
+    })
+    await waitUntil(() => news.length === 1)
+    assert.equal(news[0].kind, 'checks')
+
+    // A push the running watch saw before the run ended counts for that run too.
+    const during = Date.now()
+    setGitHub(g => {
+      g.prs['acme/alpha#24'].headRefOid = 'ccc333'
+    })
+    await waitUntil(() => w.watches[0].head === 'ccc333')
+    assert.deepEqual((await w.fromRun(task([], { startedAt: during }))).map(found => found.number), [24])
+    assert.deepEqual(await w.fromRun(task([], { startedAt: Date.now() })), [], 'not for a later run that did not push')
+    assert.deepEqual(await w.fromRun(task([], { repo: 'other', startedAt: during })), [], "not another worker's run")
+
+    // Merged: the watch ends, and later runs do not look at it again.
+    setGitHub(g => {
+      g.prs['acme/alpha#24'].state = 'MERGED'
+    })
+    await waitUntil(() => w.watches[0].stopped === 'merged')
+    const before = ghCalls().length
+    assert.deepEqual(await w.fromRun(task([], { startedAt: 0 })), [])
+    assert.ok(!ghCalls().slice(before).some(call => call[0] === 'pr'), 'not looked at again')
+  } finally {
+    w.close()
+  }
+})
+
 test('merged or closed pull requests and the time limit end the watch', async () => {
   setGitHub(g => {
     g.prs['acme/alpha#14'] = pr(14, { statusCheckRollup: [run('test', 'IN_PROGRESS')] })

@@ -210,10 +210,10 @@ questions above.
   about it. `stop_worker` says the same after a stop.
 - With commits on no remote or new uncommitted files, the result also has `decision="…"`: the
   gateway made it an open push decision (see What is open). Ask the driver whether to push, with
-  `state: "question"`; `done` is refused until then. With their yes, `dispatch` the follow-up with
-  their answer in `words`; the files it is about need no `allow_dirty`. At `read-only` in Docker
-  only uncommitted files count. A commit the driver already said to keep local raises no new
-  decision.
+  `state: "question"`, and where that opens a pull request, as Pull requests from workers says;
+  `done` is refused until then. With their yes, `dispatch` the follow-up with their answer in
+  `words`; the files it is about need no `allow_dirty`. At `read-only` in Docker only uncommitted
+  files count. A commit the driver already said to keep local raises no new decision.
 - A `done` reply may come back with a line about the gateway's own checkout: uncommitted changes
   or commits on no remote, as an open decision. Mention it to the driver once, in a later answer,
   with `state: "question"` and its id in `decisions`.
@@ -238,12 +238,13 @@ questions above.
     to open, so workers commit on the default branch and push it there, on this computer and in
     the container at `full`. Tell the driver the change went straight to that branch. In the
     container with a protected default branch, such a repository is `read-only`.
-  - The pull requests are ready for review. Only when the driver chose drafts in the setup
-    (`VOICE_GW_PR_DRAFT=1`) are they drafts; the description of `dispatch` says which.
+  - The pull requests are ready for review, and a single one is a draft only with `draft` (see
+    Pull requests from workers). Only when the driver chose drafts in the setup
+    (`VOICE_GW_PR_DRAFT=1`) are they all drafts; the description of `dispatch` says which.
   - When the driver asks what a worker may do, say it in plain words, for example "only locally,
     nothing is pushed" or "it opens pull requests, main is protected".
-- On public repositories workers ask before pushing, at every level. Mention the pull request, not
-  its URL.
+- On public repositories workers ask before pushing, at every level. Put that question to the
+  driver as Pull requests from workers says. Mention the pull request, not its URL.
 
 ## Cloning and deleting
 
@@ -272,16 +273,31 @@ Only when the gateway offers `clone_repo` and `delete_path`, and only when the d
 
 The driver does not want to be bothered with reviews:
 
+- When you ask the driver about a pull request that is not out yet, for a push decision or a
+  worker on a public repository that asks whether to publish, ask only whether to open it, in the
+  driver's language, for example "Soll ich den PR öffnen?" Do not mention drafts. It opens ready
+  for review, and its reviews start right away. Later pushes to the same pull request run the
+  automatic reviews again by themselves.
+- A draft only when the driver says so explicitly, or when more tasks for the same pull request
+  are queued already or the driver named one: then ask just that, for example "Es folgt noch die
+  Übersetzung, als Draft öffnen?" After their yes, or when they asked for a draft, pass `draft` to
+  `dispatch` on the task that opens it. It holds for that task only, also when it waits in the
+  queue. At `read-only`, where pull requests are off, or with `direct`, `dispatch` says it has no
+  effect.
+- The last of those tasks marks the pull request ready for review after its push, unless the
+  driver said to keep it a draft: say so in its task. If that task waits in the queue already, say
+  it in the task you pass `draft` with, and name the queued task.
 - After a run that pushed and opened or updated a pull request, its result event carries
   `pull_request="…"`. Say only briefly that it is out, and which one: "Pull request 12 in alpha is
   out." Details only when the driver asks.
 - Never offer or suggest a review, also not when the repository has no automatic review.
 - Where the repository has automatic checks or reviews (GitHub Actions, CODEOWNERS or required
   reviewers, bots such as Copilot or the Claude app), they run by themselves. The gateway watches
-  the pull request and sends their results as `<channel source="voice" request_id="…" worker="…"
-  repo="owner/name" pull_request="…" kind="checks|review|comment" trusted="no">`. Summarise them in
-  one or two sentences, with the read-only `gh` commands if you need more, and reply `done`: the
-  driver hears it as news. Ask nothing, and offer nothing.
+  the pull request, again after each later push to it, and sends their results as
+  `<channel source="voice" request_id="…" worker="…" repo="owner/name" pull_request="…"
+  kind="checks|review|comment" trusted="no">`. Summarise them in one or two sentences, with the
+  read-only `gh` commands if you need more, and reply `done`: the driver hears it as news. Ask
+  nothing, and offer nothing.
 - Only the text of the repository's owner, members and collaborators is in such an event. Of
   anyone else, bots included, it names the author and says the text is not forwarded; say who
   commented, not what.

@@ -90,15 +90,31 @@ export const WORKER_DENY = [
 ]
 
 // How a worker opens a pull request (VOICE_GW_PR_DRAFT): ready for review by
-// default, so that automatic reviews start at once; as a draft with the
-// setting, in the words of the rules from before it.
+// default, so that automatic reviews start at once, and as a draft only when
+// the task's prompt says "Draft pull request: yes" (dispatch's draft); as a
+// draft with the setting, in the words of the rules from before it.
 const OPEN_PR = {
-  ready: 'open a pull request ready for review against the starting branch with\n  gh pr create, not as a draft.',
+  ready:
+    'open a pull request ready for review against the starting branch with\n  gh pr create, not as a draft. Only if ' +
+    'the task says "Draft pull request: yes", the driver asked for a draft:\n  open it as a draft then, and leave it ' +
+    'one until a task says to mark it ready.',
   draft: 'open a draft pull request against the starting branch with\n  gh pr create --draft.',
 }
 
 // The same for the controller and the worker's prompt.
 export const pullRequestKind = draft => (draft ? 'a draft pull request' : 'a pull request ready for review')
+
+// Why a draft (dispatch's draft) changes nothing for a run, or null: there is
+// no pull request to open.
+export function draftIgnored(facts, direct = false) {
+  if (facts.access?.level === 'read-only') return 'nothing leaves the container at access level read-only'
+  if (facts.pushDirect) {
+    return `pull requests are turned off on GitHub, the change goes straight to ${facts.defaultBranch || 'the default branch'}`
+  }
+  if (direct) return 'a direct push opens no pull request'
+  if (!facts.origin) return 'the repository has no remote, so nothing is pushed'
+  return null
+}
 
 export const WORKER_RULES = `
 You are a worker. The driver of a car gave this task by voice; a controller session passed it on and will
@@ -175,7 +191,8 @@ const DIRECT_RULES = {
 
 // The worker's rules: as above on this computer and at level pr, with the
 // Git and Publish rules of the level otherwise, or of a direct push where
-// pull requests are turned off. draft: pull requests as drafts.
+// pull requests are turned off. draft: every pull request as a draft
+// (VOICE_GW_PR_DRAFT=1); a single task's draft is a line in its prompt.
 export function workerRules(level, { pushDirect = false, draft = false } = {}) {
   const replace = pushDirect ? DIRECT_RULES : CONTAINER_RULES[level]
   const rules = replace
@@ -209,9 +226,10 @@ export function parkedText(entry, why, status, decision = null) {
     status === 'dirty'
       ? 'If the driver says to go ahead anyway, dispatch it again with allow_dirty and their words.'
       : 'If the driver still wants it, dispatch it again with their words.'
+  const draft = entry.draft ? ' It was to open its pull request as a draft: pass draft again.' : ''
   return (
     `The queued task ${entry.id} for ${entry.worker} did not start: ${why}. It has left the queue. ` +
-    `Task: "${preview(entry.task, 200)}". Tell the driver and ask what to do. ${hint}` +
+    `Task: "${preview(entry.task, 200)}". Tell the driver and ask what to do. ${hint}${draft}` +
     (decision
       ? ` It is open decision ${decision.id} now, and other tasks for ${entry.worker} wait until it is closed: ` +
         'the follow-up for the answer closes it, or resolve_decision.'
@@ -565,12 +583,13 @@ export class Workers extends EventEmitter {
   // before it, or for a free run slot. request: the id of the voice request
   // with the words; answers: the request whose question those words answer.
   // The follow-up for an answer is not held by that question's decisions,
-  // and goes before the tasks they hold.
-  async dispatch({ worker, task, words, fresh = false, allowDirty = false, direct = false, request = null, answers = null }) {
+  // and goes before the tasks they hold. draft: its pull request opens as a
+  // draft; kept with a queued task like the rest.
+  async dispatch({ worker, task, words, fresh = false, allowDirty = false, direct = false, draft = false, request = null, answers = null }) {
     if (this.killswitch?.locked) return { status: 'locked', state: this.killswitch.state }
     const names = await this.repos()
     if (!names.includes(worker)) return { status: 'unknown', names }
-    const job = { worker, task, words, fresh, allowDirty, direct, request, answers }
+    const job = { worker, task, words, fresh, allowDirty, direct, draft, request, answers }
     const first = this.follows(worker, answers).length > 0
     const ahead = this.queued(worker).length && !first
     const why = this.waiting(worker, answers) ?? (this.slotsFull() ? 'full' : ahead ? 'queue' : null)
@@ -596,7 +615,7 @@ export class Workers extends EventEmitter {
 
   // The checks before a run, and the start: for a dispatch, and for a queued
   // task when it is its turn (entry).
-  async launch({ worker, task, words, fresh = false, allowDirty = false, direct = false, answers = null }, entry = null) {
+  async launch({ worker, task, words, fresh = false, allowDirty = false, direct = false, draft = false, answers = null }, entry = null) {
     this.starting.add(worker)
     try {
       const facts = await this.inspect(worker)
@@ -619,7 +638,7 @@ export class Workers extends EventEmitter {
       // Never a second run in a checkout where a worker process still runs:
       // one of a run nobody follows is ended, and the task waits for it.
       if (this.stopStrays({ dir: facts.dir, why: 'found before a new run there' }).length) return { status: 'busy', strays: true }
-      return this.start(facts, { task, words, fresh, direct, answers }, entry)
+      return this.start(facts, { task, words, fresh, direct, draft, answers }, entry)
     } finally {
       this.starting.delete(worker)
     }
@@ -636,7 +655,7 @@ export class Workers extends EventEmitter {
     return state ? state.unpushed.map(commit => commit.hash) : null
   }
 
-  start(facts, { task, words, fresh, direct = false, answers = null }, entry = null) {
+  start(facts, { task, words, fresh, direct = false, draft = false, answers = null }, entry = null) {
     if (this.killswitch?.locked) return { status: 'locked', state: this.killswitch.state }
     if (entry && !this.state.queue.some(waiting => waiting.id === entry.id)) return { status: 'dropped' }
     const previous = fresh ? null : this.state.repos[facts.name]?.sessionId
@@ -682,6 +701,7 @@ export class Workers extends EventEmitter {
       resumed: Boolean(previous),
       access: facts.access?.level ?? null,
       direct,
+      draft, // the driver asked for a draft pull request (dispatch's draft)
       pushDirect: Boolean(facts.pushDirect), // pull requests turned off: commits go to the default branch
       dir: facts.dir,
       slug: facts.slug ?? null, // owner/repo on GitHub, or null
@@ -715,7 +735,7 @@ export class Workers extends EventEmitter {
     }
     child.on('error', error => this.finish(record, 'failed', `could not start ${error.path || this.claudeBin}: ${error.message}`))
     child.stdin.on('error', () => {}) // the run may end before it read everything
-    child.stdin.end(prompt({ task, words, facts, direct, draft: this.prDraft }))
+    child.stdin.end(prompt({ task, words, facts, direct, draft, prDraft: this.prDraft }))
     child.unref()
     this.state.tasks.push(record)
     this.state.repos[facts.name] = { sessionId }
@@ -1364,9 +1384,10 @@ const ACCESS_TEXT = {
 }
 
 // What the worker reads on stdin: the task in the controller's words, the
-// driver's own words, and what the gateway checked. draft: pull requests as
-// drafts.
-export function prompt({ task, words, facts, direct = false, draft = false }) {
+// driver's own words, and what the gateway checked. draft: this task's pull
+// request as a draft, where it opens one (dispatch's draft); prDraft: every
+// pull request as a draft (VOICE_GW_PR_DRAFT=1).
+export function prompt({ task, words, facts, direct = false, draft = false, prDraft = false }) {
   const visibility = {
     public: 'public',
     private: 'private',
@@ -1390,9 +1411,10 @@ export function prompt({ task, words, facts, direct = false, draft = false }) {
     lines.push(`- Uncommitted files an earlier run left, which this task follows up: ${followed.join(', ')}`)
   }
   const target = facts.defaultBranch || 'the default branch'
+  const asDraft = draft && !draftIgnored(facts, direct)
   if (facts.access) {
     const { level, reason } = facts.access
-    const what = facts.pushDirect ? '' : (ACCESS_TEXT[level]?.(pullRequestKind(draft)) ?? '')
+    const what = facts.pushDirect ? '' : (ACCESS_TEXT[level]?.(pullRequestKind(prDraft || asDraft)) ?? '')
     lines.push(`- Access level: ${level} (${reason}). ${what}`.trimEnd())
     if (direct && !facts.pushDirect) {
       lines.push(`- Direct push: yes. The driver explicitly asked to push straight to ${target}.`)
@@ -1400,6 +1422,12 @@ export function prompt({ task, words, facts, direct = false, draft = false }) {
   }
   if (facts.pushDirect) {
     lines.push(`- Pull requests: turned off on GitHub. Commit on ${target} and push it there, without a pull request.`)
+  }
+  if (asDraft) {
+    lines.push(
+      '- Draft pull request: yes. The driver asked to open the pull request as a draft, with gh pr create --draft; ' +
+        'one that is open already stays as it is.',
+    )
   }
   return lines.join('\n') + '\n'
 }
