@@ -80,6 +80,11 @@ not possible with FileVault). While the watchdog runs, `caffeinate -i -s` keeps 
 sleep (`VOICE_GW_CAFFEINATE=0` turns that off); a closed laptop lid without an external display
 still sends it to sleep.
 
+Claude Code keeps its login in the macOS keychain, which a process reaches only from your login
+session. Start the controller from the LaunchAgent or a Terminal on the Mac; a tmux server first
+started over SSH may not find the login (the session then says to log in). If that happens, stop
+it, `tmux kill-server`, and start it again from the Mac.
+
 ## 5. What to test
 
 Run them in this order; each says what you should see. Note the number of any step that does not
@@ -100,16 +105,21 @@ behave so, with `grep watchdog .logs/gateway.log | tail -20` and
    `caffeinate: this Mac does not go to sleep`, and `pmset -g assertions | grep caffeinate` shows it.
 5. **A voice request.** `node scripts/fake-voice.mjs`, then `ask Is the gateway up?`. Expected: a
    short answer from the controller within a minute. Leave fake-voice open for the next steps.
-6. **A worker run and the git check.** A sample repository without a remote, next to the gateway:
+6. **A worker run and the git check.** A sample repository next to the gateway, with a local
+   remote (the check counts commits on no remote only where there is one):
 
    ```bash
+   git init --bare ~/voice-sample-origin.git
    cd ~/Developer && mkdir voice-sample && cd voice-sample
    git init -b main && echo hello > README.md && git add . && git commit -m init
+   git remote add origin ~/voice-sample-origin.git && git push -u origin main
    ```
 
-   In fake-voice: `send Tell the voice-sample worker to add the line "tested on macOS" to the README and commit it.`
-   Expected: the result says it is done, and the controller asks whether to push, since the commit is
-   on no remote (the gateway's git check). `answer No, keep it local.`
+   In fake-voice: `send Tell the voice-sample worker to add the line "tested on macOS" to the README and commit it, without pushing.`
+   Expected: the result says it is done, and the controller says the commit is on no remote and asks
+   whether to push (the gateway's git check: `worker audit voice-sample … 1 commit on no remote` in
+   `.logs/gateway.log`, perhaps also "not back on its starting branch").
+   `answer No, keep it local.` closes it. Had the worker pushed anyway, the check says clean.
 7. **stop_worker ends the whole run.** `send Tell the voice-sample worker to run sleep 100 in the shell, then report.`
    Within 30 seconds, in a second terminal: `pgrep -fl "sleep 100"` and `pgrep -fl "claude -p"` show
    it. `send Stop the voice-sample worker.` Expected: within 10 seconds both `pgrep` commands print
@@ -130,4 +140,4 @@ behave so, with `grep watchdog .logs/gateway.log | tail -20` and
 12. **The Funnel, if Tailscale is set up.** `scripts/funnel.sh start` prints the connector URL and
     reports the relays; `scripts/funnel.sh state` says `on`; `scripts/funnel.sh stop`.
 
-Afterwards: `rm -rf ~/Developer/voice-sample`.
+Afterwards: `rm -rf ~/Developer/voice-sample ~/voice-sample-origin.git`.
