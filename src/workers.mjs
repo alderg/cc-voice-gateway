@@ -410,7 +410,7 @@ export class Workers extends EventEmitter {
     effort = '',
     prDraft = false,
     maxRuns = 2,
-    timeoutMinutes = 60,
+    timeoutMinutes = 360, // 0: no time limit
     resultGraceMs = RESULT_GRACE_MS,
     killAfterMs = KILL_AFTER_MS,
   }) {
@@ -1194,7 +1194,7 @@ export class Workers extends EventEmitter {
       log('worker', task.repo, task.id, `gave its result and has not ended after ${duration(this.resultGraceMs)}; ending it`)
       return this.halt(task)
     }
-    if (now - task.startedAt > this.timeoutMs) {
+    if (this.timeoutMs && now - task.startedAt > this.timeoutMs) {
       this.halt(task, { reason: `stopped at the time limit of ${duration(this.timeoutMs)}`, report: true })
     }
   }

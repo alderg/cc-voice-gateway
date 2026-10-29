@@ -534,7 +534,8 @@ What applies to every worker run (`src/workers.mjs`):
 - **Before a run:** the gateway refuses a dispatch without your words from a recent voice request
   ([5.4](#54-approvals-by-voice)) and a checkout with uncommitted changes until you agree. A
   second run in the same repository, or one more than `VOICE_GW_MAX_WORKERS` runs, waits in the
-  queue instead. A run stops after `VOICE_GW_WORKER_TIMEOUT` minutes.
+  queue instead. A run stops after `VOICE_GW_WORKER_TIMEOUT` minutes, six hours by default
+  (`0`: no time limit).
 - **When a run has ended:** when every process of it has, not when its output shows a result.
   Claude Code can answer a turn of its own first, such as the notification of a background task
   left over in the session it resumes, write a result for it and go on with the task in the same
@@ -1521,7 +1522,7 @@ setting with where it came from.
 | `VOICE_GW_CONTROLLER_LEVEL` | `confined` | `clone-delete` or `unrestricted` ([5.3](#53-the-controllers-confinement)); the gateway, the confine hook and the start script read it |
 | `VOICE_GW_DISPATCH_WINDOW` | `30` | Minutes a voice request counts for `dispatch`: only words from requests this recent start a run |
 | `VOICE_GW_MAX_WORKERS` | `2` | Runs at the same time |
-| `VOICE_GW_WORKER_TIMEOUT` | `60` | Minutes before a run is stopped |
+| `VOICE_GW_WORKER_TIMEOUT` | `360` | Minutes before a run is stopped; `0`: no time limit |
 | `VOICE_GW_WORKER_MODEL` | Claude Code's default | `--model` for every worker run, host and Docker |
 | `VOICE_GW_WORKER_EFFORT` | Claude Code's default | `--effort`: `low`, `medium`, `high`, `xhigh`, `max` |
 | `VOICE_GW_CLAUDE_BIN` | `claude` | Claude Code for workers (inside the container in Docker mode) |

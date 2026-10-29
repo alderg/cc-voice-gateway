@@ -104,7 +104,8 @@ export const config = {
   // request of the last this many minutes (channel.mjs).
   dispatchWindowMinutes: num(env.VOICE_GW_DISPATCH_WINDOW, 30),
   maxWorkers: num(env.VOICE_GW_MAX_WORKERS, 2),
-  workerTimeoutMinutes: num(env.VOICE_GW_WORKER_TIMEOUT, 60),
+  // 0: no time limit.
+  workerTimeoutMinutes: env.VOICE_GW_WORKER_TIMEOUT?.trim() === '0' ? 0 : num(env.VOICE_GW_WORKER_TIMEOUT, 360),
   claudeBin: env.VOICE_GW_CLAUDE_BIN || 'claude',
   // Model and effort of the workers' runs (claude --model, --effort), on this
   // computer and in the container. Empty: Claude Code's defaults.

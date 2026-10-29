@@ -43,7 +43,7 @@ export function fields(root) {
     VOICE_GW_PORT: { default: '8787', valid: INT(1024, 65535) },
     VOICE_GW_WORKER_ROOT: { default: dirname(root), valid: PATH },
     VOICE_GW_MAX_WORKERS: { default: '2', valid: INT(1, 10) },
-    VOICE_GW_WORKER_TIMEOUT: { default: '60', valid: INT(5, 1440) },
+    VOICE_GW_WORKER_TIMEOUT: { default: '360', valid: value => value === '0' || INT(5, 1440)(value) },
     VOICE_GW_PR_DRAFT: { default: '0', valid: ONE_OF('0', '1') },
     VOICE_GW_SCRATCH: { default: '0', valid: ONE_OF('0', '1') },
     VOICE_GW_SCRATCH_ROOT: { default: join(homedir(), 'voice-scratch'), valid: PATH },
