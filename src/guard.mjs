@@ -452,11 +452,7 @@ export class RunGuard {
     this.maxFiles = limits.maxFiles ?? 300
     this.maxLines = limits.maxLines ?? 30000
     this.log = log
-    const docker = Boolean(runner.container)
-    this.home = docker ? '/home/worker' : homedir()
-    this.claudeConfig = (!docker && process.env.CLAUDE_CONFIG_DIR) || `${this.home}/.claude`
-    // On macOS also /private/tmp and the per-user /var/folders/…/T (platform.mjs).
-    this.allowedRoots = [...new Set([...(docker ? ['/tmp', '/var/tmp'] : tempFolders()), ...allowed])]
+    this.allowedPaths = allowed // VOICE_GW_KILL_ALLOW_PATHS
     this.runs = new Map() // task id -> what the rules know about the run
     this.ghWarned = false
     workers.on('started', task => this.started(task))
@@ -478,13 +474,34 @@ export class RunGuard {
 
   // --- the run --------------------------------------------------------------
 
-  // Also for runs that were going when the gateway started.
+  // Where the runs of a runner live: in the container or on this computer.
+  // Their home, Claude Code's folder there, and the folders they may write to
+  // besides their workspace: the temporary ones (on macOS also /private/tmp
+  // and the per-user /var/folders/…/T, platform.mjs) and
+  // VOICE_GW_KILL_ALLOW_PATHS.
+  places(runner) {
+    const docker = Boolean(runner.container)
+    const home = docker ? '/home/worker' : homedir()
+    return {
+      home,
+      claudeConfig: (!docker && process.env.CLAUDE_CONFIG_DIR) || `${home}/.claude`,
+      roots: [...new Set([...(docker ? ['/tmp', '/var/tmp'] : tempFolders()), ...this.allowedPaths])],
+    }
+  }
+
+  // Also for runs that were going when the gateway started. The runner of
+  // the run's workspace, as Workers knows it.
   started(task) {
     if (this.runs.has(task.id)) return
+    const runner = this.workers.runnerOf?.(task) ?? this.runner
+    const { home, claudeConfig, roots } = this.places(runner)
     const run = {
       id: task.id,
       repo: task.repo,
-      dir: task.dir ?? this.runner.dir(task.repo),
+      runner,
+      home,
+      roots, // where it may write besides its workspace and its memory folder
+      dir: task.dir ?? runner.dir(task.repo),
       memory: null,
       slug: task.slug ?? null,
       branch: task.defaultBranch ?? null,
@@ -497,7 +514,7 @@ export class RunGuard {
       tripped: new Set(),
       checking: null,
     }
-    run.memory = memoryFolder(this.claudeConfig, run.dir)
+    run.memory = memoryFolder(claudeConfig, run.dir)
     this.runs.set(task.id, run)
     run.ready = this.baseline(run)
   }
@@ -525,7 +542,7 @@ export class RunGuard {
       const path = part.input?.[FILE_TOOLS[part.name]]
       run.edits++
       if (typeof path === 'string') {
-        const target = this.resolve(run.dir, path)
+        const target = this.resolve(run, run.dir, path)
         if (target) run.files.add(target)
         if (target && !this.allowed(run, target)) this.violation(run, 'write outside the allowed folders', `${part.name} ${target}`)
       }
@@ -559,7 +576,7 @@ export class RunGuard {
       const head = await this.head(run)
       if (!head || head === run.head) return
       const moved = `${run.branch} on GitHub moved from ${short(run.head)} to ${short(head)} during the run`
-      const local = await this.runner.git(run.dir, 'cat-file', '-e', `${head}^{commit}`)
+      const local = await run.runner.git(run.dir, 'cat-file', '-e', `${head}^{commit}`)
       if (local !== null) {
         this.violation(run, 'push to the default branch', `${moved}, and the worker's repository holds the new head`)
       } else {
@@ -602,7 +619,7 @@ export class RunGuard {
   // Whether the worker's repository logged a push to the branch since the run
   // started: git push moves origin/<branch>, with "update by push".
   async pushedSince(run, branch) {
-    const reflog = await this.runner.git(run.dir, 'reflog', 'show', '--date=unix', '--format=%gd %gs', `refs/remotes/origin/${branch}`)
+    const reflog = await run.runner.git(run.dir, 'reflog', 'show', '--date=unix', '--format=%gd %gs', `refs/remotes/origin/${branch}`)
     const since = Math.floor(run.startedAt / 1000)
     return (reflog ?? '').split('\n').some(line => {
       const match = /@\{(\d+)\} update by push$/.exec(line.trim())
@@ -634,7 +651,7 @@ export class RunGuard {
       if (name && !CLAUSES.has(name)) {
         if (name === 'cd' || name === 'pushd') {
           const dir = args.find(arg => !arg.startsWith('-') || arg === '-')
-          cwd = dir === undefined ? this.home : dir === '-' ? null : this.resolve(cwd, dir)
+          cwd = dir === undefined ? run.home : dir === '-' ? null : this.resolve(run, cwd, dir)
         } else if (name === 'popd') {
           cwd = null
         }
@@ -655,16 +672,16 @@ export class RunGuard {
         if (name === 'eval' && args.length) this.shell(run, args.join(' '), cwd)
         if (event.heredocs.length && ['cat', 'tee'].includes(name)) {
           for (const target of targets) {
-            const path = this.resolve(cwd, target)
+            const path = this.resolve(run, cwd, target)
             if (path) scripts.set(path, event.heredocs.join(''))
           }
         }
         const file = SHELLS.has(basename(name)) || ['source', '.'].includes(name) ? args.find(arg => !arg.startsWith('-')) : name
-        const script = file !== undefined && scripts.get(this.resolve(cwd, file))
+        const script = file !== undefined && scripts.get(this.resolve(run, cwd, file))
         if (script) this.shell(run, script, cwd)
       }
       for (const target of targets) {
-        const path = this.resolve(cwd, target)
+        const path = this.resolve(run, cwd, target)
         if (path && !this.allowed(run, path)) {
           this.violation(run, 'write outside the allowed folders', `${shown} writes ${path}`)
         }
@@ -712,11 +729,12 @@ export class RunGuard {
     return []
   }
 
-  // An absolute path, or null where a variable hides it.
-  resolve(base, path) {
+  // An absolute path, or null where a variable hides it; ~ and $HOME are
+  // the run's home.
+  resolve(run, base, path) {
     let expanded = String(path)
-    if (expanded === '~' || expanded.startsWith('~/')) expanded = this.home + expanded.slice(1)
-    expanded = expanded.replace(/^\$\{?HOME\}?(?=\/|$)/, this.home)
+    if (expanded === '~' || expanded.startsWith('~/')) expanded = run.home + expanded.slice(1)
+    expanded = expanded.replace(/^\$\{?HOME\}?(?=\/|$)/, run.home)
     if (/[$`]/.test(expanded)) return null
     if (!expanded.startsWith('/') && base === null) return null
     return posix.resolve(base ?? '/', expanded)
@@ -724,7 +742,7 @@ export class RunGuard {
 
   allowed(run, path) {
     if (isDevice(path)) return true
-    return [run.dir, run.memory, ...this.allowedRoots].some(root => path === root || path.startsWith(root.replace(/\/$/, '') + '/'))
+    return [run.dir, run.memory, ...run.roots].some(root => path === root || path.startsWith(root.replace(/\/$/, '') + '/'))
   }
 
   // --- size ---------------------------------------------------------------------
@@ -732,9 +750,9 @@ export class RunGuard {
   async checkSize(run) {
     const since = Math.floor(run.startedAt / 1000)
     const [committed, pending, untracked] = await Promise.all([
-      this.runner.git(run.dir, 'log', '--all', `--since=@${since}`, '--numstat', '--format='),
-      this.runner.git(run.dir, 'diff', '--numstat', 'HEAD'),
-      this.runner.git(run.dir, 'ls-files', '--others', '--exclude-standard'),
+      run.runner.git(run.dir, 'log', '--all', `--since=@${since}`, '--numstat', '--format='),
+      run.runner.git(run.dir, 'diff', '--numstat', 'HEAD'),
+      run.runner.git(run.dir, 'ls-files', '--others', '--exclude-standard'),
     ])
     const files = new Set()
     let lines = 0

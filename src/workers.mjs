@@ -3,6 +3,8 @@
 // tools list_workers, dispatch, worker_status and stop_worker. Optionally they
 // run in a Docker container with its own clones instead (runners.mjs), with
 // an access level per repository that the GitHub token decides (access.mjs).
+// Where a run works is its workspace; its kind says which runner reaches it
+// (workspaces.mjs).
 //
 // Each task is one `claude -p` run in the repository's checkout, without
 // approvals. A follow-up resumes the repository's last Claude session, so the
@@ -46,6 +48,7 @@ import { chmodSync, closeSync, fstatSync, mkdirSync, openSync, readFileSync, rea
 import { join, relative } from 'node:path'
 import { log, preview } from './log.mjs'
 import { HostRunner, MARK, alive, startOf } from './runners.mjs'
+import { Repositories, kindOf } from './workspaces.mjs'
 
 const POLL_MS = 1000
 // A run that gave its result and has not ended after this long without
@@ -391,7 +394,9 @@ export class Workers extends EventEmitter {
     killAfterMs = KILL_AFTER_MS,
   }) {
     super()
-    this.runner = runner
+    this.runner = runner // the repositories'
+    // The kinds of workspace, by name (workspaces.mjs).
+    this.kinds = { repo: new Repositories(runner) }
     this.access = access // GitHubAccess in the container, null on this computer
     this.killswitch = killswitch // while it is locked, nothing starts
     this.ledger = ledger // open decisions: they hold a repository's queue
@@ -495,11 +500,39 @@ export class Workers extends EventEmitter {
     this.save()
   }
 
+  // --- workspaces ---------------------------------------------------------
+
+  // The kind whose name it is, or null (workspaces.mjs).
+  workspace(name) {
+    return Object.values(this.kinds).find(kind => kind.owns(name)) ?? null
+  }
+
+  // The runner that reaches a run's workspace: of its kind, by its record.
+  runnerOf(task) {
+    return this.kinds[kindOf(task)]?.runner ?? this.runner
+  }
+
+  dirOf(name) {
+    return (this.workspace(name) ?? this.kinds.repo).dir(name)
+  }
+
+  // The names of the kind that `name` belongs to, for checking it; the
+  // repositories for a name of no kind. Throws when the worker container does
+  // not answer.
+  async known(name) {
+    return (this.workspace(name) ?? this.kinds.repo).names()
+  }
+
+  // Every runner, once.
+  runners() {
+    return [...new Set(Object.values(this.kinds).map(kind => kind.runner))]
+  }
+
   // --- repositories -------------------------------------------------------
 
   // Throws when the worker container does not answer.
   repos() {
-    return this.runner.names()
+    return this.kinds.repo.names()
   }
 
   // What gh on this computer says about a repository: { visibility, pulls,
@@ -587,7 +620,7 @@ export class Workers extends EventEmitter {
   // draft; kept with a queued task like the rest.
   async dispatch({ worker, task, words, fresh = false, allowDirty = false, direct = false, draft = false, request = null, answers = null }) {
     if (this.killswitch?.locked) return { status: 'locked', state: this.killswitch.state }
-    const names = await this.repos()
+    const names = await this.known(worker)
     if (!names.includes(worker)) return { status: 'unknown', names }
     const job = { worker, task, words, fresh, allowDirty, direct, draft, request, answers }
     const first = this.follows(worker, answers).length > 0
@@ -662,6 +695,8 @@ export class Workers extends EventEmitter {
     const sessionId = previous || randomUUID()
     const id = this.newTaskId()
     const mark = randomUUID() // VOICE_GW_RUN of every process of the run
+    const kind = kindOf(facts)
+    const runner = this.runnerOf({ kind })
     mkdirSync(this.tasksDir, { recursive: true, mode: 0o700 })
     const file = join(this.tasksDir, `${id}.jsonl`)
     const errFile = join(this.tasksDir, `${id}.err`)
@@ -683,14 +718,16 @@ export class Workers extends EventEmitter {
     const env = workerEnv({ [MARK.run]: mark, [MARK.task]: id, [MARK.repo]: facts.dir })
     let child
     try {
-      child = this.runner.spawn(id, this.claudeBin, args, { cwd: facts.dir, stdio: ['pipe', out, err], env })
+      child = runner.spawn(id, this.claudeBin, args, { cwd: facts.dir, stdio: ['pipe', out, err], env })
     } finally {
       closeSync(out)
       closeSync(err)
     }
     const record = {
       id,
-      repo: facts.name,
+      kind, // of its workspace (workspaces.mjs)
+      repo: facts.name, // the workspace's name
+      container: runner.container ?? null, // where it runs: the container, or null for this computer
       task,
       words,
       state: 'running', // until every process of the run has ended (check)
@@ -768,7 +805,7 @@ export class Workers extends EventEmitter {
     if (!task.stopping) task.stopping = { reason, at: now, signalled: now }
     else if (reason && !task.stopping.reason) task.stopping.reason = reason // the gateway's end becomes a stop
     if (reason) task.reported = !report
-    this.runner.stop(task, 'SIGTERM')
+    this.runnerOf(task).stop(task, 'SIGTERM')
     this.save()
   }
 
@@ -832,7 +869,7 @@ export class Workers extends EventEmitter {
   waiting(repo, answers = null) {
     const last = this.lastTask(repo)
     if (this.running().some(t => t.repo === repo) || this.starting.has(repo) || this.auditing.has(repo)) return 'busy'
-    if (this.strays.has(this.runner.dir(repo))) return 'busy'
+    if (this.strays.has(this.dirOf(repo))) return 'busy'
     if (last && !last.reported) return 'busy'
     if (this.holds(repo, answers).length) return 'decision'
     return null
@@ -856,7 +893,7 @@ export class Workers extends EventEmitter {
       reason, // busy, decision, queue (others before it), full (no run slot)
       position: this.queued(job.worker).indexOf(entry) + 1,
       task: this.running().find(t => t.repo === job.worker) ?? null,
-      strays: this.strays.has(this.runner.dir(job.worker)), // worker processes of a run nobody followed, being ended
+      strays: this.strays.has(this.dirOf(job.worker)), // worker processes of a run nobody followed, being ended
       running: this.running(),
       holds: this.holds(job.worker, job.answers),
     }
@@ -888,7 +925,7 @@ export class Workers extends EventEmitter {
   async startQueued(entry) {
     let names
     try {
-      names = await this.repos()
+      names = await this.known(entry.worker)
     } catch (error) {
       this.pausedUntil = Date.now() + PAUSE_MS
       log('queue waits:', error.message)
@@ -981,7 +1018,8 @@ export class Workers extends EventEmitter {
 
   // Whether the run's own process is still there.
   ownAlive(task) {
-    return this.runner.alive ? this.runner.alive(task) : alive(task.pid)
+    const runner = this.runnerOf(task)
+    return runner.alive ? runner.alive(task) : alive(task.pid)
   }
 
   // One look at a running run: what it wrote, and whether its processes are
@@ -994,7 +1032,7 @@ export class Workers extends EventEmitter {
     this.follow(task)
     if (task.state !== 'running') return
     const own = this.ownAlive(task)
-    const left = own ? null : (this.runner.processes?.(task) ?? [])
+    const left = own ? null : (this.runnerOf(task).processes?.(task) ?? [])
     if (!own && !left.length) {
       this.follow(task) // whatever it wrote last
       return this.conclude(task)
@@ -1003,7 +1041,7 @@ export class Workers extends EventEmitter {
     if (task.stopping) {
       if (now - task.stopping.signalled >= this.killAfterMs) {
         task.stopping.signalled = now
-        this.runner.stop(task, 'SIGKILL')
+        this.runnerOf(task).stop(task, 'SIGKILL')
       }
       return
     }
@@ -1023,7 +1061,7 @@ export class Workers extends EventEmitter {
   // Every process of the run is gone: its outcome. Stopped, with the reason;
   // otherwise by its result.
   conclude(task) {
-    const cleanup = this.runner.cleanup?.(task)
+    const cleanup = this.runnerOf(task).cleanup?.(task)
     if (cleanup) {
       const done = cleanup.finally(() => this.cleaning.get(task.repo) === done && this.cleaning.delete(task.repo))
       this.cleaning.set(task.repo, done)
@@ -1050,26 +1088,37 @@ export class Workers extends EventEmitter {
     return marks
   }
 
-  // Worker processes in the checkouts here (or only in dir) of a run that no
+  // The runs nobody follows that the runners find, of every kind, each with
+  // the runner that ends it; one found by two runners counts once.
+  findStrays() {
+    const known = this.knownMarks()
+    const found = new Map()
+    for (const runner of this.runners()) {
+      for (const stray of runner.strays?.(known) ?? []) if (!found.has(stray.run)) found.set(stray.run, { ...stray, runner })
+    }
+    return [...found.values()]
+  }
+
+  // Worker processes in the workspaces here (or only in dir) of a run that no
   // gateway follows: from a run whose record was lost, for example. Nobody
   // watches them, so they get SIGTERM now and SIGKILL later (checkStrays),
   // and no run starts in their checkout until they are gone. Returns them.
   stopStrays({ dir = null, why = 'found' } = {}) {
-    const strays = (this.runner.strays?.(this.knownMarks()) ?? []).filter(stray => !dir || stray.repo === dir)
+    const strays = this.findStrays().filter(stray => !dir || stray.repo === dir)
     const now = Date.now()
     for (const stray of strays) {
       if (!this.strays.has(stray.repo)) {
         log(`worker ${processes(stray.pids.length)} of a run nobody follows in ${stray.repo} (task ${stray.task ?? 'unknown'}), ${why}: ending them`)
         this.strays.set(stray.repo, { at: now, signalled: now })
       }
-      this.runner.stopStray(stray, 'SIGTERM')
+      stray.runner.stopStray(stray, 'SIGTERM')
     }
     return strays
   }
 
   checkStrays() {
     if (!this.strays.size) return
-    const strays = this.runner.strays?.(this.knownMarks()) ?? []
+    const strays = this.findStrays()
     const now = Date.now()
     for (const [dir, entry] of this.strays) {
       const left = strays.filter(stray => stray.repo === dir)
@@ -1078,7 +1127,7 @@ export class Workers extends EventEmitter {
         log('the worker processes nobody followed in', dir, 'have ended')
       } else if (now - entry.signalled >= this.killAfterMs) {
         entry.signalled = now
-        for (const stray of left) this.runner.stopStray(stray, 'SIGKILL')
+        for (const stray of left) stray.runner.stopStray(stray, 'SIGKILL')
       }
     }
   }
@@ -1131,7 +1180,7 @@ export class Workers extends EventEmitter {
     if (message.type === 'assistant') {
       for (const part of message.message?.content ?? []) {
         if (part.type === 'tool_use') {
-          task.steps = [...task.steps, describeStep(part.name, part.input, this.runner.dir(task.repo))].slice(-MAX_STEPS)
+          task.steps = [...task.steps, describeStep(part.name, part.input, task.dir ?? this.dirOf(task.repo))].slice(-MAX_STEPS)
           this.emit('tool', task, part) // for the kill switch's rules (guard.mjs)
         } else if (part.type === 'text' && part.text?.trim()) {
           task.lastText = preview(part.text, 300)
@@ -1211,7 +1260,7 @@ export class Workers extends EventEmitter {
     if (task.audit) return task.audit
     // Until it is done, the next queued task there waits.
     this.auditing.add(task.repo)
-    const now = await gitState((...args) => this.git(...args), task.dir ?? this.runner.dir(task.repo))
+    const now = await gitState((...args) => this.git(...args), task.dir ?? this.dirOf(task.repo))
       .catch(() => null)
       .finally(() => this.auditing.delete(task.repo))
     if (!now) {

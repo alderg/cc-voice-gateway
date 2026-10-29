@@ -550,7 +550,7 @@ async function workerTool(workers, name, args, spoken) {
   }
   if (name === 'list_workers') return toolText(await workers.listText())
   if (!worker) return toolText('worker is required: a repository name from list_workers.', true)
-  const names = await workers.repos()
+  const names = await workers.known(worker)
   if (!names.includes(worker)) {
     return toolText(`No repository "${worker}". Known: ${names.join(', ')}.`, true)
   }

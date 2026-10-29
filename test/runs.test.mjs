@@ -171,6 +171,26 @@ function setup(options = {}) {
   return { root, dir, stateDir, workers, make, dispatch }
 }
 
+test('the workspace layer: repositories are its one kind, named by their folder; a record without a kind is one', async () => {
+  const { workers, dispatch } = setup()
+  try {
+    assert.deepEqual(Object.keys(workers.kinds), ['repo'])
+    assert.equal(workers.workspace('alpha').kind, 'repo')
+    assert.equal(workers.workspace('scratch/new'), null, 'a name with a slash is no folder name')
+    assert.deepEqual(await workers.known('scratch/new'), ['alpha'], 'checked against the repositories, as before')
+    assert.equal((await workers.dispatch({ worker: 'scratch/new', task: 'x', words: 'the words' })).status, 'unknown')
+    assert.deepEqual(workers.runners(), [workers.runner])
+    const { task } = await dispatch('Count the files.')
+    assert.equal(task.kind, 'repo')
+    assert.equal(task.container, null, 'on this computer')
+    assert.equal(workers.runnerOf(task), workers.runner)
+    assert.equal(workers.runnerOf({ repo: 'alpha' }), workers.runner, 'a record of an older version')
+    await until(() => task.state !== 'running')
+  } finally {
+    workers.close()
+  }
+})
+
 test('a result before the task does not end the run: it ends when its process has, with the result of its task', async () => {
   const { workers, dispatch } = setup()
   try {
