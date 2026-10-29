@@ -9,12 +9,23 @@ This README is the technical documentation. The idea in a short video is on the
 
 [![Video: cc-voice-gateway, Claude Code from Claude's voice mode](docs/assets/video-thumbnail.png)](https://alderg.github.io/cc-voice-gateway/#video)
 
+> [!WARNING]
+> **Driving comes first.** When you use this in the car, keep your full attention on the traffic,
+> not on the conversation or the work. It is built so that you can, at any moment: open items and
+> unanswered questions are kept, and when you come back, ask for the status and everything is
+> listed, brought up to date and followed up.
+>
+> **Use at your own risk.** Follow the traffic rules and laws where you drive, including those on
+> phone use. The authors accept no liability for accidents, injuries or damage of any kind arising
+> from its use; see also sections 7 and 8 of the [licence](LICENSE).
+
 > **Provided as-is, as a prototype.** This is solely a prototype of an idea: a way to use Claude
 > Code from Claude's voice mode, which cannot reach Claude Code on its own. It comes without
 > warranty and without support, and there is no communication of any kind about this project: no
 > announcements, no support, no answers to issues or messages. It is not an Anthropic product.
 >
-> Used with Claude voice mode in the Claude app on the iPhone. Claude Code channels are a research
+> Used with Claude voice mode in the Claude app, on the phone and in the car with CarPlay or Android
+> Auto; tested so far only on the iPhone and with CarPlay. Claude Code channels are a research
 > preview; their flags and protocol may change.
 
 Licensed under the [Apache License 2.0](LICENSE).
@@ -190,7 +201,7 @@ confirmed it.
 
 | | Voice front end | What it controls | Where the code runs | Car | Source and licence |
 |---|---|---|---|---|---|
-| **cc-voice-gateway** | Claude's voice mode in the Claude app, through a custom MCP connector | A running Claude Code session (channel), which dispatches headless workers | Your computer; workers optionally in Docker | Wherever the Claude app's voice mode runs | This repository, Apache 2.0 |
+| **cc-voice-gateway** | Claude's voice mode in the Claude app, through a custom MCP connector | A running Claude Code session (channel), which dispatches headless workers | Your computer; workers optionally in Docker | CarPlay or Android Auto, wherever the Claude app's voice mode runs; tested with CarPlay | This repository, Apache 2.0 |
 | [carcode][carcode] | Siri: a Siri Shortcut ("Hey Siri, Jarvis") on the iPhone | The Claude Code CLI on your Mac, with your login | Your Mac, reached through a Cloudflare quick tunnel; the server can run on Linux, the Shortcut needs macOS once | CarPlay, through Siri | Open source, MIT |
 | [DashVox][dashvox] | Its own iPhone app, with CarPlay and Apple Watch | Claude Code, Claude Cowork, Codex or another CLI, over SSH on your machines | Your machines; the app's backend is DashVox Cloud or self-hosted | CarPlay | App free, with a paid tier; source code unverified |
 | [VoiceMode][voicemode] | Microphone and speakers of the computer; speech recognition and output local (Whisper.cpp, Kokoro) or through OpenAI-compatible services | Claude Code itself, as an MCP server or plugin | Your computer | None documented | Open source, MIT |
@@ -198,7 +209,9 @@ confirmed it.
 | Claude for Android Auto | Unverified: no official or third-party Claude app for Android Auto was found | – | – | – | – |
 
 For the car itself, the Claude app supports CarPlay ([MacRumors, 2026-09-04][carplay]); this
-project uses whatever voice mode the app offers there.
+project uses whatever voice mode the app offers there. Nothing in it is specific to CarPlay, so
+Android Auto should work the same where the app offers voice mode; so far it was tested only with
+CarPlay.
 
 What this project adds over the others:
 
@@ -856,7 +869,8 @@ is guarded as follows:
   watchdog and the setup assistant. The controller's Bash allowlist exists because of Ubuntu
   24.04+.
 - **Not tested:** macOS. The scripts know its paths (managed settings, LaunchAgent).
-- **Phone:** the Claude app on the iPhone; Android not tested.
+- **Phone and car:** the Claude app on the iPhone, in the car with CarPlay. Android and Android
+  Auto are not tested; nothing in the gateway is specific to either.
 
 **Claude subscription.** The account that runs Claude Code and the account in the Claude app may
 differ.
