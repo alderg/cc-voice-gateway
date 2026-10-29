@@ -140,7 +140,7 @@ Claude app, and Claude Code on your computer. It is one Node.js process with two
 Work in a repository goes to a **worker**: a headless `claude -p` run in that repository, started
 by the gateway when the controller calls `dispatch`. One worker per repository, two at a time by
 default. Workers run in your checkouts, or in a Docker container whose GitHub token sets what they
-may publish: nothing, draft pull requests, or also a direct push to the default branch. A worker's
+may publish: nothing, pull requests, or also a direct push to the default branch. A worker's
 result reaches the controller as a channel event; the controller summarises it, and you hear it
 as news in the voice conversation. If it asks you something after the conversation has ended,
 the question also goes to Telegram.
@@ -590,6 +590,9 @@ What applies to every worker run (`src/workers.mjs`):
   force-push, merge or delete branches, ask before pushing a public repository, never end with
   commits on no remote or uncommitted changes without naming them and asking about the push. These
   are rules, not limits; the check after the run is code.
+- **Pull requests** are opened ready for review, so that automatic reviews start at once.
+  `VOICE_GW_PR_DRAFT=1` makes them drafts, as before; bot reviewers usually skip a draft, and it
+  has to be marked ready before a merge.
 
 | | On this computer | In Docker |
 |---|---|---|
@@ -624,8 +627,8 @@ with the reason, for example `access pr (main is protected by a ruleset)`.
 | Level | Token | Default branch | Workers |
 |---|---|---|---|
 | `read-only` | None, or one that cannot push or open pull requests | Any | Commit on a local `voice/` branch. Never push, never open a pull request ([4.5](#45-pushing-from-a-read-only-container)) |
-| `pr` | Can push (Contents) and open pull requests | Protected by branch protection or a ruleset | Push a `voice/` branch and open a draft pull request |
-| `full` | As `pr` | Not protected | A draft pull request by default; a push to the default branch only when you ask, through `dispatch` with `direct` |
+| `pr` | Can push (Contents) and open pull requests | Protected by branch protection or a ruleset | Push a `voice/` branch and open a pull request |
+| `full` | As `pr` | Not protected | A pull request by default; a push to the default branch only when you ask, through `dispatch` with `direct` |
 
 **How the level is detected**, per repository:
 
@@ -1298,7 +1301,7 @@ at most three short sentences, without code, paths or lists.
 | "Allow." / "Deny." | `approve` with the five-letter code |
 | "Which repositories can you work in?" | `list_workers`: branch, uncommitted changes, what each worker does; in Docker the level |
 | "Ask the alpha worker whether the tests pass." | `dispatch`; the controller confirms, the result follows as news |
-| "Tell the alpha worker to fix the typo in the README." | The worker commits on a `voice/` branch, pushes and opens a draft pull request (in Docker: depends on the level); you hear that it is out |
+| "Tell the alpha worker to fix the typo in the README." | The worker commits on a `voice/` branch, pushes and opens a pull request (in Docker: depends on the level); you hear that it is out |
 | "Tell it to add a test for that too." | A follow-up in the same worker session, on the same branch |
 | "Then also update the changelog in alpha." (while alpha works) | `dispatch=queued`: it starts by itself after the run, and you hear its result |
 | "What is the alpha worker doing?" | `worker_status`, with the queue there |
@@ -1431,6 +1434,7 @@ setting with where it came from.
 | `VOICE_GW_WORKER_EFFORT` | Claude Code's default | `--effort`: `low`, `medium`, `high`, `xhigh`, `max` |
 | `VOICE_GW_CLAUDE_BIN` | `claude` | Claude Code for workers (inside the container in Docker mode) |
 | `VOICE_GW_GH_BIN` | `gh` | GitHub CLI on this computer |
+| `VOICE_GW_PR_DRAFT` | `0` | `1`: workers open their pull requests as drafts; `0`: ready for review |
 | `VOICE_GW_PR_POLL` | `60` | Seconds between looks at a watched pull request |
 | `VOICE_GW_PR_WATCH_HOURS` | `24` | Hours before a watch ends |
 | `VOICE_GW_TELEGRAM_AFTER` | `600` | Seconds without a voice call before questions and approvals also go to Telegram ([5.8](#58-the-telegram-fallback)) |
@@ -1531,7 +1535,7 @@ do not set them.
 | A result says `git="1 commit on no remote"` although the worker pushed | The check counts commits that no remote-tracking branch (`refs/remotes/…`) has. A push to a URL instead of a named remote does not update them; `git fetch` in the checkout does. Without any remote, commits never count. |
 | What did a worker do? | `.state/tasks/<task>.jsonl` holds the whole run. `claude --resume <session>` in the repository opens the session; `.state/workers.json` lists the session ids. |
 | A private repository is handled like a public one | `gh` is not logged in or not on the `PATH`, so the visibility is unknown, and the worker asks before pushing to be safe. |
-| No news about checks or reviews on a worker's pull request | The log says why: `gh is not logged in`, or `stopped watching pull request … : nothing automatic runs` (often a draft that bot reviewers skip), `merged`, `closed` or `time limit`. Only pull requests on `voice/` branches that a run linked to are watched. `.state/pulls.json` lists the watches. |
+| No news about checks or reviews on a worker's pull request | The log says why: `gh is not logged in`, or `stopped watching pull request … : nothing automatic runs` (often a draft that bot reviewers skip, with `VOICE_GW_PR_DRAFT=1`), `merged`, `closed` or `time limit`. Only pull requests on `voice/` branches that a run linked to are watched. `.state/pulls.json` lists the watches. |
 | The controller cannot merge a pull request | A draft must be marked ready first (a task for the worker). Required reviews or checks, conflicts and other branch protection apply; `--admin` is blocked on purpose. With `VOICE_GW_PERMISSION_RELAY=0` the approval only appears at the terminal. |
 | The controller says a `gh` command was blocked | Only the commands in [The controller's confinement](#53-the-controllers-confinement) pass, each with `--repo owner/name` and flags as separate words. If it does not know about `gh` at all, restart the controller so that it reads the current `controller/CLAUDE.md`. |
 | The controller says a tool is blocked | Expected for every tool that is not on the confine hook's list ([confinement](#53-the-controllers-confinement)): MCP tools from your settings or plugins, subagents, skills, web access. Ask for it at the desk, or let a worker do it with `dispatch`. |
