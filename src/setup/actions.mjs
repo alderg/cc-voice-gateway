@@ -15,7 +15,8 @@ import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync
 import { homedir, hostname, platform as osPlatform } from 'node:os'
 import { dirname, isAbsolute, join } from 'node:path'
 import { ACCESS_LEVELS, GitHubAccess } from '../access.mjs'
-import { CONTROLLER_LEVELS, EFFORTS, KILLSWITCH_MODES } from '../config.mjs'
+import { connect } from 'node:net'
+import { CONTROLLER_LEVELS, EFFORTS, KILLSWITCH_MODES, WORKER_LIMITS } from '../config.mjs'
 import { LAUNCH_AGENT, MAC_TAILSCALE, SERVICE, findCommand, servicePath } from '../platform.mjs'
 import { HostRunner } from '../runners.mjs'
 import { SETTINGS_FILE_NAME, formatSettings, readSettings } from '../settings.mjs'
@@ -43,6 +44,7 @@ export function fields(root) {
     VOICE_GW_PORT: { default: '8787', valid: INT(1024, 65535) },
     VOICE_GW_WORKER_ROOT: { default: dirname(root), valid: PATH },
     VOICE_GW_MAX_WORKERS: { default: '2', valid: INT(1, 10) },
+    VOICE_GW_MAX_WORKERS_PER_REPO: { default: '1', valid: INT(1, 10) },
     VOICE_GW_WORKER_TIMEOUT: { default: '360', valid: value => value === '0' || INT(5, 1440)(value) },
     VOICE_GW_PR_DRAFT: { default: '0', valid: ONE_OF('0', '1') },
     VOICE_GW_SCRATCH: { default: '0', valid: ONE_OF('0', '1') },
@@ -541,8 +543,10 @@ export function createSetup({
     ])
   }
 
+  // Returns the settings before and after, for liveNote.
   function writeFiles({ values, docker, scratchDocker, telegramOn }, line) {
     secureFolder(secretsDir)
+    const before = readSettings(settingsFile)
     const written = []
     const put = (file, value) => {
       writePrivate(file, value)
@@ -571,6 +575,36 @@ export function createSetup({
     if (existsSync(workerSecrets)) chmodSync(workerSecrets, 0o700)
     line(`written to ${secretsDir} (folders 0700, files 0600): ${written.join(', ')}`)
     say(`setup: written ${written.join(', ')}`)
+    return { before, after: readSettings(settingsFile) }
+  }
+
+  // Whether a gateway runs on these secrets: its admin socket answers.
+  function gatewayRuns() {
+    return new Promise(resolve => {
+      const socket = connect(join(secretsDir, 'admin.sock'))
+      const done = running => {
+        socket.destroy()
+        resolve(running)
+      }
+      socket.on('connect', () => done(true))
+      socket.on('error', () => done(false))
+      socket.setTimeout(2000, () => done(false))
+    })
+  }
+
+  // A gateway that runs takes the worker limits from the settings file at
+  // once (src/live.mjs); every other setting at its next start.
+  async function liveNote({ before, after }, line) {
+    const names = [...new Set([...Object.keys(before), ...Object.keys(after)])].filter(name => before[name] !== after[name])
+    if (!names.length || !(await gatewayRuns())) return
+    const limits = names.filter(name => name in WORKER_LIMITS)
+    const others = names.filter(name => !(name in WORKER_LIMITS))
+    if (limits.length) {
+      line(`the running gateway applies ${limits.join(' and ')} at once, without a restart; runs going run to the end`)
+    }
+    if (others.length) {
+      line(`the running gateway takes the other changed settings (${others.join(', ')}) at its next start: restart the controller`)
+    }
   }
 
   async function setUpDocker(values, docker, line) {
@@ -825,7 +859,8 @@ export function createSetup({
     const { values, docker, scratchDocker } = validate(body)
     const telegramOn = Boolean(body.telegram?.enabled)
     finishing = startJob('writing the setup', async line => {
-      writeFiles({ values, docker, scratchDocker, telegramOn }, line)
+      const settings = writeFiles({ values, docker, scratchDocker, telegramOn }, line)
+      await liveNote(settings, line)
       let ok = true
       if (docker) ok = (await setUpDocker(values, docker, line)) && ok
       if (scratchDocker) ok = (await setUpScratchDocker(values, line)) && ok

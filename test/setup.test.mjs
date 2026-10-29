@@ -12,6 +12,7 @@ import assert from 'node:assert/strict'
 import { execFileSync, spawn, spawnSync } from 'node:child_process'
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
+import { createServer as createSocketServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -504,11 +505,16 @@ test('finishing: invalid input is refused before anything is written', async () 
 
 test('finishing: the files in .secrets with mode 0600 in folders of 0700, the container, the watchdog, then the server ends', async () => {
   const { call } = flow.page
+  // A gateway runs on these secrets: its admin socket answers.
+  mkdirSync(SECRETS, { recursive: true })
+  const gateway = createSocketServer(socket => socket.end())
+  await new Promise(resolve => gateway.listen(join(SECRETS, 'admin.sock'), resolve))
   const { status, data } = await call('/api/finish', {
     settings: {
       VOICE_GW_PORT: '8791',
       VOICE_GW_WORKER_ROOT: DEV,
       VOICE_GW_MAX_WORKERS: '2', // the default: left out
+      VOICE_GW_MAX_WORKERS_PER_REPO: '3',
       VOICE_GW_DOCKER: 'voice-workers',
       VOICE_GW_DOCKER_FOLDER: FOLDER,
       VOICE_GW_DOCKER_IMAGE: 'cc-voice-worker',
@@ -528,7 +534,11 @@ test('finishing: the files in .secrets with mode 0600 in folders of 0700, the co
   })
   assert.equal(status, 200)
   const done = await follow(flow.page, data.job)
+  gateway.close()
   assert.equal(done.state, 'done', done.lines.join('\n'))
+  // The running gateway takes the worker limits at once, the rest at its next start.
+  assert.ok(done.lines.some(line => /the running gateway applies VOICE_GW_MAX_WORKERS_PER_REPO at once, without a restart/.test(line)), done.lines.join('\n'))
+  assert.ok(done.lines.some(line => /the running gateway takes the other changed settings \(.*VOICE_GW_PORT.*\) at its next start: restart the controller/.test(line)))
 
   const mode = path => statSync(path).mode & 0o777
   assert.equal(mode(SECRETS), 0o700)
@@ -547,6 +557,7 @@ test('finishing: the files in .secrets with mode 0600 in folders of 0700, the co
   assert.deepEqual(readSettings(join(SECRETS, 'gateway.env')), {
     VOICE_GW_PORT: '8791',
     VOICE_GW_WORKER_ROOT: DEV,
+    VOICE_GW_MAX_WORKERS_PER_REPO: '3',
     VOICE_GW_DOCKER: 'voice-workers',
     VOICE_GW_DOCKER_FOLDER: FOLDER,
     VOICE_GW_CONTROLLER_MODEL: 'sonnet',

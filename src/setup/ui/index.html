@@ -38,7 +38,12 @@
     <label>Repositories folder <input data-setting="VOICE_GW_WORKER_ROOT"></label>
     <p class="guide">Every git repository directly in this folder gets a worker (on this computer, without Docker).</p>
     <label>Runs at a time <input data-setting="VOICE_GW_MAX_WORKERS" inputmode="numeric"></label>
-    <p class="guide">How many workers may run at once.</p>
+    <p class="guide">How many workers may run at once, in all repositories together: the limit that protects your
+      subscription. Every run of a repository counts.</p>
+    <label>Runs per repository <input data-setting="VOICE_GW_MAX_WORKERS_PER_REPO" inputmode="numeric"></label>
+    <p class="guide">How many of them in one repository at once. 1, the default: one after the other. More: the first
+      runs in the checkout, every further one in a git worktree of its own, and the controller decides per task
+      whether it can run next to the others. Both limits apply at once in a running gateway, without a restart.</p>
     <label>Time limit per run (minutes) <input data-setting="VOICE_GW_WORKER_TIMEOUT" inputmode="numeric"></label>
     <p class="guide">A run is stopped after this; 360 is six hours. 0: no time limit.</p>
     <label>Pull requests from workers
