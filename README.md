@@ -129,7 +129,8 @@ by the gateway when the controller calls `dispatch`. One worker per repository, 
 default. Workers run in your checkouts, or in a Docker container whose GitHub token sets what they
 may publish: nothing, draft pull requests, or also a direct push to the default branch. A worker's
 result reaches the controller as a channel event; the controller summarises it, and you hear it
-as news in the voice conversation, or by Telegram once the conversation has ended.
+as news in the voice conversation. If it asks you something after the conversation has ended,
+the question also goes to Telegram.
 
 | Part | Code | Runs where | Role |
 |---|---|---|---|
@@ -163,7 +164,7 @@ What this project tries, and why:
 | A running Claude Code session (the controller) as the receiver, through a channel | It keeps context across requests, asks back and summarises. A fresh `claude -p` per request would forget everything |
 | Workers as separate headless runs | The controller stays responsive and confined; several repositories can be worked on at once; a run survives a controller restart |
 | Approvals relayed to the voice conversation | The channel's permission relay lets Claude Code's approval prompts be answered by voice |
-| Telegram as an optional second return channel | Voice assistants only poll. Once you hang up, a late result would wait until the next conversation |
+| Telegram as an optional fallback for what needs you | Voice assistants only poll. Once you hang up, a question or an approval would wait until the next conversation. Results can wait; they stay off Telegram |
 | Docker with access levels derived from the GitHub token | Host workers run as you, with your logins. A container with a scoped token limits what a run can reach and publish |
 | Changes out of a read-only container as a git bundle into a clean clone | Fetching from the container's folder would run git with config that the container controls |
 | A kill switch in the gateway's code | A lock that does not depend on the controller following instructions |
@@ -209,7 +210,7 @@ What this project adds over the others:
   worker come back to you.
 - **Approvals and merges by voice.** Claude Code's approval prompts reach the conversation. A merge
   needs your spoken yes and then an approval ([confinement](#53-the-controllers-confinement)).
-- **Telegram after the call**, optional.
+- **Telegram after the call**, optional, only for questions, approvals and alerts.
 - **Isolation as a choice.** Workers on the host, or in Docker at a level that the GitHub token
   decides, with a defined path out for read-only containers.
 - **A kill switch in code**, with triggers by voice, Telegram, fixed rules and the controller.
@@ -267,7 +268,7 @@ have these states:
 | Variant | Turned on by | Effect |
 |---|---|---|
 | Voice only | default | News reaches you when the voice AI calls |
-| Voice + Telegram | `.secrets/telegram_token` and `.secrets/telegram_chat_id` | After 60 s without a voice call, results, questions and approvals also go to Telegram; `/stop` locks the kill switch |
+| Voice + Telegram | `.secrets/telegram_token` and `.secrets/telegram_chat_id` | After 10 minutes without a voice call, questions and approvals also go to Telegram; results wait for the next call. `/stop` locks the kill switch |
 | Workers on this computer | default (`VOICE_GW_DOCKER` empty) | Runs in your checkouts as you |
 | Workers in Docker | `VOICE_GW_DOCKER=<container>` | Runs in the container; the level per repository comes from its GitHub token, or from `VOICE_GW_ACCESS` |
 
@@ -325,7 +326,7 @@ to a lost phone or a leaked token.
 | A worker on this computer | Everything your user can, without approvals | Nothing is blocked; rules only observe (see 5.9) |
 | A worker in Docker | The mounted folder, the container's tokens, the network | Your other files, SSH keys, `gh` login; more on GitHub than its token allows |
 | Others on GitHub | Comment on a watched pull request: the news names them; the text of the repository's owner, members and collaborators reaches the controller, marked `trusted="no"` | Get anyone else's text to the controller through the watch; have a fork or someone else's pull request watched (see 8.4) |
-| The Telegram chat | Receive news; send `/stop`; turn the Funnel on and off | Anything else; other chats are ignored |
+| The Telegram chat | Receive questions, approval requests and alerts; send `/stop`; turn the Funnel on and off | Anything else; other chats are ignored |
 
 ### 5.2 The voice endpoint and OAuth
 
@@ -654,11 +655,17 @@ folder, `.git` included.
 ### 5.8 The Telegram fallback
 
 - **On only with both files:** `.secrets/telegram_token` and `.secrets/telegram_chat_id`.
-- **When:** after `VOICE_GW_TELEGRAM_AFTER` seconds (60) without a voice tool call, voice mode
-  counts as ended. Results, questions and approval requests then also go to the chat, each once;
-  interim `working` updates do not. The kill switch alarm goes at once, whether voice mode is on
-  or not, and so do a note when the gateway ends because another process holds its port and the
-  alerts about suspicious requests and sign-ins ([5.2](#52-the-voice-endpoint-and-oauth)).
+- **When:** after `VOICE_GW_TELEGRAM_AFTER` seconds (600) without a voice tool call, voice mode
+  counts as ended. Gaps of a few minutes between calls are normal while you talk, so the wait is
+  long.
+- **What:** only what needs you. Questions and approval requests that voice mode has not picked
+  up then also go to the chat, each once. Results, news and interim `working` updates never do;
+  they wait for the next voice call. A question the controller settled in the meantime is not
+  sent.
+- **Not waiting for that:** the kill switch alarm goes at once, whether voice mode is on or not,
+  and so do a note when the gateway ends because another process holds its port, the alerts
+  about suspicious requests and sign-ins ([5.2](#52-the-voice-endpoint-and-oauth)), the Funnel's
+  messages ([7.3](#73-publishing-the-endpoint)) and the watchdog's.
 - **Inbound:** only the kill switch (`/stop`, `/killswitch`, `/emergencystop` or an emergency
   phrase) and the Funnel (`/funnel on`, `/funnel off`, `/funnel`, "keep alive";
   [7.3](#73-publishing-the-endpoint)), only from the configured private chat. Everything else is
@@ -1237,7 +1244,7 @@ gateway reads them at its start: restart the controller after a change.
 | `VOICE_GW_GH_BIN` | `gh` | GitHub CLI on this computer |
 | `VOICE_GW_PR_POLL` | `60` | Seconds between looks at a watched pull request |
 | `VOICE_GW_PR_WATCH_HOURS` | `24` | Hours before a watch ends |
-| `VOICE_GW_TELEGRAM_AFTER` | `60` | Seconds without a voice call before Telegram takes over |
+| `VOICE_GW_TELEGRAM_AFTER` | `600` | Seconds without a voice call before questions and approvals also go to Telegram ([5.8](#58-the-telegram-fallback)) |
 | `VOICE_GW_TELEGRAM_POLL` | `25` | Seconds one poll of the bot for `/stop` waits |
 | `VOICE_GW_TELEGRAM_API` | `https://api.telegram.org` | Bot API; tests use a stand-in |
 | `VOICE_GW_FUNNEL_IDLE` | `0`, off | Minutes after the last voice call before the gateway turns the Funnel off ([7.3](#73-publishing-the-endpoint)) |
@@ -1337,7 +1344,7 @@ do not set them.
 | The setup assistant does not start | `needs a terminal`: it shows its link only on a terminal, so run it directly, not with its output redirected. `cannot listen on …: EADDRINUSE`: choose another `--port`. |
 | The setup page cannot be reached from another computer | A firewall blocks the port, or `--host` names one address only. Or use the SSH tunnel the terminal shows. |
 | "Find my chat" finds nothing | Write to the bot after checking the token; Telegram keeps messages for 24 hours. A running gateway that polls the same bot takes them away: quit the controller first. |
-| No Telegram message | Messages go out only after `VOICE_GW_TELEGRAM_AFTER` seconds without a voice call, and only for what the voice assistant has not picked up. `telegram fallback off` in the log: a file was missing or empty when the gateway started; fix it and restart the controller. `telegram send failed: 400 Bad Request: chat not found`: wrong chat ID, or you never wrote to the bot. `401 Unauthorized`: wrong token. |
+| No Telegram message | Questions and approvals go out only after `VOICE_GW_TELEGRAM_AFTER` seconds (600) without a voice call, and only if the voice assistant has not picked them up. Results never go to Telegram. `telegram fallback off` in the log: a file was missing or empty when the gateway started; fix it and restart the controller. `telegram send failed: 400 Bad Request: chat not found`: wrong chat ID, or you never wrote to the bot. `401 Unauthorized`: wrong token. |
 | `The worker container voice-workers does not answer` | The container is stopped or was removed: `docker start voice-workers`, or `scripts/start-workers-container.sh`. |
 | `access read-only (no GitHub token)` although there is one | It must be `.secrets/worker/github_token`, readable for the gateway. A new token counts at the next check, within ten minutes. |
 | `access read-only (the token cannot see the repository (404))` | The token's repository access does not include it, or the organisation has not approved the token yet. |

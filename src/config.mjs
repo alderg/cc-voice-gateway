@@ -114,8 +114,10 @@ export const config = {
 
   // Telegram fallback, on when both of its files in the secrets folder are set:
   // after this many seconds without a voice tool call, the voice mode counts
-  // as ended, and results, questions and approvals also go to Telegram.
-  telegramAfterSeconds: num(env.VOICE_GW_TELEGRAM_AFTER, 60),
+  // as ended, and questions and approvals also go to Telegram. Results wait
+  // for the next voice call. Long, because gaps of a few minutes between voice
+  // calls are normal while the driver talks.
+  telegramAfterSeconds: num(env.VOICE_GW_TELEGRAM_AFTER, 600),
   telegramApi: env.VOICE_GW_TELEGRAM_API || 'https://api.telegram.org',
 
   // The Tailscale Funnel (funnel.mjs): off by itself this many minutes after

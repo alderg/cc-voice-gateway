@@ -2,11 +2,17 @@
 //
 // Voice assistants only poll: while one keeps calling the voice tools, it
 // hears everything itself. When no voice tool call has come for a while
-// (VOICE_GW_TELEGRAM_AFTER, 60 s by default), the voice mode counts as ended.
-// From then on, results, questions and approval requests that the voice client
-// has not received also go to the driver's Telegram chat, each once. The voice
-// path stays as it is; Telegram comes on top. Interim "working" updates stay
-// off Telegram.
+// (VOICE_GW_TELEGRAM_AFTER, 600 s by default), the voice mode counts as ended.
+// Gaps of a few minutes between calls are normal while the driver talks, so
+// the wait is long. From then on, only what needs the driver also goes to their
+// Telegram chat, each once: questions the voice client has not received, and
+// approval requests it has not announced. Results, news and interim "working"
+// updates never go there; they wait for the next voice call. The voice path
+// stays as it is.
+//
+// The other messages to the chat come from elsewhere and go at once, voice
+// mode or not: the kill switch alarm, alerts about suspicious requests and
+// sign-ins (ipguard.mjs), the Funnel (funnel.mjs) and the watchdog.
 //
 // Inbound, the gateway takes a few commands from the configured private chat:
 // the kill switch (/stop or an emergency phrase), and the Tailscale Funnel on
@@ -217,14 +223,17 @@ export class TelegramCommands extends EventEmitter {
   }
 }
 
-function describeUpdate(request, update) {
-  const question = update.state === 'question'
+function describeQuestion(request, update) {
   const about = request.worker
     ? `worker ${request.worker.repo}, task ${request.worker.task}`
     : `"${preview(request.text, 60)}"`
-  const lines = [`${question ? 'Question' : 'Result'} for request ${request.id} (${about})`, '', update.text]
-  if (question) lines.push('', `Answer in voice mode and mention ${request.id}.`)
-  return lines.join('\n')
+  return [
+    `Question for request ${request.id} (${about})`,
+    '',
+    update.text,
+    '',
+    `Answer in voice mode and mention ${request.id}.`,
+  ].join('\n')
 }
 
 function describePermission(permission) {
@@ -238,7 +247,7 @@ function describePermission(permission) {
 }
 
 export class TelegramFallback {
-  constructor(store, { send, afterSeconds = 60, log = defaultLog }) {
+  constructor(store, { send, afterSeconds = 600, log = defaultLog }) {
     this.store = store
     this.send = send
     this.afterSeconds = afterSeconds
@@ -270,7 +279,7 @@ export class TelegramFallback {
         this.log(
           active
             ? 'voice mode on: telegram fallback paused'
-            : `voice mode ended (no voice call for ${this.afterSeconds} s): telegram fallback on`,
+            : `voice mode ended (no voice call for ${this.afterSeconds} s): telegram fallback on for questions and approvals`,
         )
       }
       if (active) {
@@ -286,16 +295,21 @@ export class TelegramFallback {
     }
   }
 
-  // Everything the voice client has not received yet, except interim updates.
+  // What needs the driver and has not reached them by voice: open questions
+  // and approval requests. Results, news and interim updates wait for the
+  // next voice call.
   flush() {
     let marked = false
     for (const request of this.store.requests.values()) {
       if (request.origin === 'alarm') continue // the kill switch sends its own alarm
+      // Done: answered, finished without the driver or ended by a restart. A
+      // question in it needs nobody any more.
+      if (request.state === 'done') continue
       for (const update of request.updates.slice(request.cursor)) {
-        if (update.state === 'working' || update.telegram) continue
+        if (update.state !== 'question' || update.telegram) continue
         update.telegram = true
         marked = true
-        this.deliver(describeUpdate(request, update))
+        this.deliver(describeQuestion(request, update))
       }
     }
     for (const permission of this.store.openPermissions()) {

@@ -1,5 +1,6 @@
 // Telegram as a fallback return channel: once the voice mode has ended,
-// results, questions and approvals also go to Telegram.
+// questions and approvals also go to Telegram. Results never do; they wait
+// for the next voice call.
 //
 // A local HTTP server stands in for the Telegram Bot API; no test sends a real
 // message. The fallback itself is tested with a Store and a fake send, the
@@ -123,33 +124,85 @@ test('activation: only when both secret files are set and not empty', () => {
 test('while the voice client polls, nothing goes to Telegram', async () => {
   const { store, sent, telegram, voiceCall } = fallback()
   const request = voiceCall(() => store.createRequest('How many files are there?'))
-  store.addUpdate(request.id, 'done', 'Three files.')
+  store.addUpdate(request.id, 'question', 'In the playground or everywhere?')
   await sleep(AFTER * 500)
   voiceCall(() => store.takeUnread(request))
   await sleep(AFTER * 1000 + 100)
-  assert.deepEqual(sent, [], 'the voice client got the result in time')
+  assert.deepEqual(sent, [], 'the voice client got the question in time')
   telegram.close()
 })
 
-test('after the timeout, results, questions and approvals go out once each; working does not', async () => {
+test('voice calls within the window keep everything off Telegram, however long the conversation', async () => {
+  const { store, sent, logged, telegram, voiceCall } = fallback()
+  const request = voiceCall(() => store.createRequest('Run the tests.'))
+  store.addUpdate(request.id, 'question', 'All of them, or only the unit tests?')
+  store.addPermission({ request_id: 'qwert', tool_name: 'Bash', description: 'Run ls', input_preview: '' })
+
+  // Calls that read nothing of it (status, another request), each within the
+  // window, for several windows in a row.
+  for (let i = 0; i < 6; i++) {
+    await sleep(AFTER * 500)
+    voiceCall(() => {})
+  }
+  assert.deepEqual(sent, [], 'nothing while the gaps stay below the window')
+  assert.ok(!logged.some(line => /voice mode ended/.test(line)), 'the voice mode never ended')
+
+  // The calls stop: after the window, what needs the driver goes out.
+  await waitFor(() => sent.length === 2)
+  assert.match(sent[0], new RegExp(`^Question for request ${request.id} \\("Run the tests\\."\\)\n\nAll of them, or only the unit tests\\?\n\nAnswer in voice mode and mention ${request.id}\\.$`))
+  assert.match(sent[1], /^Approval request qwert /)
+  telegram.close()
+})
+
+test('after the silence, a result alone sends nothing', async () => {
+  const { store, sent, logged, telegram, voiceCall } = fallback()
+  const request = voiceCall(() => store.createRequest('How many files are in the playground?'))
+  store.addUpdate(request.id, 'working', 'Looking.')
+
+  // Answered while the voice mode was still on, but never polled.
+  store.addUpdate(request.id, 'done', 'There are three files.')
+  await waitFor(() => logged.some(line => /voice mode ended .*telegram fallback on for questions and approvals/.test(line)))
+  // Results after the switch, from the controller and from a worker, stay off Telegram too.
+  const worker = store.createRequest('Worker alpha finished task t3cz: done after 2 minutes.', {
+    origin: 'worker',
+    worker: { repo: 'alpha', task: 't3cz' },
+  })
+  store.addUpdate(worker.id, 'done', 'Pull request 12 in alpha is out.')
+  store.changed()
+  await sleep(AFTER * 1000 + 100)
+  store.changed()
+  assert.deepEqual(sent, [], 'results wait for the voice client')
+
+  // The next voice call still gets them.
+  assert.equal(voiceCall(() => store.takeUnread(request)).at(-1).text, 'There are three files.')
+  assert.equal(voiceCall(() => store.takeUnread(worker))[0].text, 'Pull request 12 in alpha is out.')
+  telegram.close()
+})
+
+test('after the silence, questions and approvals go out once each; results and working do not', async () => {
   const { store, sent, logged, telegram, voiceCall } = fallback()
   const request = voiceCall(() => store.createRequest('How many files are in the playground?'))
   store.addUpdate(request.id, 'working', 'Looking.')
   assert.deepEqual(sent, [])
 
-  // Answered while the voice mode was still on, but never polled.
-  store.addUpdate(request.id, 'done', 'There are three files.')
+  // Asked while the voice mode was still on, but never polled.
+  store.addUpdate(request.id, 'question', 'Count the hidden files too?')
   await waitFor(() => sent.length === 1)
-  assert.match(sent[0], /^Result for request [a-z0-9]{4} \("How many files are in the playground\?"\)\n\nThere are three files\.$/)
+  assert.match(sent[0], /^Question for request [a-z0-9]{4} \("How many files are in the playground\?"\)\n\nCount the hidden files too\?\n\nAnswer in voice mode and mention [a-z0-9]{4}\.$/)
   assert.ok(logged.some(line => /voice mode ended .*telegram fallback on/.test(line)))
 
-  // After the switch, new items go out right away.
+  // After the switch, new questions and approvals go out right away; results do not.
   const worker = store.createRequest('Worker cc-voice-gateway finished task t3cz: done after 2 minutes.', {
     origin: 'worker',
     worker: { repo: 'cc-voice-gateway', task: 't3cz' },
   })
   store.addUpdate(worker.id, 'working', 'Reading the result.')
   store.addUpdate(worker.id, 'question', 'The tests pass. Should I open a pull request?')
+  const other = store.createRequest('Worker alpha finished task t4ab: done after 1 minute.', {
+    origin: 'worker',
+    worker: { repo: 'alpha', task: 't4ab' },
+  })
+  store.addUpdate(other.id, 'done', 'The README typo is fixed.')
   store.addPermission({
     request_id: 'abcde',
     tool_name: 'Write',
@@ -160,7 +213,9 @@ test('after the timeout, results, questions and approvals go out once each; work
   assert.match(sent[1], new RegExp(`^Question for request ${worker.id} \\(worker cc-voice-gateway, task t3cz\\)\n`))
   assert.match(sent[1], new RegExp(`Answer in voice mode and mention ${worker.id}\\.$`))
   assert.match(sent[2], /^Approval request abcde \(controller session\)\n\nWrite: Create playground\/hello\.txt\nDetails: /)
-  assert.ok(!sent.join('\n').includes('Looking') && !sent.join('\n').includes('Reading the result'))
+  const all = sent.join('\n')
+  assert.ok(!all.includes('Looking') && !all.includes('Reading the result') && !all.includes('README typo'))
+  assert.ok(!/^Result/m.test(all))
 
   // No duplicates, however often the store changes or the timer runs.
   store.changed()
@@ -170,16 +225,31 @@ test('after the timeout, results, questions and approvals go out once each; work
   telegram.close()
 })
 
-test('no duplicates when the voice client polls the same result later', async () => {
+test('a question the controller has settled since is not sent', async () => {
+  const { store, sent, logged, telegram, voiceCall } = fallback()
+  const request = voiceCall(() => store.createRequest('Clean up the playground.'))
+  store.addUpdate(request.id, 'question', 'Delete the notes too?')
+  store.addUpdate(request.id, 'done', 'Never mind, the notes were empty; all clean.')
+  const answered = voiceCall(() => store.createRequest('Rename the notes.'))
+  store.addUpdate(answered.id, 'question', 'To what name?')
+  store.markAnswered(answered, 'zzzz') // the driver answered with a new request
+  await waitFor(() => logged.some(line => /voice mode ended/.test(line)))
+  await sleep(100)
+  store.changed()
+  assert.deepEqual(sent, [])
+  telegram.close()
+})
+
+test('no duplicates when the voice client polls the same question later', async () => {
   const { store, sent, telegram, voiceCall } = fallback()
   const request = voiceCall(() => store.createRequest('Run the tests.'))
   await sleep(AFTER * 1000 + 100)
-  store.addUpdate(request.id, 'done', 'All 44 tests pass.')
+  store.addUpdate(request.id, 'question', 'Two tests fail. Fix them?')
   await waitFor(() => sent.length === 1)
 
   // The voice mode comes back and reads it too, then ends again.
   const read = voiceCall(() => store.takeUnread(request))
-  assert.equal(read[0].text, 'All 44 tests pass.')
+  assert.equal(read[0].text, 'Two tests fail. Fix them?')
   voiceCall(() => store.takeUnread(request))
   await sleep(AFTER * 1000 + 100)
   store.changed()
@@ -191,24 +261,24 @@ test('when polling resumes, Telegram stops until the voice mode ends again', asy
   const { store, sent, logged, telegram, voiceCall } = fallback()
   const first = voiceCall(() => store.createRequest('First.'))
   await sleep(AFTER * 1000 + 100)
-  store.addUpdate(first.id, 'done', 'First answer.')
+  store.addUpdate(first.id, 'question', 'First question?')
   await waitFor(() => sent.length === 1)
 
   // A long poll is running: the voice mode is on again, however long it waits.
   store.voiceCallStarted()
   assert.ok(logged.some(line => /voice mode on: telegram fallback paused/.test(line)))
   const second = store.createRequest('Second.')
-  store.addUpdate(second.id, 'done', 'Second answer.')
+  store.addUpdate(second.id, 'question', 'Second question?')
   await sleep(AFTER * 1000 + 100)
   assert.equal(sent.length, 1, 'nothing while a voice call is running')
   store.voiceCallEnded()
   await sleep(AFTER * 500)
   assert.equal(sent.length, 1, 'nothing within the timeout after the call')
 
-  // The voice client did not take the second answer; once the voice mode has
-  // ended again, it goes out.
+  // The voice client did not take the second question; once the voice mode
+  // has ended again, it goes out.
   await waitFor(() => sent.length === 2)
-  assert.match(sent[1], /Second answer\./)
+  assert.match(sent[1], /Second question\?/)
   telegram.close()
 })
 
@@ -228,12 +298,12 @@ test('a failing Telegram call is logged and changes nothing for the voice path',
   const { store, sent, logged, telegram, voiceCall } = fallback({ fail: true })
   const request = voiceCall(() => store.createRequest('Anything new?'))
   await sleep(AFTER * 1000 + 100)
-  assert.equal(store.addUpdate(request.id, 'done', 'Nothing new.').state, 'done')
+  assert.equal(store.addUpdate(request.id, 'question', 'Since when?').state, 'question')
   await waitFor(() => logged.some(line => line.includes('telegram send failed')))
-  assert.match(logged.find(line => line.includes('telegram send failed')), /Result for request .* - 503 Service Unavailable/)
+  assert.match(logged.find(line => line.includes('telegram send failed')), /Question for request .* - 503 Service Unavailable/)
   assert.deepEqual(sent, [])
-  // The voice client still gets the answer, and the failed item is not retried.
-  assert.equal(voiceCall(() => store.takeUnread(request))[0].text, 'Nothing new.')
+  // The voice client still gets the question, and the failed item is not retried.
+  assert.equal(voiceCall(() => store.takeUnread(request))[0].text, 'Since when?')
   store.changed()
   await sleep(50)
   assert.equal(logged.filter(line => line.includes('telegram send failed')).length, 1)
@@ -247,11 +317,14 @@ test('after a restart: what the voice client heard is not sent, even when it rea
   const sentBefore = []
   const before = new TelegramFallback(first, options(sentBefore))
   first.voiceCallStarted()
-  const request = first.createRequest('Is the build green?')
-  first.addUpdate(request.id, 'done', 'Yes, green.')
+  // A worker's question: unlike a voice request, a restart leaves it open.
+  const request = first.createRequest('Worker alpha finished task t5cd: done after 3 minutes.', {
+    origin: 'worker',
+    worker: { repo: 'alpha', task: 't5cd' },
+  })
+  first.addUpdate(request.id, 'question', 'The build is green. Open a pull request?')
   await sleep(150) // the change is saved; reading it later is no change
   first.takeUnread(request)
-  first.markClosed(request)
   first.voiceCallEnded()
   await sleep(150)
   before.close()
@@ -262,7 +335,26 @@ test('after a restart: what the voice client heard is not sent, even when it rea
   await sleep(AFTER * 1000 + 150)
   second.changed()
   assert.deepEqual([...sentBefore, ...sentAfter], [], 'the voice client had it; Telegram never sends it')
-  assert.equal(second.getRequest(request.id).closed, true)
+  assert.equal(second.getRequest(request.id).state, 'question')
+  after.close()
+})
+
+test("after a restart: a voice request's question is not sent; the restart ended the request", async () => {
+  const file = join(TMP, 'voice-question', 'requests.json')
+  const first = new Store({ file, log: () => {} })
+  first.voiceCallStarted()
+  const request = first.createRequest('Tidy up the playground.')
+  first.addUpdate(request.id, 'question', 'Delete the old notes?')
+  first.voiceCallEnded()
+  first.save()
+
+  const second = new Store({ file, log: () => {} })
+  const sent = []
+  const after = new TelegramFallback(second, { afterSeconds: AFTER, log: () => {}, send: async text => sent.push(text) })
+  await sleep(AFTER * 1000 + 150)
+  second.changed()
+  assert.equal(second.getRequest(request.id).state, 'done')
+  assert.deepEqual(sent, [], 'the voice client hears the restart note instead')
   after.close()
 })
 
@@ -286,9 +378,12 @@ test('after a restart: nothing is sent twice, and what is left waits for the voi
   const sentBefore = []
   const before = new TelegramFallback(first, options(sentBefore))
   first.voiceCallStarted()
-  const request = first.createRequest('Run the tests.')
+  const request = first.createRequest('Worker alpha finished task t6ef: done after 4 minutes.', {
+    origin: 'worker',
+    worker: { repo: 'alpha', task: 't6ef' },
+  })
   first.voiceCallEnded()
-  first.addUpdate(request.id, 'done', 'All pass.')
+  first.addUpdate(request.id, 'question', 'All pass. Open a pull request?')
   await waitFor(() => sentBefore.length === 1) // sent when the voice mode ended, not on a change
   before.close()
 
@@ -300,8 +395,8 @@ test('after a restart: nothing is sent twice, and what is left waits for the voi
   assert.deepEqual(sentAfter, [], 'the voice client gets its time after the restart')
   await waitFor(() => sentAfter.length === 1)
   await sleep(100)
-  assert.equal(sentAfter.length, 1, 'only the new question, not the result sent before the restart')
-  assert.match(sentAfter[0], /^Question for request/)
+  assert.equal(sentAfter.length, 1, 'only the new question, not the one sent before the restart')
+  assert.match(sentAfter[0], /^Question for request .*\n\nPush it as well\?\n/)
   after.close()
 })
 
@@ -431,37 +526,47 @@ test('gateway without the secret files: one info line, no Telegram', async () =>
   }
 })
 
-test('gateway with Telegram: sends after the voice mode ended, survives a failing API, never logs the token', async () => {
+test('gateway with Telegram: questions after the voice mode ended, results never; survives a failing API, never logs the token', async () => {
   api.mode = 'ok'
   api.messages.length = 0
   const gw = await startGateway('with', { telegram: true })
   try {
-    assert.match(gw.log, /telegram fallback ready: after 1 s without a voice call/)
+    assert.match(gw.log, /telegram fallback ready: questions and approvals after 1 s without a voice call/)
 
     // While the voice client polls, the answer goes by voice only.
     const first = idOf(await gw.call('send', { message: 'Is the build green?' }))
     await gw.reply(first, 'done', 'Yes, green.')
     assert.match(await gw.call('get_reply', { id: first }), /Yes, green\./)
 
-    // The voice mode ends; the result goes to Telegram, and to the voice client too.
+    // The voice mode ends; a result stays for the voice client.
     const second = idOf(await gw.call('send', { message: 'Run the tests.' }))
     await gw.reply(second, 'working', 'Running.')
     await sleep(1300)
     await gw.reply(second, 'done', 'All tests pass.')
+    await sleep(300)
+    assert.equal(api.messages.length, 0, 'no result on Telegram')
+    assert.match(await gw.call('get_reply', { id: second }), /All tests pass\./)
+
+    // A question goes to Telegram, and to the voice client too.
+    const third = idOf(await gw.call('send', { message: 'Push the fix.' }))
+    await sleep(1300)
+    await gw.reply(third, 'question', 'To main or as a pull request?')
     await waitFor(() => api.messages.length === 1)
     assert.equal(api.messages[0].chat_id, CHAT_ID)
-    assert.match(api.messages[0].text, new RegExp(`^Result for request ${second} \\("Run the tests\\."\\)\n\nAll tests pass\\.$`))
-    const polled = await gw.call('get_reply', { id: second })
-    assert.match(polled, /All tests pass\./)
+    assert.match(
+      api.messages[0].text,
+      new RegExp(`^Question for request ${third} \\("Push the fix\\."\\)\n\nTo main or as a pull request\\?\n\nAnswer in voice mode and mention ${third}\\.$`),
+    )
+    assert.match(await gw.call('get_reply', { id: third }), /To main or as a pull request\?/)
 
     // The API fails: logged without the token, the voice path goes on.
     api.mode = 'reject'
-    const third = idOf(await gw.call('send', { message: 'Anything else?' }))
+    const fourth = idOf(await gw.call('send', { message: 'Anything else?' }))
     await sleep(1300)
-    assert.equal((await gw.reply(third, 'done', 'Nothing else.')).isError, false)
+    assert.equal((await gw.reply(fourth, 'question', 'About which repository?')).isError, false)
     await waitFor(() => gw.log.includes('telegram send failed'))
-    assert.match(gw.log, /telegram send failed: Result for request \w+ .* - 400 Bad Request: chat not found/)
-    assert.match(await gw.call('get_reply', { id: third }), /Nothing else\./)
+    assert.match(gw.log, /telegram send failed: Question for request \w+ .* - 400 Bad Request: chat not found/)
+    assert.match(await gw.call('get_reply', { id: fourth }), /About which repository\?/)
     assert.equal(api.messages.length, 1, 'no message twice')
     assert.ok(!gw.log.includes(TOKEN), 'the token never reaches the log')
   } finally {

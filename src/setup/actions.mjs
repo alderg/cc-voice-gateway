@@ -45,7 +45,7 @@ export function fields(root) {
     VOICE_GW_WORKER_TIMEOUT: { default: '60', valid: INT(5, 1440) },
     VOICE_GW_PERMISSION_RELAY: { default: '1', valid: ONE_OF('1', '0') },
     VOICE_GW_CONTROLLER_LEVEL: { default: 'confined', valid: ONE_OF(...CONTROLLER_LEVELS) },
-    VOICE_GW_TELEGRAM_AFTER: { default: '60', valid: INT(10, 3600) },
+    VOICE_GW_TELEGRAM_AFTER: { default: '600', valid: INT(10, 3600) },
     VOICE_GW_FUNNEL_IDLE: { default: '0', valid: INT(0, 1440) },
     VOICE_GW_DOCKER: { default: '', valid: NAME },
     VOICE_GW_DOCKER_FOLDER: { default: join(homedir(), 'docker-developer'), valid: PATH },

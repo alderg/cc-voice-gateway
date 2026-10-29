@@ -10,10 +10,10 @@
 // plus a Unix socket for scripts/pair.mjs (pairing codes, connections), the
 // workers: headless Claude Code runs in the repositories next to this one, or
 // in a Docker container with its own clones, a watch on the pull requests they
-// open, for checks and reviews, and optionally Telegram, for news after the
-// voice mode ended. At the controller levels clone-delete and unrestricted,
-// also cloning and deleting in the worker root (folders.mjs). Over all of it,
-// the kill switch (killswitch.mjs).
+// open, for checks and reviews, and optionally Telegram, for questions and
+// approvals after the voice mode ended, and for alarms. At the controller
+// levels clone-delete and unrestricted, also cloning and deleting in the
+// worker root (folders.mjs). Over all of it, the kill switch (killswitch.mjs).
 
 import { CONTROLLER_LEVELS, EFFORTS, ROOT, VERSION, config } from './config.mjs'
 import { log } from './log.mjs'
@@ -214,7 +214,8 @@ pulls.on('news', async news => {
   }
 })
 
-// Telegram, if set up, reaches the driver once the voice mode has ended.
+// Telegram, if set up, reaches the driver with questions and approvals once the
+// voice mode has ended, and with alarms at once.
 const telegram = loadTelegram({
   tokenFile: config.telegramTokenFile,
   chatIdFile: config.telegramChatIdFile,
@@ -229,7 +230,7 @@ if (config.funnelIdleMinutes) {
 }
 if (telegram) {
   new TelegramFallback(store, { send: text => telegram.send(text), afterSeconds: config.telegramAfterSeconds })
-  log(`telegram fallback ready: after ${config.telegramAfterSeconds} s without a voice call`)
+  log(`telegram fallback ready: questions and approvals after ${config.telegramAfterSeconds} s without a voice call`)
   // Inbound, only the kill switch and the Funnel, only from the configured chat.
   telegramCommands = new TelegramCommands(telegram, { pollSeconds: config.telegramPollSeconds }).start()
   telegramCommands.on('stop', ({ text }) => killswitch.trip({ trigger: 'telegram', reason: `"${text}" on Telegram` }))
