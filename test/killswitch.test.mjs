@@ -243,6 +243,9 @@ test('rule: writes outside the repository and the temporary folders', () => {
   // A > in quotes is no redirection: a sed pattern, a message.
   inside.bash(`sed -n '/<section id="selection"/,/<\\/section>/p' index.html`)
   inside.bash('echo "a > b" && grep -c "<div>" index.html > /tmp/count.txt')
+  // The end of a command substitution is no part of the target.
+  inside.bash('for p in $(pgrep node); do echo "$p $(readlink /proc/$p/cwd 2>/dev/null)"; done')
+  inside.bash('v=$(git rev-parse HEAD 2>/dev/null) && w=`cat a 2>/dev/null`')
   assert.deepEqual(inside.tripped, [], 'nothing outside')
   inside.guard.close()
 
@@ -257,6 +260,7 @@ test('rule: writes outside the repository and the temporary folders', () => {
     ['Bash', 'echo x > "/etc/quoted target"', '/etc/quoted'],
     ['Bash', "echo \\' > /etc/escaped \\'", '/etc/escaped'],
     ['Bash', `echo '<b>' >> '/etc/after quotes'`, '/etc/after'],
+    ['Bash', 'echo "$(cat a > /etc/substituted)"', '/etc/substituted'],
   ]) {
     const run = guarded()
     if (kind === 'Write') run.tool('Write', { file_path: value, content: 'x' })

@@ -64,10 +64,11 @@ const words = segment =>
 
 // The segment with quoted text blanked out, so that a > in a quoted pattern or
 // message is no redirection. A quoted redirection target stays, and so do
-// escaped quotes, which open nothing.
+// escaped quotes, which open nothing, and double quotes around a command
+// substitution, whose redirections are real.
 const unquoted = segment =>
   segment.replace(/\\.|(>>?\s*)?('[^']*'|"(?:[^"\\]|\\.)*")/gs, (all, redirect, quoted) =>
-    quoted === undefined || redirect ? all : ' '.repeat(quoted.length))
+    quoted === undefined || redirect || /^"[\s\S]*(\$\(|`)/.test(quoted) ? all : ' '.repeat(quoted.length))
 
 // Segments of a command line: && || ; | and new lines.
 const segments = command => String(command).split(/&&|\|\||;|\n|\|/).map(s => s.trim()).filter(Boolean)
@@ -327,7 +328,7 @@ export class RunGuard {
   // Explicit write targets of one command: redirections and known commands.
   targets(segment, name, args) {
     const found = []
-    for (const match of unquoted(segment).matchAll(/(?:^|[^<>&0-9])(?:[0-9]|&)?>>?\s*((?:'[^']*'|"[^"]*"|[^\s;&|<>'"])+)/g)) {
+    for (const match of unquoted(segment).matchAll(/(?:^|[^<>&0-9])(?:[0-9]|&)?>>?\s*((?:'[^']*'|"[^"]*"|[^\s;&|<>'"()`])+)/g)) {
       if (!match[1].startsWith('&')) found.push(match[1].replace(/'([^']*)'|"([^"]*)"/g, '$1$2'))
     }
     const operands = args.filter(arg => !arg.startsWith('-'))
