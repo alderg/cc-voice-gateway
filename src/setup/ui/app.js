@@ -186,9 +186,11 @@ function fillSettings() {
 
 function fillWatchdog() {
   $('#watchdog-status').textContent = state.watchdog.status || 'unknown'
+  $('#watchdog-linux').hidden = state.watchdog.platform === 'darwin'
+  $('#watchdog-macos').hidden = state.watchdog.platform !== 'darwin'
   $('#watchdog-unit').textContent =
     state.watchdog.platform === 'darwin'
-      ? `(at login: a LaunchAgent, ${state.watchdog.unit})`
+      ? `(at login: a LaunchAgent, ${state.watchdog.unit}${state.watchdog.unitExists ? ', exists already' : ''}${state.watchdog.loaded ? ', loaded' : ''})`
       : `(at boot: a systemd user service, ${state.watchdog.unit}${state.watchdog.unitExists ? ', exists already' : ''}${state.watchdog.linger ? ', lingering on already' : ''})`
   const tmux = state.checks.find(check => check.name === 'tmux')
   if (!tmux?.ok) {

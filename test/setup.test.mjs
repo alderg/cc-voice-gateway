@@ -2,9 +2,10 @@
 // one-time token, the session, the rate limit, the origin check and the
 // timeouts), and its steps with stand-ins: one local HTTP server answers as
 // the Telegram Bot API and as the GitHub API, and fake docker, tmux,
-// systemctl, loginctl, gh and claude commands record what they are asked to
-// do. At the end: the files in .secrets and their modes, and that no secret
-// reaches a log line, the terminal or a response.
+// systemctl, loginctl, launchctl, plutil, gh and claude commands record what
+// they are asked to do. At the end: the files in .secrets and their modes, and
+// that no secret reaches a log line, the terminal or a response. The autostart
+// on Linux and on macOS, whichever this runs on.
 
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
@@ -12,7 +13,7 @@ import { execFileSync, spawn, spawnSync } from 'node:child_process'
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url)).replace(/\/$/, '')
@@ -31,6 +32,8 @@ const HOME = join(TMP, 'home')
 const CALLS = join(TMP, 'calls.jsonl') // what the fake commands were asked to do
 const ECHO = join(TMP, 'echo') // a line the fake docker build prints, to test redaction
 const LINGER = join(TMP, 'linger') // the fake loginctl's lingering: yes, no (without the file), or denied
+const LOADED = join(TMP, 'launch-agent-loaded') // the fake launchctl: the LaunchAgent is loaded
+const SESSION = join(TMP, 'tmux-session') // the fake tmux: the session "voice" runs
 
 const TELEGRAM_TOKEN = '987654321:TEST-telegram-token-never-shown-xyz12'
 const GITHUB_TOKEN = 'github_pat_TEST_setup_token_never_shown_0123456789'
@@ -98,9 +101,19 @@ switch (${JSON.stringify(name)}) {
     break
   case 'tmux':
     if (argv[0] === '-V') out('tmux 3.4')
-    if (argv[0] === 'has-session') process.exit(1)
+    if (argv[0] === 'has-session') process.exit(existsSync(${JSON.stringify(SESSION)}) ? 0 : 1)
     break
   case 'systemctl':
+    break
+  case 'launchctl':
+    // print answers 113 for a service that is not loaded; bootstrap loads it,
+    // and like kickstart has launchd run it, whose tmux starts the session.
+    if (argv[0] === 'print') process.exit(existsSync(${JSON.stringify(LOADED)}) ? 0 : 113)
+    if (argv[0] === 'bootstrap') writeFileSync(${JSON.stringify(LOADED)}, '')
+    if (argv[0] === 'bootstrap' || argv[0] === 'kickstart') writeFileSync(${JSON.stringify(SESSION)}, '')
+    break
+  case 'plutil':
+    out(argv[1] + ': OK')
     break
   case 'loginctl': {
     const linger = existsSync(${JSON.stringify(LINGER)}) ? readFileSync(${JSON.stringify(LINGER)}, 'utf8') : 'no'
@@ -149,6 +162,8 @@ const setupEnv = () => ({
   VOICE_SETUP_TMUX_BIN: join(BIN, 'tmux'),
   VOICE_SETUP_SYSTEMCTL_BIN: join(BIN, 'systemctl'),
   VOICE_SETUP_LOGINCTL_BIN: join(BIN, 'loginctl'),
+  VOICE_SETUP_LAUNCHCTL_BIN: join(BIN, 'launchctl'),
+  VOICE_SETUP_PLUTIL_BIN: join(BIN, 'plutil'),
   VOICE_SETUP_TAILSCALE_BIN: join(BIN, 'no-tailscale'),
   VOICE_GW_TELEGRAM_API: api.url,
   VOICE_GW_GITHUB_API: api.url,
@@ -194,7 +209,7 @@ const say = line => terminal.push(line)
 
 before(async () => {
   mkdirSync(BIN, { recursive: true })
-  for (const name of ['claude', 'gh', 'tmux', 'systemctl', 'loginctl', 'docker']) {
+  for (const name of ['claude', 'gh', 'tmux', 'systemctl', 'loginctl', 'launchctl', 'plutil', 'docker']) {
     writeFileSync(join(BIN, name), FAKE(name))
     chmodSync(join(BIN, name), 0o755)
   }
@@ -339,9 +354,14 @@ test('the command shows its link only on a terminal, never in a pipe', () => {
   assert.doesNotMatch(cli.stdout + cli.stderr, /\?t=/)
 })
 
-test('the command on a terminal: one link per address, and it ends by itself', { skip: process.platform !== 'linux' || spawnSync('script', ['--version']).status !== 0 }, async () => {
-  const command = `${process.execPath} ${join(ROOT, 'scripts', 'setup.mjs')} --host 127.0.0.1 --port 0 --idle 0.02`
-  const child = spawn('script', ['-qec', command, '/dev/null'], { env: { ...process.env, VOICE_GW_SECRETS_DIR: SECRETS } })
+// A terminal for a command: script(1) of util-linux on Linux, of BSD on macOS.
+const onTerminal = command =>
+  process.platform === 'darwin' ? ['-q', '/dev/null', ...command] : ['-qec', command.join(' '), '/dev/null']
+const noScript = process.platform === 'darwin' ? false : process.platform !== 'linux' || spawnSync('script', ['--version']).status !== 0
+
+test('the command on a terminal: one link per address, and it ends by itself', { skip: noScript }, async () => {
+  const command = [process.execPath, join(ROOT, 'scripts', 'setup.mjs'), '--host', '127.0.0.1', '--port', '0', '--idle', '0.02']
+  const child = spawn('script', onTerminal(command), { env: { ...process.env, VOICE_GW_SECRETS_DIR: SECRETS } })
   let out = ''
   child.stdout.on('data', chunk => (out += chunk))
   child.stderr.on('data', chunk => (out += chunk))
@@ -605,6 +625,150 @@ test('the autostart: lingering already on is left alone, and a refused one leave
   assert.match(denied.text, new RegExp(`it needs sudo loginctl enable-linger ${uid}, and until then the controller starts only at a login`))
   assert.match(denied.text, /\ndone$/)
   rmSync(LINGER, { force: true })
+})
+
+// --- macOS --------------------------------------------------------------------------
+
+// A plist as launchd reads it: the XML parsed strictly (each tag closed in
+// order, no bare <, > or & in a text), into dicts, arrays, strings, booleans.
+function parsePlist(xml) {
+  const header =
+    '<?xml version="1.0" encoding="UTF-8"?>\n' +
+    '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+  assert.ok(xml.startsWith(header), 'the XML declaration and the plist DTD')
+  const tokens = xml.slice(header.length).match(/<[^<>]*>|[^<]+/g).filter(token => token.trim())
+  let at = 0
+  const take = expected => assert.equal(tokens[at++], expected)
+  const text = () => {
+    if (tokens[at].startsWith('<')) return ''
+    const raw = tokens[at++]
+    assert.doesNotMatch(raw, />|&(?!(?:amp|lt|gt);)/, 'escaped')
+    return raw.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&')
+  }
+  const value = () => {
+    const tag = tokens[at++]
+    if (tag === '<true/>') return true
+    if (tag === '<false/>') return false
+    if (tag === '<string>') {
+      const s = text()
+      take('</string>')
+      return s
+    }
+    if (tag === '<array>') {
+      const list = []
+      while (tokens[at] !== '</array>') list.push(value())
+      at++
+      return list
+    }
+    if (tag === '<dict>') {
+      const dict = {}
+      while (tokens[at] !== '</dict>') {
+        take('<key>')
+        const key = text()
+        take('</key>')
+        dict[key] = value()
+      }
+      at++
+      return dict
+    }
+    throw new Error(`unexpected ${tag}`)
+  }
+  take('<plist version="1.0">')
+  const result = value()
+  take('</plist>')
+  assert.equal(at, tokens.length, 'nothing after </plist>')
+  return result
+}
+
+// The setup on macOS, whatever this runs on: its PATH as in a Terminal without
+// Homebrew's shellenv, tmux found on it by name, and the fake launchctl.
+async function macSetup(name, watchdog, { loaded = false, session = false } = {}) {
+  const home = join(TMP, `mac-${name}`)
+  mkdirSync(home, { recursive: true })
+  for (const [file, on] of [[LOADED, loaded], [SESSION, session]]) {
+    if (on) writeFileSync(file, '')
+    else rmSync(file, { force: true })
+  }
+  const env = { ...setupEnv(), PATH: `${BIN}:/usr/bin:/bin:/odd&<dir>` }
+  delete env.VOICE_SETUP_TMUX_BIN
+  const setup = createSetup({ root: ROOT, secretsDir: join(TMP, `secrets-mac-${name}`), env, home, platform: 'darwin', say })
+  const state = await setup.api['GET /api/state']({})
+  const start = calls().length
+  const { job } = await setup.api['POST /api/finish']({
+    body: { settings: { VOICE_GW_PORT: '8787', VOICE_GW_DOCKER: '' }, telegram: { enabled: false }, docker: { enabled: false }, watchdog },
+  })
+  let done
+  for (let i = 0; i < 250 && (done = setup.api['GET /api/jobs/:id']({ id: job })).state === 'running'; i++) await sleep(20)
+  const file = join(home, 'Library', 'LaunchAgents', 'com.drawio.cc-voice-gateway.plist')
+  const mine = calls().slice(start).map(c => `${c.command} ${c.argv.join(' ')}`)
+  return { home, state, file, done, text: done.lines.join('\n'), calls: mine }
+}
+
+test('macOS: the autostart is a LaunchAgent that launchd loads and starts in tmux; nothing of systemd', async () => {
+  const uid = process.getuid()
+  const mac = await macSetup('start', { autostart: true, startNow: true })
+  assert.equal(mac.state.watchdog.platform, 'darwin')
+  assert.equal(mac.state.watchdog.unit, mac.file)
+  assert.equal(mac.state.watchdog.linger, null, 'no lingering on macOS')
+  assert.equal(mac.state.watchdog.loaded, false)
+  assert.equal(mac.done.state, 'done', mac.text)
+
+  const agent = parsePlist(readFileSync(mac.file, 'utf8'))
+  assert.equal(statSync(mac.file).mode & 0o777, 0o644)
+  assert.equal(agent.Label, 'com.drawio.cc-voice-gateway')
+  // tmux by its full path: launchd does not search the PATH it sets.
+  assert.deepEqual(agent.ProgramArguments, [join(BIN, 'tmux'), 'new-session', '-d', '-s', 'voice', join(ROOT, 'scripts', 'start-controller.sh')])
+  assert.equal(agent.WorkingDirectory, ROOT)
+  const path = agent.EnvironmentVariables.PATH.split(':')
+  assert.deepEqual(path.slice(0, 4), [BIN, '/usr/bin', '/bin', '/odd&<dir>'], 'yours first, escaped in the XML')
+  for (const dir of ['/opt/homebrew/bin', '/usr/local/bin', join(mac.home, '.local', 'bin'), dirname(process.execPath)]) {
+    assert.ok(path.includes(dir), `${dir} on the LaunchAgent's PATH`)
+  }
+  // Like Type=forking: tmux returns at once, the watchdog inside restarts.
+  assert.equal(agent.RunAtLoad, true)
+  assert.equal(agent.KeepAlive, false)
+  assert.equal(agent.AbandonProcessGroup, true)
+  assert.equal(agent.StandardOutPath, join(mac.home, 'Library', 'Logs', 'cc-voice-gateway.log'))
+  assert.equal(agent.StandardErrorPath, agent.StandardOutPath)
+
+  const service = `gui/${uid}/com.drawio.cc-voice-gateway`
+  assert.ok(mac.calls.includes(`plutil -lint ${mac.file}`), 'checked with plutil')
+  assert.ok(mac.calls.includes(`launchctl print ${service}`))
+  assert.ok(mac.calls.includes(`launchctl bootstrap gui/${uid} ${mac.file}`))
+  assert.ok(!mac.calls.some(c => /^(systemctl|loginctl) /.test(c)), 'nothing of systemd')
+  assert.ok(!mac.calls.some(c => c.startsWith('tmux new-session')), 'launchd started it, not the setup')
+  assert.match(mac.text, /LaunchAgent com\.drawio\.cc-voice-gateway loaded: launchd starts the controller in tmux at every login, and started it now/)
+  assert.match(mac.text, /the controller runs in the tmux session "voice": tmux attach -t voice/)
+  assert.match(mac.text, /\ndone$/)
+})
+
+test('macOS: autostart alone loads at the next login; loaded already, a kickstart; a running session is left alone', async () => {
+  const uid = process.getuid()
+  const later = await macSetup('later', { autostart: true, startNow: false })
+  assert.equal(later.done.state, 'done', later.text)
+  assert.ok(existsSync(later.file))
+  assert.ok(!later.calls.some(c => /^launchctl (bootstrap|kickstart)/.test(c) || c.startsWith('tmux new-session')), 'nothing started')
+  assert.match(later.text, new RegExp(`starts the controller in tmux at your next login; to load it now, which also starts it: launchctl bootstrap gui/${uid} `))
+
+  const again = await macSetup('again', { autostart: true, startNow: true }, { loaded: true })
+  assert.equal(again.state.watchdog.loaded, true)
+  assert.equal(again.done.state, 'done', again.text)
+  assert.ok(again.calls.includes(`launchctl kickstart gui/${uid}/com.drawio.cc-voice-gateway`))
+  assert.ok(!again.calls.some(c => c.startsWith('launchctl bootstrap')))
+  assert.match(again.text, /was loaded already, with the file as it was then \(a changed one counts after: launchctl bootout gui\/\d+\/com\.drawio\.cc-voice-gateway; launchctl bootstrap /)
+
+  const running = await macSetup('running', { autostart: true, startNow: true }, { session: true })
+  assert.equal(running.done.state, 'done', running.text)
+  assert.ok(!running.calls.some(c => /^launchctl (bootstrap|kickstart)/.test(c) || c.startsWith('tmux new-session')))
+  assert.match(running.text, /the tmux session "voice" already runs; not started again\. The LaunchAgent starts it at your next login/)
+
+  // Without the autostart: tmux directly, as on Linux.
+  const now = await macSetup('now', { autostart: false, startNow: true })
+  assert.equal(now.done.state, 'done', now.text)
+  assert.ok(now.calls.some(c => c.startsWith('tmux new-session -d -s voice')))
+  assert.ok(!now.calls.some(c => c.startsWith('launchctl ') && !c.startsWith('launchctl print')))
+  rmSync(SESSION, { force: true })
+  rmSync(LOADED, { force: true })
 })
 
 test('the settings file: one line per setting, read without running anything', () => {

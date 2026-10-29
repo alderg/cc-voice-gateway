@@ -16,6 +16,7 @@ import { homedir, hostname, platform as osPlatform } from 'node:os'
 import { dirname, isAbsolute, join } from 'node:path'
 import { ACCESS_LEVELS, GitHubAccess } from '../access.mjs'
 import { CONTROLLER_LEVELS, EFFORTS } from '../config.mjs'
+import { LAUNCH_AGENT, MAC_TAILSCALE, SERVICE, findCommand, servicePath } from '../platform.mjs'
 import { HostRunner } from '../runners.mjs'
 import { SETTINGS_FILE_NAME, formatSettings, readSettings } from '../settings.mjs'
 import { Telegram } from '../telegram.mjs'
@@ -25,7 +26,6 @@ import { MARKETPLACE, PLUGIN, channelMode } from '../../scripts/channel-mode.mjs
 export const MODELS = ['fable', 'opus', 'sonnet', 'haiku']
 const MIN_CLAUDE = [2, 1, 80]
 const MAX_LINES = 400
-const SERVICE = 'cc-voice-gateway'
 
 // The settings the page sets, with their defaults (as in config.mjs and the
 // start scripts) and what a valid value looks like. A value equal to its
@@ -144,6 +144,9 @@ export function createSetup({
   say = () => {},
   setupToken = '',
 }) {
+  // On macOS the checks, the commands and the LaunchAgent also look where
+  // Homebrew, Claude Code's installer and Docker Desktop put their commands.
+  if (platform === 'darwin') env = { ...env, PATH: servicePath({ platform, path: env.PATH, home }) }
   const bin = {
     claude: env.VOICE_GW_CLAUDE_BIN || 'claude',
     docker: env.VOICE_GW_DOCKER_BIN || 'docker',
@@ -152,7 +155,11 @@ export function createSetup({
     tmux: env.VOICE_SETUP_TMUX_BIN || 'tmux',
     systemctl: env.VOICE_SETUP_SYSTEMCTL_BIN || 'systemctl',
     loginctl: env.VOICE_SETUP_LOGINCTL_BIN || 'loginctl',
-    tailscale: env.VOICE_SETUP_TAILSCALE_BIN || 'tailscale',
+    launchctl: env.VOICE_SETUP_LAUNCHCTL_BIN || 'launchctl',
+    plutil: env.VOICE_SETUP_PLUTIL_BIN || 'plutil',
+    tailscale:
+      env.VOICE_SETUP_TAILSCALE_BIN ||
+      (platform === 'darwin' && !findCommand('tailscale', env.PATH) && existsSync(MAC_TAILSCALE) ? MAC_TAILSCALE : 'tailscale'),
   }
   const telegramApi = env.VOICE_GW_TELEGRAM_API || 'https://api.telegram.org'
   const githubApi = env.VOICE_GW_GITHUB_API || 'https://api.github.com'
@@ -277,9 +284,16 @@ export function createSetup({
 
   function unitFile() {
     return platform === 'darwin'
-      ? join(home, 'Library', 'LaunchAgents', `com.drawio.${SERVICE}.plist`)
+      ? join(home, 'Library', 'LaunchAgents', `${LAUNCH_AGENT}.plist`)
       : join(home, '.config', 'systemd', 'user', `${SERVICE}.service`)
   }
+
+  // macOS: launchd's domain for this user's LaunchAgents, and whether ours is
+  // loaded there (launchctl print answers 113 when it is not).
+  const launchDomain = () => `gui/${uid}`
+  const launchService = () => `${launchDomain()}/${LAUNCH_AGENT}`
+  const launchLoaded = async () => (await output(bin.launchctl, ['print', launchService()])).code === 0
+  const tmuxSession = async () => (await output(bin.tmux, ['has-session', '-t', 'voice'])).code === 0
 
   // Lingering: systemd starts the user's services at boot and keeps them
   // running without a login. Without it they start at a login and stop soon
@@ -291,11 +305,12 @@ export function createSetup({
   async function state({ server }) {
     const current = readSettings(settingsFile)
     const settings = Object.fromEntries(Object.entries(FIELDS).map(([name, field]) => [name, current[name] ?? field.default]))
-    const [list, git, watchdog, linger] = await Promise.all([
+    const [list, git, watchdog, linger, loaded] = await Promise.all([
       checks(),
       Promise.all([output(bin.git, ['config', '--global', 'user.name']), output(bin.git, ['config', '--global', 'user.email'])]),
       output(join(root, 'scripts', 'start-controller.sh'), ['--status'], { env: { ...env, VOICE_GW_SECRETS_DIR: secretsDir } }),
       platform === 'darwin' ? null : lingering(),
+      platform === 'darwin' ? launchLoaded() : null,
     ])
     const plugin = channelMode({ env, root })
     return {
@@ -320,6 +335,7 @@ export function createSetup({
         unit: unitFile(),
         unitExists: existsSync(unitFile()),
         linger,
+        loaded, // macOS: the LaunchAgent is loaded in launchd
       },
       plugin: {
         mode: plugin.mode,
@@ -580,22 +596,46 @@ export function createSetup({
     return ok
   }
 
+  // The tmux the autostart runs, by its full path: launchd does not search
+  // the PATH it sets for the job, and Homebrew's tmux is not in its own.
+  const tmuxPath = () => findCommand(bin.tmux, env.PATH) ?? bin.tmux
+
+  // Where the LaunchAgent's own output goes: tmux's, a line at most. The
+  // controller logs to .logs/gateway.log as on Linux.
+  const launchLog = () => join(home, 'Library', 'Logs', `${SERVICE}.log`)
+
   function unitText() {
     const start = join(root, 'scripts', 'start-controller.sh')
     if (platform === 'darwin') {
-      const xml = text => text.replace(/&/g, '&amp;').replace(/</g, '&lt;')
+      // At every login (RunAtLoad), and once now when loaded. Like the
+      // systemd unit's Type=forking: tmux starts its server and returns, so
+      // no KeepAlive, or launchd would start it again and again; the watchdog
+      // in the tmux session restarts the controller. AbandonProcessGroup:
+      // the tmux server stays when its starter ends.
+      const xml = text => text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      const string = text => `<string>${xml(text)}</string>`
       return [
         '<?xml version="1.0" encoding="UTF-8"?>',
         '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">',
-        '<plist version="1.0"><dict>',
-        `  <key>Label</key><string>com.drawio.${SERVICE}</string>`,
-        '  <key>ProgramArguments</key><array>',
-        `    <string>${xml(bin.tmux)}</string><string>new-session</string><string>-d</string><string>-s</string><string>voice</string><string>${xml(start)}</string>`,
+        '<plist version="1.0">',
+        '<dict>',
+        `  <key>Label</key>${string(LAUNCH_AGENT)}`,
+        '  <key>ProgramArguments</key>',
+        '  <array>',
+        ...[tmuxPath(), 'new-session', '-d', '-s', 'voice', start].map(arg => `    ${string(arg)}`),
         '  </array>',
-        `  <key>WorkingDirectory</key><string>${xml(root)}</string>`,
-        `  <key>EnvironmentVariables</key><dict><key>PATH</key><string>${xml(env.PATH ?? '')}</string></dict>`,
+        `  <key>WorkingDirectory</key>${string(root)}`,
+        '  <key>EnvironmentVariables</key>',
+        '  <dict>',
+        `    <key>PATH</key>${string(env.PATH ?? '')}`,
+        '  </dict>',
         '  <key>RunAtLoad</key><true/>',
-        '</dict></plist>',
+        '  <key>KeepAlive</key><false/>',
+        '  <key>AbandonProcessGroup</key><true/>',
+        `  <key>StandardOutPath</key>${string(launchLog())}`,
+        `  <key>StandardErrorPath</key>${string(launchLog())}`,
+        '</dict>',
+        '</plist>',
         '',
       ].join('\n')
     }
@@ -616,7 +656,7 @@ export function createSetup({
       'RemainAfterExit=yes',
       `WorkingDirectory=${literal(root)}`,
       `Environment=${quote(`PATH=${env.PATH ?? ''}`)}`,
-      `ExecStart=${exec(bin.tmux)} new-session -d -s voice ${exec(start)}`,
+      `ExecStart=${exec(tmuxPath())} new-session -d -s voice ${exec(start)}`,
       `ExecStop=${exec(start)} --stop`,
       '',
       '[Install]',
@@ -625,15 +665,68 @@ export function createSetup({
     ].join('\n')
   }
 
+  // macOS: the LaunchAgent, checked with plutil. launchd loads it at every
+  // login and then starts the controller. Loading it now (bootstrap) starts
+  // it at once, so only when it is to start now; loaded already, a kickstart
+  // runs it again. Returns whether the controller is to run, or null when
+  // there is nothing to start now.
+  async function launchAgent(file, startNow, line) {
+    const lint = await output(bin.plutil, ['-lint', file])
+    if (lint.code !== 0 && lint.code !== null) {
+      line(`plutil finds the LaunchAgent invalid: ${lint.text}`)
+      return false
+    }
+    const domain = launchDomain()
+    const service = launchService()
+    const loaded = await launchLoaded()
+    const reload = `launchctl bootout ${service}; launchctl bootstrap ${domain} ${file}`
+    if (!startNow) {
+      line(
+        loaded
+          ? `the LaunchAgent ${LAUNCH_AGENT} is loaded; a changed file counts from your next login, or now with: ${reload}`
+          : `the LaunchAgent ${LAUNCH_AGENT} starts the controller in tmux at your next login; to load it now, which also starts it: launchctl bootstrap ${domain} ${file}`,
+      )
+      return null
+    }
+    if (await tmuxSession()) {
+      line(`the tmux session "voice" already runs; not started again${loaded ? '' : `. The LaunchAgent starts it at your next login, or: launchctl bootstrap ${domain} ${file}`}`)
+      return null
+    }
+    const args = loaded ? ['kickstart', service] : ['bootstrap', domain, file]
+    const code = await runCommand(bin.launchctl, args, { env, onLine: line, timeoutMs: 30000 })
+    if (code !== 0) {
+      line(`launchctl ${args[0]} failed; the LaunchAgent is there: ${file}`)
+      return false
+    }
+    line(
+      loaded
+        ? `the LaunchAgent ${LAUNCH_AGENT} was loaded already, with the file as it was then (a changed one counts after: ${reload}); started it with launchctl kickstart`
+        : `LaunchAgent ${LAUNCH_AGENT} loaded: launchd starts the controller in tmux at every login, and started it now`,
+    )
+    // launchd starts the job on its own time: wait for its tmux session.
+    for (let i = 0; i < 20; i++) {
+      if (await tmuxSession()) {
+        line('the controller runs in the tmux session "voice": tmux attach -t voice, and answer its questions at the first start')
+        return true
+      }
+      await new Promise(resolve => setTimeout(resolve, 500))
+    }
+    line(`no tmux session "voice" after 10 seconds; see ${launchLog()} and .logs/gateway.log`)
+    return false
+  }
+
   async function setUpWatchdog(watchdog, line) {
     let ok = true
+    let started = false
     if (watchdog.autostart) {
       const file = unitFile()
       mkdirSync(dirname(file), { recursive: true })
       writeFileSync(file, unitText(), { mode: 0o644 })
       line(`autostart written: ${file}`)
       if (platform === 'darwin') {
-        line(`to turn it on: launchctl bootstrap gui/${uid} ${file}`)
+        const launched = await launchAgent(file, Boolean(watchdog.startNow), line)
+        ok = launched !== false
+        started = launched !== false // if launchd did not start it, tmux below does
       } else {
         const reload = await runCommand(bin.systemctl, ['--user', 'daemon-reload'], { env, onLine: line, timeoutMs: 30000 })
         const enable = await runCommand(bin.systemctl, ['--user', 'enable', `${SERVICE}.service`], { env, onLine: line, timeoutMs: 30000 })
@@ -658,8 +751,8 @@ export function createSetup({
         }
       }
     }
-    if (watchdog.startNow) {
-      if ((await output(bin.tmux, ['has-session', '-t', 'voice'])).code === 0) {
+    if (watchdog.startNow && !started) {
+      if (await tmuxSession()) {
         line('the tmux session "voice" already runs; not started again')
       } else {
         const code = await runCommand(bin.tmux, ['new-session', '-d', '-s', 'voice', join(root, 'scripts', 'start-controller.sh')], {

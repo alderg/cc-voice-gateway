@@ -202,10 +202,16 @@
     crash, in a tmux session. On its first start Claude Code asks a few questions at the terminal:
     attach with <code>tmux attach -t voice</code> and answer them.
   </p>
-  <p class="guide">
+  <p class="guide" id="watchdog-linux">
     On Linux the autostart also turns on lingering for your user (<code>loginctl enable-linger</code>):
     without it, systemd starts the service only at a login and stops it after the last one, an SSH
     session too.
+  </p>
+  <p class="guide" id="watchdog-macos" hidden>
+    On macOS the autostart is a LaunchAgent: launchd starts the controller when you log in, not at boot.
+    With "Start it now" too, the setup loads it, which starts it at once. For a Mac that comes back by
+    itself after a restart, turn on automatic login (not possible with FileVault). While the watchdog runs,
+    the Mac does not go to sleep by itself; a closed laptop lid still sends it to sleep.
   </p>
   <p>Now: <span id="watchdog-status"></span></p>
   <label><input type="checkbox" id="watchdog-autostart"> Start it automatically <span id="watchdog-unit" class="sub"></span></label>
