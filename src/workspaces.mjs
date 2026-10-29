@@ -236,18 +236,26 @@ export function scratchPrompt({ task, words, facts }) {
 
 const plural = (n, unit) => `${n} ${unit}${n === 1 ? '' : 's'}`
 
+// The names a check keeps of each kind of change; the counts are whole.
+const KEPT = 20
+
 // What a run changed in its work folder, from the files before and after it
-// (runners' files()): the paths made, changed (size or time) and removed.
-// more: there were more files than a look lists.
+// (runners' files()): the paths made, changed (size or time) and removed,
+// the first KEPT of each, and how many of each there are. more: there were
+// more files than a look lists.
 export function fileChanges(before, after, max) {
   const was = new Map(before.map(file => [file.path, file]))
   const now = new Set(after.map(file => file.path))
+  const made = after.filter(file => !was.has(file.path)).map(file => file.path)
+  const changed = after
+    .filter(file => was.has(file.path) && (was.get(file.path).bytes !== file.bytes || was.get(file.path).mtime !== file.mtime))
+    .map(file => file.path)
+  const removed = before.filter(file => !now.has(file.path)).map(file => file.path)
   return {
-    made: after.filter(file => !was.has(file.path)).map(file => file.path),
-    changed: after
-      .filter(file => was.has(file.path) && (was.get(file.path).bytes !== file.bytes || was.get(file.path).mtime !== file.mtime))
-      .map(file => file.path),
-    removed: before.filter(file => !now.has(file.path)).map(file => file.path),
+    made: made.slice(0, KEPT),
+    changed: changed.slice(0, KEPT),
+    removed: removed.slice(0, KEPT),
+    counts: { made: made.length, changed: changed.length, removed: removed.length },
     more: after.length > max,
   }
 }
@@ -256,10 +264,11 @@ export function fileChanges(before, after, max) {
 // attribute: a fixed vocabulary, no file name, which the run chose.
 export function filesSummary(check) {
   if (!check?.ok) return 'not checked'
+  const { made, changed, removed } = check.counts
   const parts = []
-  if (check.made.length) parts.push(`${plural(check.made.length, 'file')} made`)
-  if (check.changed.length) parts.push(`${check.changed.length} changed`)
-  if (check.removed.length) parts.push(`${check.removed.length} removed`)
+  if (made) parts.push(`${plural(made, 'file')} made`)
+  if (changed) parts.push(`${changed} changed`)
+  if (removed) parts.push(`${removed} removed`)
   return parts.length ? parts.join(', ') + (check.more ? ', more not counted' : '') : 'nothing made or changed'
 }
 
@@ -267,11 +276,12 @@ export function filesSummary(check) {
 export function filesText(check) {
   if (!check) return null
   if (!check.ok) return 'Work folder check by the gateway: not possible, the folder could not be read.'
-  const list = paths => preview(paths.slice(0, 8).join(', ') + (paths.length > 8 ? ', …' : ''), 240)
+  const list = (paths, count) => preview(paths.slice(0, 8).join(', ') + (count > 8 ? ', …' : ''), 240)
+  const { made, changed, removed } = check.counts
   const parts = []
-  if (check.made.length) parts.push(`${plural(check.made.length, 'file')} made (${list(check.made)})`)
-  if (check.changed.length) parts.push(`${check.changed.length} changed (${list(check.changed)})`)
-  if (check.removed.length) parts.push(`${check.removed.length} removed (${list(check.removed)})`)
+  if (made) parts.push(`${plural(made, 'file')} made (${list(check.made, made)})`)
+  if (changed) parts.push(`${changed} changed (${list(check.changed, changed)})`)
+  if (removed) parts.push(`${removed} removed (${list(check.removed, removed)})`)
   if (check.more) parts.push('and more than it counts')
   return `Work folder check by the gateway: ${parts.length ? parts.join(', ') : 'no file made, changed or removed'}.`
 }

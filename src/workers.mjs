@@ -58,7 +58,6 @@ import {
   filesText,
   kindOf,
   scratchEntries,
-  scratchId,
   scratchPrompt,
 } from './workspaces.mjs'
 
@@ -1446,6 +1445,7 @@ export class Workers extends EventEmitter {
       .catch(() => null)
       .finally(() => this.auditing.delete(task.repo))
     task.audit = now ? { ok: true, at: Date.now(), ...fileChanges(task.startFiles ?? [], now, MAX_FILES) } : { ok: false, at: Date.now() }
+    delete task.startFiles // done with; the state keeps only what the check found
     task.decision = null
     log('worker check', task.repo, task.id, filesSummary(task.audit))
     try {

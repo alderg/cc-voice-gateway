@@ -232,6 +232,7 @@ test('a follow-up continues in the same folder and session, and counts only what
     assert.deepEqual(next.task.audit.made, [])
     assert.deepEqual(next.task.audit.changed, ['report.md'])
     assert.deepEqual(next.task.audit.removed, ['data/table.csv'])
+    assert.equal(next.task.startFiles, undefined, 'the listing before the run is not kept after the check')
     assert.equal(workers.checkMeta(next.task).files, '1 changed, 1 removed')
   } finally {
     workers.close()
@@ -472,7 +473,14 @@ test('what changed in a folder, in words for the attribute and in a line with th
   const before = [{ path: 'a.md', bytes: 1, mtime: 1 }, { path: 'b.md', bytes: 1, mtime: 1 }, { path: 'c.md', bytes: 1, mtime: 1 }]
   const after = [{ path: 'a.md', bytes: 1, mtime: 1 }, { path: 'b.md', bytes: 2, mtime: 5 }, { path: 'd.pdf', bytes: 9, mtime: 5 }]
   const check = { ok: true, ...fileChanges(before, after, 100) }
-  assert.deepEqual(check, { ok: true, made: ['d.pdf'], changed: ['b.md'], removed: ['c.md'], more: false })
+  assert.deepEqual(check, {
+    ok: true,
+    made: ['d.pdf'],
+    changed: ['b.md'],
+    removed: ['c.md'],
+    counts: { made: 1, changed: 1, removed: 1 },
+    more: false,
+  })
   assert.equal(filesSummary(check), '1 file made, 1 changed, 1 removed')
   assert.equal(filesText(check), 'Work folder check by the gateway: 1 file made (d.pdf), 1 changed (b.md), 1 removed (c.md).')
   const none = { ok: true, ...fileChanges(before, before, 100) }
@@ -480,6 +488,14 @@ test('what changed in a folder, in words for the attribute and in a line with th
   assert.equal(filesText(none), 'Work folder check by the gateway: no file made, changed or removed.')
   assert.equal(filesSummary({ ok: false }), 'not checked')
   assert.match(filesText({ ok: false }), /not possible, the folder could not be read/)
+
+  // Many: the names of the first few are kept, the counts are whole.
+  const lots = Array.from({ length: 30 }, (_, i) => ({ path: `page-${i}.png`, bytes: 1, mtime: 1 }))
+  const many = { ok: true, ...fileChanges([], lots, 25) }
+  assert.equal(many.made.length, 20)
+  assert.equal(many.counts.made, 30)
+  assert.equal(filesSummary(many), '30 files made, more not counted')
+  assert.match(filesText(many), /^Work folder check by the gateway: 30 files made \(page-0\.png, .*page-7\.png, …\), and more than it counts\.$/)
 })
 
 // --- the gateway --------------------------------------------------------------------
