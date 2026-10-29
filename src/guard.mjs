@@ -485,21 +485,23 @@ export class RunGuard {
   places(runner) {
     const docker = Boolean(runner.container)
     const home = docker ? '/home/worker' : homedir()
+    const temp = docker ? ['/tmp', '/var/tmp'] : tempFolders()
     return {
       home,
       claudeConfig: (!docker && process.env.CLAUDE_CONFIG_DIR) || `${home}/.claude`,
-      roots: [...new Set([...(docker ? ['/tmp', '/var/tmp'] : tempFolders()), ...this.allowedPaths])],
+      temp,
+      roots: [...new Set([...temp, ...this.allowedPaths])],
     }
   }
 
   // Also for runs that were going when the gateway started. The runner of
   // the run's workspace, as Workers knows it. A run in a work folder may
-  // write only there and in its memory folder: not even in the temporary
-  // folders or VOICE_GW_KILL_ALLOW_PATHS.
+  // write only there, in the temporary folders and in its memory folder: not
+  // in VOICE_GW_KILL_ALLOW_PATHS.
   started(task) {
     if (this.runs.has(task.id)) return
     const runner = this.workers.runnerOf?.(task) ?? this.runner
-    const { home, claudeConfig, roots } = this.places(runner)
+    const { home, claudeConfig, temp, roots } = this.places(runner)
     const scratch = task.kind === 'scratch'
     const run = {
       id: task.id,
@@ -507,7 +509,7 @@ export class RunGuard {
       scratch,
       runner,
       home,
-      roots: scratch ? [] : roots, // where it may write besides its workspace and its memory folder
+      roots: scratch ? temp : roots, // where it may write besides its workspace and its memory folder
       dir: task.dir ?? runner.dir(task.repo),
       memory: null,
       slug: task.slug ?? null,

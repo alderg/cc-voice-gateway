@@ -38,7 +38,7 @@ const { SCRATCH_NEW, ScratchFolders, fileChanges, filesSummary, filesText, scrat
 // The stand-in for claude. Words in the task:
 //   MAKE      writes report.md and data/table.csv
 //   CHANGE    appends to report.md and removes data/table.csv
-//   OUTSIDE   a Bash call that writes to /tmp, and one into its folder
+//   OUTSIDE   a Bash call that writes to /srv, and one into its folder
 //   SLOW      takes long before its result
 const FAKE_CLAUDE = `#!/usr/bin/env node
 import { appendFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
@@ -61,7 +61,7 @@ if (/CHANGE/.test(input)) {
 }
 if (/OUTSIDE/.test(input)) {
   out({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Bash', input: { command: 'python3 calc.py > result.txt' } }] } })
-  out({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Bash', input: { command: 'echo x > /tmp/voice-gw-scratch-outside' } }] } })
+  out({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Bash', input: { command: 'echo x > /srv/voice-gw-scratch-outside' } }] } })
 }
 setTimeout(() => {
   out({ type: 'assistant', message: { content: [{ type: 'text', text: 'Working on it.' }] } })
@@ -187,7 +187,7 @@ test('scratch/new: a new empty folder, the run in it with rules of its own; afte
     const rules = arg(call, '--append-system-prompt')
     assert.match(rules, /^You are a worker\./)
     assert.match(rules, /Your work folder is the current directory/)
-    assert.match(rules, /It is the only place you may write/)
+    assert.match(rules, /Every file you make goes there, scripts included; only temporary files may also go to \/tmp/)
     assert.doesNotMatch(rules, /voice\/<short-name>|gh pr create/)
     assert.match(call.input, /^MAKE: sum up the quarter in a report\.\n\nThe driver's own words: "the words"\n/)
     assert.match(call.input, new RegExp(`^- Work folder: ${task.repo}, new and empty$`, 'm'))
@@ -329,7 +329,7 @@ test('the kill switch: no new work folder while locked, and a run in one stops l
   }
 })
 
-test('the rules: a run in a work folder writes only there and in its memory folder, not even in /tmp', async () => {
+test('the rules: a run in a work folder writes only there, in the temporary folders and in its memory folder', async () => {
   const { workers, dispatch } = setup()
   const tripped = []
   const guard = new RunGuard({
@@ -347,11 +347,11 @@ test('the rules: a run in a work folder writes only there and in its memory fold
     await ended(task)
     await until(() => tripped.length >= 2)
     const reasons = tripped.map(event => event.reason)
-    assert.match(reasons[0], new RegExp(`^write outside the allowed folders: "echo x > /tmp/voice-gw-scratch-outside" writes /tmp/voice-gw-scratch-outside \\(worker ${task.repo}, task ${task.id}\\)$`))
+    assert.match(reasons[0], new RegExp(`^write outside the allowed folders: "echo x > /srv/voice-gw-scratch-outside" writes /srv/voice-gw-scratch-outside \\(worker ${task.repo}, task ${task.id}\\)$`))
     assert.match(reasons[1], new RegExp(`^many changes: more than 1 files in the work folder after one run \\(worker ${task.repo}`))
     assert.equal(tripped.length, 2, 'its own folder is no write outside')
 
-    // The same commands in a repository's run: /tmp is fine there.
+    // In a repository's run /tmp is fine as well.
     const plain = new EventEmitter()
     const repoTripped = []
     const repoGuard = new RunGuard({ workers: plain, runner: workers.runner, killswitch: { trip: e => repoTripped.push(e) }, mainCheckSeconds: 3600, log: () => {} })
@@ -361,7 +361,7 @@ test('the rules: a run in a work folder writes only there and in its memory fold
     assert.deepEqual(repoTripped, [])
     repoGuard.close()
 
-    // Its memory folder is its own; the allowed paths of repositories are not its.
+    // Its memory folder and the temporary folders are its own; the allowed paths of repositories are not.
     const scratchTask = { id: 'tscr', kind: 'scratch', repo: 'scratch/abcd', dir: '/scratch/2026-01-01-abcd', startedAt: Date.now() }
     const third = new EventEmitter()
     const thirdTripped = []
@@ -369,6 +369,7 @@ test('the rules: a run in a work folder writes only there and in its memory fold
     third.emit('started', scratchTask)
     third.emit('tool', scratchTask, { type: 'tool_use', name: 'Write', input: { file_path: `${homedir()}/.claude/projects/-scratch-2026-01-01-abcd/memory/note.md` } })
     third.emit('tool', scratchTask, { type: 'tool_use', name: 'Write', input: { file_path: 'notes/a.md' } })
+    third.emit('tool', scratchTask, { type: 'tool_use', name: 'Bash', input: { command: 'python3 -I gen.py > /tmp/voice-gw-scratch-out.txt' } })
     assert.deepEqual(thirdTripped, [])
     third.emit('tool', scratchTask, { type: 'tool_use', name: 'Write', input: { file_path: '/opt/allowed/x' } })
     assert.match(thirdTripped[0], /^write outside the allowed folders: Write \/opt\/allowed\/x/)
