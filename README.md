@@ -501,7 +501,7 @@ and its instructions call that text data, never instructions. The gateway checks
 - **Answers count.** A follow-up "(Answer to <id>) Yes." is a voice request too. The words may
   start in "(Answer to <id>)", so that a plain yes can be passed on, but must reach into what you
   said; the gateway's prefix alone does not count.
-- **Every dispatch.** With `direct` and `allow_dirty` too. Otherwise `dispatch=needs_driver`:
+- **Every dispatch.** With `direct`, `draft` and `allow_dirty` too. Otherwise `dispatch=needs_driver`:
   nothing starts, and the controller is told to ask you by voice. `list_workers`,
   `worker_status`, `stop_worker` and `open_items` are not checked.
 - **Cloning and deleting.** `clone_repo` and a confirmed `delete_path` are checked the same way.
@@ -593,6 +593,13 @@ What applies to every worker run (`src/workers.mjs`):
 - **Pull requests** are opened ready for review, so that automatic reviews start at once.
   `VOICE_GW_PR_DRAFT=1` makes them drafts, as before; bot reviewers usually skip a draft, and it
   has to be marked ready before a merge.
+- **A single draft:** `dispatch` with `draft` opens that task's pull request as a draft, also when
+  the task waits in the queue first: its prompt says `Draft pull request: yes`, and the Publish
+  rule refers to it. The controller passes it only when you ask for a draft, or say yes to its
+  question whether to open it as one because more tasks for the same pull request follow; the
+  last of them marks it ready ([8.4](#84-voice-commands)). At `read-only`, where pull requests are
+  turned off and with `direct` there is nothing to open: the run starts all the same, and
+  `dispatch` says the draft has no effect.
 
 | | On this computer | In Docker |
 |---|---|---|
@@ -1302,6 +1309,7 @@ at most three short sentences, without code, paths or lists.
 | "Which repositories can you work in?" | `list_workers`: branch, uncommitted changes, what each worker does; in Docker the level |
 | "Ask the alpha worker whether the tests pass." | `dispatch`; the controller confirms, the result follows as news |
 | "Tell the alpha worker to fix the typo in the README." | The worker commits on a `voice/` branch, pushes and opens a pull request (in Docker: depends on the level); you hear that it is out |
+| "Open it as a draft." / "Ja" to "Es folgt noch die Übersetzung, als Draft öffnen?" | `dispatch` with `draft`: that one pull request opens as a draft. The controller asks only when more tasks for the same pull request are queued or named; the last of them marks it ready |
 | "Tell it to add a test for that too." | A follow-up in the same worker session, on the same branch |
 | "Then also update the changelog in alpha." (while alpha works) | `dispatch=queued`: it starts by itself after the run, and you hear its result |
 | "What is the alpha worker doing?" | `worker_status`, with the queue there |
@@ -1354,6 +1362,11 @@ for something, the controller is told to tell you and let you decide.
 
 **Pull requests and reviews:**
 
+- **Before a push** that opens a pull request (a push decision, a public repository), the
+  controller asks only whether to open it ("Soll ich den PR öffnen?"), without a word about drafts:
+  it opens ready for review, and its reviews start at once. A draft only when you say so, or when
+  more tasks for the same pull request are queued: then it asks "Es folgt noch X, als Draft
+  öffnen?".
 - **After a push** you hear only that the pull request is out, and which one. The controller never
   offers a review.
 - **The watch.** The gateway takes the pull request URLs in a run's output and checks with `gh`
@@ -1362,6 +1375,11 @@ for something, the controller is told to tell you and let you decide.
   (60), five times as long after 15 looks. Without a `gh` login it watches nothing. In Docker, a
   pull request opened with the container's token is watched only if that token belongs to the
   same account.
+- **Later pushes.** A later run that names the pull request watches it anew, from the start, also
+  after the watch stopped, so the reviews and checks that run again reach you. One that pushed to
+  it or marked it ready without naming it is caught too: when a run ends, the gateway looks again
+  at the last three pull requests it watched for that repository, and one whose head commit or
+  draft state changed while the run went counts as the run's.
 - **What becomes news:**
   - finished checks, once per push;
   - new reviews and comments, except those of the account `gh` is logged in as;
@@ -1371,7 +1389,7 @@ for something, the controller is told to tell you and let you decide.
 - **When the watch stops:**
   - nothing shows up in the first five looks;
   - the pull request is merged or closed;
-  - after `VOICE_GW_PR_WATCH_HOURS` (24).
+  - after `VOICE_GW_PR_WATCH_HOURS` (24); a later push starts it again (above).
 
 A worker's checkout must not be used at the desk while it runs there: workers switch branches in
 your checkouts. A worker never commits, stashes or discards changes it did not make.
@@ -1535,7 +1553,7 @@ do not set them.
 | A result says `git="1 commit on no remote"` although the worker pushed | The check counts commits that no remote-tracking branch (`refs/remotes/…`) has. A push to a URL instead of a named remote does not update them; `git fetch` in the checkout does. Without any remote, commits never count. |
 | What did a worker do? | `.state/tasks/<task>.jsonl` holds the whole run. `claude --resume <session>` in the repository opens the session; `.state/workers.json` lists the session ids. |
 | A private repository is handled like a public one | `gh` is not logged in or not on the `PATH`, so the visibility is unknown, and the worker asks before pushing to be safe. |
-| No news about checks or reviews on a worker's pull request | The log says why: `gh is not logged in`, or `stopped watching pull request … : nothing automatic runs` (often a draft that bot reviewers skip, with `VOICE_GW_PR_DRAFT=1`), `merged`, `closed` or `time limit`. Only pull requests on `voice/` branches that a run linked to are watched. `.state/pulls.json` lists the watches. |
+| No news about checks or reviews on a worker's pull request | The log says why: `gh is not logged in`, or `stopped watching pull request … : nothing automatic runs` (often a draft that bot reviewers skip, with `VOICE_GW_PR_DRAFT=1` or `draft`; marking it ready in a later run watches it again), `merged`, `closed` or `time limit`. Only pull requests on `voice/` branches that a run linked to, or pushed to after that, are watched. `.state/pulls.json` lists the watches. |
 | The controller cannot merge a pull request | A draft must be marked ready first (a task for the worker). Required reviews or checks, conflicts and other branch protection apply; `--admin` is blocked on purpose. With `VOICE_GW_PERMISSION_RELAY=0` the approval only appears at the terminal. |
 | The controller says a `gh` command was blocked | Only the commands in [The controller's confinement](#53-the-controllers-confinement) pass, each with `--repo owner/name` and flags as separate words. If it does not know about `gh` at all, restart the controller so that it reads the current `controller/CLAUDE.md`. |
 | The controller says a tool is blocked | Expected for every tool that is not on the confine hook's list ([confinement](#53-the-controllers-confinement)): MCP tools from your settings or plugins, subagents, skills, web access. Ask for it at the desk, or let a worker do it with `dispatch`. |
