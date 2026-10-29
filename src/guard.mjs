@@ -14,7 +14,11 @@
 //   outside         writes outside the repository and the temporary folders:
 //                   the file tools by their path, shell commands by explicit
 //                   targets (redirections, tee, cp, mv, rm, mkdir, touch, ln,
-//                   chmod, chown, truncate, sed -i, dd of=), after cd.
+//                   chmod, chown, truncate, sed -i, dd of=), after cd. The
+//                   command line is read as a shell reads it (parseShell):
+//                   quoted text, comments and heredocs are data; commands in
+//                   $(…), `…`, <(…), >(…), sh -c and a shell's heredoc are
+//                   commands. Devices such as /dev/null are no write.
 //   many changes    more file edits in a run than maxEdits; at the end, more
 //                   files or lines changed than maxFiles or maxLines, counting
 //                   commits made during the run on any branch and what is not
@@ -33,9 +37,23 @@ import { log as defaultLog, preview } from './log.mjs'
 import { tempFolders } from './platform.mjs'
 
 const FILE_TOOLS = { Write: 'file_path', Edit: 'file_path', MultiEdit: 'file_path', NotebookEdit: 'notebook_path' }
-const DEVICES = ['/dev/null', '/dev/stdout', '/dev/stderr', '/dev/tty']
 const WRAPPERS = new Set(['sudo', 'command', 'exec', 'nohup', 'time', 'env', 'nice'])
+// Words of compound commands before the command itself, or after it.
+const KEYWORDS = new Set(['if', 'then', 'else', 'elif', 'fi', 'do', 'done', 'while', 'until', '!', '{', '}', 'esac'])
+// Commands whose words are not a command: a loop's list, a case's word.
+const CLAUSES = new Set(['for', 'select', 'case', 'function'])
+const SHELLS = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh'])
 const short = sha => String(sha).slice(0, 7)
+
+// Writing to these changes no file: the null device and its kind, the
+// standard streams, terminals, and file descriptors that are open already
+// (opening them for writing was a redirection of its own).
+export function isDevice(path) {
+  return (
+    ['/dev/null', '/dev/zero', '/dev/full', '/dev/stdin', '/dev/stdout', '/dev/stderr', '/dev/tty'].includes(path) ||
+    /^\/(?:dev\/fd|proc\/self\/fd|dev\/pts)\/\d+$/.test(path)
+  )
+}
 
 // gh api options that take a value; -f and -F (fields) make it a POST.
 const GH_API_VALUES = new Set(['-H', '--header', '-q', '--jq', '-t', '--template', '--cache', '--hostname', '-p', '--preview'])
@@ -59,20 +77,304 @@ function gh(ghBin, args) {
   })
 }
 
-// Words of one shell command, quotes removed; good enough for explicit paths.
-const words = segment =>
-  (segment.match(/(?:'[^']*'|"[^"]*"|[^\s'"])+/g) ?? []).map(word => word.replace(/'([^']*)'|"([^"]*)"/g, '$1$2'))
+// --- shell command lines ------------------------------------------------------
+//
+// What the rules need from a command line, read as a shell reads it: the
+// simple commands in the order they run, each with its words (quotes removed,
+// escapes resolved; an expansion stays as written, $name or ${…}, and a
+// command substitution becomes $(…)) and the targets of its redirections that
+// write. Quoted text, comments, here-strings and heredoc bodies are data, so a
+// > or a ; in a pattern, a message or a script that is written to a file is
+// none. The commands in $(…), `…`, <(…) and >(…), in the body of a heredoc
+// without quotes around its delimiter, and in a heredoc a shell reads, are
+// commands, between { type: 'open' } and { type: 'close' }, as are those of a
+// subshell ( … ): a cd in them stays there. In (( … )), $(( … )) and [[ … ]],
+// < and > compare. Not a whole shell: what it does not see is in the README.
 
-// The segment with quoted text blanked out, so that a > in a quoted pattern or
-// message is no redirection. A quoted redirection target stays, and so do
-// escaped quotes, which open nothing, and double quotes around a command
-// substitution, whose redirections are real.
-const unquoted = segment =>
-  segment.replace(/\\.|(>>?\s*)?('[^']*'|"(?:[^"\\]|\\.)*")/gs, (all, redirect, quoted) =>
-    quoted === undefined || redirect || /^"[\s\S]*(\$\(|`)/.test(quoted) ? all : ' '.repeat(quoted.length))
+export function parseShell(source) {
+  return new ShellParser(String(source)).parse(0, null).events
+}
 
-// Segments of a command line: && || ; | and new lines.
-const segments = command => String(command).split(/&&|\|\||;|\n|\|/).map(s => s.trim()).filter(Boolean)
+const REDIRECT = /^(\d*)(&>>|&>|>>|>\||>&|>|<<<|<<-|<<|<>|<&|<)/
+const WRITES = new Set(['>', '>>', '>|', '&>', '&>>', '<>'])
+
+class ShellParser {
+  constructor(src) {
+    this.src = src
+  }
+
+  // From i to the end, or to the ) that closes what began before i (closer).
+  // Returns { events, end }, end being after the closer. Every step moves on
+  // by at least one character.
+  parse(i, closer) {
+    const src = this.src
+    const events = []
+    const pending = [] // heredocs, whose bodies begin with the next line
+    let command = null
+    let depth = 0 // subshells opened here
+    const current = at => (command ??= { type: 'command', words: [], writes: [], start: at, end: at })
+    const finish = () => {
+      if (!command) return
+      command.text = src.slice(command.start, command.end).trim()
+      events.push(command)
+      command = null
+    }
+    // In [[ … ]], < > ( ) && || belong to the test.
+    const inTest = () => {
+      const open = command?.words.lastIndexOf('[[') ?? -1
+      return open >= 0 && !command.words.slice(open).includes(']]')
+    }
+    while (i < src.length) {
+      const c = src[i]
+      const next = src[i + 1]
+      const test = '<>()&|'.includes(c) && inTest()
+      if (c === ' ' || c === '\t' || c === '\r') {
+        i++
+      } else if (c === '\\' && next === '\n') {
+        i += 2
+      } else if (c === '\n') {
+        finish()
+        i = this.heredocs(i + 1, pending, events)
+      } else if (c === '#') {
+        while (i < src.length && src[i] !== '\n') i++
+      } else if (test && '<>()'.includes(c)) {
+        current(i).words.push(c)
+        command.end = ++i
+      } else if (test && ((c === '&' && next === '&') || (c === '|' && next === '|'))) {
+        current(i).words.push(c + next)
+        command.end = i += 2
+      } else if (c === ')') {
+        finish()
+        if (depth === 0 && closer === ')') return { events, end: i + 1 }
+        if (depth > 0) {
+          depth--
+          events.push({ type: 'close' })
+        }
+        i++
+      } else if (c === '(' && next === '(' && (!command || command.words.every(w => KEYWORDS.has(w) || w === 'for'))) {
+        current(i).words.push('((…))') // arithmetic
+        command.end = i = this.arithmetic(i + 2)
+      } else if (c === '(') {
+        finish()
+        depth++
+        events.push({ type: 'open' })
+        i++
+      } else if ((c === '<' || c === '>') && next === '(') {
+        // A process substitution: its commands run, it is a word here.
+        current(i)
+        i = this.nested(i + 2, events)
+        command.words.push('$(…)')
+        command.end = i
+      } else if (REDIRECT.test(src.slice(i, i + 12)) && !(c === '&' && next !== '>')) {
+        i = this.redirect(i, current(i), pending, events)
+        command.end = i
+      } else if (c === ';' || c === '&' || c === '|') {
+        finish()
+        i += c === next || (c === '|' && next === '&') || (c === ';' && next === '&') ? 2 : 1
+        if (c === ';' && src[i] === '&') i++ // ;;&
+      } else {
+        const word = this.word(i, events)
+        current(i).words.push(word.text)
+        command.end = i = word.end
+      }
+    }
+    finish()
+    return { events, end: i }
+  }
+
+  // A redirection at i: a write target goes to the command, a heredoc waits
+  // for the next line. Returns the index after it.
+  redirect(i, command, pending, events) {
+    const src = this.src
+    const [all, fd, op] = REDIRECT.exec(src.slice(i, i + 12))
+    i += all.length
+    while (src[i] === ' ' || src[i] === '\t') i++
+    const target = this.word(i, events)
+    if (op === '<<' || op === '<<-') {
+      pending.push({ delimiter: target.text, strip: op === '<<-', quoted: target.quoted, command })
+    } else if (WRITES.has(op) || (op === '>&' && !fd && !/^(\d+-?|-)$/.test(target.text))) {
+      // >&word with a word that is no file descriptor writes to that file
+      if (target.text) command.writes.push(target.text)
+    }
+    return target.end
+  }
+
+  // A substitution's commands from i to its ), between open and close.
+  nested(i, events) {
+    const inner = this.parse(i, ')')
+    events.push({ type: 'open' }, ...inner.events, { type: 'close' })
+    return inner.end
+  }
+
+  // From inside (( to after the matching )).
+  arithmetic(i) {
+    let depth = 2
+    while (i < this.src.length) {
+      const c = this.src[i++]
+      if (c === '(') depth++
+      else if (c === ')' && --depth === 0) return i
+    }
+    return i
+  }
+
+  // One word from i: { text, quoted, end }.
+  word(i, events) {
+    const src = this.src
+    let text = ''
+    let quoted = false
+    while (i < src.length && !' \t\r\n;&|()<>'.includes(src[i])) {
+      const c = src[i]
+      if (c === '\\') {
+        if (src[i + 1] !== '\n') text += src[i + 1] ?? ''
+        quoted = true
+        i += 2
+      } else if (c === "'") {
+        const end = src.indexOf("'", i + 1)
+        const stop = end < 0 ? src.length : end
+        text += src.slice(i + 1, stop)
+        quoted = true
+        i = stop + 1
+      } else if (c === '$' && src[i + 1] === "'") {
+        // $'…', with backslash escapes
+        i += 2
+        while (i < src.length && src[i] !== "'") {
+          if (src[i] === '\\') {
+            text += src[i + 1] ?? ''
+            i += 2
+          } else {
+            text += src[i++]
+          }
+        }
+        quoted = true
+        i++
+      } else if (c === '"') {
+        quoted = true
+        i++
+        while (i < src.length && src[i] !== '"') {
+          if (src[i] === '\\' && '$`"\\\n'.includes(src[i + 1] ?? '')) {
+            if (src[i + 1] !== '\n') text += src[i + 1]
+            i += 2
+          } else if (src[i] === '$' || src[i] === '`') {
+            const expansion = this.expansion(i, events)
+            text += expansion.text
+            i = expansion.end
+          } else {
+            text += src[i++]
+          }
+        }
+        i++
+      } else if (c === '$' || c === '`') {
+        const expansion = this.expansion(i, events)
+        text += expansion.text
+        i = expansion.end
+      } else {
+        text += c
+        i++
+      }
+    }
+    return { text, quoted, end: i }
+  }
+
+  // An expansion at i ($ or `): { text, end }; the commands of a
+  // substitution go to events.
+  expansion(i, events) {
+    const src = this.src
+    if (src[i] === '`') {
+      // In backticks, \` \\ and \$ stand for the character itself.
+      let j = i + 1
+      let code = ''
+      while (j < src.length && src[j] !== '`') {
+        if (src[j] === '\\' && '`\\$'.includes(src[j + 1] ?? '')) {
+          code += src[j + 1]
+          j += 2
+        } else {
+          code += src[j++]
+        }
+      }
+      const inner = new ShellParser(code).parse(0, null)
+      events.push({ type: 'open' }, ...inner.events, { type: 'close' })
+      return { text: '$(…)', end: j + 1 }
+    }
+    const next = src[i + 1]
+    if (next === '(' && src[i + 2] === '(') return { text: '$((…))', end: this.arithmetic(i + 3) }
+    if (next === '(') return { text: '$(…)', end: this.nested(i + 2, events) }
+    if (next === '{') {
+      // ${…} to its brace; a substitution in it runs
+      let j = i + 2
+      let depth = 1
+      let text = '${'
+      while (j < src.length && depth) {
+        const c = src[j]
+        if (c === '\\') {
+          text += src.slice(j, j + 2)
+          j += 2
+        } else if (c === "'") {
+          const end = src.indexOf("'", j + 1)
+          const stop = end < 0 ? src.length : end + 1
+          text += src.slice(j, stop)
+          j = stop
+        } else if (c === '$' || c === '`') {
+          const expansion = this.expansion(j, events)
+          text += expansion.text
+          j = expansion.end
+        } else {
+          if (c === '{') depth++
+          else if (c === '}') depth--
+          text += c
+          j++
+        }
+      }
+      return { text, end: j }
+    }
+    const name = /^(?:[A-Za-z_][A-Za-z0-9_]*|[0-9@*#?$!-])/.exec(src.slice(i + 1, i + 129))?.[0] ?? ''
+    return { text: `$${name}`, end: i + 1 + name.length }
+  }
+
+  // The bodies of the heredocs opened on the line before, from i on. A body
+  // is data, unless a shell reads it as its script. In one without quotes
+  // around its delimiter, $(…) and `…` run. Returns the index after them.
+  heredocs(i, pending, events) {
+    const src = this.src
+    while (pending.length) {
+      const { delimiter, strip, quoted, command } = pending.shift()
+      let body = ''
+      while (i < src.length) {
+        const end = src.indexOf('\n', i)
+        const stop = end < 0 ? src.length : end
+        const line = src.slice(i, stop)
+        i = stop + 1
+        if ((strip ? line.replace(/^\t+/, '') : line) === delimiter) break
+        body += `${line}\n`
+      }
+      const { name, args } = commandOf(command.words)
+      if (SHELLS.has(basename(name)) && !args.some(arg => /^-[a-zA-Z]*c[a-zA-Z]*$/.test(arg))) {
+        const inner = new ShellParser(body).parse(0, null)
+        events.push({ type: 'open' }, ...inner.events, { type: 'close' })
+      } else if (!quoted) {
+        const inner = new ShellParser(body)
+        for (let j = 0; j < body.length; ) {
+          if (body[j] === '\\') j += 2
+          else if (body[j] === '$' || body[j] === '`') j = inner.expansion(j, events).end
+          else j++
+        }
+      }
+    }
+    return Math.min(i, src.length)
+  }
+}
+
+const basename = name => String(name ?? '').split('/').pop()
+
+// The command of a simple command's words: past keywords (if, do, …),
+// wrappers (sudo, env, …) and variable assignments. { name, args }.
+function commandOf(words) {
+  let at = 0
+  while (at < words.length && (KEYWORDS.has(words[at]) || WRAPPERS.has(words[at]) || /^[A-Za-z_][A-Za-z0-9_]*\+?=/.test(words[at]))) {
+    at++
+  }
+  const [name = null, ...args] = words.slice(at)
+  return { name, args }
+}
 
 // git [-C dir] [-c key=value] push [options] [remote [refspec...]]: the
 // branches it names as targets, and whether it pushes all of them; null for
@@ -293,33 +595,51 @@ export class RunGuard {
     })
   }
 
-  shell(run, command) {
-    let cwd = run.dir
-    for (const segment of segments(command)) {
-      const all = words(segment)
-      let at = 0
-      while (at < all.length && (WRAPPERS.has(all[at]) || /^[A-Za-z_][A-Za-z0-9_]*=/.test(all[at]))) at++
-      const [name, ...args] = all.slice(at)
-      if (!name) continue
-      if (name === 'cd') {
-        cwd = args[0] ? this.resolve(cwd, args[0]) : this.home
+  // The commands of a Bash call, as a shell runs them (parseShell), with the
+  // folder each runs in: cd changes it for what follows, but not out of a
+  // subshell or a substitution; after a cd whose target a variable hides,
+  // only absolute targets count. sh -c, bash -c and eval run their text.
+  shell(run, command, cwd = run.dir) {
+    const outer = []
+    for (const event of parseShell(command)) {
+      if (event.type === 'open') {
+        outer.push(cwd)
         continue
       }
-      const push = name === 'git' ? pushTargets(args) : null
-      if (push && (push.all || push.branches.includes(run.branch ?? 'main')) && !run.direct) {
-        this.violation(run, 'push to the default branch', `the command "${preview(segment, 120)}"`)
+      if (event.type === 'close') {
+        if (outer.length) cwd = outer.pop()
+        continue
       }
-      if (push) {
-        for (const branch of push.branches) run.pushed.add(branch)
-        // Whatever the command line says, GitHub has the last word, a moment later.
-        setTimeout(() => this.checkHead(run), 5000).unref()
+      const shown = `"${preview(event.text, 120)}"`
+      const { name, args } = commandOf(event.words)
+      const targets = [...event.writes]
+      if (name && !CLAUSES.has(name)) {
+        if (name === 'cd' || name === 'pushd') {
+          const dir = args.find(arg => !arg.startsWith('-') || arg === '-')
+          cwd = dir === undefined ? this.home : dir === '-' ? null : this.resolve(cwd, dir)
+        } else if (name === 'popd') {
+          cwd = null
+        }
+        const push = name === 'git' ? pushTargets(args) : null
+        if (push && (push.all || push.branches.includes(run.branch ?? 'main')) && !run.direct) {
+          this.violation(run, 'push to the default branch', `the command ${shown}`)
+        }
+        if (push) {
+          for (const branch of push.branches) run.pushed.add(branch)
+          // Whatever the command line says, GitHub has the last word, a moment later.
+          setTimeout(() => this.checkHead(run), 5000).unref()
+        }
+        const merge = name === 'gh' && !run.direct ? ghMerge(args, command) : null
+        if (merge) this.violation(run, 'push to the default branch', `the command ${shown} ${merge}`)
+        targets.push(...this.targets(name, args))
+        const c = SHELLS.has(basename(name)) ? args.findIndex(arg => /^-[a-zA-Z]*c[a-zA-Z]*$/.test(arg)) : -1
+        if (c >= 0 && args[c + 1] !== undefined) this.shell(run, args[c + 1], cwd)
+        if (name === 'eval' && args.length) this.shell(run, args.join(' '), cwd)
       }
-      const merge = name === 'gh' && !run.direct ? ghMerge(args, command) : null
-      if (merge) this.violation(run, 'push to the default branch', `the command "${preview(segment, 120)}" ${merge}`)
-      for (const target of this.targets(segment, name, args)) {
-        const path = cwd === null ? null : this.resolve(cwd, target)
+      for (const target of targets) {
+        const path = this.resolve(cwd, target)
         if (path && !this.allowed(run, path)) {
-          this.violation(run, 'write outside the allowed folders', `"${preview(segment, 120)}" writes ${path}`)
+          this.violation(run, 'write outside the allowed folders', `${shown} writes ${path}`)
         }
       }
     }
@@ -327,19 +647,42 @@ export class RunGuard {
 
   // --- writes -------------------------------------------------------------------
 
-  // Explicit write targets of one command: redirections and known commands.
-  targets(segment, name, args) {
-    const found = []
-    for (const match of unquoted(segment).matchAll(/(?:^|[^<>&0-9])(?:[0-9]|&)?>>?\s*((?:'[^']*'|"[^"]*"|[^\s;&|<>'"()`])+)/g)) {
-      if (!match[1].startsWith('&')) found.push(match[1].replace(/'([^']*)'|"([^"]*)"/g, '$1$2'))
+  // What a command writes by its operands: the files and folders of the
+  // commands that make, change or remove them.
+  targets(name, args) {
+    const operands = []
+    const valued = { cp: ['-t', '-S'], mv: ['-t', '-S'], install: ['-t', '-m', '-o', '-g', '-S'], ln: ['-t', '-S'], rsync: [] }[name] ?? []
+    let into = null // -t / --target-directory
+    for (let i = 0; i < args.length; i++) {
+      const arg = args[i]
+      if (arg === '--') {
+        operands.push(...args.slice(i + 1))
+        break
+      }
+      if (['-t', '--target-directory'].includes(arg) && valued.includes('-t')) into = args[++i]
+      else if (arg.startsWith('--target-directory=')) into = arg.slice('--target-directory='.length)
+      else if (valued.includes(arg)) i++
+      else if (!arg.startsWith('-') || arg === '-') operands.push(arg)
     }
-    const operands = args.filter(arg => !arg.startsWith('-'))
-    if (['tee', 'rm', 'rmdir', 'mkdir', 'touch', 'truncate', 'shred', 'unlink'].includes(name)) found.push(...operands)
-    else if (['chmod', 'chown', 'chgrp'].includes(name)) found.push(...operands.slice(1))
-    else if (['cp', 'mv', 'install', 'ln', 'rsync'].includes(name) && operands.length > 1) found.push(operands.at(-1))
-    else if (name === 'sed' && args.some(arg => /^-i/.test(arg) || arg === '--in-place')) found.push(...operands.slice(1))
-    else if (name === 'dd') found.push(...args.filter(arg => arg.startsWith('of=')).map(arg => arg.slice(3)))
-    return found.filter(path => !DEVICES.includes(path))
+    if (['tee', 'rm', 'rmdir', 'mkdir', 'touch', 'truncate', 'shred', 'unlink'].includes(name)) return operands
+    if (['chmod', 'chown', 'chgrp'].includes(name)) return operands.slice(1)
+    if (['cp', 'mv', 'install', 'ln', 'rsync'].includes(name)) {
+      if (into !== null) return [into]
+      if (name === 'install' && args.includes('-d')) return operands
+      return operands.length > 1 ? [operands.at(-1)] : []
+    }
+    if (name === 'sed' && args.some(arg => /^-[a-zA-Z]*i/.test(arg) || arg.startsWith('--in-place'))) {
+      // The script is the first operand, unless -e or -f gave it.
+      const scripts = args.some(arg => /^-[a-zA-Z]*[ef]$/.test(arg) || /^--(expression|file)/.test(arg))
+      const files = []
+      for (let i = 0; i < args.length; i++) {
+        if (/^-[a-zA-Z]*[ef]$/.test(args[i]) || ['--expression', '--file'].includes(args[i])) i++
+        else if (!args[i].startsWith('-')) files.push(args[i])
+      }
+      return scripts ? files : files.slice(1)
+    }
+    if (name === 'dd') return args.filter(arg => arg.startsWith('of=')).map(arg => arg.slice(3))
+    return []
   }
 
   // An absolute path, or null where a variable hides it.
@@ -353,6 +696,7 @@ export class RunGuard {
   }
 
   allowed(run, path) {
+    if (isDevice(path)) return true
     return [run.dir, ...this.allowedRoots].some(root => path === root || path.startsWith(root.replace(/\/$/, '') + '/'))
   }
 

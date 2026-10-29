@@ -766,7 +766,7 @@ controller following instructions.
 | Voice | "emergency stop" or "kill switch"; or the tool `emergency_stop`, which the voice AI calls for the same words in any language | In `send` and `ask` before anything reaches the controller: the message starts with the phrase, or has at most six words |
 | Telegram | `/stop` or a phrase | See 5.8 |
 | Rule: default branch | A push to the default branch, or a merge, without a direct dispatch at level `full`, in a repository with pull requests turned on | In the run's commands: `git push` to the default branch, `--all`, `--mirror`, `gh pr merge`, and `gh api` calls that merge (`PUT …/pulls/<n>/merge`, `POST …/merges`, the GraphQL mutations `mergePullRequest`, `enablePullRequestAutoMerge`, `mergeBranch`). With `gh`, every `VOICE_GW_KILL_CHECK` seconds and at the end: the default branch moved on GitHub, and the worker's repository holds the new head, or the new head merged a pull request of the run (below) |
-| Rule: outside | Writes outside the repository, `/tmp`, `/var/tmp` (and the system's temp folder on this computer) and `VOICE_GW_KILL_ALLOW_PATHS` | The file tools by path. Shell commands by explicit targets: redirections, `tee`, `cp`, `mv`, `rm`, `mkdir`, `touch`, `ln`, `chmod`, `chown`, `truncate`, `sed -i`, `dd of=`, also after `cd`; `$HOME` and `~` are expanded |
+| Rule: outside | Writes outside the repository, `/tmp`, `/var/tmp` (and the system's temp folder on this computer) and `VOICE_GW_KILL_ALLOW_PATHS`; writing to `/dev/null`, the standard streams, a terminal or `/dev/fd/N` is none | The file tools by path. Shell commands by explicit targets: redirections, `tee`, `cp`, `mv`, `rm`, `mkdir`, `touch`, `ln`, `chmod`, `chown`, `truncate`, `sed -i`, `dd of=`, also after `cd`; `$HOME` and `~` are expanded. The command line is read as a shell reads it: quoted text, comments, here-strings and heredoc bodies are data, so a `>` or `;` in a pattern, a commit message or a script written to a file is none; the commands in `$(…)`, backticks, `<(…)`, `>(…)`, `sh -c`, `eval` and a heredoc a shell reads are checked like any other |
 | Rule: many changes | More than 500 file edits in a run; at its end more than 300 files or 30,000 lines changed | Edits as they happen; at the end the commits made during the run plus what is not committed. `VOICE_GW_KILL_MAX_*` |
 | Controller | `raise_alarm` with a reason | One more signal, never the only one |
 
@@ -864,8 +864,9 @@ is guarded as follows:
 - **The rules see a step only after it ran.** They read the commands Claude Code reports; the
   command that breaks a rule has usually run already.
 - **Hidden actions are missed.** Not seen:
-  - a push or a write inside a script, an alias or another language;
-  - targets in variables other than `$HOME`;
+  - a push or a write inside a script, an alias or another language, also a script the run wrote
+    to a file with a heredoc and then runs;
+  - targets in variables other than `$HOME`, and relative targets after a `cd` into one;
   - writes by programs, such as `npm install` into `~/.npm`;
   - paths behind symlinks.
 
