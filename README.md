@@ -35,6 +35,7 @@ Licensed under the [Apache License 2.0](LICENSE).
 From a clone to the first voice request, on a computer with the [prerequisites](#6-prerequisites):
 Node.js 20 or later, Claude Code logged in with claude.ai, `gh` logged in, tmux and Tailscale. On
 Team and Enterprise an Owner first does the [admin steps](#74-admin-steps-for-team-and-enterprise).
+Linux or macOS ([install and test on a Mac](docs/macos.md)); on Windows, inside WSL.
 
 1. **Clone the repository** with the GitHub CLI:
 
@@ -77,7 +78,8 @@ Team and Enterprise an Owner first does the [admin steps](#74-admin-steps-for-te
    first start, and with the development flag the channel warning at every start
    ([8.1](#81-starting-and-stopping)). Run the next steps in a second terminal.
 
-5. **Start the funnel.** On Linux, run `sudo tailscale set --operator=$USER` once before.
+5. **Start the funnel.** On Linux, run `sudo tailscale set --operator=$USER` once before; the
+   macOS app needs nothing.
 
    ```bash
    scripts/funnel.sh start
@@ -891,6 +893,8 @@ is guarded as follows:
 | Docker | Tested with 29.8.0 | Optional: workers in a container | Docker installed as a snap cannot mount folders from `/tmp` |
 | tmux | Tested with 3.6 | Optional: the controller in the background | The setup assistant's autostart uses it |
 | systemd user services | – | Optional: autostart at boot on Linux | With lingering (`loginctl enable-linger`), which the setup assistant turns on; without it, only at a login and until the last logout |
+| launchd (macOS) | – | Optional: autostart at login on macOS | A LaunchAgent, which the setup assistant writes and loads; at boot only with automatic login |
+| bash | 3.2 or later | The start scripts | macOS's `/bin/bash` 3.2 will do; no GNU tools needed |
 | A public HTTPS address on port 443 | – | Claude's servers reach the gateway | Tailscale Funnel (tested, 1.104.2) or a reverse proxy |
 | Claude app | Current | Voice mode with the connector | Used on the iPhone |
 
@@ -911,7 +915,24 @@ is guarded as follows:
 - **Tested:** Ubuntu 26.04.1 LTS, for the gateway, workers on the host and in Docker, the
   watchdog and the setup assistant. The controller's Bash allowlist exists because of Ubuntu
   24.04+.
-- **Not tested:** macOS. The scripts know its paths (managed settings, LaunchAgent).
+- **macOS:** supported, with Homebrew's `node`, `git`, `gh` and `tmux`, the `claude-code` cask,
+  and Tailscale and Docker Desktop where wanted; [install and test on a Mac](docs/macos.md). The
+  scripts run with macOS's own `/bin/bash` 3.2 and BSD tools; the test suite checks them with bash
+  3.2. What differs from Linux:
+  - **Autostart:** a LaunchAgent, `~/Library/LaunchAgents/com.drawio.cc-voice-gateway.plist`, that
+    starts the controller in tmux at login (not at boot: with automatic login it comes back after a
+    restart). The setup assistant writes it with your `PATH` plus Homebrew's folders, checks it
+    with `plutil` and loads it with `launchctl` ([7.2](#72-by-hand), [8.1](#81-starting-and-stopping)).
+  - **Sleep:** while the watchdog runs, `caffeinate` keeps the Mac from idle sleep
+    (`VOICE_GW_CAFFEINATE=0` turns it off). A closed laptop lid still sends it to sleep.
+  - **Paths:** the managed settings in `/Library/Application Support/ClaudeCode/`; the temporary
+    folders the kill switch allows include `/private/tmp` and `/var/folders/…/T`; the Tailscale
+    app's command line is found without "Install CLI".
+  - Written and checked on Linux, with bash 3.2 in Docker and the macOS code paths in the tests;
+    the first run on a Mac follows the checklist in [docs/macos.md](docs/macos.md).
+- **Windows:** through WSL 2. Follow the Linux instructions inside WSL (Ubuntu); the gateway,
+  tmux and the workers run there, and the autostart is a systemd user service if WSL runs systemd.
+  Nothing runs on Windows itself.
 - **Phone and car:** the Claude app on the iPhone, in the car with CarPlay. Android and Android
   Auto are not tested; nothing in the gateway is specific to either.
 
@@ -957,7 +978,7 @@ the `localhost` link).
 | Models | Model and effort for the controller (`--model`, `--effort` from `start-controller.sh`) and for every worker run, on the host and in Docker | Choices, or Claude Code's defaults |
 | Telegram | Checks the token (`getMe`), finds your private chat with `getUpdates` once you wrote to the bot, sends a test message | A token from [@BotFather](https://t.me/BotFather), one message to the bot |
 | Workers in Docker | Checks the GitHub token and shows the level per repository with the gateway's detection. Builds the image with its progress shown. Starts the container, sets git's name and email in it, and clones the chosen repositories inside it | A token from `claude setup-token`, optionally a GitHub token ([5.6](#56-access-levels-and-their-detection)), the repositories |
-| Watchdog | On Linux, writes and enables a systemd user service that starts the controller in tmux at boot, and turns on lingering for your user so that it keeps running without a login (if that is refused, it shows the `sudo` command); or starts it now in tmux. On macOS it writes a LaunchAgent and shows the `launchctl bootstrap` command | Choices |
+| Watchdog | On Linux, writes and enables a systemd user service that starts the controller in tmux at boot, and turns on lingering for your user so that it keeps running without a login (if that is refused, it shows the `sudo` command); or starts it now in tmux. On macOS it writes a LaunchAgent that starts it in tmux at login, checks it with `plutil`, and with "start it now" loads it with `launchctl bootstrap`, which starts it (`kickstart` if it is loaded already); without, launchd loads it at the next login | Choices |
 | Plugin | Shows whether `voice@cc-voice-gateway` is on the organisation's channel allowlist; registers the marketplace if it is; otherwise shows the admin steps | The admin |
 | Finish | Writes `.secrets/` (5.10) and ends | – |
 
@@ -1027,6 +1048,18 @@ docker exec voice-workers git config --global user.email "you@example.com"
 `PATH`), then `systemctl --user enable cc-voice-gateway.service` and `loginctl enable-linger`, so
 that it starts at boot and keeps running without a login.
 
+**Autostart on macOS:** a LaunchAgent, `~/Library/LaunchAgents/com.drawio.cc-voice-gateway.plist`,
+whose `ProgramArguments` are the same tmux command with tmux's full path (launchd does not search
+the `PATH`), with `EnvironmentVariables` `PATH` (yours plus `/opt/homebrew/bin`, `/usr/local/bin`,
+`~/.local/bin` and Node's folder), `WorkingDirectory` the repository, `RunAtLoad` true, `KeepAlive`
+false (tmux returns at once; the watchdog restarts), `AbandonProcessGroup` true, and
+`StandardOutPath`/`StandardErrorPath` `~/Library/Logs/cc-voice-gateway.log`. Then:
+
+```bash
+plutil -lint ~/Library/LaunchAgents/com.drawio.cc-voice-gateway.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.drawio.cc-voice-gateway.plist  # starts it now, and at every login
+```
+
 Then go on with [Getting started](#getting-started) from step 4.
 
 ### 7.3 Publishing the endpoint
@@ -1043,7 +1076,9 @@ Claude's servers call the connector from Anthropic's cloud. Any tunnel or revers
   `VOICE_GW_MCP_ALLOW=any`;
 - allows **responses of up to a minute**, since `get_reply` waits up to 40 seconds.
 
-**Tailscale Funnel** (tested). On Linux run `sudo tailscale set --operator=$USER` once.
+**Tailscale Funnel** (tested). On Linux run `sudo tailscale set --operator=$USER` once. On macOS
+the script finds the Tailscale app's command line by itself; `VOICE_GW_TAILSCALE_BIN` names
+another.
 
 ```bash
 scripts/funnel.sh start    # prints https://<host>.ts.net/mcp; reports when all relays answer
@@ -1120,6 +1155,19 @@ scripts/start-controller.sh --stop              # stop session and watchdog
 VOICE_GW_WATCHDOG=0 scripts/start-controller.sh # without the watchdog
 ```
 
+With the autostart, the service or LaunchAgent only starts tmux; `--stop` ends the controller in
+either case.
+
+| | Linux (systemd user service) | macOS (LaunchAgent) |
+|---|---|---|
+| Start | `systemctl --user start cc-voice-gateway` | `launchctl kickstart gui/$(id -u)/com.drawio.cc-voice-gateway` |
+| Stop | `systemctl --user stop cc-voice-gateway` | `scripts/start-controller.sh --stop` |
+| Restart | `systemctl --user restart cc-voice-gateway` | `--stop`, then `kickstart` |
+| Status | `systemctl --user status cc-voice-gateway` | `launchctl print gui/$(id -u)/com.drawio.cc-voice-gateway` |
+| On at boot or login | `systemctl --user enable cc-voice-gateway` | `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.drawio.cc-voice-gateway.plist` |
+| Off | `systemctl --user disable cc-voice-gateway` | `launchctl bootout gui/$(id -u)/com.drawio.cc-voice-gateway` |
+| Its own output | `journalctl --user -u cc-voice-gateway` | `~/Library/Logs/cc-voice-gateway.log` |
+
 **What the start script does:**
 
 - **Folder and mode:** starts `claude` in `controller/` with `--permission-mode manual`.
@@ -1162,8 +1210,9 @@ tool that is not on its list ([confinement](#53-the-controllers-confinement)).
 | Gives up after this many restarts within the window | 5 in 1800 s | `VOICE_GW_WATCHDOG_MAX_RESTARTS`, `VOICE_GW_WATCHDOG_WINDOW` |
 | One watchdog at a time | lock in `.state/controller.lock` | – |
 | Settings read again before every start, so a restart takes a change; the controller level, `VOICE_GW_SECRETS_DIR`, `VOICE_GW_STATE_DIR`, `VOICE_GW_LOG_FILE` and the watchdog's own settings stay until the start script starts again | – | `.secrets/gateway.env` |
-| Log | `watchdog:` lines in `.logs/gateway.log`: who started and who stopped it (the autostart's service, or user, process and terminal), and each start's settings with where they came from | – |
+| Log | `watchdog:` lines in `.logs/gateway.log`: who started and who stopped it (the autostart's service or LaunchAgent, or user, process and terminal), and each start's settings with where they came from | – |
 | Telegram on each restart and when it gives up | if the two Telegram files exist | – |
+| macOS: no idle sleep while it runs (`caffeinate -i -s`, ended with the watchdog) | on | `VOICE_GW_CAFFEINATE` |
 
 With the development flag, a restarted session waits for the channel warning to be answered at the
 terminal (`tmux attach -t voice`, Enter); with the plugin it does not.
@@ -1380,6 +1429,7 @@ setting with where it came from.
 | `VOICE_GW_WATCHDOG_BACKOFF` | `5` | First pause in seconds |
 | `VOICE_GW_WATCHDOG_BACKOFF_MAX` | `300` | Longest pause |
 | `VOICE_GW_WATCHDOG_STABLE` | `600` | A run this long resets the pause |
+| `VOICE_GW_CAFFEINATE` | `1` | macOS: `0` lets the Mac sleep by its energy settings while the watchdog runs |
 | `VOICE_GW_CHANNEL` | chosen | `plugin` or `development` |
 | `VOICE_GW_MANAGED_SETTINGS` | `/etc/claude-code/managed-settings.json`, on macOS `/Library/Application Support/ClaudeCode/managed-settings.json` | Managed settings file on this computer |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Where Claude Code keeps `remote-settings.json` and the marketplaces |
@@ -1407,7 +1457,8 @@ do not set them.
 | `VOICE_SETUP_PORT` | `8790` | Port |
 | `VOICE_SETUP_TIMEOUT` | `30` | Minutes at most |
 | `VOICE_SETUP_IDLE` | `10` | Minutes without activity |
-| `VOICE_SETUP_GIT_BIN`, `VOICE_SETUP_TMUX_BIN`, `VOICE_SETUP_SYSTEMCTL_BIN`, `VOICE_SETUP_TAILSCALE_BIN` | `git`, `tmux`, `systemctl`, `tailscale` | Commands the assistant runs; tests use stand-ins |
+| `VOICE_SETUP_GIT_BIN`, `VOICE_SETUP_TMUX_BIN`, `VOICE_SETUP_SYSTEMCTL_BIN`, `VOICE_SETUP_LOGINCTL_BIN`, `VOICE_SETUP_LAUNCHCTL_BIN`, `VOICE_SETUP_PLUTIL_BIN`, `VOICE_SETUP_TAILSCALE_BIN` | `git`, `tmux`, `systemctl`, `loginctl`, `launchctl`, `plutil`, `tailscale` | Commands the assistant runs; tests use stand-ins. On macOS it also looks in Homebrew's folders, and for Tailscale in the app |
+| `VOICE_GW_TAILSCALE_BIN` | `tailscale`, on macOS else the Tailscale app's | The tailscale command `scripts/funnel.sh` runs |
 | `FUNNEL_PORT` | `443` | Public port of the Funnel |
 
 ### 8.8 Troubleshooting
@@ -1476,6 +1527,11 @@ do not set them.
 | `the controller is already running (watchdog …)` | A watchdog runs already, for example in another tmux window. `scripts/start-controller.sh --status`; `--stop` ends it. |
 | `watchdog: giving up …` | The session kept crashing, for example because the login expired. Look at the controller terminal, fix the cause, and start it again. |
 | After a reboot the controller runs only while you are logged in, and stops when your SSH session ends | Lingering is off for your user: `loginctl enable-linger`, or `sudo loginctl enable-linger $USER` if that is refused. The setup assistant turns it on with the autostart. |
+| macOS: after a restart of the Mac the controller does not run | LaunchAgents start at a login. Log in, or turn on automatic login (System Settings, Users & Groups; not with FileVault). `launchctl print gui/$(id -u)/com.drawio.cc-voice-gateway` shows whether it is loaded. |
+| macOS: the LaunchAgent does not start the controller | `~/Library/Logs/cc-voice-gateway.log` has tmux's message: `duplicate session: voice` means it runs already. `scripts/check-macos.sh` checks the plist, its tmux and whether its `PATH` finds node, claude, git and gh; run the setup again from a Terminal that finds them. |
+| macOS: `launchctl bootstrap` says `Bootstrap failed: 5: Input/output error` | It is loaded already: `launchctl bootout gui/$(id -u)/com.drawio.cc-voice-gateway` first, or `launchctl kickstart` to start it. Or the plist is invalid: `plutil -lint` says where. |
+| macOS: voice requests stop while nobody uses the Mac | The Mac sleeps. The watchdog's `caffeinate` prevents idle sleep (log line `caffeinate: …`, `pmset -g assertions`), not a closed lid without an external display; check that `VOICE_GW_CAFFEINATE` is not `0`. |
+| A start script fails at once with `mapfile: command not found` or another bash error on macOS | A checkout from before macOS support: pull. Since then the scripts run with bash 3.2; `scripts/check-macos.sh` runs `bash -n` on each with `/bin/bash`. |
 
 Claude Code's debug log is at `~/.claude/debug/<session-id>.txt`.
 
@@ -1504,6 +1560,7 @@ src/
   admin.mjs          Unix socket for pair.mjs, unlock.mjs and fake-voice
   config.mjs         settings from the environment and .secrets/gateway.env
   settings.mjs       reads and writes .secrets/gateway.env
+  platform.mjs       what differs on macOS: temporary folders, the autostart's PATH and names
   setup/             the setup assistant: server.mjs (guard), actions.mjs (steps), ui/ (page)
   http.mjs, log.mjs  small HTTP helpers; log to stderr and file, never stdout
 controller/
@@ -1527,11 +1584,13 @@ scripts/
   funnel.sh, check-public.mjs  Tailscale Funnel, and a check through its relays
   telegram-notify.mjs          one Telegram message, for the watchdog
   fake-voice.mjs               play the voice AI at the desk
+  check-macos.sh               the checks on a Mac, PASS or FAIL each (docs/macos.md)
 test/                one file per area; npm test runs them all, with stand-ins for Claude Code,
                      gh, docker, the GitHub API and Telegram
 docs/
   *.drawio.svg       the diagrams, made with draw.io
   index.html         the product page (GitHub Pages, from this folder)
+  macos.md           install and test on a Mac, step by step
   assets/            the video, its poster, the README thumbnail, the dark architecture diagram
 video/               the video's sources: script.json (voiceover), slides.html (frames), build.mjs
 ```
