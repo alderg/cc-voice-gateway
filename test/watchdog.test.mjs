@@ -4,7 +4,9 @@
 //
 // A fake claude follows a plan, one step per start: exit with a code, run
 // until stopped, or serve the gateway's /healthz for a while and then stop
-// answering. A local HTTP server stands in for the Telegram Bot API; no test
+// answering; with stats, it saves the statistics as the gateway does, at its
+// start and its end (src/stats.mjs), for the message when the gateway shuts
+// down. A local HTTP server stands in for the Telegram Bot API; no test
 // reaches the real one, and the real .state, log and .secrets stay untouched.
 
 import { test, before, after } from 'node:test'
@@ -15,6 +17,9 @@ import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+
+process.env.VOICE_GW_LOG_FILE = ''
+const { Stats } = await import('../src/stats.mjs')
 
 const SCRIPT = fileURLToPath(new URL('../scripts/start-controller.sh', import.meta.url))
 const NOTIFY = fileURLToPath(new URL('../scripts/telegram-notify.mjs', import.meta.url))
@@ -38,12 +43,24 @@ const note = event => appendFileSync(process.env.FAKE_CLAUDE_LOG, JSON.stringify
   pid: process.pid, event, step, lock: lock ?? null, mode: process.env.VOICE_GW_CHANNEL_MODE ?? null, restarted, settings, fromFile,
 }) + '\\n')
 note('start')
+// the gateway's statistics: saved as it starts, and with the end as it ends
+const startedAt = Date.now()
+const saveStats = ended => {
+  if (!step.stats) return
+  const data = JSON.parse(readFileSync(process.env.FAKE_STATS, 'utf8'))
+  data.current.since = startedAt
+  data.session = process.pid // the gateway notes its parent, this session
+  if (ended) data.current.endedAt = Date.now()
+  writeFileSync(process.env.VOICE_GW_STATE_DIR + '/stats.json', JSON.stringify(data))
+}
+saveStats(false)
 // what the setup assistant does meanwhile: new settings, for the next start
 if ('settings' in step) writeFileSync(process.env.VOICE_GW_SECRETS_DIR + '/gateway.env', step.settings)
-process.on('SIGTERM', () => { note('SIGTERM'); process.exit(143) })
+process.on('SIGTERM', () => { note('SIGTERM'); saveStats(true); process.exit(143) })
 if (step.restart) {
   // what the gateway does for restart_controller: a note for the watchdog, then SIGTERM
   writeFileSync(lock + '/restart', JSON.stringify({ by: 'voice', at: new Date().toISOString() }))
+  saveStats(true)
   process.exit(143)
 } else if (step.serve) {
   // the gateway answers for a while, then no longer, while the session goes on
@@ -53,6 +70,7 @@ if (step.restart) {
 } else if (step.run) {
   setInterval(() => {}, 1000)
 } else {
+  saveStats(true)
   process.exit(step.exit)
 }
 `
@@ -60,11 +78,20 @@ if (step.restart) {
 // --- the stand-in Telegram API -------------------------------------------------
 
 const telegram = { server: null, url: '', messages: [], fail: false }
+const STATS = join(TMP, 'stats-template.json') // what a gateway saved: two hours, two runs, a question
 
 before(async () => {
   mkdirSync(BIN, { recursive: true })
   writeFileSync(join(BIN, 'claude'), FAKE_CLAUDE)
   chmodSync(join(BIN, 'claude'), 0o755)
+  const clock = { now: Date.now() }
+  const stats = new Stats({ file: STATS, now: () => clock.now, log: () => {} })
+  for (const [id, state] of [['t1', 'done'], ['t2', 'failed']]) {
+    stats.runEnded({ id, repo: 'alpha', kind: 'repo', state, startedAt: clock.now, finishedAt: clock.now + 20 * 60000 })
+  }
+  stats.current.voice.requests = 3
+  clock.now += 2 * 60 * 60000
+  stats.close()
   telegram.server = createServer((req, res) => {
     let body = ''
     req.on('data', chunk => (body += chunk))
@@ -120,6 +147,7 @@ function setup(plan, { secrets = true, env = {} } = {}) {
       VOICE_GW_WATCHDOG_INTERVAL: '0.2',
       FAKE_CLAUDE_PLAN: join(dir, 'plan.json'),
       FAKE_CLAUDE_LOG: join(dir, 'claude.jsonl'),
+      FAKE_STATS: STATS,
       CLAUDE_CONFIG_DIR: join(dir, 'claude-config'),
       VOICE_GW_MANAGED_SETTINGS: join(dir, 'no-managed-settings.json'),
       ...env,
@@ -252,7 +280,7 @@ test('a restart the controller asked for starts again at once, does not count, a
   const sent = telegram.messages.slice(before).map(m => m.text)
   assert.equal(sent.length, 2, sent.join('\n'))
   for (const text of sent) {
-    assert.match(text, /: the controller restarts now \(requested by voice\)\. Confirm the development channel at the terminal \(tmux attach -t voice\), otherwise voice requests do not arrive\. A message follows when it is ready\.$/)
+    assert.match(text, /: a restart was requested by voice; the controller restarts now\. Confirm the development channel at the terminal \(tmux attach -t voice\), otherwise voice requests do not arrive\. A message follows when it is ready\.$/)
   }
 })
 
@@ -369,7 +397,7 @@ test('Claude in Chrome: marked as seen, a restart needs no confirmation; if it c
   asPlugin(restarted)
   assert.equal((await run(restarted)).status, 0)
   assert.deepEqual(telegram.messages.slice(before).map(m => m.text.replace(/^.*?: /, '')), [
-    "the controller restarts now (requested by voice). Claude in Chrome's notice for the first start may wait for Enter at the terminal (tmux attach -t voice). A message follows when it is ready.",
+    "a restart was requested by voice; the controller restarts now. Claude in Chrome's notice for the first start may wait for Enter at the terminal (tmux attach -t voice). A message follows when it is ready.",
   ])
 })
 
@@ -405,7 +433,7 @@ test('a restart of the autostart\'s service: one message as it begins, and the n
   assert.match(c.log(), /watchdog: stop requested by the service cc-voice-gateway\.service/)
   assert.match(c.log(), /watchdog: a restart of the service cc-voice-gateway\.service: the controller session starts again right after this stop/)
   assert.deepEqual(telegram.messages.slice(before).map(m => m.text.replace(/^.*?: /, '')), [
-    'the controller restarts now (a restart of the service cc-voice-gateway.service). Confirm the development channel at the terminal (tmux attach -t voice), otherwise voice requests do not arrive. A message follows when it is ready.',
+    'a restart of the service cc-voice-gateway.service was requested; the controller restarts now. Confirm the development channel at the terminal (tmux attach -t voice), otherwise voice requests do not arrive. A message follows when it is ready.',
   ])
 
   // systemd starts the next watchdog: it tells its gateway why, for the
@@ -443,7 +471,88 @@ test('a crash sends its own message only; a restart on purpose one that it begin
   const sent = telegram.messages.slice(before).map(m => m.text.replace(/^.*?: /, ''))
   assert.equal(sent.length, 2, sent.join('\n'))
   assert.match(sent[0], /^the controller session crashed \(exit code 1\) and starts again in 0\.05 s\. /)
-  assert.match(sent[1], /^the controller restarts now \(requested by voice\)\. /)
+  assert.match(sent[1], /^a restart was requested by voice; the controller restarts now\. /)
+})
+
+// --- the shutdown message with the statistics ------------------------------------
+
+const texts = (before, c) => telegram.messages.slice(before).map(m => m.text.replace(/^cc-voice-gateway on [^:]*: /, ''))
+const SHUTDOWN_STATS = /\n\nIn 2 h: 2 worker runs \(1 done, 1 failed\), 40 min of work\. 3 voice requests\.\n\nAll time, since \d{4}-\d\d-\d\d \(1 start\): 2 worker runs, 40 min of work\./
+
+test('a restart by voice: "a restart was requested", then the shutdown message with the statistics; quitting sends the shutdown message too', async () => {
+  const before = telegram.messages.length
+  const c = setup([{ restart: true, stats: true }, { exit: 0, stats: true }])
+  assert.equal((await run(c)).status, 0)
+  const sent = texts(before, c)
+  assert.equal(sent.length, 3, sent.join('\n---\n'))
+  assert.match(sent[0], /^a restart was requested by voice; the controller restarts now\. Confirm the development channel at the terminal/)
+  assert.match(sent[1], /^the gateway is shutting down now for the restart\. Its statistics:/)
+  assert.match(sent[1], SHUTDOWN_STATS)
+  assert.match(sent[1], /\n\nA message follows when it is ready again\.$/)
+  assert.match(sent[2], /^the gateway is shutting down now \(the controller session was ended at the terminal\)\. Its statistics:/)
+  // The next gateway sends the third of the restart: that the controller is ready again.
+  assert.equal(c.starts()[1].restarted, 'a restart requested by voice')
+  assert.match(c.log(), /watchdog: telegram: sent the shutdown message with the statistics/)
+})
+
+test('a restart of the service: --stop says it was requested, the stopping watchdog sends the statistics; a plain stop only the statistics', async () => {
+  const c = setup([{ run: true, stats: true }, { exit: 0 }])
+  let before = telegram.messages.length
+  const first = spawn(SCRIPT, [], { env: c.env, stdio: 'ignore' })
+  const done = exited(first)
+  await waitUntil(() => existsSync(join(c.dir, 'state', 'controller.lock', 'claude.pid')))
+  assert.equal((await runCommand(SCRIPT, ['--stop'], systemd(c, 'restart'))).status, 0)
+  assert.equal(await done, 0)
+  let sent = texts(before, c)
+  assert.equal(sent.length, 2, sent.join('\n---\n'))
+  assert.match(sent[0], /^a restart of the service cc-voice-gateway\.service was requested; the controller restarts now\./)
+  assert.match(sent[1], /^the gateway is shutting down now for the restart\. Its statistics:/)
+  assert.ok(existsSync(join(c.dir, 'state', 'controller.restarting')), 'the note stays for the next watchdog')
+
+  // The next watchdog's session quits before its gateway saved anything: no message.
+  before = telegram.messages.length
+  assert.equal((await run(c)).status, 0)
+  assert.equal(telegram.messages.length, before)
+  assert.match(c.log(), /watchdog: statistics: none saved by a gateway of this session/)
+
+  const stop = setup([{ run: true, stats: true }])
+  before = telegram.messages.length
+  const again = spawn(SCRIPT, [], { env: stop.env, stdio: 'ignore' })
+  const ended = exited(again)
+  await waitUntil(() => existsSync(join(stop.dir, 'state', 'controller.lock', 'claude.pid')))
+  assert.equal((await runCommand(SCRIPT, ['--stop'], systemd(stop, 'stop'))).status, 0)
+  assert.equal(await ended, 0)
+  sent = texts(before, stop)
+  assert.equal(sent.length, 1, sent.join('\n---\n'))
+  assert.match(sent[0], /^the gateway is shutting down now \(the service cc-voice-gateway\.service was stopped\)\. Its statistics:/)
+  assert.match(sent[0], SHUTDOWN_STATS)
+})
+
+test('a stop at the computer: the statistics, without who stopped it; a crash keeps its one message; an older file says nothing', async () => {
+  const c = setup([{ run: true, stats: true }])
+  let before = telegram.messages.length
+  const first = spawn(SCRIPT, [], { env: c.env, stdio: 'ignore' })
+  const done = exited(first)
+  await waitUntil(() => existsSync(join(c.dir, 'state', 'controller.lock', 'claude.pid')))
+  assert.equal((await run(c, ['--stop'])).status, 0)
+  assert.equal(await done, 0)
+  let sent = texts(before, c)
+  assert.deepEqual(sent.map(text => text.split('\n')[0]), ['the gateway is shutting down now (stopped at the computer). Its statistics:'])
+
+  before = telegram.messages.length
+  const crash = setup([{ exit: 1, stats: true }, { exit: 0 }])
+  assert.equal((await run(crash)).status, 0)
+  sent = texts(before, crash)
+  assert.equal(sent.length, 1, sent.join('\n---\n'))
+  assert.match(sent[0], /^the controller session crashed \(exit code 1\)/)
+
+  // The statistics of a gateway of another session: not this one's.
+  before = telegram.messages.length
+  const stale = setup([{ exit: 0 }])
+  mkdirSync(join(stale.dir, 'state'), { recursive: true })
+  writeFileSync(join(stale.dir, 'state', 'stats.json'), JSON.stringify({ ...JSON.parse(readFileSync(STATS, 'utf8')), session: 1 }))
+  assert.equal((await run(stale)).status, 0)
+  assert.equal(telegram.messages.length, before)
 })
 
 test('VOICE_GW_WATCHDOG=0 starts claude directly, as before', async () => {

@@ -69,6 +69,7 @@ const GATEWAY_TOOLS = [
   'order_queue',
   'open_items',
   'resolve_decision',
+  'stats',
   'restart_controller',
   'raise_alarm',
   'clone_repo',

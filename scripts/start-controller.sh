@@ -53,17 +53,22 @@
 # VOICE_GW_WATCHDOG_MAX_RESTARTS restarts within VOICE_GW_WATCHDOG_WINDOW
 # seconds. Quitting the session (exit code 0, or Ctrl+C) or --stop ends it for
 # good. One watchdog at a time. Restarts go to the gateway's log, and to
-# Telegram if .secrets/telegram_token and .secrets/telegram_chat_id exist: one
-# message when a restart begins, a crash or one on purpose, and one from the
-# gateway when the controller is ready again (src/restart.mjs). With the
-# development flag, a restart waits for the warning to be answered at the
-# terminal, and so does a start whose Claude in Chrome notice could not be
-# marked as seen; the message says so. See the README, "The watchdog". The
-# controller can also ask for a restart (restart_controller, src/restart.mjs):
-# that one starts again at once and does not count as a crash. A restart of
-# the autostart's systemd service (systemctl --user restart) runs --stop with
-# systemd's job "restart": --stop then says on Telegram that the restart
-# begins, and leaves the reason for the watchdog that starts next. Before every
+# Telegram if .secrets/telegram_token and .secrets/telegram_chat_id exist. A
+# restart on purpose: "a restart was requested", then the message that the
+# gateway is shutting down, with the statistics of its running time
+# (scripts/stats.mjs, from the file the gateway saves), and one from the next
+# gateway when the controller is ready again (src/restart.mjs). A stop, or
+# quitting the session, sends only the shutdown message; a crash only its own
+# message, and the ready one; a plain start nothing. With the development
+# flag, a restart waits for the warning to be answered at the terminal, and so
+# does a start whose Claude in Chrome notice could not be marked as seen; the
+# message that the restart was requested says so. See the README, "The
+# watchdog". The controller can also ask for a restart (restart_controller,
+# src/restart.mjs): that one starts again at once and does not count as a
+# crash. A restart of the autostart's systemd service (systemctl --user
+# restart) runs --stop with systemd's job "restart": --stop then says on
+# Telegram that the restart was requested, and leaves the reason for this
+# watchdog's shutdown message and for the watchdog that starts next. Before every
 # start the watchdog reads .secrets/gateway.env again, so that a restart takes
 # changed settings; only the level and the folders this script took at its own
 # start stay until it starts again. The log says who started and stopped it,
@@ -190,13 +195,34 @@ terminal_hint() {
   printf '%s' "$hint"
 }
 
-# A restart on purpose begins: one message, with the reason ($1) and what the
-# start may wait for ($2: the channel mode). The gateway sends the next one
+# A restart on purpose begins: "a restart was requested" ($1 says by whom),
+# with what the start may wait for ($2: the channel mode). The shutdown
+# message with the statistics follows (report_stats), and the next gateway's
 # when the controller is ready again. A crash has its own message instead.
 announce_restart() {
   local hint
   hint=$(terminal_hint "$2")
-  notify "cc-voice-gateway on $host: the controller restarts now ($1).${hint:+ $hint} A message follows when it is ready."
+  notify "cc-voice-gateway on $host: $1; the controller restarts now.${hint:+ $hint} A message follows when it is ready."
+}
+
+# The session has ended on purpose, and its gateway with it: the message that
+# the gateway is shutting down, with the statistics of its running time
+# (scripts/stats.mjs). $1: "restart", or why it stops. Only for the gateway
+# of the session that ended ($session_pid), if it saved its statistics; never
+# after a crash.
+report_stats() {
+  local result args=(--shutdown --session "${session_pid:-0}")
+  if [ "$1" = restart ]; then args+=(--restart); else args+=(--why "$1"); fi
+  result=$(node "$ROOT/scripts/stats.mjs" "${args[@]}" 2>&1) || true
+  [ "$result" = 'telegram: not set up' ] || log "$result"
+}
+
+# Whether --stop left a note just now: a restart of the service, not a stop.
+service_restarting() {
+  local at= reason=
+  [ -f "$RESTARTING" ] || return 1
+  read -r at reason <"$RESTARTING" || true
+  [[ $at =~ ^[0-9]+$ ]] && [ $(($(date +%s) - at)) -lt 600 ]
 }
 
 # The job systemd runs for the autostart's service at this moment: "restart"
@@ -262,8 +288,8 @@ if [ "${1:-}" = --status ] || [ "${1:-}" = --stop ]; then
     printf '%s %s\n' "$(date +%s)" "$reason" >"$RESTARTING"
     log "$reason: the controller session starts again right after this stop"
     case $(node "$ROOT/scripts/channel-mode.mjs" 2>/dev/null || echo development) in
-      plugin*) announce_restart "$reason" plugin ;;
-      *) announce_restart "$reason" development ;;
+      plugin*) announce_restart "$reason was requested" plugin ;;
+      *) announce_restart "$reason was requested" development ;;
     esac
   fi
   [ -n "$session" ] && kill -TERM "$session" 2>/dev/null || true
@@ -467,6 +493,7 @@ while :; do
   # In the foreground, so that the session owns the terminal; the small shell
   # notes its process id and then becomes claude.
   sh -c 'echo $$ > "$1"; shift; exec "$@"' sh "$LOCK/claude.pid" claude "${claude_args[@]}" "$@" || status=$?
+  session_pid=$(cat "$LOCK/claude.pid" 2>/dev/null || true) # its gateway's parent, for report_stats
   kill "$monitor_pid" 2>/dev/null || true
   wait "$monitor_pid" 2>/dev/null || true
   monitor_pid=
@@ -476,13 +503,26 @@ while :; do
   if [ "$stopping" = 1 ] || [ -e "$STOP" ]; then
     by=$(cat "$STOP" 2>/dev/null || true)
     log "the controller session was stopped${by:+ by $by} (exit code $status): not restarting"
+    # The driver hears that the gateway shuts down, and why: for the restart
+    # of the service that --stop announced, or a stop, without who exactly
+    # (the log has it).
+    if service_restarting; then
+      report_stats restart
+    elif [ "$by" = "the service $SERVICE" ]; then
+      report_stats "the service $SERVICE was stopped"
+    elif [ -n "$by" ]; then
+      report_stats 'stopped at the computer'
+    else
+      report_stats stopped
+    fi
     exit 0
   fi
   if [ -e "$LOCK/restart" ]; then
     by=$(sed -n 's/.*"by":"\([^"]*\)".*/\1/p' "$LOCK/restart")
     log "the controller session ended for a restart requested by ${by:-the controller} (exit code $status): starting it again at once, not counted as a crash"
     printf 'a restart requested by %s\n' "${by:-the controller}" >"$LOCK/restarted"
-    announce_restart "requested by ${by:-the controller}" "$channel_mode"
+    announce_restart "a restart was requested by ${by:-the controller}" "$channel_mode"
+    report_stats restart
     next="starting the controller session again (requested restart)"
     continue
   fi
@@ -490,9 +530,11 @@ while :; do
     reason="its gateway stopped answering"
   elif [ "$status" = 0 ]; then
     log "the controller session ended normally (exit code 0): not restarting"
+    report_stats 'the controller session was ended at the terminal'
     exit 0
   elif [ "$status" = 130 ]; then
     log "the controller session ended with Ctrl+C (exit code 130): not restarting"
+    report_stats 'the controller session was ended at the terminal'
     exit 0
   elif [ "$status" -gt 128 ]; then
     reason="killed by signal $(kill -l $((status - 128)) 2>/dev/null || echo $((status - 128))) (exit code $status)"

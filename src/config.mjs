@@ -241,6 +241,8 @@ config.requestsFile = join(config.stateDir, 'requests.json')
 config.jobsFile = join(config.stateDir, 'jobs.json')
 config.adminSocket = join(config.secretsDir, 'admin.sock')
 config.pullsStateFile = join(config.stateDir, 'pulls.json')
+// The statistics of this running time and of all time (stats.mjs).
+config.statsFile = join(config.stateDir, 'stats.json')
 config.telegramTokenFile = join(config.secretsDir, 'telegram_token')
 config.telegramChatIdFile = join(config.secretsDir, 'telegram_chat_id')
 // The kill switch's state: outside controller/, and not in .secrets/worker.

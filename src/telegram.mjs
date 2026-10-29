@@ -15,8 +15,9 @@
 // sign-ins (ipguard.mjs), the Funnel (funnel.mjs) and the watchdog.
 //
 // Inbound, the gateway takes a few commands from the configured private chat:
-// the kill switch (/stop or an emergency phrase), and the Tailscale Funnel on
-// and off (/funnel on, /funnel off, /funnel, "keep alive"; see funnel.mjs).
+// the kill switch (/stop or an emergency phrase), the Tailscale Funnel on
+// and off (/funnel on, /funnel off, /funnel, "keep alive"; see funnel.mjs),
+// and the statistics (/stats, /stats all; see stats.mjs).
 //
 // On only when .secrets/telegram_token and .secrets/telegram_chat_id both
 // exist and are not empty. The token is part of every API address, so it must
@@ -135,12 +136,19 @@ export function funnelCommand(text) {
   return FUNNEL_WORDS[words] ?? null
 }
 
+// The statistics: /stats for this running time, /stats all for all time.
+export function statsCommand(text) {
+  const match = /^\/stats(?:@\w+)?(?:\s+(all))?$/i.exec(String(text).trim())
+  return match ? { all: Boolean(match[1]) } : null
+}
+
 // Waits `ms`, or less if the signal aborts. The timer's abort listener goes
 // away with it, so a long run of backoffs leaves none behind.
 export const pause = (ms, signal) => delay(ms, undefined, { signal }).catch(() => {})
 
 // Inbound: polls the bot for messages from the configured private chat and
-// emits 'stop' for a stop command and 'funnel' for a Funnel command. Every
+// emits 'stop' for a stop command, 'funnel' for a Funnel command and 'stats'
+// for the statistics. Every
 // other chat, and every other message, is ignored. A command older than
 // maxAgeSeconds, sent while the gateway was not listening, does not count:
 // Telegram keeps messages for a day, and yesterday's /funnel on must not open
@@ -211,7 +219,8 @@ export class TelegramCommands extends EventEmitter {
     }
     const stop = isStopCommand(message.text)
     const funnel = stop ? null : funnelCommand(message.text)
-    if (!stop && !funnel) return
+    const stats = stop || funnel ? null : statsCommand(message.text)
+    if (!stop && !funnel && !stats) return
     const age = Math.round(Date.now() / 1000 - Number(message.date))
     if (age > this.maxAgeSeconds) {
       this.log(`telegram commands: ignored "${preview(message.text, 40)}", sent ${age} s ago`)
@@ -219,7 +228,8 @@ export class TelegramCommands extends EventEmitter {
       return
     }
     if (stop) this.emit('stop', { text: message.text })
-    else this.emit('funnel', { action: funnel, text: message.text })
+    else if (funnel) this.emit('funnel', { action: funnel, text: message.text })
+    else this.emit('stats', { all: stats.all, text: message.text })
   }
 }
 

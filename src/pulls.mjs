@@ -77,6 +77,12 @@ function outcome(check) {
   return 'failed'
 }
 
+// The checks' outcomes in numbers, for the statistics.
+function checkCounts(checks) {
+  const count = what => checks.filter(c => outcome(c) === what).length
+  return { passed: count('passed'), failed: count('failed'), skipped: count('skipped') }
+}
+
 function describeChecks(checks) {
   const failed = checks.filter(c => outcome(c) === 'failed').map(c => c.name || c.context || 'unnamed')
   const passed = checks.filter(c => outcome(c) === 'passed').length
@@ -173,8 +179,9 @@ export class PullWatcher extends EventEmitter {
   // --- watching -----------------------------------------------------------
 
   // The pull requests a finished run opened or worked on, as gh shows them:
-  // [{ number, title, isDraft, url }]. Starts watching each of them: those it
-  // names by URL, and earlier ones of its repository that changed while it
+  // [{ number, title, isDraft, url, opened }], opened when the gateway never
+  // watched it before, for the statistics. Starts watching each of them: those
+  // it names by URL, and earlier ones of its repository that changed while it
   // went (earlier).
   async fromRun(task) {
     if (!task.slug) return []
@@ -184,7 +191,8 @@ export class PullWatcher extends EventEmitter {
     const since = task.startedAt ?? Date.now()
     const found = []
     const add = pr => {
-      found.push({ number: pr.number, title: pr.title, isDraft: Boolean(pr.isDraft), url: pr.url })
+      const opened = !this.watches.some(w => w.key === `${task.slug}#${pr.number}`)
+      found.push({ number: pr.number, title: pr.title, isDraft: Boolean(pr.isDraft), url: pr.url, opened })
       this.note(this.watch({ worker: task.repo, slug: task.slug, number: pr.number, title: pr.title }), pr)
     }
     for (const number of named) {
@@ -281,11 +289,13 @@ export class PullWatcher extends EventEmitter {
     const comments = (pr.comments ?? []).filter(c => !own(c.author?.login))
     const lines = []
     const kinds = []
+    let finished = null // the checks' outcomes, for the statistics
 
     if (checks.length && checks.every(complete) && pr.headRefOid && !entry.checked.includes(pr.headRefOid)) {
       entry.checked = [...entry.checked, pr.headRefOid].slice(-20)
       lines.push(describeChecks(checks))
       kinds.push('checks')
+      finished = checkCounts(checks)
     }
     const newReviews = reviews.filter(r => !entry.reviews.includes(r.id))
     if (newReviews.length) {
@@ -332,6 +342,10 @@ export class PullWatcher extends EventEmitter {
         slug: entry.slug,
         number: entry.number,
         kind: kinds.join(','),
+        // In numbers, for the statistics (stats.mjs).
+        checks: finished,
+        reviews: newReviews.map(review => String(review.state)),
+        comments: newComments.length,
         text: [
           `Pull request ${entry.number} in ${entry.slug} (worker ${entry.worker}): "${preview(pr.title, 80)}".`,
           ...lines,

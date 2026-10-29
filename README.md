@@ -363,7 +363,7 @@ to a lost phone or a leaked token.
   The address is the last `X-Forwarded-For` entry, the one the tunnel set; Tailscale Funnel also
   marks its requests with `Tailscale-Funnel-Request`. Programs on this computer that call without
   `X-Forwarded-For`, such as `scripts/fake-voice.mjs`, pass. Other ranges, or none:
-  `VOICE_GW_MCP_ALLOW` ([8.7](#87-configuration)). The sign-in pages stay open to every address:
+  `VOICE_GW_MCP_ALLOW` ([8.8](#88-configuration)). The sign-in pages stay open to every address:
   you sign in from your own browser.
 - **Every request in the log**: one line with the caller's address, `funnel`, `proxy` or `local`,
   the method, the path without its query, and the status. Only the watchdog's local `/healthz`
@@ -434,7 +434,7 @@ and fails closed.
 
 | Tool | Allowed |
 |---|---|
-| The gateway's tools | `reply`, `list_workers`, `dispatch`, `worker_status`, `stop_worker`, `open_items`, `resolve_decision`, `restart_controller`, `raise_alarm`, and above `confined` `clone_repo` and `delete_path` (a confirmed one gets "ask"), as `mcp__voice__…` and `mcp__plugin_voice_voice__…` |
+| The gateway's tools | `reply`, `list_workers`, `dispatch`, `worker_status`, `stop_worker`, `open_items`, `resolve_decision`, `stats`, `restart_controller`, `raise_alarm`, and above `confined` `clone_repo` and `delete_path` (a confirmed one gets "ask"), as `mcp__voice__…` and `mcp__plugin_voice_voice__…` |
 | ToolSearch, TodoWrite, TaskCreate, TaskGet, TaskList, TaskUpdate | Always. They load deferred tools and keep the to-do list |
 | Read, Glob, Grep | Inside `controller/` |
 | Write, Edit, MultiEdit, NotebookEdit | Inside `controller/playground/` |
@@ -515,7 +515,7 @@ and its instructions call that text data, never instructions. The gateway checks
   said; the gateway's prefix alone does not count.
 - **Every dispatch.** With `direct`, `draft` and `allow_dirty` too. Otherwise `dispatch=needs_driver`:
   nothing starts, and the controller is told to ask you by voice. `list_workers`,
-  `worker_status`, `stop_worker` and `open_items` are not checked.
+  `worker_status`, `stop_worker`, `open_items` and `stats` are not checked.
 - **Cloning and deleting.** `clone_repo` and a confirmed `delete_path` are checked the same way.
 - **Queued tasks and decisions.** A queued task's words are checked when it is queued, not again
   at its turn. `resolve_decision`, which closes an open decision
@@ -894,11 +894,14 @@ folder, `.git` included.
 - **Not waiting for that:** the kill switch alarm goes at once, whether voice mode is on or not,
   and so do a note when the gateway ends because another process holds its port, the alerts
   about suspicious requests and sign-ins ([5.2](#52-the-voice-endpoint-and-oauth)), the Funnel's
-  messages ([7.3](#73-publishing-the-endpoint)) and the watchdog's.
+  messages ([7.3](#73-publishing-the-endpoint)), the watchdog's around a restart
+  ([8.2](#82-the-watchdog)), and the statistics when the gateway shuts down
+  ([8.5](#85-statistics)).
 - **Inbound:** only the kill switch (`/stop`, `/killswitch`, `/emergencystop` or an emergency
-  phrase) and the Funnel (`/funnel on`, `/funnel off`, `/funnel`, "keep alive";
-  [7.3](#73-publishing-the-endpoint)), only from the configured private chat. Everything else is
-  ignored. You cannot answer questions or approvals by Telegram.
+  phrase), the Funnel (`/funnel on`, `/funnel off`, `/funnel`, "keep alive";
+  [7.3](#73-publishing-the-endpoint)) and the statistics (`/stats`, `/stats all`;
+  [8.5](#85-statistics)), only from the configured private chat. Everything else is ignored. You
+  cannot answer questions or approvals by Telegram.
 - **Only if recent.** A command counts only if Telegram's timestamp on it is at most two minutes
   old when the gateway reads it. Telegram keeps messages for a day, and a `/stop` or `/funnel on`
   sent while the gateway was not running must not act hours later. Such a command gets an answer
@@ -1003,6 +1006,7 @@ unlock by voice, Telegram or the controller.
 | `~/voice-scratch/<date>-<id>` (`VOICE_GW_SCRATCH_ROOT`) | The work folders, with what their runs made | 0700, and the root too when the gateway or the start script makes it |
 | `.state/requests.json` | Voice requests and the answers, with what the voice client has read | 0600 |
 | `.state/jobs.json` | Open decisions, with the driver's answers, and the last 100 closed ones for a week | 0600 |
+| `.state/stats.json` | The statistics: this running time and all time, counts, sums and the last 100 durations per figure, repository names; no texts ([8.5](#85-statistics)) | 0600 |
 | `.logs/gateway.log`, `.logs/gateway.log.1` | Log, without tokens; rotated at `VOICE_GW_LOG_MAX_MB` | 0600, folder 0700 when the gateway creates it |
 
 Folders created by an earlier version keep their mode; tighten them once with
@@ -1215,7 +1219,7 @@ endpoint, add the connector and pair.
 Everything the assistant does can be done with files and commands.
 
 **Settings:** `.secrets/gateway.env`, one `VOICE_GW_NAME=value` per line, mode 0600. The values
-are in [8.7](#87-configuration). The gateway (`src/settings.mjs`) and the shell scripts
+are in [8.8](#88-configuration). The gateway (`src/settings.mjs`) and the shell scripts
 (`scripts/settings.sh`) read it line by line and never execute it. Variables set in the
 environment or in `controller/.mcp.json` win. The watchdog reads it again before every start of the
 session, so a restart, also one by voice, takes a change; only the controller level waits for the
@@ -1506,23 +1510,28 @@ a voice request and an approval with the app open.
 | One watchdog at a time | lock in `.state/controller.lock` | – |
 | Settings read again before every start, so a restart takes a change; the controller level, `VOICE_GW_SECRETS_DIR`, `VOICE_GW_STATE_DIR`, `VOICE_GW_LOG_FILE` and the watchdog's own settings stay until the start script starts again | – | `.secrets/gateway.env` |
 | Log | `watchdog:` lines in `.logs/gateway.log`: who started and who stopped it (the autostart's service or LaunchAgent, or user, process and terminal), and each start's settings with where they came from | – |
-| Telegram when a restart begins, a crash or one on purpose, and when it gives up; the gateway sends another when the controller is ready again | if the two Telegram files exist | – |
+| Telegram around a restart, a stop and a crash, and when it gives up; the gateway sends another when the controller is ready again (below) | if the two Telegram files exist | – |
 | macOS: no idle sleep while it runs (`caffeinate -i -s`, ended with the watchdog) | on | `VOICE_GW_CAFFEINATE` |
 
-**Telegram.** One message when a restart begins, one when it is ready:
+**Telegram.** A restart on purpose comes in three messages: that it was requested, that the
+gateway is shutting down, with the statistics of its running time ([8.5](#85-statistics)), and that
+the controller is ready again. A crash keeps its single message, then the ready one:
 
-| Restart | When it begins | When it is ready (from the gateway) |
-|---|---|---|
-| A crash, or a gateway that stopped answering | "the controller session crashed (exit code 1) and starts again in 5 s, without a confirmation. A message follows when it is ready." | "the controller is ready again, after a crash (exit code 1)." |
-| By voice, `restart_controller` ([8.3](#83-restarting-the-controller-by-voice)) | "the controller restarts now (requested by voice). A message follows when it is ready." | "… after a restart requested by voice." |
-| The autostart's service, `systemctl --user restart cc-voice-gateway` | "the controller restarts now (a restart of the service cc-voice-gateway.service). A message follows when it is ready." | "… after a restart of the service cc-voice-gateway.service." |
+| What | 1. It begins | 2. The gateway shuts down | 3. Ready again (from the next gateway) |
+|---|---|---|---|
+| A crash, or a gateway that stopped answering | "the controller session crashed (exit code 1) and starts again in 5 s, without a confirmation. A message follows when it is ready." | – | "the controller is ready again, after a crash (exit code 1)." |
+| By voice, `restart_controller` ([8.3](#83-restarting-the-controller-by-voice)) | "a restart was requested by voice; the controller restarts now. A message follows when it is ready." | "the gateway is shutting down now for the restart. Its statistics: …" | "… after a restart requested by voice." |
+| The autostart's service, `systemctl --user restart cc-voice-gateway` | "a restart of the service cc-voice-gateway.service was requested; the controller restarts now. …" | the same | "… after a restart of the service cc-voice-gateway.service." |
+| A stop: `--stop`, `systemctl --user stop`, quitting the session | – | "the gateway is shutting down now (stopped at the computer). Its statistics: …", or "(the service cc-voice-gateway.service was stopped)", "(the controller session was ended at the terminal)" | – |
 
-Each starts with "cc-voice-gateway on <host>:". A crash gets only its own message, no second one.
+Each starts with "cc-voice-gateway on <host>:". The second comes from the watchdog, from the file
+the gateway saves as it ends (`scripts/stats.mjs`), and only for the gateway of the session that
+ended: one that never started, or never saved, sends none. A plain start or a boot sends nothing.
 The service's restart runs `start-controller.sh --stop` as systemd's `ExecStop` with the job
-`restart` (`systemctl --user list-jobs`): that `--stop` sends the message and leaves the reason in
-`.state/controller.restarting` for the watchdog systemd starts next, which hands it to its gateway
-for the ready message. A plain `systemctl --user stop`, a start, a boot and the LaunchAgent on macOS
-send nothing.
+`restart` (`systemctl --user list-jobs`): that `--stop` sends the first message and leaves the
+reason in `.state/controller.restarting`, where the stopping watchdog finds it for the second and
+the watchdog systemd starts next for the third. The LaunchAgent on macOS has no restart of its own:
+`--stop`, then `kickstart`, is a stop and a start.
 
 With the development flag, a restarted session waits for the channel warning to be answered at the
 terminal (`tmux attach -t voice`, Enter); with the plugin it does not. Claude in Chrome's notice for
@@ -1542,8 +1551,10 @@ start may wait for Enter at the terminal (tmux attach -t voice)."
    someone has to confirm at the terminal.
 2. **Only after your yes** it calls `restart_controller` with `confirm`.
 3. **The restart.** The gateway leaves a note for the watchdog and ends the session. The watchdog
-   says on Telegram that the restart begins ("the controller restarts now (requested by voice)"),
-   starts it again at once, without a pause, and does not count it as a crash.
+   says on Telegram that a restart was requested ("a restart was requested by voice; the
+   controller restarts now"), then that the gateway is shutting down, with the statistics of its
+   running time ([8.5](#85-statistics)), starts it again at once, without a pause, and does not
+   count it as a crash.
 4. **Ready message.** A Telegram message says when the controller is ready again, if Telegram is
    set up ([8.2](#82-the-watchdog)).
 
@@ -1587,6 +1598,7 @@ at most three short sentences, without code, paths or lists.
 | "Stop the alpha worker." | `stop_worker`; the next queued task there starts |
 | "Forget the changelog task." / "Stop alpha and drop the rest." | `stop_worker` with `drop` and the task's id, or with `"all"` |
 | "What is open?" / "Is anything waiting for me?" | `open_items`: open decisions, queued tasks, runs, unfinished requests; the controller answers from it |
+| "How did it go today?" / "What did the workers cost?" / "Statistics of all time." | `stats`: since this start, or with `all_time` of all time; the controller answers in two or three sentences, details when you ask ([8.5](#85-statistics)) |
 | "Leave the commits in alpha as they are." | `resolve_decision` with your words closes the push decision; alpha's queued tasks go on |
 | "Clone drawio-mcp from alderg." | Above `confined`: `clone_repo`; you hear when it is there |
 | "Delete the folder old-experiment." | Above `confined`: `delete_path` says what would be lost, the controller asks; you say yes, then confirm the approval |
@@ -1685,7 +1697,67 @@ for something, the controller is told to tell you and let you decide.
 A worker's checkout must not be used at the desk while it runs there: workers switch branches in
 your checkouts. A worker never commits, stashes or discards changes it did not make.
 
-### 8.5 Connections and testing at the desk
+### 8.5 Statistics
+
+The gateway counts over its running time, and keeps all-time totals across starts
+(`src/stats.mjs`). Nothing is looked up for it: it counts what the gateway sees anyway.
+
+| Figure | Where it comes from |
+|---|---|
+| Running time, starts, and what each start came after (a crash, a restart by voice, of the service) | The gateway's start, and the watchdog's note `restarted` |
+| Voice requests, in conversations (a new one after 10 minutes without a request); questions to you, answered, and how long you took (typical and longest); approvals by voice | The requests, the controller's replies with state "question", the answers "(Answer to …)" (`store.mjs`) |
+| Decisions raised, by kind and whether the gateway raised them itself; closed, by whom, and how long they were open | `ledger.mjs` |
+| Worker runs by outcome (done, failed, stopped), follow-ups, in worktrees, in work folders, interrupted and queued again; by repository (top three, with time and cost); worker time, typical and longest run | The runs as they end (`workers.mjs`); every work folder counts under "work folders" |
+| The most runs at once, and the time with two or more; the same in one repository | The runs' starts and ends |
+| Queue: tasks that waited, typical and longest wait; tasks that could not start; dropped | The queue |
+| Tokens in (with cache reads and writes) and out (with thinking), cost at API list prices, turns, tool calls, subagents | Each run's output, which the gateway follows anyway: per result `model_usage_since_last_result` (the usage since the result before, with the cost; `total_cost_usd` adds up the whole session, earlier runs included), the tool calls, and the `Agent` (or `Task`) calls for subagents |
+| Commits made during a run, runs that pushed, files and lines changed; pull requests opened and updated; files made or changed in work folders | The kill switch's size check at the end of each run (`guard.mjs`), the pull requests the gateway watches (`pulls.mjs`), the check of a work folder |
+| Checks finished on those pull requests (and with failures), reviews (approved, changes requested), comments | The watch on pull requests |
+| Kill switch locks, and by what | `killswitch.mjs` |
+
+**Not counted:** the controller session's own tokens. They are only in its transcript, whose cost
+line Claude Code writes when the session ends, and the sum of its messages does not match that
+line; neither is cheap and reliable while the session runs. The cost is Claude Code's at API list
+prices; on a subscription it is not what is billed.
+
+**Where you see them:**
+
+- **By voice:** "How did it go today?", "What did that cost?", "Statistics of all time." The
+  controller calls `stats` (with `all_time` for all time) and answers from its first sentences:
+  "In 5 h 20 min: 12 worker runs (10 done, 1 failed, 1 stopped), 3 h 10 min of work, at most 3 at
+  once. 31 commits and 4 pull requests opened, with 2.2 million tokens, about 23 dollars at API
+  list prices. 25 voice requests, 6 questions to the driver, answered after about 4 min." The
+  details follow in the tool's answer, one line per subject, for when you ask.
+- **On Telegram:** `/stats` for this running time in detail, `/stats all` for all time.
+- **When the gateway shuts down,** on Telegram: on a stop, when the session is quit, and before a
+  restart on purpose, between "a restart was requested" and "ready again"
+  ([8.2](#82-the-watchdog)). Not after a crash, which keeps its single message, so a crash loop
+  sends no statistics at all:
+
+  ```text
+  cc-voice-gateway on <host>: the gateway is shutting down now for the restart. Its statistics:
+
+  In 5 h 20 min: 12 worker runs (10 done, 1 failed, 1 stopped), 3 h 10 min of work, at most 3 at once. 31 commits and 4 pull requests opened, with 2.2 million tokens, about 23 dollars at API list prices. 25 voice requests, 6 questions to you, answered after about 4 min.
+
+  All time, since 2026-10-20 (14 starts): 140 worker runs, 52 h of work, 31 million tokens, about 410 dollars at API list prices, 60 pull requests opened.
+
+  A message follows when it is ready again.
+  ```
+
+  Under the watchdog the watchdog sends it, as only it knows whether the session was stopped,
+  restarted or crashed (`scripts/stats.mjs --shutdown`); it waits at most three seconds for the
+  gateway's last save. Without the watchdog the gateway sends it itself as it ends, with a limit of
+  three seconds; not when it ends for an error, such as its port taken.
+- **At the desk:** `node scripts/stats.mjs` (the last running time), `node scripts/stats.mjs --all`.
+
+**The file** `.state/stats.json` (0600): this running time and all time, written atomically a few
+seconds after a change, every five minutes, and as the gateway ends; a crash loses only those
+seconds. It holds counts, sums, maxima and the last 100 durations per figure for the typical
+values (medians), repository names and the process id of the controller session it belongs to:
+no texts, prompts or secrets. A start takes the totals from it and counts its own running time
+from zero; a file that cannot be read starts the totals again, with a line in the log.
+
+### 8.6 Connections and testing at the desk
 
 ```bash
 node scripts/pair.mjs                # pairing code for the sign-in page
@@ -1701,12 +1773,12 @@ connector call and sign-in step, and one per HTTP request with the caller's addr
 (`http 160.79.106.3 funnel POST /mcp 200`); it shows whether and how far the voice AI got, and who
 else knocked.
 
-### 8.6 Getting changes out of the container
+### 8.7 Getting changes out of the container
 
 See [4.5](#45-pushing-from-a-read-only-container). At levels `pr` and `full` the container pushes
 by itself; the clean clone still works for trying a branch here first.
 
-### 8.7 Configuration
+### 8.8 Configuration
 
 Settings come from the environment, then from `.secrets/gateway.env`. Claude Code starts the
 gateway, so environment variables for it go into the `env` block of `controller/.mcp.json`. The
@@ -1836,7 +1908,7 @@ gateway; do not set them.
 | `VOICE_GW_TAILSCALE_BIN` | `tailscale`, on macOS else the Tailscale app's | The tailscale command `scripts/funnel.sh` runs |
 | `FUNNEL_PORT` | `443` | Public port of the Funnel |
 
-### 8.8 Troubleshooting
+### 8.9 Troubleshooting
 
 | Symptom | Cause and fix |
 |---|---|
@@ -1932,6 +2004,7 @@ src/
   worktrees.mjs      the worktrees of further runs of a repository: made, with submodules, removed
   live.mjs           the worker limits from the settings file while the gateway runs
   ledger.mjs         open decisions for the driver, and the open items
+  stats.mjs          the statistics: this running time and all time, the texts
   runners.mjs        where workers run: this computer, or the Docker container; a run's processes
   access.mjs         access levels in the container, from the GitHub token
   pulls.mjs          the watch on pull requests that workers open
@@ -1970,6 +2043,7 @@ scripts/
   pair.mjs                     pairing codes, connections
   funnel.sh, check-public.mjs  Tailscale Funnel, and a check through its relays
   telegram-notify.mjs          one Telegram message, for the watchdog
+  stats.mjs                    the statistics at the desk, and the shutdown message for the watchdog
   fake-voice.mjs               play the voice AI at the desk
   check-macos.sh               the checks on a Mac, PASS or FAIL each (docs/macos.md)
 test/                one file per area; npm test runs them all, with stand-ins for Claude Code,

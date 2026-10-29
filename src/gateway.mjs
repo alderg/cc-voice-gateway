@@ -16,7 +16,10 @@
 // levels clone-delete and unrestricted, also cloning and deleting in the
 // worker root (folders.mjs). Over all of it, the kill switch (killswitch.mjs).
 // And what is open, so that nothing is forgotten: decisions for the driver
-// (ledger.mjs), the queue (workers.mjs), the requests (store.mjs).
+// (ledger.mjs), the queue (workers.mjs), the requests (store.mjs). And the
+// statistics of its running time and of all time (stats.mjs): for the
+// controller's tool stats, /stats on Telegram, and the message when it shuts
+// down.
 
 import { CONTROLLER_LEVELS, EFFORTS, KILLSWITCH_MODES, ROOT, VERSION, WORKER_LIMITS, config, environmentWinsOver, limitValue } from './config.mjs'
 import { FROM_FILE } from './settings.mjs'
@@ -36,6 +39,7 @@ import { KillSwitch, alarmText, offText } from './killswitch.mjs'
 import { RunGuard } from './guard.mjs'
 import { realpathSync } from 'node:fs'
 import { hostname } from 'node:os'
+import { setTimeout as delay } from 'node:timers/promises'
 import { DockerRunner, HostRunner } from './runners.mjs'
 import { ACCESS_LEVELS, GitHubAccess } from './access.mjs'
 import { FolderTools, clonedText } from './folders.mjs'
@@ -43,6 +47,10 @@ import { FunnelSwitch, staleText } from './funnel.mjs'
 import { Alerts, IpGuard } from './ipguard.mjs'
 import { Ledger, openItems, reminderText, startupText } from './ledger.mjs'
 import { ScratchFolders, scratchProblem } from './workspaces.mjs'
+import { Stats, shutdownText, telegramText } from './stats.mjs'
+
+// How long a shutdown waits at most for its message on Telegram.
+const FAREWELL_MS = 3000
 
 // The first line of every start: which code runs, so the log tells after a
 // restart whether the new commit is in.
@@ -69,6 +77,9 @@ store.on('answer', request => {
     log('answer not kept with its decisions:', error.message)
   }
 })
+// The statistics: all time from the file, this running time from zero. The
+// session is this gateway's parent, the controller session's claude.
+const stats = new Stats({ file: config.statsFile, session: process.ppid })
 const killswitch = new KillSwitch({ file: config.killSwitchFile, mode: config.killSwitchMode })
 if (config.killSwitchSetting && !KILLSWITCH_MODES.includes(config.killSwitchSetting)) {
   log(`VOICE_GW_KILLSWITCH=${config.killSwitchSetting} is not one of ${KILLSWITCH_MODES.join(', ')}; auto instead`)
@@ -225,8 +236,11 @@ let http
 let admin
 let funnel = null
 let settings = null // the watch on the settings file (live.mjs)
+let farewell = null // without the watchdog: the message that the gateway shuts down (below)
 let shuttingDown = false
-function shutdown(reason, code = process.exitCode ?? 0) {
+// planned: false when the gateway ends by itself for an error (its port is
+// taken), which gets no message with the statistics.
+function shutdown(reason, code = process.exitCode ?? 0, { planned = true } = {}) {
   if (shuttingDown) return
   shuttingDown = true
   log('shutting down:', reason)
@@ -239,12 +253,26 @@ function shutdown(reason, code = process.exitCode ?? 0) {
   funnel?.close()
   pulls.close() // so do the watches on pull requests
   store.save() // the requests, with what the voice client has read
-  // Give pending log writes and HTTP responses a moment, then leave.
-  setTimeout(() => process.exit(code), 200).unref()
+  // The last save of the statistics, with the end of this running time,
+  // which the watchdog's message waits for (scripts/stats.mjs).
+  const last = stats.close()
+  const told = planned ? farewell?.(reason, last) : null
+  // Give pending log writes and HTTP responses a moment, then leave; a
+  // message on its way gets a few seconds at most.
+  Promise.race([told ?? null, delay(FAREWELL_MS, null, { ref: false })]).finally(() =>
+    setTimeout(() => process.exit(code), 200).unref(),
+  )
 }
 
 // Restarting the controller by voice, through the watchdog (restart.mjs).
 const restarter = new Restarter({ store, workers, ledger, secretsDir: config.secretsDir })
+// Under the watchdog, as this session started: the watchdog then sends the
+// message when the gateway shuts down (scripts/start-controller.sh), and
+// none after a crash; without it, the gateway itself (farewell).
+const watched = restarter.watchdog().ok
+// What this start came after, and the events the statistics count.
+stats.started({ after: restarter.restartedReason() })
+stats.watch({ store, ledger, workers, guard, pulls, killswitch })
 
 // The gateway's own checkout, each time the controller answers a request with
 // "done": uncommitted changes and commits on no remote become a push
@@ -289,6 +317,7 @@ const channel = await startChannel(store, {
   folders,
   ledger,
   selfCheck,
+  stats,
   level: config.controllerLevel,
   onClose: () => shutdown('stdio closed'),
 })
@@ -308,6 +337,7 @@ workers.on('finished', async task => {
       log('pull requests of', task.id, 'not checked:', error.message)
       return []
     })
+    stats.reported(task, opened)
     const request = store.createRequest(workers.resultText(task, opened), {
       origin: 'worker',
       worker: { repo: task.repo, task: task.id },
@@ -405,6 +435,21 @@ if (telegram) {
   })
   telegramCommands.on('funnel', ({ action }) => funnel.command(action))
   telegramCommands.on('stale', stale => say(staleText(stale)))
+  // /stats: this running time in detail; /stats all: all time.
+  telegramCommands.on('stats', ({ all }) => say(telegramText(stats.snapshot(), { host: hostname(), allTime: all })))
+  // Without the watchdog the gateway itself says that it shuts down, with
+  // its statistics. Under the watchdog the watchdog says it, as only it knows
+  // whether the session was stopped, restarted or crashed; a crash keeps its
+  // own message (scripts/start-controller.sh).
+  if (!watched) {
+    farewell = (reason, snapshot) => {
+      const why = /^SIG/.test(reason) ? `on ${reason}` : 'the controller session ended'
+      return telegram
+        .send(shutdownText(snapshot, { host: hostname(), why }))
+        .then(() => log('telegram sent: the gateway shuts down, with its statistics'))
+        .catch(error => log('shutdown message not sent by Telegram:', error.message))
+    }
+  }
 } else {
   log('telegram fallback off: telegram_token and telegram_chat_id not both set')
 }
@@ -514,7 +559,7 @@ async function portBusy() {
         `lsof -nP -iTCP:${config.port} -sTCP:LISTEN, end it, then restart the controller.`,
     )
     .catch(error => log('port alarm not sent by Telegram:', error.message))
-  shutdown(`voice port ${config.port} in use`, 1)
+  shutdown(`voice port ${config.port} in use`, 1, { planned: false })
 }
 
 admin = await startAdmin(auth, config.adminSocket, { killswitch })

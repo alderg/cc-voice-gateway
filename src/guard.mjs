@@ -31,6 +31,10 @@
 //                   committed; in a work folder, more files in it than
 //                   maxFiles.
 //
+// What the size check at the end finds, with whether the run pushed, also
+// goes to the statistics ('measured', stats.mjs): the commits made during
+// the run, the files and lines changed.
+//
 // The rules observe the run; they cannot stop its first step. What they miss
 // is in the README ("Limits"): targets hidden in variables, scripts or
 // other languages, and on GitHub anything gh cannot see. In the Docker setup,
@@ -38,6 +42,7 @@
 // mounted folder.
 
 import { execFile } from 'node:child_process'
+import { EventEmitter } from 'node:events'
 import { homedir } from 'node:os'
 import { posix } from 'node:path'
 import { log as defaultLog, preview } from './log.mjs'
@@ -447,8 +452,9 @@ function ghMerge(args, command) {
   return null
 }
 
-export class RunGuard {
+export class RunGuard extends EventEmitter {
   constructor({ workers, runner, killswitch, ghBin = 'gh', limits = {}, allowed = [], mainCheckSeconds = 30, log = defaultLog }) {
+    super()
     this.workers = workers
     this.runner = runner
     this.killswitch = killswitch
@@ -578,7 +584,8 @@ export class RunGuard {
     this.runs.delete(task.id)
     await run.ready
     await this.checkHead(run)
-    await this.checkSize(run)
+    const size = await this.checkSize(run)
+    if (size) this.emit('measured', task, { ...size, pushed: run.pushed.size > 0 })
   }
 
   checkAll() {
@@ -802,18 +809,25 @@ export class RunGuard {
     return others.length ? ['--ignore-missing', '--all', '--not', ...others] : ['--all']
   }
 
+  // Returns what it found, { commits, files, lines }, or null for a work
+  // folder.
   async checkSize(run) {
-    if (run.scratch) return this.checkFiles(run)
+    if (run.scratch) {
+      await this.checkFiles(run)
+      return null
+    }
     const since = Math.floor(run.startedAt / 1000)
     const refs = await this.commitRefs(run)
     const [committed, pending, untracked] = await Promise.all([
-      run.runner.git(run.dir, 'log', ...refs, `--since=@${since}`, '--numstat', '--format='),
+      run.runner.git(run.dir, 'log', ...refs, `--since=@${since}`, '--numstat', '--format=commit %H'),
       run.runner.git(run.dir, 'diff', '--numstat', 'HEAD'),
       run.runner.git(run.dir, 'ls-files', '--others', '--exclude-standard'),
     ])
     const files = new Set()
     let lines = 0
+    let commits = 0
     for (const line of `${committed ?? ''}\n${pending ?? ''}`.split('\n')) {
+      if (line.startsWith('commit ')) commits++
       const [added, deleted, path] = line.split('\t')
       if (!path) continue
       files.add(path)
@@ -823,6 +837,7 @@ export class RunGuard {
     if (files.size > this.maxFiles || lines > this.maxLines) {
       this.violation(run, 'many changes', `${files.size} files and ${lines} lines changed in one run (limits ${this.maxFiles} files, ${this.maxLines} lines)`)
     }
+    return { commits, files: files.size, lines }
   }
 
   // A work folder has no git: the files in it at the end count.

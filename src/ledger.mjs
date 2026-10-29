@@ -31,6 +31,7 @@
 // title for example, so the events that carry them are marked trusted="no".
 
 import { randomInt } from 'node:crypto'
+import { EventEmitter } from 'node:events'
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { log as defaultLog, preview } from './log.mjs'
@@ -85,8 +86,10 @@ const normal = d => ({
   details: d.details !== null && typeof d.details === 'object' ? d.details : {},
 })
 
-export class Ledger {
+// Emits 'added' and 'closed' with the decision, for the statistics (stats.mjs).
+export class Ledger extends EventEmitter {
   constructor({ file = null, remindMinutes = 30, maxReminders = 3, log = defaultLog } = {}) {
+    super()
     this.file = file
     this.remindMs = remindMinutes * 60 * 1000
     this.maxReminders = maxReminders
@@ -198,6 +201,7 @@ export class Ledger {
     this.decisions.push(decision)
     this.save()
     this.log('decision', decision.id, decision.kind, repo ?? scope ?? '-', state, preview(text, 80))
+    this.emit('added', decision)
     return decision
   }
 
@@ -254,6 +258,7 @@ export class Ledger {
     if (words) decision.words = preview(words, 200)
     this.save()
     this.log('decision closed', decision.id, `by ${by}:`, preview(outcome, 80))
+    this.emit('closed', decision)
     return decision
   }
 

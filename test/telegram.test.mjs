@@ -613,6 +613,7 @@ test('a gateway whose port is taken ends with an error, and says so on Telegram'
     assert.ok(alert, 'a Telegram message')
     assert.equal(alert.chat_id, CHAT_ID)
     assert.match(alert.text, new RegExp(`the voice port ${port} is in use by another process, so the gateway of the controller session ends`))
+    assert.ok(!api.messages.slice(before).some(m => /shutting down now/.test(m.text)), 'an error, not a shutdown with statistics')
     assert.ok(!log.includes(TOKEN))
   } finally {
     child.kill('SIGKILL')

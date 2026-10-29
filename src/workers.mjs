@@ -52,6 +52,9 @@
 //
 // The run output holds every tool input and result, so .state/tasks and
 // .state/workers.json are for this user only (folders 0700, files 0600).
+// While following it, the gateway also counts what a run used, for the
+// statistics (stats.mjs): its tool calls, the subagents it started, and the
+// tokens, cost and turns of its results, kept with the run.
 
 import { execFile } from 'node:child_process'
 import { randomInt, randomUUID } from 'node:crypto'
@@ -59,6 +62,7 @@ import { EventEmitter } from 'node:events'
 import { chmodSync, closeSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join, posix, relative } from 'node:path'
 import { log, preview } from './log.mjs'
+import { SUBAGENT_TOOLS, addResult } from './stats.mjs'
 import { DockerRunner, HostRunner, MARK, MAX_FILES, alive, startOf } from './runners.mjs'
 import {
   Repositories,
@@ -1086,7 +1090,7 @@ export class Workers extends EventEmitter {
       // As the worktree is when the run starts (prepare).
       Object.assign(record, { startBranch: null, startDirty: null, unpushedBefore: null })
     }
-    if (entry) record.queued = entry.id // it waited in the queue as this
+    if (entry) Object.assign(record, { queued: entry.id, queuedAt: entry.queuedAt }) // it waited in the queue as this, since then
     if (entry?.requeued) Object.assign(record, { resumes: entry.resumes ?? 1, requeued: entry.requeued })
     if (scratch) {
       // For the look at the end: the files as the run found them.
@@ -1604,6 +1608,7 @@ export class Workers extends EventEmitter {
     this.state.queue = this.state.queue.filter(entry => !dropped.includes(entry))
     this.save()
     log('dropped from the queue', repo, dropped.map(entry => entry.id).join(', '))
+    this.emit('dropped', dropped)
     return dropped
   }
 
@@ -1864,8 +1869,8 @@ export class Workers extends EventEmitter {
   follow(task) {
     if (!this.followed.has(task.id)) {
       // Read from the start, also by a gateway that took the run over: what
-      // the output says is counted again.
-      Object.assign(task, { steps: [], results: 0, turnOpen: false, resultSeen: false })
+      // the output says is counted again, its figures for the statistics too.
+      Object.assign(task, { steps: [], results: 0, turnOpen: false, resultSeen: false, usage: null, tools: 0, subagents: 0 })
     }
     const cursor = this.followed.get(task.id) ?? { offset: 0, partial: '' }
     let fd
@@ -1914,6 +1919,8 @@ export class Workers extends EventEmitter {
     if (message.type === 'assistant') {
       for (const part of message.message?.content ?? []) {
         if (part.type === 'tool_use') {
+          task.tools = (task.tools ?? 0) + 1
+          if (SUBAGENT_TOOLS.has(part.name)) task.subagents = (task.subagents ?? 0) + 1
           task.steps = [...task.steps, describeStep(part.name, part.input, task.dir ?? this.dirOf(task.repo))].slice(-MAX_STEPS)
           this.emit('tool', task, part) // for the kill switch's rules (guard.mjs)
         } else if (part.type === 'text' && part.text?.trim()) {
@@ -1929,6 +1936,7 @@ export class Workers extends EventEmitter {
       // The end of a turn, not of the run: the process may go on (check).
       task.results = (task.results ?? 0) + 1
       task.turnOpen = false
+      task.usage = addResult(task.usage, message, { resumed: task.resumed })
       // A turn Claude Code answered on its own, such as the notification of
       // a background task from the session it resumed: not the task's result.
       if (message.origin?.kind === 'task-notification') return

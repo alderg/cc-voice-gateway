@@ -131,7 +131,7 @@ test("only open pull requests of the run's repository on voice/ branches, as gh 
   const { w } = watcher('which')
   try {
     assert.deepEqual(await w.fromRun(task([7, 8, 9, 10])), [
-      { number: 7, title: 'Fix the typo in the README', isDraft: true, url: 'https://github.com/acme/alpha/pull/7' },
+      { number: 7, title: 'Fix the typo in the README', isDraft: true, url: 'https://github.com/acme/alpha/pull/7', opened: true },
     ])
     assert.deepEqual(w.active().map(entry => entry.key), ['acme/alpha#7'])
     assert.deepEqual(await w.fromRun(task([7], { slug: null })), [], 'no GitHub remote')
@@ -165,6 +165,7 @@ test('checks: one event when every check on the head commit has finished, again 
     assert.deepEqual([news[0].worker, news[0].slug, news[0].number], ['alpha', 'acme/alpha', 11])
     assert.match(news[0].text, /^Pull request 11 in acme\/alpha \(worker alpha\): "Fix the typo in the README"\.$/m)
     assert.match(news[0].text, /^Checks finished on the latest push: 2 passed, 1 failed \(lint\), 1 skipped\.$/m)
+    assert.deepEqual([news[0].checks, news[0].reviews, news[0].comments], [{ passed: 2, failed: 1, skipped: 1 }, [], 0], 'in numbers, for the statistics')
     assert.match(news[0].text, /without asking anything/)
     await sleep(400)
     assert.equal(news.length, 1, 'once per commit')
@@ -404,7 +405,7 @@ test('a later run that pushed or marked it ready without naming it: the gateway 
       Object.assign(g.prs['acme/alpha#24'], { isDraft: false, headRefOid: 'bbb222', statusCheckRollup: [run('test', 'IN_PROGRESS')] })
     })
     assert.deepEqual(await w.fromRun(task([], { startedAt })), [
-      { number: 24, title: 'Fix the typo in the README', isDraft: false, url: 'https://github.com/acme/alpha/pull/24' },
+      { number: 24, title: 'Fix the typo in the README', isDraft: false, url: 'https://github.com/acme/alpha/pull/24', opened: false },
     ])
     assert.equal(w.active().length, 1)
     setGitHub(g => {

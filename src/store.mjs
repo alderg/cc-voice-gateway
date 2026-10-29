@@ -151,6 +151,7 @@ export class Store extends EventEmitter {
     this.requests.set(request.id, request)
     this.prune()
     if (answers) this.emit('answer', request)
+    this.emit('request', request) // for the statistics (stats.mjs)
     this.changed()
     return request
   }
@@ -171,6 +172,7 @@ export class Store extends EventEmitter {
     request.updates.push({ at: Date.now(), state, text })
     request.state = state
     this.controllerLastReplyAt = Date.now()
+    this.emit('reply', request, state) // for the statistics
     this.changed()
     return request
   }
@@ -238,6 +240,7 @@ export class Store extends EventEmitter {
       status: 'open', // open | allow | deny
       announced: false, // reported to the voice client at least once
     })
+    this.emit('permission', this.permissions.get(code)) // for the statistics
     this.changed()
     return code
   }
@@ -266,6 +269,7 @@ export class Store extends EventEmitter {
     if (!permission || permission.status !== 'open') return null
     permission.status = behavior
     permission.resolvedAt = Date.now()
+    this.emit('permission', permission)
     this.changed()
     return permission
   }

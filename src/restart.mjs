@@ -14,10 +14,13 @@
 // open, see store.mjs). The restarted controller gets all of it in its
 // start-up summary. Open approvals belong to the old session and are gone.
 //
-// When a restart begins, the watchdog says so on Telegram: this one, a crash,
-// or a restart of the autostart's service. After any of them the next gateway
-// finds the watchdog's note ("restarted") and, once the session is connected,
-// tells the driver on Telegram that the controller is ready again.
+// On Telegram, a restart on purpose (this one, or one of the autostart's
+// service) comes in three messages: "a restart was requested" and then that
+// the gateway is shutting down, with the statistics of its running time, both
+// from the watchdog (stats.mjs, scripts/stats.mjs); a crash has one message of
+// its own instead. After any of them the next gateway finds the watchdog's
+// note ("restarted") and, once the session is connected, tells the driver
+// that the controller is ready again. A plain start says nothing.
 
 import { execFile } from 'node:child_process'
 import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
@@ -141,17 +144,24 @@ export class Restarter {
     return `[restart=requested] The session ends in about ${Math.round(this.delayMs / 1000)} seconds, and the watchdog starts it again.`
   }
 
+  // Why the watchdog started this session again, from its note: "a crash
+  // (…)", "a restart requested by voice", "a restart of the service …"; null
+  // after a plain start. Reads only, for the statistics.
+  restartedReason() {
+    if (!this.lockDir) return null
+    try {
+      return readFileSync(join(this.lockDir, 'restarted'), 'utf8').trim() || 'a restart'
+    } catch {
+      return null
+    }
+  }
+
   // After a restart by the watchdog, once the session is connected.
   announceReady() {
     if (!this.lockDir) return
     const note = join(this.lockDir, 'restarted')
     if (!existsSync(note)) return
-    let reason = 'a restart'
-    try {
-      reason = readFileSync(note, 'utf8').trim() || reason
-    } catch {
-      // keep the default
-    }
+    const reason = this.restartedReason() ?? 'a restart'
     rmSync(note, { force: true })
     const text = `cc-voice-gateway on ${hostname()}: the controller is ready again, after ${reason}.`
     execFile(

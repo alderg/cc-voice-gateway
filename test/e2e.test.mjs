@@ -165,6 +165,7 @@ test('declares the channel and permission capabilities and the reply tool', asyn
     'order_queue',
     'open_items',
     'resolve_decision',
+    'stats',
     'restart_controller',
     'raise_alarm',
   ])
