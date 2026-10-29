@@ -384,6 +384,41 @@ test('a worktree: from the default branch as fetched now, the submodule from the
   }
 })
 
+test("a submodule commit the checkout's module lacks: from the checkout all the same, and that one commit from its URL", async () => {
+  const { root, dir, base, remotes, subRemote, workers, dispatch } = setup({ sub: 'initialised', maxPerRepo: 2 })
+  try {
+    // The submodule moves on, and so does alpha's origin, after the checkout was made.
+    const lib = join(base, 'lib-work')
+    writeFileSync(join(lib, 'lib.txt'), 'lib, newer\n')
+    git(lib, 'commit', '-q', '-am', 'newer')
+    git(lib, 'push', '-q', subRemote, 'main')
+    const other = join(base, 'other')
+    execFileSync('git', ['clone', '-q', join(remotes, 'alpha.git'), other])
+    git(other, 'submodule', 'update', '-q', '--init')
+    git(join(other, 'lib'), 'fetch', '-q', 'origin', 'main')
+    git(join(other, 'lib'), 'checkout', '-q', 'FETCH_HEAD')
+    git(other, 'commit', '-q', '-am', 'newer lib')
+    git(other, 'push', '-q', 'origin', 'main')
+    const needed = git(join(other, 'lib'), 'rev-parse', 'HEAD')
+    const before = git(join(dir, 'lib'), 'rev-parse', 'HEAD')
+
+    const a = hold()
+    const one = await dispatch(`HOLD:${a} one`)
+    const two = await dispatch(`HOLD:${a} two`, { parallel: true })
+    const wt = join(worktreesOf(root), two.task.id)
+    await until(() => callOf(two.task.id))
+    assert.deepEqual(two.task.submodules.map(s => [s.path, s.how, s.ok]), [['lib', 'from the checkout', true]])
+    assert.equal(git(join(wt, 'lib'), 'rev-parse', 'HEAD'), needed)
+    assert.equal(readFileSync(join(wt, 'lib', 'lib.txt'), 'utf8'), 'lib, newer\n')
+    assert.equal(git(join(dir, 'lib'), 'rev-parse', 'HEAD'), before, "the checkout's module as it was")
+    release(a)
+    await ended(two.task)
+    await ended(one.task)
+  } finally {
+    workers.close()
+  }
+})
+
 test("a worktree where the checkout's submodule is not initialised: a shallow clone from its URL", async () => {
   const { root, dir, workers, dispatch } = setup({ sub: 'not', maxPerRepo: 2 })
   try {
@@ -688,6 +723,9 @@ test('a limit raised since the queue was planned: the plan names the tasks that 
     assert.match(text, /^The limit of runs per repository went up from 1 to 3 since the queue was planned\./)
     assert.match(text, new RegExp(`^- alpha: running ${one.task.id} \\("HOLD:\\w+ one"\\); queued, in their order: ${x.id} \\("Update the changelog\\."\\), ${y.id} \\("Translate the README\\."\\)$`, 'm'))
     assert.match(text, /order_queue with parallel=true/)
+    // A change of the global limit meanwhile keeps the plan for the controller.
+    assert.equal(raised.setLimits({ maxRuns: 6, maxPerRepo: 3 }).plan, null)
+    assert.equal(raised.replan, plan)
     raised.planned()
     assert.equal(JSON.parse(readFileSync(join(stateDir, 'workers.json'), 'utf8')).perRepo, 3)
     // The controller marks one; it starts next to the run, in a worktree.

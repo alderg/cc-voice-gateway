@@ -130,7 +130,10 @@ export async function makeWorktree(runner, { main, dir, branch = null, again = n
   if (await isTop(runner, dir)) return { ok: true, created: false, base: null, branch: again, submodules: [] }
   await gitIn(runner, main, ['worktree', 'prune'])
   let fetched = false
-  if (remote && branch) fetched = (await gitIn(runner, main, ['fetch', '--quiet', 'origin', branch], { env, timeout: FETCH_MS })).ok
+  // Not into the submodules: a commit of one that the worktree needs comes
+  // as that one shallow commit (submodule), not as everything since.
+  const fetch = ['fetch', '--quiet', '--no-recurse-submodules', 'origin', branch]
+  if (remote && branch) fetched = (await gitIn(runner, main, fetch, { env, timeout: FETCH_MS })).ok
   const exists = async ref => (await gitIn(runner, main, ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`])).ok
   let args = null
   let base = null

@@ -1665,10 +1665,14 @@ export class Workers extends EventEmitter {
     const was = { maxRuns: this.maxRuns, maxPerRepo: this.maxPerRepo }
     this.maxRuns = maxRuns
     this.maxPerRepo = maxPerRepo
-    const plan = maxPerRepo > was.maxPerRepo ? this.planFor(was.maxPerRepo) : null
+    if (maxPerRepo === was.maxPerRepo) return { was, plan: null }
+    // A plan not delivered yet (the controller was not there) counts from
+    // the limit its queue was planned for.
+    const from = Math.min(this.replan?.from ?? was.maxPerRepo, was.maxPerRepo)
+    const plan = maxPerRepo > from ? this.planFor(from) : null
     if (plan) this.replan = plan
     else this.planned()
-    return { was, plan }
+    return { was, plan: maxPerRepo > was.maxPerRepo ? plan : null }
   }
 
   // The controller has the plan, or there was none: the queue counts as
