@@ -2,7 +2,8 @@
 // Marks Claude in Chrome's first-start notice as seen, so that an unattended
 // start of the controller session does not wait at the terminal.
 // scripts/start-controller.sh runs it before every start with
-// VOICE_GW_CONTROLLER_CHROME=1.
+// VOICE_GW_CONTROLLER_CHROME=1; the setup assistant only reads whether the
+// notice was confirmed (chromeNoticeSeen), to warn when it was not.
 //
 // At the first interactive start with Claude in Chrome on (--chrome), Claude
 // Code shows a notice before the session starts: "Claude in Chrome works with
@@ -37,7 +38,7 @@ import { fileURLToPath } from 'node:url'
 export const KEY = 'hasCompletedClaudeInChromeOnboarding'
 const STALE_MS = 10000 // proper-lockfile's default, which Claude Code keeps: an older lock was left behind
 
-export const configFile = (env = process.env) => join(env.CLAUDE_CONFIG_DIR || homedir(), '.claude.json')
+export const configFile = (env = process.env, home = homedir()) => join(env.CLAUDE_CONFIG_DIR || home, '.claude.json')
 
 // For the log: ~/.claude.json rather than the whole path.
 const shown = path => (path.startsWith(homedir() + '/') ? '~' + path.slice(homedir().length) : path)
@@ -87,6 +88,13 @@ async function lock(path, waitMs) {
     if (Date.now() >= until) return null
     await sleep(50)
   }
+}
+
+// Whether the notice was confirmed already, for the setup assistant: true or
+// false, or null when the config cannot be read. Reads only.
+export function chromeNoticeSeen({ env = process.env, home = homedir() } = {}) {
+  const { config } = read(configFile(env, home))
+  return config ? config[KEY] === true : null
 }
 
 export async function markChromeOnboarding({ env = process.env, waitMs = 5000 } = {}) {

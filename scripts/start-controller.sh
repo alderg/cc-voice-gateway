@@ -29,8 +29,8 @@
 # before the session starts, and waits for Enter or Esc at the terminal. So
 # before every start with it, scripts/chrome-onboarding.mjs marks that notice
 # as seen in Claude Code's own config (~/.claude.json), where Claude Code notes
-# it too. If that fails, the log and a Telegram message say that the start may
-# wait for Enter at the terminal.
+# it too. If that fails, the log says that the start may wait for Enter at the
+# terminal, and so does the next restart's Telegram message.
 #
 # The session runs in manual mode, whatever defaultMode the user settings set.
 # controller/.claude/settings.json lets Bash, Write and Edit run without asking,
@@ -53,12 +53,17 @@
 # VOICE_GW_WATCHDOG_MAX_RESTARTS restarts within VOICE_GW_WATCHDOG_WINDOW
 # seconds. Quitting the session (exit code 0, or Ctrl+C) or --stop ends it for
 # good. One watchdog at a time. Restarts go to the gateway's log, and to
-# Telegram if .secrets/telegram_token and .secrets/telegram_chat_id exist.
-# With the development flag, a restart waits for the warning to be answered at
-# the terminal, and so does a start whose Claude in Chrome notice could not be
-# marked as seen; see the README, "The watchdog". The
+# Telegram if .secrets/telegram_token and .secrets/telegram_chat_id exist: one
+# message when a restart begins, a crash or one on purpose, and one from the
+# gateway when the controller is ready again (src/restart.mjs). With the
+# development flag, a restart waits for the warning to be answered at the
+# terminal, and so does a start whose Claude in Chrome notice could not be
+# marked as seen; the message says so. See the README, "The watchdog". The
 # controller can also ask for a restart (restart_controller, src/restart.mjs):
-# that one starts again at once and does not count as a crash. Before every
+# that one starts again at once and does not count as a crash. A restart of
+# the autostart's systemd service (systemctl --user restart) runs --stop with
+# systemd's job "restart": --stop then says on Telegram that the restart
+# begins, and leaves the reason for the watchdog that starts next. Before every
 # start the watchdog reads .secrets/gateway.env again, so that a restart takes
 # changed settings; only the level and the folders this script took at its own
 # start stay until it starts again. The log says who started and stopped it,
@@ -84,8 +89,10 @@ CONTROLLER=$ROOT/controller
 STATE=${VOICE_GW_STATE_DIR:-$ROOT/.state}
 LOCK=$STATE/controller.lock # a directory, since mkdir is atomic: pid, claude.pid
 STOP=$STATE/controller.stop
+RESTARTING=$STATE/controller.restarting # from --stop during a restart of the service: when, and why
 LOG=${VOICE_GW_LOG_FILE-$ROOT/.logs/gateway.log} # empty: stderr only, as for the gateway
 
+SERVICE=cc-voice-gateway.service # the autostart's systemd user service (src/platform.mjs)
 MARKETPLACE=cc-voice-gateway
 PLUGIN=voice
 REMOTE_CONTROL_NAME='Voice controller' # the session's name in the Claude app, with VOICE_GW_REMOTE_CONTROL=1
@@ -131,7 +138,7 @@ log() {
 # its job in XPC_SERVICE_NAME, which the processes below inherit as well, and
 # it has no stop command, so a stop never comes from it.
 invoker() {
-  local unit=cc-voice-gateway.service agent=com.drawio.cc-voice-gateway parent tty
+  local unit=$SERVICE agent=com.drawio.cc-voice-gateway parent tty
   if [ -n "${INVOCATION_ID:-}" ] &&
     [ "$(systemctl --user show -p InvocationID --value "$unit" 2>/dev/null)" = "$INVOCATION_ID" ] &&
     { [ "$(systemctl --user show -p MainPID --value "$unit" 2>/dev/null)" = "$PPID" ] ||
@@ -163,6 +170,40 @@ notify() {
   local result
   result=$(node "$ROOT/scripts/telegram-notify.mjs" "$1" 2>&1) || true
   [ "$result" = 'telegram: not set up' ] || log "$result"
+}
+
+# What the next start may wait for at the terminal, for a restart's message:
+# the development channel's warning ($1 is the channel mode), and Claude in
+# Chrome's notice when the last start could not mark it as seen
+# (chrome_onboarding). Empty when nothing.
+chrome_confirm=0
+terminal_hint() {
+  local hint=
+  if [ "$1" != plugin ]; then
+    hint='Confirm the development channel at the terminal (tmux attach -t voice), otherwise voice requests do not arrive.'
+  fi
+  if [ "$chrome_confirm" = 1 ] && [ -n "$hint" ]; then
+    hint="$hint Claude in Chrome's notice for the first start may wait there too."
+  elif [ "$chrome_confirm" = 1 ]; then
+    hint="Claude in Chrome's notice for the first start may wait for Enter at the terminal (tmux attach -t voice)."
+  fi
+  printf '%s' "$hint"
+}
+
+# A restart on purpose begins: one message, with the reason ($1) and what the
+# start may wait for ($2: the channel mode). The gateway sends the next one
+# when the controller is ready again. A crash has its own message instead.
+announce_restart() {
+  local hint
+  hint=$(terminal_hint "$2")
+  notify "cc-voice-gateway on $host: the controller restarts now ($1).${hint:+ $hint} A message follows when it is ready."
+}
+
+# The job systemd runs for the autostart's service at this moment: "restart"
+# while a restart stops it, "stop" for a stop, nothing outside systemd.
+service_job() {
+  { systemctl --user list-jobs --no-legend --plain "$SERVICE" 2>/dev/null || true; } |
+    awk -v unit="$SERVICE" '$2 == unit { print $3; exit }'
 }
 
 # --- lock -------------------------------------------------------------------
@@ -212,6 +253,19 @@ if [ "${1:-}" = --status ] || [ "${1:-}" = --stop ]; then
   by=$(invoker stop)
   log "stop requested by $by"
   echo "$by" >"$STOP"
+  # systemctl --user restart of the autostart's service: systemd runs this as
+  # its ExecStop, with the job "restart", and starts a new watchdog right
+  # after. The driver hears that it begins; the new watchdog finds the reason,
+  # so that the gateway says when the controller is ready again.
+  if [ "$by" = "the service $SERVICE" ] && [ "$(service_job)" = restart ]; then
+    reason="a restart of the service $SERVICE"
+    printf '%s %s\n' "$(date +%s)" "$reason" >"$RESTARTING"
+    log "$reason: the controller session starts again right after this stop"
+    case $(node "$ROOT/scripts/channel-mode.mjs" 2>/dev/null || echo development) in
+      plugin*) announce_restart "$reason" plugin ;;
+      *) announce_restart "$reason" development ;;
+    esac
+  fi
   [ -n "$session" ] && kill -TERM "$session" 2>/dev/null || true
   kill -TERM "$pid" 2>/dev/null || true # in case it is pausing between two runs
   for _ in $(seq 1 100); do
@@ -229,10 +283,9 @@ cd "$CONTROLLER"
 # Claude in Chrome's notice at the first start with --chrome waits for Enter
 # at the terminal: marked as seen beforehand (scripts/chrome-onboarding.mjs),
 # so that no unattended start hangs on it. Quiet when it was seen already. If
-# it cannot be marked, the log and Telegram say that this start may wait at
-# the terminal, and chrome_confirm=1 keeps the next crash message from
-# promising a start without a confirmation.
-chrome_confirm=0
+# it cannot be marked, the log says that this start may wait at the terminal,
+# and chrome_confirm=1 puts that into the next restart's message
+# (terminal_hint); no message of its own.
 chrome_onboarding() {
   local line
   line=$(node "$ROOT/scripts/chrome-onboarding.mjs" 2>/dev/null || echo 'failed the check did not run (scripts/chrome-onboarding.mjs)')
@@ -243,8 +296,7 @@ chrome_onboarding() {
       log "chrome: marked Claude in Chrome's notice for the first start as seen in Claude Code's config, so that the session does not wait for Enter at the terminal" ;;
     *)
       chrome_confirm=1
-      log "chrome: Claude in Chrome's notice for the first start could not be marked as seen, since ${line#failed }; if Claude Code shows it, the session waits for Enter at the terminal (tmux attach -t voice)"
-      notify "cc-voice-gateway on $host: the controller session starts with Claude in Chrome, whose notice for the first start could not be marked as seen (${line#failed }). If it shows, the session waits for Enter at the terminal (tmux attach -t voice), and voice requests do not arrive until then." ;;
+      log "chrome: Claude in Chrome's notice for the first start could not be marked as seen, since ${line#failed }; if Claude Code shows it, the session waits for Enter at the terminal (tmux attach -t voice)" ;;
   esac
 }
 
@@ -383,6 +435,18 @@ fi
 restarts=() # times of the restarts within the window
 pause_ms=$backoff_ms
 next="starting the controller session (watchdog $$, started by $(invoker))"
+# Right after a restart of the service (see --stop): its reason, for the log
+# and for the gateway's message when the controller is ready again. A note
+# older than ten minutes is from a restart whose start never came.
+if [ -f "$RESTARTING" ]; then
+  at= reason=
+  read -r at reason <"$RESTARTING" || true
+  rm -f "$RESTARTING"
+  if [[ $at =~ ^[0-9]+$ ]] && [ $(($(date +%s) - at)) -lt 600 ] && [ -n "$reason" ]; then
+    printf '%s\n' "$reason" >"$LOCK/restarted"
+    next="$next, after $reason"
+  fi
+fi
 export VOICE_GW_WATCHDOG_LOCK=$LOCK # for the gateway: restart requests, readiness
 
 while :; do
@@ -418,6 +482,7 @@ while :; do
     by=$(sed -n 's/.*"by":"\([^"]*\)".*/\1/p' "$LOCK/restart")
     log "the controller session ended for a restart requested by ${by:-the controller} (exit code $status): starting it again at once, not counted as a crash"
     printf 'a restart requested by %s\n' "${by:-the controller}" >"$LOCK/restarted"
+    announce_restart "requested by ${by:-the controller}" "$channel_mode"
     next="starting the controller session again (requested restart)"
     continue
   fi
@@ -451,13 +516,12 @@ while :; do
   log "the controller session ended unexpectedly ($reason) after ${lasted} s: restart ${#restarts[@]} of at most $max_restarts within $window_s s, in $(seconds "$pause_ms") s"
   printf 'a crash (%s)\n' "$reason" >"$LOCK/restarted"
   next="starting the controller session again (restart ${#restarts[@]})"
-  if [ "$channel_mode" = plugin ] && [ "$chrome_confirm" = 0 ]; then
-    notify "cc-voice-gateway on $host: the controller session crashed ($reason) and starts again in $(seconds "$pause_ms") s, without a confirmation. A message follows when it is ready."
-  elif [ "$channel_mode" = plugin ]; then
-    # Its start says whether Claude in Chrome's notice may wait at the terminal.
-    notify "cc-voice-gateway on $host: the controller session crashed ($reason) and starts again in $(seconds "$pause_ms") s. A message follows when it is ready."
+  # The crash's own message is the one for this restart: no announce_restart.
+  hint=$(terminal_hint "$channel_mode")
+  if [ -n "$hint" ]; then
+    notify "cc-voice-gateway on $host: the controller session crashed ($reason) and starts again in $(seconds "$pause_ms") s. $hint A message follows when it is ready."
   else
-    notify "cc-voice-gateway on $host: the controller session crashed ($reason) and starts again in $(seconds "$pause_ms") s. Confirm the development channel at the terminal (tmux attach -t voice), otherwise voice requests do not arrive."
+    notify "cc-voice-gateway on $host: the controller session crashed ($reason) and starts again in $(seconds "$pause_ms") s, without a confirmation. A message follows when it is ready."
   fi
   num sleep "$(seconds "$pause_ms")" &
   wait $! || true

@@ -247,7 +247,13 @@ test('a restart the controller asked for starts again at once, does not count, a
   assert.match(log, /the controller session ended for a restart requested by voice \(exit code 143\): starting it again at once, not counted as a crash/)
   assert.match(log, /starting the controller session again \(requested restart\)/)
   assert.doesNotMatch(log, /ended unexpectedly|giving up/)
-  assert.equal(telegram.messages.length, before, 'no crash message')
+  // One message as each begins, none of a crash; the gateway sends the next
+  // when the controller is ready again.
+  const sent = telegram.messages.slice(before).map(m => m.text)
+  assert.equal(sent.length, 2, sent.join('\n'))
+  for (const text of sent) {
+    assert.match(text, /: the controller restarts now \(requested by voice\)\. Confirm the development channel at the terminal \(tmux attach -t voice\), otherwise voice requests do not arrive\. A message follows when it is ready\.$/)
+  }
 })
 
 test('every start reads the settings file again; the environment still wins, and the level stays', async () => {
@@ -331,7 +337,7 @@ function asPlugin(c) {
   )
 }
 
-test('Claude in Chrome: marked as seen, a restart needs no confirmation; if it cannot be, Telegram says to confirm at the terminal', async () => {
+test('Claude in Chrome: marked as seen, a restart needs no confirmation; if it cannot be, the log and the restart\'s message say so', async () => {
   const env = { VOICE_GW_CONTROLLER_CHROME: '1', VOICE_GW_CHANNEL: 'plugin' }
   let before = telegram.messages.length
   const marked = setup([{ exit: 1 }, { exit: 0 }], { env })
@@ -344,21 +350,100 @@ test('Claude in Chrome: marked as seen, a restart needs no confirmation; if it c
   assert.match(sent[0], /crashed \(exit code 1\) and starts again in 0\.05 s, without a confirmation\. A message follows when it is ready\./)
   assert.equal(marked.log().match(/ chrome: marked /g)?.length, 1, 'marked at the first start, quiet at the second')
 
-  // Claude Code's config does not exist yet: at each start the log and
-  // Telegram say that the notice may wait, and the crash message promises no
-  // start without a confirmation.
+  // Claude Code's config does not exist yet: each start logs that the notice
+  // may wait. No message of its own: the crash's message says it instead of
+  // promising a start without a confirmation.
   before = telegram.messages.length
   const unmarked = setup([{ exit: 1 }, { exit: 0 }], { env })
   asPlugin(unmarked)
   assert.equal((await run(unmarked)).status, 0)
   sent = telegram.messages.slice(before).map(m => m.text)
-  assert.equal(sent.length, 3, 'at both starts, and for the crash')
-  for (const text of [sent[0], sent[2]]) {
-    assert.match(text, /the controller session starts with Claude in Chrome, whose notice for the first start could not be marked as seen \(\S*\.claude\.json does not exist yet: .*\)\. If it shows, the session waits for Enter at the terminal \(tmux attach -t voice\), and voice requests do not arrive until then\./)
-  }
-  assert.match(sent[1], /crashed \(exit code 1\) and starts again in 0\.05 s\. A message follows when it is ready\./)
-  assert.doesNotMatch(sent[1], /without a confirmation/)
-  assert.equal(unmarked.log().match(/watchdog: chrome: Claude in Chrome's notice for the first start could not be marked as seen, since .*; if Claude Code shows it, the session waits for Enter at the terminal \(tmux attach -t voice\)/g)?.length, 2)
+  assert.equal(sent.length, 1, 'only the crash')
+  assert.match(sent[0], /crashed \(exit code 1\) and starts again in 0\.05 s\. Claude in Chrome's notice for the first start may wait for Enter at the terminal \(tmux attach -t voice\)\. A message follows when it is ready\./)
+  assert.doesNotMatch(sent[0], /without a confirmation/)
+  assert.equal(unmarked.log().match(/watchdog: chrome: Claude in Chrome's notice for the first start could not be marked as seen, since \S*\.claude\.json does not exist yet: .*; if Claude Code shows it, the session waits for Enter at the terminal \(tmux attach -t voice\)/g)?.length, 2)
+
+  // A restart on purpose says it too.
+  before = telegram.messages.length
+  const restarted = setup([{ restart: true }, { exit: 0 }], { env })
+  asPlugin(restarted)
+  assert.equal((await run(restarted)).status, 0)
+  assert.deepEqual(telegram.messages.slice(before).map(m => m.text.replace(/^.*?: /, '')), [
+    "the controller restarts now (requested by voice). Claude in Chrome's notice for the first start may wait for Enter at the terminal (tmux attach -t voice). A message follows when it is ready.",
+  ])
+})
+
+// --- restarts on purpose: one message as each begins -----------------------------
+
+// systemctl as the autostart's systemd sees it: the service's invocation and
+// main process, and the job it runs (restart or stop), for invoker() and --stop.
+function systemd(c, job) {
+  const dir = join(c.dir, 'systemd-bin')
+  mkdirSync(dir, { recursive: true })
+  writeFileSync(join(dir, 'systemctl'), `#!/bin/sh
+case "$*" in
+  *InvocationID*) echo test-invocation ;;
+  *MainPID*) echo ${process.pid} ;;
+  *list-jobs*) echo "4711 cc-voice-gateway.service ${job} running" ;;
+esac
+`)
+  chmodSync(join(dir, 'systemctl'), 0o755)
+  // The test runs the script itself, as systemd runs ExecStop: its parent is
+  // the service's main process.
+  return { ...c.env, PATH: `${dir}:${c.env.PATH}`, INVOCATION_ID: 'test-invocation' }
+}
+
+test('a restart of the autostart\'s service: one message as it begins, and the next watchdog leaves the reason for the ready message', async () => {
+  const c = setup([{ run: true }, { exit: 0 }])
+  let before = telegram.messages.length
+  const first = spawn(SCRIPT, [], { env: c.env, stdio: 'ignore' })
+  const done = exited(first)
+  await waitUntil(() => existsSync(join(c.dir, 'state', 'controller.lock', 'claude.pid')))
+  const stop = await runCommand(SCRIPT, ['--stop'], systemd(c, 'restart'))
+  assert.equal(stop.status, 0, stop.stderr)
+  assert.equal(await done, 0)
+  assert.match(c.log(), /watchdog: stop requested by the service cc-voice-gateway\.service/)
+  assert.match(c.log(), /watchdog: a restart of the service cc-voice-gateway\.service: the controller session starts again right after this stop/)
+  assert.deepEqual(telegram.messages.slice(before).map(m => m.text.replace(/^.*?: /, '')), [
+    'the controller restarts now (a restart of the service cc-voice-gateway.service). Confirm the development channel at the terminal (tmux attach -t voice), otherwise voice requests do not arrive. A message follows when it is ready.',
+  ])
+
+  // systemd starts the next watchdog: it tells its gateway why, for the
+  // message when the controller is ready again, and sends none of its own.
+  before = telegram.messages.length
+  assert.equal((await run(c)).status, 0)
+  assert.equal(c.starts().at(-1).restarted, 'a restart of the service cc-voice-gateway.service')
+  assert.match(c.log(), /watchdog: starting the controller session \(watchdog \d+, started by .*\), after a restart of the service cc-voice-gateway\.service$/m)
+  assert.ok(!existsSync(join(c.dir, 'state', 'controller.restarting')), 'the note is used up')
+  assert.equal(telegram.messages.length, before)
+})
+
+test('a plain stop of the service sends nothing, and an old note of a restart that never started is dropped', async () => {
+  const c = setup([{ run: true }, { exit: 0 }])
+  const before = telegram.messages.length
+  const first = spawn(SCRIPT, [], { env: c.env, stdio: 'ignore' })
+  const done = exited(first)
+  await waitUntil(() => existsSync(join(c.dir, 'state', 'controller.lock', 'claude.pid')))
+  assert.equal((await runCommand(SCRIPT, ['--stop'], systemd(c, 'stop'))).status, 0)
+  assert.equal(await done, 0)
+  assert.equal(telegram.messages.length, before, 'no message for a stop')
+  assert.ok(!existsSync(join(c.dir, 'state', 'controller.restarting')))
+  assert.doesNotMatch(c.log(), /restart of the service/)
+
+  writeFileSync(join(c.dir, 'state', 'controller.restarting'), `${Math.floor(Date.now() / 1000) - 3600} a restart of the service cc-voice-gateway.service\n`)
+  assert.equal((await run(c)).status, 0)
+  assert.equal(c.starts().at(-1).restarted, null, 'no ready message for a start an hour later')
+  assert.ok(!existsSync(join(c.dir, 'state', 'controller.restarting')))
+})
+
+test('a crash sends its own message only; a restart on purpose one that it begins', async () => {
+  const before = telegram.messages.length
+  const c = setup([{ exit: 1 }, { restart: true }, { exit: 0 }])
+  assert.equal((await run(c)).status, 0)
+  const sent = telegram.messages.slice(before).map(m => m.text.replace(/^.*?: /, ''))
+  assert.equal(sent.length, 2, sent.join('\n'))
+  assert.match(sent[0], /^the controller session crashed \(exit code 1\) and starts again in 0\.05 s\. /)
+  assert.match(sent[1], /^the controller restarts now \(requested by voice\)\. /)
 })
 
 test('VOICE_GW_WATCHDOG=0 starts claude directly, as before', async () => {

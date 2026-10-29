@@ -16,6 +16,7 @@ import { createServer as createSocketServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import vm from 'node:vm'
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url)).replace(/\/$/, '')
 const TMP = mkdtempSync(join(tmpdir(), 'voice-gw-setup-'))
@@ -883,6 +884,117 @@ test('macOS: autostart alone loads at the next login; loaded already, a kickstar
   assert.ok(!now.calls.some(c => c.startsWith('launchctl ') && !c.startsWith('launchctl print')))
   rmSync(SESSION, { force: true })
   rmSync(LOADED, { force: true })
+})
+
+// --- Claude in Chrome's notice for the first start ---------------------------------
+
+// The setup with Claude Code's config in a folder of the test.
+const chromeSetup = (name, config) =>
+  createSetup({ root: ROOT, secretsDir: join(TMP, `secrets-chrome-${name}`), env: { ...setupEnv(), CLAUDE_CONFIG_DIR: config }, home: HOME, platform: 'linux', say })
+
+test('Claude in Chrome: the page learns whether its notice for the first start is confirmed, from Claude Code\'s config, read only', async () => {
+  const config = join(TMP, 'chrome-config')
+  mkdirSync(config, { recursive: true })
+  const file = join(config, '.claude.json')
+  const seen = async () => (await chromeSetup('state', config).api['GET /api/state']({})).chrome.noticeSeen
+  assert.equal(await seen(), null, 'no config: it cannot tell')
+  writeFileSync(file, '{"numStartups": 3,')
+  assert.equal(await seen(), null, 'not valid JSON: it cannot tell')
+  writeFileSync(file, JSON.stringify({ numStartups: 3 }, null, 2))
+  assert.equal(await seen(), false)
+  writeFileSync(file, JSON.stringify({ numStartups: 3, hasCompletedClaudeInChromeOnboarding: true }, null, 2))
+  const text = readFileSync(file, 'utf8')
+  assert.equal(await seen(), true)
+  assert.equal(readFileSync(file, 'utf8'), text, 'never written')
+})
+
+// The page's script against a stand-in for the browser: every element a plain
+// object, /api/state answered with these settings and what the server saw.
+async function page(settings, chrome) {
+  const elements = new Map()
+  const element = () => ({
+    value: '', hidden: false, textContent: '', className: '', checked: false, disabled: false, dataset: {}, attributes: {}, listeners: {},
+    addEventListener(type, listener) { (this.listeners[type] ??= []).push(listener) },
+    setAttribute(name, value) { this.attributes[name] = value },
+    removeAttribute(name) { delete this.attributes[name] },
+    replaceChildren() {},
+    append() {},
+    insertRow: () => ({ insertCell: () => element() }),
+  })
+  const $ = selector => elements.get(selector) ?? elements.set(selector, element()).get(selector)
+  const select = $('#controller-chrome')
+  select.dataset.setting = 'VOICE_GW_CONTROLLER_CHROME'
+  const state = {
+    host: 'test', root: ROOT, remaining: { overallMs: 600000, idleMs: 600000 }, checks: [], overridden: [], settings,
+    models: [], efforts: [], secrets: {}, git: { name: '', email: '' }, repos: { host: [], docker: [] },
+    watchdog: { platform: 'linux', unit: 'cc-voice-gateway.service' }, plugin: { mode: 'plugin', reason: '', allowlist: {} }, chrome,
+  }
+  const context = vm.createContext({
+    document: { querySelector: $, querySelectorAll: selector => (selector === '[data-setting]' ? [select] : []) },
+    fetch: async () => ({ ok: true, status: 200, json: async () => state }),
+    setInterval: () => 0,
+    clearInterval: () => {},
+    setTimeout,
+    Option: function () {},
+  })
+  vm.runInContext(readFileSync(join(ROOT, 'src', 'setup', 'ui', 'app.js'), 'utf8'), context)
+  await sleep(50) // its start reads /api/state
+  return { notice: $('#chrome-notice'), select }
+}
+
+test('Claude in Chrome on the page: a warning with what to do at the terminal, unless its notice is confirmed already', async () => {
+  const html = readFileSync(join(ROOT, 'src', 'setup', 'ui', 'index.html'), 'utf8')
+  assert.match(html, /<select id="controller-chrome" data-setting="VOICE_GW_CONTROLLER_CHROME">/)
+  assert.match(html, /<p id="chrome-notice" class="notice wide" hidden><\/p>/)
+
+  for (const noticeSeen of [false, null]) {
+    const { notice, select } = await page({ VOICE_GW_CONTROLLER_CHROME: '1' }, { noticeSeen })
+    assert.equal(notice.hidden, false, String(noticeSeen))
+    assert.equal(notice.className, 'notice wide')
+    assert.equal(notice.attributes.role, 'alert')
+    assert.match(notice.textContent, /^Warning: at its first start with Claude in Chrome, Claude Code shows a notice about it and waits for Enter at the terminal, so a restart by the watchdog or the autostart can hang on it\./)
+    assert.match(notice.textContent, /Before relying on unattended restarts, start Claude Code once at the terminal, as this user: claude --chrome, confirm the Claude in Chrome notice with Enter, and leave with \/exit\.$/)
+    // Turned off on the page: gone.
+    select.value = '0'
+    for (const listener of select.listeners.change) listener()
+    assert.equal(notice.hidden, true)
+  }
+
+  const confirmed = await page({ VOICE_GW_CONTROLLER_CHROME: '1' }, { noticeSeen: true })
+  assert.equal(confirmed.notice.hidden, false)
+  assert.equal(confirmed.notice.className, 'guide wide')
+  assert.equal(confirmed.notice.attributes.role, undefined)
+  assert.equal(confirmed.notice.textContent, "Claude in Chrome's notice for the first start is confirmed already for this user: restarts do not wait for it.")
+
+  // Off: nothing, until it is turned on.
+  const off = await page({ VOICE_GW_CONTROLLER_CHROME: '0' }, { noticeSeen: null })
+  assert.equal(off.notice.hidden, true)
+  off.select.value = '1'
+  for (const listener of off.select.listeners.change) listener()
+  assert.equal(off.notice.hidden, false)
+  assert.match(off.notice.textContent, /^Warning: /)
+})
+
+test('finishing with Claude in Chrome on: a line with what to do at the terminal, or that its notice is confirmed already', async () => {
+  const config = join(TMP, 'chrome-finish-config')
+  mkdirSync(config, { recursive: true })
+  const finish = async (name, chrome) => {
+    const setup = chromeSetup(`finish-${name}`, config)
+    const { job } = await setup.api['POST /api/finish']({
+      body: { settings: { VOICE_GW_PORT: '8787', VOICE_GW_DOCKER: '', VOICE_GW_CONTROLLER_CHROME: chrome }, telegram: { enabled: false }, docker: { enabled: false }, watchdog: {} },
+    })
+    let done
+    for (let i = 0; i < 250 && (done = setup.api['GET /api/jobs/:id']({ id: job })).state === 'running'; i++) await sleep(20)
+    assert.equal(done.state, 'done', done.lines.join('\n'))
+    return done.lines.join('\n')
+  }
+  assert.match(
+    await finish('unknown', '1'),
+    /Claude in Chrome: before relying on unattended restarts, start Claude Code once at the terminal as this user with claude --chrome, confirm the Claude in Chrome notice with Enter and leave with \/exit; otherwise a restart can hang on that notice/,
+  )
+  writeFileSync(join(config, '.claude.json'), JSON.stringify({ hasCompletedClaudeInChromeOnboarding: true }))
+  assert.match(await finish('seen', '1'), /Claude in Chrome: its notice for the first start is confirmed already for this user; restarts do not wait for it/)
+  assert.doesNotMatch(await finish('off', '0'), /Claude in Chrome/)
 })
 
 test('the settings file: one line per setting, read without running anything', () => {

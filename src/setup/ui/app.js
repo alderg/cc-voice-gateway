@@ -181,6 +181,26 @@ function showKillSwitchWarning() {
   $('#killswitch-warning').hidden = !text
 }
 
+// Claude in Chrome: its notice at the first start waits for Enter at the
+// terminal. A warning unless the server saw it confirmed in Claude Code's
+// config (state.chrome.noticeSeen true); null means it cannot tell.
+const CHROME_WARNING =
+  'Warning: at its first start with Claude in Chrome, Claude Code shows a notice about it and waits for Enter at the ' +
+  'terminal, so a restart by the watchdog or the autostart can hang on it. The start script tries to mark it as seen ' +
+  'beforehand, but cannot always. Before relying on unattended restarts, start Claude Code once at the terminal, as ' +
+  'this user: claude --chrome, confirm the Claude in Chrome notice with Enter, and leave with /exit.'
+const CHROME_CONFIRMED = 'Claude in Chrome\'s notice for the first start is confirmed already for this user: restarts do not wait for it.'
+
+function showChromeNotice() {
+  const box = $('#chrome-notice')
+  box.hidden = $('#controller-chrome').value !== '1'
+  const confirmed = state.chrome?.noticeSeen === true
+  box.className = confirmed ? 'guide wide' : 'notice wide'
+  if (confirmed) box.removeAttribute('role')
+  else box.setAttribute('role', 'alert')
+  box.textContent = confirmed ? CHROME_CONFIRMED : CHROME_WARNING
+}
+
 // The work folders in a container of their own, when they are on.
 const scratchDocker = () => $('#scratch-on').checked && $('#scratch-docker-on').checked
 
@@ -202,6 +222,7 @@ function fillSettings() {
   }
   showLevelWarning()
   showKillSwitchWarning()
+  showChromeNotice()
   // The Funnel's idle time: 0 means never; ticking the box suggests 90.
   const idle = $('#funnel-idle')
   $('#funnel-idle-on').checked = idle.value !== '' && idle.value !== '0'
@@ -355,6 +376,7 @@ action('#docker-build', '#build-state', async () => {
 for (const id of ['#docker-on', '#scratch-on', '#scratch-docker-on']) $(id).addEventListener('change', showContainers)
 $('#controller-level').addEventListener('change', showLevelWarning)
 $('#killswitch-mode').addEventListener('change', showKillSwitchWarning)
+$('#controller-chrome').addEventListener('change', showChromeNotice)
 $('#funnel-idle-on').addEventListener('change', () => ($('#funnel-idle').disabled = !$('#funnel-idle-on').checked))
 
 function collect() {

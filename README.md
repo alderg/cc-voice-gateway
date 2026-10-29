@@ -1183,13 +1183,24 @@ the `localhost` link).
 |---|---|---|
 | This computer | Checks Node.js, `npm install`, Claude Code (2.1.80+), git, the `gh` login, Docker, tmux, Tailscale | Fixes for what is marked as needed |
 | Gateway | Port, repositories folder, runs at a time and per repository (both apply at once in a running gateway), time limit, approvals by voice, Remote Control for the controller (off by default), what the controller may do (with a warning above `confined`), what locks the kill switch (with a warning below `auto`), the Funnel off when idle and after how many minutes | Choices |
-| Models | Model and effort for the controller (`--model`, `--effort` from `start-controller.sh`) and for every worker run, on the host and in Docker | Choices, or Claude Code's defaults |
+| Models | Model and effort for the controller (`--model`, `--effort` from `start-controller.sh`) and for every worker run, on the host and in Docker. Claude in Chrome for the controller (off by default); turned on, a warning unless Claude in Chrome's notice for the first start is confirmed already (below) | Choices, or Claude Code's defaults |
 | Telegram | Checks the token (`getMe`), finds your private chat with `getUpdates` once you wrote to the bot, sends a test message | A token from [@BotFather](https://t.me/BotFather), one message to the bot |
 | Workers in Docker | Checks the GitHub token and shows the level per repository with the gateway's detection. Builds the image with its progress shown. Starts the container, sets git's name and email in it, and clones the chosen repositories inside it | A token from `claude setup-token`, optionally a GitHub token ([5.6](#56-access-levels-and-their-detection)), the repositories |
 | Work folders | Off by default. Turned on: checks their folder as the gateway does, and with a container of their own, builds the image if it is missing and starts the container with `start-workers-container.sh --scratch` ([work folders](#work-folders)) | The folder, the days they are kept, and for the container its name and the token from `claude setup-token` |
 | Watchdog | On Linux, writes and enables a systemd user service that starts the controller in tmux at boot, and turns on lingering for your user so that it keeps running without a login (if that is refused, it shows the `sudo` command); or starts it now in tmux. On macOS it writes a LaunchAgent that starts it in tmux at login, checks it with `plutil`, and with "start it now" loads it with `launchctl bootstrap`, which starts it (`kickstart` if it is loaded already); without, launchd loads it at the next login | Choices |
 | Plugin | Shows whether `voice@cc-voice-gateway` is on the organisation's channel allowlist; registers the marketplace if it is; otherwise shows the admin steps | The admin |
 | Finish | Writes `.secrets/` (5.10) and ends | – |
+
+**Claude in Chrome.** At its first start with Claude in Chrome, Claude Code shows a notice about it
+and waits for Enter at the terminal, so a restart by the watchdog or the autostart can hang there.
+The start script marks it as seen before each start ([8.1](#81-starting-and-stopping)), but cannot
+always. With Claude in Chrome on, the assistant therefore shows a warning, and repeats it when it
+writes the setup: before relying on unattended restarts, start Claude Code once at the terminal, as
+the user the controller runs as, with `claude --chrome`, confirm the Claude in Chrome notice with
+Enter and leave with `/exit`. If Claude Code's config (`~/.claude.json`, or
+`$CLAUDE_CONFIG_DIR/.claude.json`) says that the notice is confirmed already
+(`hasCompletedClaudeInChromeOnboarding`), it says so instead; it only reads that file. If it cannot
+tell, it warns.
 
 Values equal to their default are left out of `.secrets/gateway.env`, and other settings already in
 it stay. Unticking Telegram deletes its two files. Options: `--host` (`0.0.0.0`), `--port` (`8790`),
@@ -1395,8 +1406,9 @@ either case.
   as seen: `hasCompletedClaudeInChromeOnboarding` in Claude Code's `~/.claude.json`
   (`$CLAUDE_CONFIG_DIR/.claude.json` if set), the key Claude Code sets itself once it has shown the
   notice. Only that key, only when it is missing, under Claude Code's own lock on the file. If it
-  cannot (no such file yet, not valid JSON, locked for 5 s), the log line `watchdog: chrome: …` and
-  a Telegram message say that the start may wait for Enter at the terminal.
+  cannot (no such file yet, not valid JSON, locked for 5 s), the log line `watchdog: chrome: …` says
+  that the start may wait for Enter at the terminal, and so does the next restart's Telegram message
+  ([8.2](#82-the-watchdog)).
 - **The channel,** chosen by `scripts/channel-mode.mjs` before every start:
   - **plugin**, when the organisation's managed settings (`~/.claude/remote-settings.json`, or the
     managed settings file on this computer) name `voice@cc-voice-gateway` in
@@ -1494,15 +1506,32 @@ a voice request and an approval with the app open.
 | One watchdog at a time | lock in `.state/controller.lock` | – |
 | Settings read again before every start, so a restart takes a change; the controller level, `VOICE_GW_SECRETS_DIR`, `VOICE_GW_STATE_DIR`, `VOICE_GW_LOG_FILE` and the watchdog's own settings stay until the start script starts again | – | `.secrets/gateway.env` |
 | Log | `watchdog:` lines in `.logs/gateway.log`: who started and who stopped it (the autostart's service or LaunchAgent, or user, process and terminal), and each start's settings with where they came from | – |
-| Telegram on each restart and when it gives up, and at a start whose Claude in Chrome notice could not be marked as seen | if the two Telegram files exist | – |
+| Telegram when a restart begins, a crash or one on purpose, and when it gives up; the gateway sends another when the controller is ready again | if the two Telegram files exist | – |
 | macOS: no idle sleep while it runs (`caffeinate -i -s`, ended with the watchdog) | on | `VOICE_GW_CAFFEINATE` |
+
+**Telegram.** One message when a restart begins, one when it is ready:
+
+| Restart | When it begins | When it is ready (from the gateway) |
+|---|---|---|
+| A crash, or a gateway that stopped answering | "the controller session crashed (exit code 1) and starts again in 5 s, without a confirmation. A message follows when it is ready." | "the controller is ready again, after a crash (exit code 1)." |
+| By voice, `restart_controller` ([8.3](#83-restarting-the-controller-by-voice)) | "the controller restarts now (requested by voice). A message follows when it is ready." | "… after a restart requested by voice." |
+| The autostart's service, `systemctl --user restart cc-voice-gateway` | "the controller restarts now (a restart of the service cc-voice-gateway.service). A message follows when it is ready." | "… after a restart of the service cc-voice-gateway.service." |
+
+Each starts with "cc-voice-gateway on <host>:". A crash gets only its own message, no second one.
+The service's restart runs `start-controller.sh --stop` as systemd's `ExecStop` with the job
+`restart` (`systemctl --user list-jobs`): that `--stop` sends the message and leaves the reason in
+`.state/controller.restarting` for the watchdog systemd starts next, which hands it to its gateway
+for the ready message. A plain `systemctl --user stop`, a start, a boot and the LaunchAgent on macOS
+send nothing.
 
 With the development flag, a restarted session waits for the channel warning to be answered at the
 terminal (`tmux attach -t voice`, Enter); with the plugin it does not. Claude in Chrome's notice for
 the first start would wait there too, at a start by the watchdog or the autostart alike; the start
-script marks it as seen beforehand ([8.1](#81-starting-and-stopping)). Only when that fails do the
-log and Telegram say that the start may wait for Enter at the terminal, and the crash message then
-does not promise a start without a confirmation.
+script marks it as seen beforehand ([8.1](#81-starting-and-stopping)). The message when a restart
+begins names what it may wait for: "Confirm the development channel at the terminal (tmux attach -t
+voice), otherwise voice requests do not arrive." instead of "without a confirmation", and, when the
+last start could not mark Claude in Chrome's notice as seen, "Claude in Chrome's notice for the first
+start may wait for Enter at the terminal (tmux attach -t voice)."
 
 ### 8.3 Restarting the controller by voice
 
@@ -1513,9 +1542,10 @@ does not promise a start without a confirmation.
    someone has to confirm at the terminal.
 2. **Only after your yes** it calls `restart_controller` with `confirm`.
 3. **The restart.** The gateway leaves a note for the watchdog and ends the session. The watchdog
+   says on Telegram that the restart begins ("the controller restarts now (requested by voice)"),
    starts it again at once, without a pause, and does not count it as a crash.
 4. **Ready message.** A Telegram message says when the controller is ready again, if Telegram is
-   set up.
+   set up ([8.2](#82-the-watchdog)).
 
 What survives:
 
@@ -1761,7 +1791,7 @@ limits at once.
 |---|---|---|
 | `VOICE_GW_CONTROLLER_MODEL` | Claude Code's default | `--model` for the controller |
 | `VOICE_GW_CONTROLLER_EFFORT` | Claude Code's default | `--effort` for the controller |
-| `VOICE_GW_CONTROLLER_CHROME` | `0` | `1`: `--chrome` for the controller, so it can use Claude in Chrome: a Chrome with the Claude extension, signed in, open on a desktop of the same user (a remote desktop session that stays when you disconnect works). Before each start the script marks Claude in Chrome's notice for the first start as seen, so that the session does not wait at the terminal ([8.1](#81-starting-and-stopping)) |
+| `VOICE_GW_CONTROLLER_CHROME` | `0` | `1`: `--chrome` for the controller, so it can use Claude in Chrome: a Chrome with the Claude extension, signed in, open on a desktop of the same user (a remote desktop session that stays when you disconnect works). Before each start the script marks Claude in Chrome's notice for the first start as seen, so that the session does not wait at the terminal ([8.1](#81-starting-and-stopping)); to be sure, confirm it once at the terminal with `claude --chrome` ([7.1](#71-with-the-setup-assistant)) |
 | `VOICE_GW_REMOTE_CONTROL` | `0` | `1`: `--remote-control "Voice controller"` for the controller, to follow and steer it at claude.ai/code and in the Claude app ([Remote Control](#remote-control-from-the-claude-app)); not the workers, whose headless runs Remote Control does not connect. Any other value counts as `0`. The gateway reads it too, to say so in its log |
 | `VOICE_GW_WATCHDOG` | `1` | `0`: start without the watchdog |
 | `VOICE_GW_WATCHDOG_INTERVAL` | `30` | Seconds between health checks |

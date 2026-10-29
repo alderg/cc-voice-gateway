@@ -14,9 +14,10 @@
 // open, see store.mjs). The restarted controller gets all of it in its
 // start-up summary. Open approvals belong to the old session and are gone.
 //
-// After any restart by the watchdog, the next gateway finds its note
-// ("restarted") and, once the session is connected, tells the driver on
-// Telegram that the controller is ready again.
+// When a restart begins, the watchdog says so on Telegram: this one, a crash,
+// or a restart of the autostart's service. After any of them the next gateway
+// finds the watchdog's note ("restarted") and, once the session is connected,
+// tells the driver on Telegram that the controller is ready again.
 
 import { execFile } from 'node:child_process'
 import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs'

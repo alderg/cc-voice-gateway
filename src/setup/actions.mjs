@@ -24,6 +24,7 @@ import { Telegram } from '../telegram.mjs'
 import { githubSlug } from '../workers.mjs'
 import { scratchProblem } from '../workspaces.mjs'
 import { MARKETPLACE, PLUGIN, channelMode } from '../../scripts/channel-mode.mjs'
+import { chromeNoticeSeen } from '../../scripts/chrome-onboarding.mjs'
 
 export const MODELS = ['fable', 'opus', 'sonnet', 'haiku']
 const MIN_CLAUDE = [2, 1, 80]
@@ -352,6 +353,10 @@ export function createSetup({
         reason: plugin.reason,
         allowlist: { marketplace: MARKETPLACE, plugin: PLUGIN },
       },
+      // Claude in Chrome's notice for the first start, confirmed already in
+      // Claude Code's config: true, false, or null when it cannot tell. Read
+      // only; the page warns unless it is true.
+      chrome: { noticeSeen: chromeNoticeSeen({ env, home }) },
     }
   }
 
@@ -854,6 +859,16 @@ export function createSetup({
     return ok
   }
 
+  // With Claude in Chrome on: its notice for the first start waits for Enter
+  // at the terminal. The start script marks it as seen before each start, but
+  // cannot always; confirmed once by hand, no restart waits for it.
+  const chromeNote = () =>
+    chromeNoticeSeen({ env, home }) === true
+      ? 'Claude in Chrome: its notice for the first start is confirmed already for this user; restarts do not wait for it'
+      : 'Claude in Chrome: before relying on unattended restarts, start Claude Code once at the terminal as this user with ' +
+        'claude --chrome, confirm the Claude in Chrome notice with Enter and leave with /exit; otherwise a restart can hang ' +
+        'on that notice'
+
   async function finish({ body, server }) {
     if (finishing) throw fail('The setup is already being written.', 409)
     const { values, docker, scratchDocker } = validate(body)
@@ -865,6 +880,7 @@ export function createSetup({
       if (docker) ok = (await setUpDocker(values, docker, line)) && ok
       if (scratchDocker) ok = (await setUpScratchDocker(values, line)) && ok
       if (body.watchdog?.autostart || body.watchdog?.startNow) ok = (await setUpWatchdog(body.watchdog, line)) && ok
+      if (settings.after.VOICE_GW_CONTROLLER_CHROME === '1') line(chromeNote())
       if (body.plugin?.register && channelMode({ env, root }).mode === 'plugin-register') {
         const code = await runCommand(bin.claude, ['plugin', 'marketplace', 'add', root], { env, onLine: line, timeoutMs: 60000 })
         line(code === 0 ? `registered this repository as the marketplace ${MARKETPLACE}` : 'registering the marketplace failed; the start script tries again')
