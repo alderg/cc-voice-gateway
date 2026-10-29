@@ -27,9 +27,10 @@
 // mounted folder.
 
 import { execFile } from 'node:child_process'
-import { homedir, tmpdir } from 'node:os'
+import { homedir } from 'node:os'
 import { posix } from 'node:path'
 import { log as defaultLog, preview } from './log.mjs'
+import { tempFolders } from './platform.mjs'
 
 const FILE_TOOLS = { Write: 'file_path', Edit: 'file_path', MultiEdit: 'file_path', NotebookEdit: 'notebook_path' }
 const DEVICES = ['/dev/null', '/dev/stdout', '/dev/stderr', '/dev/tty']
@@ -139,7 +140,8 @@ export class RunGuard {
     this.log = log
     const docker = Boolean(runner.container)
     this.home = docker ? '/home/worker' : homedir()
-    this.allowedRoots = [...new Set([...(docker ? [] : [tmpdir()]), '/tmp', '/var/tmp', ...allowed])]
+    // On macOS also /private/tmp and the per-user /var/folders/…/T (platform.mjs).
+    this.allowedRoots = [...new Set([...(docker ? ['/tmp', '/var/tmp'] : tempFolders()), ...allowed])]
     this.runs = new Map() // task id -> what the rules know about the run
     this.ghWarned = false
     workers.on('started', task => this.started(task))
