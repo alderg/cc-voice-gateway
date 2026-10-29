@@ -186,6 +186,15 @@ if (config.controllerLevelSetting && !CONTROLLER_LEVELS.includes(config.controll
   log(`VOICE_GW_CONTROLLER_LEVEL=${config.controllerLevelSetting} is not one of ${CONTROLLER_LEVELS.join(', ')}; confined instead`)
 }
 log(`controller level ${config.controllerLevel}`)
+// Remote Control is the start script's, for the controller session only
+// (config.mjs); the log says why the workers do not get it.
+if (config.remoteControl) {
+  log(
+    'remote control: the start script connects the controller session (--remote-control); worker runs do not get ' +
+      'it: they are headless (claude -p), and Claude Code connects only interactive sessions' +
+      (containers.length ? '; in the containers, the token from claude setup-token cannot connect one either' : ''),
+  )
+}
 let folders = null
 if (config.controllerLevel !== 'confined') {
   if (config.docker) log('clone_repo and delete_path: not with workers in Docker')

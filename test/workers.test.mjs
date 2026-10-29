@@ -216,7 +216,8 @@ before(async () => {
   mkdirSync(join(TMP, 'secrets'), { recursive: true })
   writeFileSync(
     join(TMP, 'secrets', 'gateway.env'),
-    '# written by the setup assistant\nVOICE_GW_WORKER_MODEL=sonnet\nVOICE_GW_WORKER_EFFORT=low\nVOICE_GW_MAX_WORKERS=9\n',
+    '# written by the setup assistant\nVOICE_GW_WORKER_MODEL=sonnet\nVOICE_GW_WORKER_EFFORT=low\nVOICE_GW_MAX_WORKERS=9\n' +
+      'VOICE_GW_REMOTE_CONTROL=1\n',
   )
   gw = await startGateway()
 })
@@ -296,6 +297,9 @@ test('dispatch runs claude -p in the checkout; the result reaches the controller
   assert.equal(arg(call, '--permission-prompts'), 'none')
   assert.equal(arg(call, '--model'), 'sonnet', 'model from .secrets/gateway.env')
   assert.equal(arg(call, '--effort'), 'low', 'effort from .secrets/gateway.env')
+  // VOICE_GW_REMOTE_CONTROL=1 there is the controller's: Claude Code connects
+  // only interactive sessions, and ignores --remote-control in a claude -p run.
+  assert.ok(!call.args.includes('--remote-control'))
   const deny = JSON.parse(arg(call, '--settings')).permissions.deny
   for (const rule of ['mcp__claude_ai_*', 'SendMessage', 'AskUserQuestion']) assert.ok(deny.includes(rule), rule)
   assert.match(arg(call, '--append-system-prompt'), /voice\/<short-name>/)

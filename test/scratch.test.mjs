@@ -736,9 +736,11 @@ test('VOICE_GW_SCRATCH_DOCKER: made, run and looked at through docker exec in th
     FAKE_DOCKER_FOLDER: mount,
     FAKE_DOCKER_MOUNT: mount,
     FAKE_DOCKER_RUNS: join(TMP, 'runs'),
+    VOICE_GW_REMOTE_CONTROL: '1', // the controller's only, and not with the container's token
   })
   try {
     assert.match(gw.log(), new RegExp(`work folders on: a new folder per task in ${mount}, in the container voice-scratch, which sees only the work folders, removed 60 days`))
+    assert.match(gw.log(), /remote control: .*worker runs do not get it: .*; in the containers, the token from claude setup-token cannot connect one either/)
     await until(() => /work folder container voice-scratch: work folders from host folder/.test(gw.log()))
     assert.match(gw.log(), new RegExp(`work folder container voice-scratch: work folders from host folder ${mount}, running as ${uid}\\n`))
     assert.doesNotMatch(gw.log(), /work folder container voice-scratch: (no host folder|it mounts)/)
@@ -757,6 +759,7 @@ test('VOICE_GW_SCRATCH_DOCKER: made, run and looked at through docker exec in th
     assert.ok(calls.some(call => call.join(' ') === `exec voice-scratch mkdir -m 700 ${dir}`), 'made in the container')
     const run = calls.find(call => call.includes('voice-run'))
     assert.deepEqual(run.slice(0, 8), ['exec', '-i', '-w', dir, 'voice-scratch', 'voice-run', id, join(BIN, 'claude')])
+    assert.ok(!run.includes('--remote-control'), 'a headless run, which Remote Control does not connect')
     assert.ok(calls.some(call => call[1] === 'voice-scratch' && call[2] === 'sh' && call.includes(dir)), 'looked at in the container')
     const call = await until(() => callOf('MAKE: compute the travel costs.'))
     assert.equal(call.cwd, dir)

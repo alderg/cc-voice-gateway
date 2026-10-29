@@ -96,6 +96,51 @@ test('start-controller.sh takes the model and effort from .secrets/gateway.env, 
   }
 })
 
+// .secrets/gateway.env with these lines, as the setup assistant writes it.
+const withSettings = text => config => {
+  const secrets = join(dirname(config), 'secrets')
+  mkdirSync(secrets)
+  writeFileSync(join(secrets, 'gateway.env'), text)
+}
+
+test('start-controller.sh turns Remote Control on with VOICE_GW_REMOTE_CONTROL=1, under a fixed name; off otherwise', () => {
+  const on = runWithStub(['--debug'], withSettings('VOICE_GW_REMOTE_CONTROL=1\n'))
+  // A name of its own: without one, the app would title the session after the
+  // first voice request.
+  assert.equal(valueOf(on.argv, '--remote-control'), 'Voice controller')
+  assert.equal(on.argv.at(-1), '--debug', 'options given to the script still come last')
+  assert.equal(valueOf(on.argv, '--permission-mode'), 'manual', 'the same session, also steered from the app')
+  assert.match(on.log, /remote control: the session "Voice controller" can be followed and steered in claude\.ai\/code and the Claude app, by whoever is signed in to this claude\.ai account/)
+  for (const text of ['', 'VOICE_GW_REMOTE_CONTROL=0\n', 'VOICE_GW_REMOTE_CONTROL=yes\n', 'VOICE_GW_REMOTE_CONTROL=true\n']) {
+    const off = runWithStub([], withSettings(text))
+    assert.ok(!off.argv.includes('--remote-control') && !off.argv.includes('--rc'), JSON.stringify(text))
+    assert.doesNotMatch(off.log, /remote control/)
+  }
+})
+
+test('VOICE_GW_REMOTE_CONTROL in the config: 1 is on, from the environment or the settings file; any other value counts as 0', () => {
+  const secrets = mkdtempSync(join(tmpdir(), 'voice-gw-rc-'))
+  const configUrl = new URL('../src/config.mjs', import.meta.url).href
+  const remoteControl = (value, file = null) => {
+    rmSync(join(secrets, 'gateway.env'), { force: true })
+    if (file !== null) writeFileSync(join(secrets, 'gateway.env'), `VOICE_GW_REMOTE_CONTROL=${file}\n`)
+    const env = { ...process.env, VOICE_GW_SECRETS_DIR: secrets }
+    delete env.VOICE_GW_REMOTE_CONTROL
+    if (value !== null) env.VOICE_GW_REMOTE_CONTROL = value
+    const script = `const { config } = await import(${JSON.stringify(configUrl)}); console.log(config.remoteControl)`
+    return execFileSync(process.execPath, ['--input-type=module', '-e', script], { env, encoding: 'utf8' }).trim()
+  }
+  try {
+    assert.equal(remoteControl(null), 'false', 'off by default')
+    assert.equal(remoteControl('1'), 'true')
+    assert.equal(remoteControl(null, '1'), 'true', 'from .secrets/gateway.env')
+    assert.equal(remoteControl('0', '1'), 'false', 'the environment wins')
+    for (const value of ['0', '', 'yes', 'true', 'on', ' 1', '2']) assert.equal(remoteControl(value), 'false', JSON.stringify(value))
+  } finally {
+    rmSync(secrets, { recursive: true, force: true })
+  }
+})
+
 const ROOT = fileURLToPath(new URL('..', import.meta.url)).replace(/\/$/, '')
 const allowlisted = config =>
   writeFileSync(

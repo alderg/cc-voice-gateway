@@ -20,8 +20,10 @@
 # Both read the gateway's settings from controller/.mcp.json and from
 # .secrets/gateway.env, which the setup assistant writes (scripts/setup.mjs).
 # From the latter this script also takes the session's model and effort:
-# VOICE_GW_CONTROLLER_MODEL and VOICE_GW_CONTROLLER_EFFORT, and with
-# VOICE_GW_CONTROLLER_CHROME=1 Claude in Chrome (--chrome).
+# VOICE_GW_CONTROLLER_MODEL and VOICE_GW_CONTROLLER_EFFORT, with
+# VOICE_GW_CONTROLLER_CHROME=1 Claude in Chrome (--chrome), and with
+# VOICE_GW_REMOTE_CONTROL=1 Remote Control (--remote-control): the session can
+# then be followed and steered from claude.ai/code and the Claude app.
 #
 # The session runs in manual mode, whatever defaultMode the user settings set.
 # controller/.claude/settings.json lets Bash, Write and Edit run without asking,
@@ -78,6 +80,7 @@ LOG=${VOICE_GW_LOG_FILE-$ROOT/.logs/gateway.log} # empty: stderr only, as for th
 
 MARKETPLACE=cc-voice-gateway
 PLUGIN=voice
+REMOTE_CONTROL_NAME='Voice controller' # the session's name in the Claude app, with VOICE_GW_REMOTE_CONTROL=1
 
 # --- settings ---------------------------------------------------------------
 
@@ -261,6 +264,14 @@ choose_channel() {
   if [ -n "${VOICE_GW_CONTROLLER_MODEL:-}" ]; then claude_args+=(--model "$VOICE_GW_CONTROLLER_MODEL"); fi
   if [ -n "${VOICE_GW_CONTROLLER_EFFORT:-}" ]; then claude_args+=(--effort "$VOICE_GW_CONTROLLER_EFFORT"); fi
   if [ "${VOICE_GW_CONTROLLER_CHROME:-0}" = 1 ]; then claude_args+=(--chrome); fi
+  # Remote Control, under a fixed name, so that a voice request does not
+  # become the session's title in the app. Only this session gets it: Claude
+  # Code connects interactive sessions, not the workers' claude -p runs. Without
+  # an eligible claude.ai login the session starts all the same, with a notice.
+  if [ "${VOICE_GW_REMOTE_CONTROL:-0}" = 1 ]; then
+    claude_args+=(--remote-control "$REMOTE_CONTROL_NAME")
+    log "remote control: the session \"$REMOTE_CONTROL_NAME\" can be followed and steered in claude.ai/code and the Claude app, by whoever is signed in to this claude.ai account"
+  fi
   export VOICE_GW_CHANNEL_MODE=$channel_mode # for the gateway (restart.mjs)
 }
 

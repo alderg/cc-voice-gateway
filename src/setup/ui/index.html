@@ -50,6 +50,15 @@
       <select data-setting="VOICE_GW_PERMISSION_RELAY"><option value="1">on</option><option value="0">off, only at the terminal</option></select>
     </label>
     <p class="guide">The rare approval the controller needs is read out in the car.</p>
+    <label>Remote Control
+      <select data-setting="VOICE_GW_REMOTE_CONTROL"><option value="0">off (default)</option><option value="1">on, for the controller</option></select>
+    </label>
+    <p class="guide">Follow the controller as "Voice controller" at <code>claude.ai/code</code> or in the Claude app's
+      Code tab: read along, type to it, answer its approvals. Only the controller:
+      <a href="https://code.claude.com/docs/en/remote-control" target="_blank" rel="noreferrer noopener">Remote Control</a>
+      connects interactive sessions, not the workers' headless runs. Needs Claude Code signed in with claude.ai here;
+      on Team and Enterprise an Owner turns it on first. Whoever is signed in to that account can then steer the
+      controller; typed words start no worker, only voice requests do.</p>
     <label>What the controller may do
       <select id="controller-level" data-setting="VOICE_GW_CONTROLLER_LEVEL">
         <option value="confined">confined (default)</option>

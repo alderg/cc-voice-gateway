@@ -342,6 +342,7 @@ to a lost phone or a leaked token.
 | The controller, level `confined` (default) | Read `controller/`, write `controller/playground/`, read pull request and CI status, merge after an approval, dispatch workers with your words from a recent voice request, raise the alarm | Start a worker on words that only a worker result or a pull request brought in (see 5.4); anything else (see 5.3) |
 | The controller at `clone-delete` | As at `confined`; also clone GitHub repositories into the worker root and delete files and folders there, each deletion after its plan, your words and an approval | Delete outside the worker root, the gateway's own checkout, or in a repository while its worker runs |
 | The controller at `unrestricted` | Everything your user can: any command, any file, `.secrets/` included, the web, subagents; your MCP servers and connectors after an approval | Nothing is blocked; a merge in the strict form and a confirmed `delete_path` still ask (see 5.3) |
+| Whoever is signed in to your claude.ai account, with Remote Control on | Follow the controller in the Claude app or at claude.ai/code, type to it, answer its approvals, stop its turn, switch it between Manual, Accept edits and Plan ([Remote Control](#remote-control-from-the-claude-app)) | Start a worker, clone or delete by typing (see 5.4); lift the confinement; see or steer the workers' runs |
 | A worker on this computer | Everything your user can, without approvals | Nothing is blocked; rules only observe (see 5.9) |
 | A worker in Docker | The mounted folder, the container's tokens, the network | Your other files, SSH keys, `gh` login; more on GitHub than its token allows |
 | A run in a work folder on this computer | Everything your user can, without approvals; the rules allow writes only in its folder | Nothing is blocked; rules only observe, as for any worker |
@@ -493,6 +494,10 @@ and fails closed.
   request's text told it to.
 - **Turning it off:** `VOICE_GW_PERMISSION_RELAY=0`. Then approvals, merges included, happen only
   at the terminal.
+- **Answered elsewhere.** With [Remote Control](#remote-control-from-the-claude-app) on, the Claude
+  app shows the prompt too, as a third place. An answer at the terminal or in the app does not
+  reach the gateway: the car keeps the prompt until it drops after `VOICE_GW_PERMISSION_TTL`, and
+  an answer by voice then has no effect.
 - **Secrets in prompts:** Claude Code masks recognisable credentials in relayed prompts, but not
   every secret ([channels reference][ref]).
 
@@ -1064,6 +1069,7 @@ differ.
 | Voice mode in the Claude app | All plans ([voice mode][voice]) | – |
 | Custom connector (remote MCP) | Free (one connector), Pro, Max, Team, Enterprise ([connectors][connectors]) | On Team, only Owners and Primary Owners add connectors |
 | Claude Code channels | Pro and Max without an admin step ([channels][channels]) | An Owner enables channels: Organization settings → Claude Code → Channels, or `channelsEnabled: true` |
+| Remote Control for the controller, optional | Pro, Max, Team, Enterprise; not with an API key or a token from `setup-token` ([Remote Control][rc]) | An Owner turns on Remote Control: Organization settings → Claude Code |
 | Channel plugin without the prompt | Team and Enterprise managed setting `allowedChannelPlugins` ([channels][channels-admin]) | Owner, see [7.4](#74-admin-steps-for-team-and-enterprise) |
 | `claude setup-token` for the container | Pro, Max, Team or Enterprise ([authentication][auth]) | – |
 
@@ -1074,7 +1080,7 @@ On a Team plan this means:
 - `claude setup-token` works.
 
 A token from `setup-token` can only make model requests; it is used for the workers in the
-container, not for the controller.
+container, not for the controller. It cannot open a Remote Control session either.
 
 ## 7. Installation
 
@@ -1094,7 +1100,7 @@ the `localhost` link).
 | Step | What the assistant does | What you give it |
 |---|---|---|
 | This computer | Checks Node.js, `npm install`, Claude Code (2.1.80+), git, the `gh` login, Docker, tmux, Tailscale | Fixes for what is marked as needed |
-| Gateway | Port, repositories folder, runs at a time, time limit, approvals by voice, what the controller may do (with a warning above `confined`), what locks the kill switch (with a warning below `auto`), the Funnel off when idle and after how many minutes | Choices |
+| Gateway | Port, repositories folder, runs at a time, time limit, approvals by voice, Remote Control for the controller (off by default), what the controller may do (with a warning above `confined`), what locks the kill switch (with a warning below `auto`), the Funnel off when idle and after how many minutes | Choices |
 | Models | Model and effort for the controller (`--model`, `--effort` from `start-controller.sh`) and for every worker run, on the host and in Docker | Choices, or Claude Code's defaults |
 | Telegram | Checks the token (`getMe`), finds your private chat with `getUpdates` once you wrote to the bot, sends a test message | A token from [@BotFather](https://t.me/BotFather), one message to the bot |
 | Workers in Docker | Checks the GitHub token and shows the level per repository with the gateway's detection. Builds the image with its progress shown. Starts the container, sets git's name and email in it, and clones the chosen repositories inside it | A token from `claude setup-token`, optionally a GitHub token ([5.6](#56-access-levels-and-their-detection)), the repositories |
@@ -1240,7 +1246,11 @@ On claude.ai, as Owner or Primary Owner:
 1. **Enable channels:** Organization settings → Claude Code → Channels, or `channelsEnabled: true`
    in the managed settings ([channels][channels-admin]).
 2. **Custom connector:** on Team, only Owners and Primary Owners add it ([connectors][connectors]).
-3. **Optional, the channel without the prompt.** Open
+3. **Optional, Remote Control** for the controller
+   ([Remote Control](#remote-control-from-the-claude-app)): Organization settings → Claude Code →
+   Remote Control, on; it is off by default there. On Enterprise with custom roles, your roles also
+   need the cloud sessions and the Claude Code remote control permission ([Remote Control][rc]).
+4. **Optional, the channel without the prompt.** Open
    [Organization settings → Claude Code → Managed settings](https://claude.ai/admin-settings/claude-code),
    keep what is there, and add:
 
@@ -1293,8 +1303,9 @@ either case.
 
 - **Folder and mode:** starts `claude` in `controller/` with `--permission-mode manual`.
 - **Model and effort:** `--model`/`--effort` from `VOICE_GW_CONTROLLER_MODEL` and
-  `VOICE_GW_CONTROLLER_EFFORT`, and `--chrome` with `VOICE_GW_CONTROLLER_CHROME=1`; options given
-  to the script come last and win.
+  `VOICE_GW_CONTROLLER_EFFORT`, `--chrome` with `VOICE_GW_CONTROLLER_CHROME=1`, and
+  `--remote-control "Voice controller"` with `VOICE_GW_REMOTE_CONTROL=1`
+  ([below](#remote-control-from-the-claude-app)); options given to the script come last and win.
 - **The channel,** chosen by `scripts/channel-mode.mjs` before every start:
   - **plugin**, when the organisation's managed settings (`~/.claude/remote-settings.json`, or the
     managed settings file on this computer) name `voice@cc-voice-gateway` in
@@ -1316,6 +1327,66 @@ the gateway lives and ends with the session. Do not drop the user settings with
 `--setting-sources`: Claude Code then reports channels as not enabled for the organisation. Your
 plugins, hooks and allow rules therefore load into the controller; the confine hook blocks every
 tool that is not on its list ([confinement](#53-the-controllers-confinement)).
+
+#### Remote Control from the Claude app
+
+Off by default; `VOICE_GW_REMOTE_CONTROL=1`, or the setup assistant, turns it on, from the next
+start of the session (a restart by voice will do). The start script then passes
+`--remote-control "Voice controller"` ([Remote Control][rc]). At claude.ai/code or in the Claude
+app's Code tab, on an iPad for example, the session "Voice controller" shows what reaches the
+controller and what it does: the voice requests, its answers, the worker results.
+
+| Session | Remote Control | Why |
+|---|---|---|
+| Controller | Yes | An interactive session, signed in with claude.ai |
+| Workers on this computer, work folders | No | Headless `claude -p` runs. `--remote-control` and the setting `remoteControlAtStartup` are for interactive sessions; in a `-p` run Claude Code ignores the flag without a word (checked with 2.1.310) |
+| Workers in Docker, the work folders' container | No | Headless too, and the token from `claude setup-token` only makes model requests: it cannot open a Remote Control session ([authentication][auth]) |
+
+The gateway's log says the same at its start. From the app, on the controller:
+
+- **Type to it.** A typed message reaches the session as your turn, not through the channel: no
+  `request_id`, nothing read aloud. The controller answers it in the app (`controller/CLAUDE.md`).
+- **No worker by typing.** Typed words are no voice request, so `dispatch` answers `needs_driver`
+  ([5.4](#54-approvals-by-voice)), as do `clone_repo`, a confirmed `delete_path` and
+  `resolve_decision`. Say it by voice. Status questions, `list_workers`, `worker_status`,
+  `open_items`, `stop_worker` and a merge (your yes, then the approval) work.
+- **Approvals** show in the terminal, in the car and in the app; the first answer counts
+  ([5.4](#54-approvals-by-voice)).
+- **Stop, mode, commands.** Stop ends the current turn, as Esc does. The mode picker offers
+  Manual, Accept edits and Plan; leave it at Manual. Bypass and auto are turned off in
+  `controller/.claude/settings.json`. `/exit` from the app ends the session as at the terminal,
+  and the watchdog takes that as quitting: it does not start it again.
+- **The confinement holds.** The confine hook sees every tool call, whoever asked for it, in every
+  mode ([5.3](#53-the-controllers-confinement)). The workers and the kill switch's rules are not
+  touched.
+- **Each start is a new session** in the app; after a restart the one before shows as offline.
+
+It needs Claude Code on this computer signed in with claude.ai, not an API key, `apiKeyHelper` or
+`ANTHROPIC_AUTH_TOKEN`; Anthropic's API, not Amazon Bedrock, Google Cloud's Agent Platform,
+Microsoft Foundry or another `ANTHROPIC_BASE_URL`; and neither
+`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` nor `DISABLE_GROWTHBOOK` set. On Team and Enterprise
+an Owner turns it on ([7.4](#74-admin-steps-for-team-and-enterprise)). Without that, the session starts all the same,
+with a notice in its terminal; `claude doctor` names the check that failed. If Claude Code asks
+once whether to enable Remote Control, answer at the terminal (`tmux attach -t voice`).
+
+Claude Code's documentation names no conflict between Remote Control and channels; the
+combination has not been tried with a live session here yet. Before relying on it in the car, try
+a voice request and an approval with the app open.
+
+**Security.**
+
+- **Your claude.ai account steers the controller.** Whoever is signed in to it, on any device, can
+  read the session and act in it, with your approvals: merge at `confined`, delete at
+  `clone-delete`, anything at `unrestricted`. Protect the account; "Require trusted devices" ties
+  Remote Control to devices you enrolled ([Remote Control][rc]).
+- **The transcript is stored at Anthropic** while connected, voice requests, worker results and
+  tool output included, to keep the devices in sync ([Remote Control][rc]).
+- **Typed is not spoken.** The dispatch check holds in code. The controller takes a typed message
+  as yours, as it should; what it does without the check (stopping a worker, a restart, a merge
+  with your approval) a typed message can ask for.
+- **Your sessions on other machines reach it too.** Over the same connection they can send it
+  messages ([cross-session messaging][csm]), as sessions on this computer always could; its
+  instructions treat them as data.
 
 ### 8.2 The watchdog
 
@@ -1580,6 +1651,7 @@ setting with where it came from.
 | `VOICE_GW_CONTROLLER_MODEL` | Claude Code's default | `--model` for the controller |
 | `VOICE_GW_CONTROLLER_EFFORT` | Claude Code's default | `--effort` for the controller |
 | `VOICE_GW_CONTROLLER_CHROME` | `0` | `1`: `--chrome` for the controller, so it can use Claude in Chrome: a Chrome with the Claude extension, signed in, open on a desktop of the same user (a remote desktop session that stays when you disconnect works) |
+| `VOICE_GW_REMOTE_CONTROL` | `0` | `1`: `--remote-control "Voice controller"` for the controller, to follow and steer it at claude.ai/code and in the Claude app ([Remote Control](#remote-control-from-the-claude-app)); not the workers, whose headless runs Remote Control does not connect. Any other value counts as `0`. The gateway reads it too, to say so in its log |
 | `VOICE_GW_WATCHDOG` | `1` | `0`: start without the watchdog |
 | `VOICE_GW_WATCHDOG_INTERVAL` | `30` | Seconds between health checks |
 | `VOICE_GW_WATCHDOG_HEALTH_FAILS` | `3` | Failed checks before a restart |
@@ -1687,6 +1759,8 @@ do not set them.
 | The Funnel goes off while you still use voice mode | It goes off `VOICE_GW_FUNNEL_IDLE` minutes after the last voice call; a long silence counts. Raise the minutes, or send "keep alive". |
 | No approval by voice | Expected for Bash, Write and Edit: they run without asking. For other tools: the session runs in auto or bypass mode, an allow rule covers the tool, or it is a trust or consent dialog, which is not relayed. Start the session with `scripts/start-controller.sh`. |
 | The controller still starts with the development flag after the admin step | The log line `channel: the development flag, since …` says why. The script reads Claude Code's local copy of the managed settings (`~/.claude/remote-settings.json`), which Claude Code updates when a session starts, so the first start after the admin step still sees the old copy: answer the warning or quit, and start again. `node scripts/channel-mode.mjs` shows what the next start will use; `claude doctor` shows whether the managed settings arrived. |
+| With `VOICE_GW_REMOTE_CONTROL=1`, "Voice controller" is missing in the Claude app | It counts from the next start of the session; the log line `watchdog: remote control: …` shows that it was passed. The controller's terminal (`tmux attach -t voice`) shows why it did not connect, and `claude doctor` which check failed: Claude Code signed in with an API key or a token instead of claude.ai, `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` or `DISABLE_GROWTHBOOK` set, or on Team and Enterprise Remote Control not turned on by an Owner ([7.4](#74-admin-steps-for-team-and-enterprise)). After a restart, take the newest session of that name. |
+| No worker shows up in the Claude app | Expected: only the controller connects. Worker runs are headless (`claude -p`), which Remote Control does not connect ([Remote Control](#remote-control-from-the-claude-app)); ask the controller what a worker does, or read `.state/tasks/<task>.jsonl`. |
 | "Restart the controller" and the controller says it cannot restart itself | It was not started by `scripts/start-controller.sh` with the watchdog. Restart it at the computer. |
 | Voice requests stop arriving after a crash | The watchdog started the session again, and the development-channel warning waits: `tmux attach -t voice`, then Enter. `grep watchdog .logs/gateway.log` shows what happened. |
 | `the controller is already running (watchdog …)` | A watchdog runs already, for example in another tmux window. `scripts/start-controller.sh --status`; `--stop` ends it. |
@@ -1764,8 +1838,8 @@ video/               the video's sources: script.json (voiceover), slides.html (
 ## 10. Sources
 
 - [Claude Code: channels][channels], [channels reference][ref], [enterprise controls][channels-admin]
-- [Claude Code: Remote Control][rc], [authentication and setup-token][auth], [sandboxing][sandbox],
-  [permissions][perm]
+- [Claude Code: Remote Control][rc], [cross-session messaging][csm], [authentication and
+  setup-token][auth], [sandboxing][sandbox], [permissions][perm]
 - [Claude Help Center: voice mode][voice], [custom connectors][connectors]
 - [MCP authorisation][mcpauth], [Tailscale Funnel][funnel]
 - [carcode][carcode], [DashVox][dashvox], [VoiceMode][voicemode], [Claude on CarPlay][carplay]
@@ -1779,6 +1853,7 @@ video/               the video's sources: script.json (voiceover), slides.html (
 [channels-admin]: https://code.claude.com/docs/en/channels#enterprise-controls
 [ref]: https://code.claude.com/docs/en/channels-reference
 [rc]: https://code.claude.com/docs/en/remote-control
+[csm]: https://code.claude.com/docs/en/cross-session-messaging
 [auth]: https://code.claude.com/docs/en/authentication
 [perm]: https://code.claude.com/docs/en/permissions
 [sandbox]: https://code.claude.com/docs/en/sandboxing

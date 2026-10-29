@@ -404,6 +404,7 @@ test('the start: checks, current settings, repositories and the plugin, without 
   assert.equal(data.settings.VOICE_GW_SCRATCH, '0', 'work folders off, by default')
   assert.equal(data.settings.VOICE_GW_SCRATCH_DOCKER, '', 'and on this computer when turned on')
   assert.equal(data.settings.VOICE_GW_SCRATCH_DAYS, '60')
+  assert.equal(data.settings.VOICE_GW_REMOTE_CONTROL, '0', 'Remote Control off, by default')
   assert.deepEqual(data.secrets, { telegramToken: null, telegramChatId: null, githubToken: null, claudeToken: null })
   assert.deepEqual(data.git, { name: 'Test Driver', email: 'driver@example.com' })
   assert.equal(data.plugin.mode, 'development')
@@ -484,10 +485,12 @@ test('finishing: invalid input is refused before anything is written', async () 
       VOICE_GW_SCRATCH: 'yes',
       VOICE_GW_SCRATCH_DAYS: '366',
       VOICE_GW_SCRATCH_DOCKER: 'a b',
+      VOICE_GW_REMOTE_CONTROL: 'yes',
       NOPE: '1',
     },
   })
   assert.equal(refused.status, 400)
+  assert.match(refused.data.error, /VOICE_GW_REMOTE_CONTROL: not a valid value/)
   assert.match(refused.data.error, /VOICE_GW_PORT: not a valid value/)
   assert.match(refused.data.error, /VOICE_GW_WORKER_MODEL: not a valid value/)
   assert.match(refused.data.error, /VOICE_GW_KILLSWITCH: not a valid value/)
@@ -516,6 +519,7 @@ test('finishing: the files in .secrets with mode 0600 in folders of 0700, the co
       VOICE_GW_WORKER_EFFORT: 'high',
       VOICE_GW_KILLSWITCH: 'manual',
       VOICE_GW_PR_DRAFT: '1',
+      VOICE_GW_REMOTE_CONTROL: '1',
     },
     telegram: { enabled: true },
     docker: { enabled: true, repos: ['acme/guarded', 'acme/open'], gitName: 'Test Driver', gitEmail: 'driver@example.com' },
@@ -551,6 +555,7 @@ test('finishing: the files in .secrets with mode 0600 in folders of 0700, the co
     VOICE_GW_WORKER_EFFORT: 'high',
     VOICE_GW_KILLSWITCH: 'manual',
     VOICE_GW_PR_DRAFT: '1',
+    VOICE_GW_REMOTE_CONTROL: '1',
   })
   for (const value of SECRET_VALUES) assert.ok(!readFileSync(join(SECRETS, 'gateway.env'), 'utf8').includes(value))
 

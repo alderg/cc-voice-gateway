@@ -100,6 +100,13 @@ export const config = {
   // An unknown value counts as confined; the gateway says so in its log.
   controllerLevel: CONTROLLER_LEVELS.includes(env.VOICE_GW_CONTROLLER_LEVEL) ? env.VOICE_GW_CONTROLLER_LEVEL : 'confined',
   controllerLevelSetting: env.VOICE_GW_CONTROLLER_LEVEL ?? '',
+  // Remote Control (VOICE_GW_REMOTE_CONTROL=1): scripts/start-controller.sh
+  // starts the controller session with --remote-control, so that it can be
+  // followed and steered from claude.ai/code and the Claude app. Not the
+  // workers: Claude Code connects only interactive sessions, not claude -p
+  // runs, and a token from claude setup-token, as in the containers, cannot
+  // connect one at all. Any other value counts as 0.
+  remoteControl: env.VOICE_GW_REMOTE_CONTROL === '1',
   // A dispatch starts a run only with the driver's own words from a voice
   // request of the last this many minutes (channel.mjs).
   dispatchWindowMinutes: num(env.VOICE_GW_DISPATCH_WINDOW, 30),

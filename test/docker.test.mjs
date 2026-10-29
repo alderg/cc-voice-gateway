@@ -230,6 +230,7 @@ before(async () => {
       VOICE_GW_WORKER_MODEL: 'opus',
       VOICE_GW_WORKER_EFFORT: 'high',
       VOICE_GW_PR_DRAFT: '', // the default, also where the controller's settings set it
+      VOICE_GW_REMOTE_CONTROL: '1', // the controller's only, and not with the container's token
       FAKE_DOCKER_LOG: join(TMP, 'docker-calls.jsonl'),
       FAKE_DOCKER_CONTAINER: CONTAINER,
       FAKE_DOCKER_DOWN: DOWN,
@@ -497,6 +498,10 @@ test('Docker: runs go through voice-run in the container, with the rules of thei
   assert.equal(arg(call, '--permission-mode'), 'bypassPermissions')
   assert.equal(arg(call, '--model'), 'opus', 'VOICE_GW_WORKER_MODEL reaches the run in the container')
   assert.equal(arg(call, '--effort'), 'high', 'VOICE_GW_WORKER_EFFORT too')
+  // VOICE_GW_REMOTE_CONTROL=1 is the controller's: a headless run with the
+  // token from claude setup-token cannot have it, and the log says why.
+  assert.ok(!call.args.includes('--remote-control') && !exec.includes('--remote-control'))
+  assert.match(gw.log, /remote control: the start script connects the controller session \(--remote-control\); worker runs do not get it: they are headless \(claude -p\), and Claude Code connects only interactive sessions; in the containers, the token from claude setup-token cannot connect one either/)
   assert.match(arg(call, '--append-system-prompt'), /Publish: nothing leaves the container\. Never push and never open a pull request/)
   assert.doesNotMatch(arg(call, '--append-system-prompt'), /gh pr create/)
   assert.match(call.input, /^- Access level: read-only \(the token cannot push \(Contents is read-only\)\)\. Nothing leaves this container: no push, no pull request\.$/m)

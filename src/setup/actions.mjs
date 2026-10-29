@@ -50,6 +50,7 @@ export function fields(root) {
     VOICE_GW_SCRATCH_DAYS: { default: '60', valid: value => value === '0' || INT(1, 365)(value) },
     VOICE_GW_SCRATCH_DOCKER: { default: '', valid: NAME },
     VOICE_GW_PERMISSION_RELAY: { default: '1', valid: ONE_OF('1', '0') },
+    VOICE_GW_REMOTE_CONTROL: { default: '0', valid: ONE_OF('0', '1') },
     VOICE_GW_CONTROLLER_LEVEL: { default: 'confined', valid: ONE_OF(...CONTROLLER_LEVELS) },
     VOICE_GW_KILLSWITCH: { default: 'auto', valid: ONE_OF(...KILLSWITCH_MODES) },
     VOICE_GW_TELEGRAM_AFTER: { default: '600', valid: INT(10, 3600) },
