@@ -433,7 +433,11 @@ function dispatchText(worker, result) {
       const { entry, position, reason } = result
       const holds = result.holds ?? []
       const why = {
-        busy: result.task ? `task ${result.task.id} is running there` : 'the last run there is just ending',
+        busy: result.task
+          ? `task ${result.task.id} is ${result.task.stopping ? 'ending' : 'running'} there`
+          : result.strays
+            ? 'worker processes of an earlier run that nobody followed still ran there; the gateway is ending them'
+            : 'the last run there is just ending',
         decision: `an open decision about ${worker} holds its tasks: ${holds.map(d => decisionLine(d)).join('; ')}`,
         queue: 'tasks queued there before it go first',
         full: `every run slot is taken (${result.running.map(t => t.repo).join(', ')})`,
@@ -561,15 +565,26 @@ async function stopText(workers, worker, drop) {
   }
   const dropped = drop === 'all' ? workers.drop(worker, 'all') : []
   const task = workers.stop(worker)
+  // It has stopped when every process of it is gone; then git is looked at.
+  const ended = task ? await workers.ended(task) : true
+  // Not yet: the gateway goes on ending it, and its result event comes then.
+  if (!ended) task.reported = false
   const queued = workers.queued(worker)
   const head = [`worker=${worker}`]
-  if (task) head.push(`stopped task=${task.id}`)
+  if (task) head.push(`${ended ? 'stopped' : 'stopping'} task=${task.id}`)
   if (dropped.length) head.push(`dropped=${dropped.length}`)
   if (queued.length) head.push(`queued=${queued.length}`)
   // A stopped run gets no result event; its audit comes with this answer,
   // and so does the decision the audit raised, which belongs to no request
   // yet: the controller asks the driver about it now.
-  const parts = task ? ['Stopped.', auditText(await workers.audit(task))] : ['Nothing is running there.']
+  const parts = !task
+    ? ['Nothing is running there.']
+    : ended
+      ? ['Stopped.', auditText(await workers.audit(task))]
+      : [
+          'Stopping: not all of its processes have ended yet. The gateway goes on ending them, nothing else starts ' +
+            'there until they have, and its result arrives as an event then.',
+        ]
   const decision = task?.decision ? workers.ledger?.get(task.decision) : null
   if (decision && decision.state !== 'closed') {
     head.push(`decision=${decision.id}`)

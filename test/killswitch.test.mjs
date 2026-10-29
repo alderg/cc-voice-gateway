@@ -716,7 +716,11 @@ test('a rule: a push to main in a run locks it, and every running worker stops',
   const state = await waitUntil(async () => (await killswitchState()).state)
   assert.equal(state.trigger, 'rule')
   assert.match(state.reason, /^push to the default branch: the command "git push origin main" \(worker alpha, task t[a-z0-9]{3}\)$/)
-  const status = await gw.controller('worker_status', { worker: 'beta' })
+  // Ending until every process of it is gone, then stopped.
+  const status = await waitUntil(async () => {
+    const out = await gw.controller('worker_status', { worker: 'beta' })
+    return /^\[worker=beta state=stopped /.test(out.text) && out
+  })
   assert.match(status.text, new RegExp(`^\\[worker=beta state=stopped task=${slowId}`))
   assert.match(status.text, /Problem: kill switch \(rule\)/)
   await waitUntil(() => {

@@ -529,6 +529,23 @@ What applies to every worker run (`src/workers.mjs`):
   ([5.4](#54-approvals-by-voice)) and a checkout with uncommitted changes until you agree. A
   second run in the same repository, or one more than `VOICE_GW_MAX_WORKERS` runs, waits in the
   queue instead. A run stops after `VOICE_GW_WORKER_TIMEOUT` minutes.
+- **When a run has ended:** when every process of it has, not when its output shows a result.
+  Claude Code can answer a turn of its own first, such as the notification of a background task
+  left over in the session it resumes, write a result for it and go on with the task in the same
+  process; a run can also leave a server or a test running. Every process of a run carries marks
+  in its environment, which whatever it starts inherits (`VOICE_GW_RUN`, `VOICE_GW_TASK`,
+  `VOICE_GW_REPO`). The gateway finds them by these on Linux, besides the run's process group and
+  the tree below it, also those that left the group or whose parent ended. Until all of them are
+  gone, the run counts as running (`state=ending` once it is being stopped): the rules watch it,
+  the kill switch stops it, nothing else starts in its checkout, and its git check waits. When the
+  run's own process ends while processes it started still run, the gateway ends those; a run that
+  gave its result and stays without a word for two minutes, the gateway ends too. Stopping sends
+  SIGTERM to all of it, then SIGKILL every five seconds until it is gone, also from the next
+  gateway after a restart. A run's own process is recognised by its start time, so a later
+  process with the same id is never taken for it. Worker processes in a checkout that belong to no
+  run the gateway follows (its state was lost, for example) are ended when the gateway starts,
+  before a run there, and by the kill switch, and nothing starts in that checkout until they are
+  gone.
 - **The queue:** `dispatch` answers `dispatch=queued` with the task's id (`q…`), its position and
   why: `busy` (a run is going there), `queue` (tasks queued there go first) or `full` (no run
   slot). Your words are checked when it is queued, not again. The gateway starts queued tasks by
@@ -579,7 +596,8 @@ What applies to every worker run (`src/workers.mjs`):
 | Runs as | You, in your checkouts in `VOICE_GW_WORKER_ROOT` | Your user id, in the container's clones in the mounted folder |
 | Reaches | Everything your user can: files, SSH keys, the `gh` login, `.secrets/`, this repository's code | The mounted folder, `/run/secrets/voice` (read-only), the network |
 | GitHub | Your `gh` login: every repository you can write to | The container's token, at the level it allows |
-| Started by | `spawn` in its own process group | `docker exec … voice-run`, which hands over the tokens and starts its own process group |
+| Started by | `spawn` in its own process group, with the run's marks | `docker exec … voice-run`, which hands over the tokens, marks the run (`VOICE_GW_TASK`) and starts its own process group |
+| Stopped by | Signals to its process group, the tree below it and every process with its marks | `voice-stop`: its process group and every process with its mark, in the container; also once its own process has ended |
 | Isolation | None | The container |
 
 ![Workers in Docker](docs/docker.drawio.svg)
@@ -773,8 +791,9 @@ pull requests turned off are exempt, as for pushes.
   when the switch tripped; `send` and `ask` hand nothing over. The queue is emptied, and the
   controller's alarm names its tasks: they do not start after the unlock by themselves.
 - **Approvals:** open ones are denied, new ones are denied automatically.
-- **Workers:** every run stops, and so does a clone that is going. With Docker the container stops
-  and loses its restart policy.
+- **Workers:** every run stops, with every process it started, also a run that is ending, and so do
+  worker processes that no run accounts for and a clone that is going. With Docker the container
+  stops and loses its restart policy.
   While locked, `scripts/start-workers-container.sh` mounts the folder read-only, and the gateway
   stops a container with a writable `/repos` within `VOICE_GW_KILL_CHECK` seconds.
 - **Alarm:** to Telegram at once, to every voice chat with its next call (`[ALARM]`), and to the
@@ -858,8 +877,11 @@ is guarded as follows:
   use your SSH keys and `gh` login, and change this repository's code (the gateway, the confine
   hook, `controller/CLAUDE.md`), which takes effect at the next restart; leaving this checkout out
   of the workers ([5.5](#55-workers-on-this-computer-or-in-docker)) only keeps runs from starting
-  in it. A process a worker detached from its process group can survive a stop. **Only Docker
-  isolates.**
+  in it. A process that clears its environment and leaves both the run's process group and the
+  tree below it can survive a stop; on systems without `/proc`, such as macOS, so can one that
+  only leaves the group and the tree. **Only Docker isolates.**
+- **The container's scripts come with the image.** `voice-run` and `voice-stop` are copied into
+  it when it is built; rebuild it (`docker build`, see `docker/Dockerfile`) for a newer version.
 - **In Docker,** the container can do what its token allows on GitHub, and reaches the network.
 - **The controller reads untrusted text.** Worker results, pull request news and what read-only
   `gh` shows reach it. `trusted="no"` and its instructions ask it to treat them as data; that is
@@ -1546,7 +1568,7 @@ src/
   ipguard.mjs        the door: access log, /mcp only from Anthropic's addresses, alerts on Telegram
   workers.mjs        workers: repositories, claude -p runs, the queue, the check after a run, results
   ledger.mjs         open decisions for the driver, and the open items
-  runners.mjs        where workers run: this computer, or the Docker container
+  runners.mjs        where workers run: this computer, or the Docker container; a run's processes
   access.mjs         access levels in the container, from the GitHub token
   pulls.mjs          the watch on pull requests that workers open
   telegram.mjs       Telegram fallback, and /stop and /funnel from your chat

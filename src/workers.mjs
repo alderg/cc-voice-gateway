@@ -10,6 +10,19 @@
 // .state/tasks/<id>.jsonl, so they survive a gateway restart, which comes with
 // every controller restart; the gateway follows the file and the process id.
 //
+// A run has ended when its processes have: its own, and every process it
+// started (runners.mjs). A result in its output does not end it. Claude Code
+// may answer a turn of its own first, such as the notification of a
+// background task left over in the session it resumes, and then go on with
+// the task in the same process; and a run may leave a server or a test
+// running. Until every process is gone, the run counts as running: the rules
+// watch it, the kill switch stops it, and nothing else starts in its
+// checkout. A run that gave its result and stays without a word, or whose own
+// process ended while what it started did not, the gateway ends itself.
+// Worker processes in a checkout that belong to no run the gateway follows
+// (its state was lost, for example) are ended too, and nothing starts there
+// until they are gone.
+//
 // A task for a repository whose worker is busy, or while every run slot is
 // taken, waits in a queue in .state/workers.json and starts by itself when
 // it is its turn (pump), so nobody has to remember to send it again. While a
@@ -32,9 +45,13 @@ import { EventEmitter } from 'node:events'
 import { chmodSync, closeSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { join, relative } from 'node:path'
 import { log, preview } from './log.mjs'
-import { HostRunner, alive } from './runners.mjs'
+import { HostRunner, MARK, alive, startOf } from './runners.mjs'
 
 const POLL_MS = 1000
+// A run that gave its result and has not ended after this long without
+// writing anything more is ended by the gateway; normally claude ends at once.
+const RESULT_GRACE_MS = 2 * 60 * 1000
+const KILL_AFTER_MS = 5000 // SIGTERM to a run's processes, then SIGKILL after this long, again and again
 const GITHUB_CACHE_MS = 10 * 60 * 1000 // what gh says about a repository
 const MAX_STEPS = 5
 const KEEP_TASKS = 40
@@ -222,11 +239,14 @@ export function githubSlug(url) {
   return match ? match[1] : null
 }
 
-function workerEnv() {
+// marks: the run's marks (runners.mjs), which everything it starts inherits.
+function workerEnv(marks = {}) {
   const env = { ...process.env }
   for (const name of SESSION_ENV) delete env[name]
-  return env
+  return { ...env, ...marks }
 }
+
+const processes = n => `${n} process${n === 1 ? '' : 'es'}`
 
 // The files in the output of git status --porcelain.
 const changedFiles = status =>
@@ -337,6 +357,8 @@ export class Workers extends EventEmitter {
     effort = '',
     maxRuns = 2,
     timeoutMinutes = 60,
+    resultGraceMs = RESULT_GRACE_MS,
+    killAfterMs = KILL_AFTER_MS,
   }) {
     super()
     this.runner = runner
@@ -352,12 +374,17 @@ export class Workers extends EventEmitter {
     this.effort = effort // claude --effort
     this.maxRuns = maxRuns
     this.timeoutMs = timeoutMinutes * 60 * 1000
+    this.resultGraceMs = resultGraceMs
+    this.killAfterMs = killAfterMs
     this.github = new Map() // owner/repo -> { at, info: { visibility, pulls, branch } }
     this.starting = new Set() // repositories between the checks and the start
     this.auditing = new Set() // repositories whose checkout the audit looks at
     this.pumping = false // a queued task is being started
     this.pausedUntil = 0 // the queue waits for the worker container
     this.followed = new Map() // task id -> { offset, partial }
+    this.strays = new Map() // checkout -> { at, signalled }: worker processes of no run followed here, being ended
+    this.cleaning = new Map() // repository -> what the runner still clears up after a run there (the container)
+    this.swept = false // the first poll looks for strays
     this.state = this.load()
     // Also a folder an older version left with the default mode.
     try {
@@ -535,7 +562,10 @@ export class Workers extends EventEmitter {
     const ahead = this.queued(worker).length && !first
     const why = this.waiting(worker, answers) ?? (this.slotsFull() ? 'full' : ahead ? 'queue' : null)
     if (why) return this.enqueue(job, why, { first })
-    return this.launch(job)
+    const result = await this.launch(job)
+    // Worker processes of a run nobody followed were still in the checkout.
+    if (result.status === 'busy') return this.enqueue(job, 'busy', { first })
+    return result
   }
 
   // The decisions that the driver's answer on request `answers` is about, of
@@ -571,6 +601,11 @@ export class Workers extends EventEmitter {
       const foreign = facts.dirty.filter(file => !decided.has(file))
       if (foreign.length && !allowDirty) return { status: 'dirty', files: foreign }
       facts.unpushed = await this.baseline(facts.dir)
+      // What the last run in the container left there is cleared first.
+      await this.cleaning.get(worker)
+      // Never a second run in a checkout where a worker process still runs:
+      // one of a run nobody follows is ended, and the task waits for it.
+      if (this.stopStrays({ dir: facts.dir, why: 'found before a new run there' }).length) return { status: 'busy', strays: true }
       return this.start(facts, { task, words, fresh, direct, answers }, entry)
     } finally {
       this.starting.delete(worker)
@@ -594,6 +629,7 @@ export class Workers extends EventEmitter {
     const previous = fresh ? null : this.state.repos[facts.name]?.sessionId
     const sessionId = previous || randomUUID()
     const id = this.newTaskId()
+    const mark = randomUUID() // VOICE_GW_RUN of every process of the run
     mkdirSync(this.tasksDir, { recursive: true, mode: 0o700 })
     const file = join(this.tasksDir, `${id}.jsonl`)
     const errFile = join(this.tasksDir, `${id}.err`)
@@ -612,9 +648,10 @@ export class Workers extends EventEmitter {
       ...(this.effort ? ['--effort', this.effort] : []),
       ...(previous ? ['--resume', sessionId] : ['--session-id', sessionId]),
     ]
+    const env = workerEnv({ [MARK.run]: mark, [MARK.task]: id, [MARK.repo]: facts.dir })
     let child
     try {
-      child = this.runner.spawn(id, this.claudeBin, args, { cwd: facts.dir, stdio: ['pipe', out, err], env: workerEnv() })
+      child = this.runner.spawn(id, this.claudeBin, args, { cwd: facts.dir, stdio: ['pipe', out, err], env })
     } finally {
       closeSync(out)
       closeSync(err)
@@ -624,8 +661,10 @@ export class Workers extends EventEmitter {
       repo: facts.name,
       task,
       words,
-      state: 'running',
+      state: 'running', // until every process of the run has ended (check)
       pid: child.pid ?? null,
+      pidStart: startOf(child.pid), // to tell it from a later process with the same id
+      mark,
       sessionId,
       resumed: Boolean(previous),
       access: facts.access?.level ?? null,
@@ -675,34 +714,62 @@ export class Workers extends EventEmitter {
     return { status: 'started', task: record, facts, closed: closed.map(d => d.id) }
   }
 
-  // Stopped by the controller, which knows and needs no event; or by the time
-  // limit, which the controller hears about like any other end of a run.
+  // Stopped by the controller, which knows and needs no event (by the time
+  // limit, see check). The run gets its signals at once and ends once all its
+  // processes are gone, which ended() waits for.
   stop(worker, { reason = 'stopped by the controller', report = false } = {}) {
     const task = this.running().find(t => t.repo === worker)
     if (!task) return null
-    this.runner.stop(task)
-    task.reported = !report
-    this.finish(task, 'stopped', reason)
+    this.halt(task, { reason, report })
     return task
   }
 
-  // The kill switch: every run stops. The controller hears about it once,
-  // from the gateway, not per run. Every run gets its signal and is marked
-  // stopped before the state is saved; an error in saving comes after that.
+  // SIGTERM to every process of the run, then SIGKILL every killAfterMs
+  // until they are gone (check), also from the next gateway, as it is kept in
+  // the state. reason: why it was stopped, its outcome then; null for a run
+  // the gateway only makes end, whose result counts. report: whether the
+  // controller hears about the stop as an event. The signals go out before
+  // the state is saved; an error in saving comes after them.
+  halt(task, { reason = null, report = false } = {}) {
+    const now = Date.now()
+    if (!task.stopping) task.stopping = { reason, at: now, signalled: now }
+    else if (reason && !task.stopping.reason) task.stopping.reason = reason // the gateway's end becomes a stop
+    if (reason) task.reported = !report
+    this.runner.stop(task, 'SIGTERM')
+    this.save()
+  }
+
+  // Waits until the run has ended, at most ms; whether it has.
+  async ended(task, ms = 15000) {
+    for (const until = Date.now() + ms; task.state === 'running' && Date.now() < until; ) {
+      await new Promise(resolve => setTimeout(resolve, 100))
+      try {
+        this.check(task)
+      } catch (error) {
+        log('following worker runs failed:', error.message)
+      }
+    }
+    return task.state !== 'running'
+  }
+
+  // The kill switch: every run stops, and so do worker processes of runs
+  // nobody follows here. The controller hears about it once, from the
+  // gateway, not per run. Every run gets its signals before the state is
+  // saved; an error in saving comes after that. Runs whose processes are
+  // gone already end at once, the others with the next polls.
   stopAll(reason) {
     const stopped = this.running()
-    for (const task of stopped) {
-      this.runner.stop(task)
-      task.reported = true
-    }
     let failed = null
-    for (const task of stopped) {
+    const attempt = action => {
       try {
-        this.finish(task, 'stopped', reason)
+        action()
       } catch (error) {
         failed ??= error
       }
     }
+    for (const task of stopped) attempt(() => this.halt(task, { reason }))
+    attempt(() => this.stopStrays({ why: 'the kill switch locked' }))
+    for (const task of stopped) attempt(() => this.check(task))
     if (failed) throw failed
     return stopped
   }
@@ -725,13 +792,14 @@ export class Workers extends EventEmitter {
     return this.running().length + this.starting.size >= this.maxRuns
   }
 
-  // 'busy' while a repository cannot take a run: one is going or starting,
-  // or the last one is still being checked or reported. 'decision' while an
-  // open decision holds it (except those that `answers` answers). Otherwise
-  // null.
+  // 'busy' while a repository cannot take a run: one is going, ending or
+  // starting, worker processes nobody followed are being ended there, or the
+  // last run is still being checked or reported. 'decision' while an open
+  // decision holds it (except those that `answers` answers). Otherwise null.
   waiting(repo, answers = null) {
     const last = this.lastTask(repo)
-    if (last?.state === 'running' || this.starting.has(repo) || this.auditing.has(repo)) return 'busy'
+    if (this.running().some(t => t.repo === repo) || this.starting.has(repo) || this.auditing.has(repo)) return 'busy'
+    if (this.strays.has(this.runner.dir(repo))) return 'busy'
     if (last && !last.reported) return 'busy'
     if (this.holds(repo, answers).length) return 'decision'
     return null
@@ -755,6 +823,7 @@ export class Workers extends EventEmitter {
       reason, // busy, decision, queue (others before it), full (no run slot)
       position: this.queued(job.worker).indexOf(entry) + 1,
       task: this.running().find(t => t.repo === job.worker) ?? null,
+      strays: this.strays.has(this.runner.dir(job.worker)), // worker processes of a run nobody followed, being ended
       running: this.running(),
       holds: this.holds(job.worker, job.answers),
     }
@@ -802,8 +871,8 @@ export class Workers extends EventEmitter {
       log('queued task', entry.id, 'could not start:', error.message)
       return this.park(entry, 'it could not start; the gateway log says why')
     }
-    // locked: it waits; dropped: the controller took it out meanwhile.
-    if (['started', 'locked', 'dropped'].includes(result.status)) return
+    // locked and busy: it waits; dropped: the controller took it out meanwhile.
+    if (['started', 'locked', 'dropped', 'busy'].includes(result.status)) return
     const why = {
       origin: 'the origin of the repository changed in the container; it needs a look at the desk',
       refused: 'a direct push needs access level full, and the repository is not at full',
@@ -861,24 +930,132 @@ export class Workers extends EventEmitter {
   // --- following runs -----------------------------------------------------
 
   poll() {
+    if (!this.swept) {
+      this.swept = true
+      this.stopStrays({ why: 'found when the gateway started' })
+    }
     for (const task of this.running()) {
-      this.follow(task)
-      if (task.state !== 'running') continue
-      if (task.resultSeen) {
-        this.finish(task, task.isError ? 'failed' : 'done', task.isError ? task.result : null)
-      } else if (!alive(task.pid)) {
-        this.follow(task) // whatever it wrote last
-        if (task.resultSeen) this.finish(task, task.isError ? 'failed' : 'done', task.isError ? task.result : null)
-        else this.finish(task, 'failed', this.errorTail(task) || 'ended without a result')
-      } else if (Date.now() - task.startedAt > this.timeoutMs) {
-        this.stop(task.repo, { reason: `stopped at the time limit of ${duration(this.timeoutMs)}`, report: true })
+      try {
+        this.check(task)
+      } catch (error) {
+        log('following worker runs failed:', error.message) // the run is checked again next time
       }
     }
+    this.checkStrays()
     for (const task of this.unreported()) this.emit('finished', task)
     this.pump()
   }
 
+  // Whether the run's own process is still there.
+  ownAlive(task) {
+    return this.runner.alive ? this.runner.alive(task) : alive(task.pid)
+  }
+
+  // One look at a running run: what it wrote, and whether its processes are
+  // still there. It ends only when every one of them has (conclude). Its own
+  // process ended but processes it started did not: the gateway ends those.
+  // It gave its result and stays without a word for resultGraceMs: the
+  // gateway ends it. Being stopped: SIGKILL every killAfterMs. At the time
+  // limit: stopped, and the controller hears about it like any other end.
+  check(task) {
+    this.follow(task)
+    if (task.state !== 'running') return
+    const own = this.ownAlive(task)
+    const left = own ? null : (this.runner.processes?.(task) ?? [])
+    if (!own && !left.length) {
+      this.follow(task) // whatever it wrote last
+      return this.conclude(task)
+    }
+    const now = Date.now()
+    if (task.stopping) {
+      if (now - task.stopping.signalled >= this.killAfterMs) {
+        task.stopping.signalled = now
+        this.runner.stop(task, 'SIGKILL')
+      }
+      return
+    }
+    if (!own) {
+      log('worker', task.repo, task.id, `has ended, but ${processes(left.length)} it started still run; ending them`)
+      return this.halt(task)
+    }
+    if (task.results && !task.turnOpen && now - (task.lastLineAt ?? now) >= this.resultGraceMs) {
+      log('worker', task.repo, task.id, `gave its result and has not ended after ${duration(this.resultGraceMs)}; ending it`)
+      return this.halt(task)
+    }
+    if (now - task.startedAt > this.timeoutMs) {
+      this.halt(task, { reason: `stopped at the time limit of ${duration(this.timeoutMs)}`, report: true })
+    }
+  }
+
+  // Every process of the run is gone: its outcome. Stopped, with the reason;
+  // otherwise by its result.
+  conclude(task) {
+    const cleanup = this.runner.cleanup?.(task)
+    if (cleanup) {
+      const done = cleanup.finally(() => this.cleaning.get(task.repo) === done && this.cleaning.delete(task.repo))
+      this.cleaning.set(task.repo, done)
+    }
+    if (task.stopping?.reason) return this.finish(task, 'stopped', task.stopping.reason)
+    if (task.resultSeen) return this.finish(task, task.isError ? 'failed' : 'done', task.isError ? task.result : null)
+    const why = task.results ? 'it answered only a notification of its own, not its task' : 'ended without a result'
+    return this.finish(task, 'failed', this.errorTail(task) || why)
+  }
+
+  // --- worker processes nobody follows ------------------------------------
+
+  // The marks of the runs this gateway follows, and of those another
+  // gateway on the same state follows, as its file says.
+  knownMarks() {
+    const marks = new Set(this.running().map(task => task.mark).filter(Boolean))
+    try {
+      for (const task of JSON.parse(readFileSync(this.stateFile, 'utf8')).tasks ?? []) {
+        if (task?.state === 'running' && task.mark) marks.add(task.mark)
+      }
+    } catch {
+      // no state yet
+    }
+    return marks
+  }
+
+  // Worker processes in the checkouts here (or only in dir) of a run that no
+  // gateway follows: from a run whose record was lost, for example. Nobody
+  // watches them, so they get SIGTERM now and SIGKILL later (checkStrays),
+  // and no run starts in their checkout until they are gone. Returns them.
+  stopStrays({ dir = null, why = 'found' } = {}) {
+    const strays = (this.runner.strays?.(this.knownMarks()) ?? []).filter(stray => !dir || stray.repo === dir)
+    const now = Date.now()
+    for (const stray of strays) {
+      if (!this.strays.has(stray.repo)) {
+        log(`worker ${processes(stray.pids.length)} of a run nobody follows in ${stray.repo} (task ${stray.task ?? 'unknown'}), ${why}: ending them`)
+        this.strays.set(stray.repo, { at: now, signalled: now })
+      }
+      this.runner.stopStray(stray, 'SIGTERM')
+    }
+    return strays
+  }
+
+  checkStrays() {
+    if (!this.strays.size) return
+    const strays = this.runner.strays?.(this.knownMarks()) ?? []
+    const now = Date.now()
+    for (const [dir, entry] of this.strays) {
+      const left = strays.filter(stray => stray.repo === dir)
+      if (!left.length) {
+        this.strays.delete(dir)
+        log('the worker processes nobody followed in', dir, 'have ended')
+      } else if (now - entry.signalled >= this.killAfterMs) {
+        entry.signalled = now
+        for (const stray of left) this.runner.stopStray(stray, 'SIGKILL')
+      }
+    }
+  }
+
   follow(task) {
+    if (!this.followed.has(task.id)) {
+      // Read from the start, also by a gateway that took the run over: what
+      // the output says is counted again.
+      Object.assign(task, { steps: [], results: 0, turnOpen: false, resultSeen: false })
+    }
     const cursor = this.followed.get(task.id) ?? { offset: 0, partial: '' }
     let fd
     try {
@@ -912,6 +1089,12 @@ export class Workers extends EventEmitter {
       task.sessionId = message.session_id
       this.state.repos[task.repo] = { sessionId: message.session_id }
     }
+    // For the end of a run that gave its result (check): when it last wrote,
+    // and whether a turn is going.
+    task.lastLineAt = Date.now()
+    if (['assistant', 'user'].includes(message.type) || (message.type === 'system' && message.subtype === 'init')) {
+      task.turnOpen = true
+    }
     if (message.type === 'assistant') {
       for (const part of message.message?.content ?? []) {
         if (part.type === 'tool_use') {
@@ -927,6 +1110,12 @@ export class Workers extends EventEmitter {
         if (part.type === 'tool_result') this.notePulls(task, resultContent(part.content))
       }
     } else if (message.type === 'result') {
+      // The end of a turn, not of the run: the process may go on (check).
+      task.results = (task.results ?? 0) + 1
+      task.turnOpen = false
+      // A turn Claude Code answered on its own, such as the notification of
+      // a background task from the session it resumed: not the task's result.
+      if (message.origin?.kind === 'task-notification') return
       task.resultSeen = true
       task.isError = Boolean(message.is_error) || message.subtype !== 'success'
       task.result = String(message.result ?? message.subtype ?? '').trim()
@@ -1090,7 +1279,8 @@ export class Workers extends EventEmitter {
     const queue = (queued.length ? `; queued: ${queueList(queued)}` : '') + (open.length ? `; open decisions: ${open.join(', ')}` : '')
     if (!task) return `idle${queue}`
     if (task.state === 'running') {
-      return `running ${task.id} for ${duration(Date.now() - task.startedAt)} ("${preview(task.task, 50)}")${queue}`
+      const what = task.stopping ? 'ending' : 'running'
+      return `${what} ${task.id} for ${duration(Date.now() - task.startedAt)} ("${preview(task.task, 50)}")${queue}`
     }
     return `idle, last task ${task.id} ${task.state} ${duration(Date.now() - task.finishedAt)} ago${queue}`
   }
@@ -1107,7 +1297,10 @@ export class Workers extends EventEmitter {
     if (!task) return `[worker=${repo} state=idle] No task yet.${queued.length ? ` Queued: ${queueList(queued)}.` : ''}`
     const lines = []
     if (task.state === 'running') {
-      lines.push(`[worker=${repo} state=running task=${task.id} elapsed=${Math.round((Date.now() - task.startedAt) / 1000)}s]`)
+      // Ending: stopped, or done, while processes of it are still there.
+      const state = task.stopping ? 'ending' : 'running'
+      lines.push(`[worker=${repo} state=${state} task=${task.id} elapsed=${Math.round((Date.now() - task.startedAt) / 1000)}s]`)
+      if (task.stopping) lines.push(`Ending: ${task.stopping.reason ?? 'it gave its result, and the gateway ends what is left of it'}; nothing else starts here until all its processes are gone.`)
     } else {
       lines.push(`[worker=${repo} state=${task.state} task=${task.id} took=${duration(task.finishedAt - task.startedAt)}]`)
     }

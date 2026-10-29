@@ -4,7 +4,9 @@
 # Starts one worker run for the gateway (docker exec ... voice-run). Hands it
 # the tokens from the mounted secrets, without them ever being in the
 # container's configuration, and puts it in its own process group, whose id
-# goes to /tmp/voice-runs/<task> so that voice-stop ends the whole run.
+# goes to /tmp/voice-runs/<task> so that voice-stop ends the whole run. The
+# mark VOICE_GW_TASK, which everything the run starts inherits, lets
+# voice-stop find processes that left the group too.
 set -eu
 task="$1"
 shift
@@ -17,5 +19,7 @@ if [ -s "$secrets/github_token" ]; then
   GH_TOKEN="$(cat "$secrets/github_token")"
   export GH_TOKEN
 fi
+VOICE_GW_TASK="$task"
+export VOICE_GW_TASK
 mkdir -p /tmp/voice-runs
 exec setsid -w sh -c 'echo $$ > "/tmp/voice-runs/$1"; shift; exec "$@"' sh "$task" "$@"

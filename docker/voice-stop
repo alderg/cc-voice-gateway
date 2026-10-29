@@ -2,15 +2,43 @@
 # voice-stop <task>
 #
 # Ends a run that voice-run started, with everything it started: SIGTERM to
-# its process group, SIGKILL if it is still there after five seconds.
-file="/tmp/voice-runs/$1"
-[ -s "$file" ] || exit 0
-group="-$(cat "$file")"
-if env kill -TERM -- "$group" 2>/dev/null; then
+# its process group and to every process with its mark in the environment
+# (VOICE_GW_TASK, also those that left the group), SIGKILL to what is still
+# there after five seconds. The gateway also calls it once a run's own process
+# has ended, for whatever the run left running.
+task="$1"
+[ -n "$task" ] || exit 0
+file="/tmp/voice-runs/$task"
+group=
+[ -s "$file" ] && group="-$(cat "$file")"
+
+# The processes with the run's mark.
+marked() {
+  for env in /proc/[0-9]*/environ; do
+    [ -r "$env" ] || continue
+    if { tr '\0' '\n' <"$env"; } 2>/dev/null | grep -qxF "VOICE_GW_TASK=$task"; then
+      pid="${env#/proc/}"
+      echo "${pid%/environ}"
+    fi
+  done
+}
+
+# Sends $1 to the group and the marked processes; fails if none was there.
+signal() {
+  sent=1
+  if [ -n "$group" ] && env kill "-$1" -- "$group" 2>/dev/null; then sent=0; fi
+  for pid in $(marked); do
+    if env kill "-$1" "$pid" 2>/dev/null; then sent=0; fi
+  done
+  return $sent
+}
+
+if signal TERM; then
   for _ in 1 2 3 4 5; do
     sleep 1
-    env kill -0 -- "$group" 2>/dev/null || break
+    if { [ -n "$group" ] && env kill -0 -- "$group" 2>/dev/null; } || [ -n "$(marked)" ]; then continue; fi
+    break
   done
-  env kill -KILL -- "$group" 2>/dev/null || true
+  signal KILL || true
 fi
 rm -f "$file"
