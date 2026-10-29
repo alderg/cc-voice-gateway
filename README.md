@@ -143,7 +143,9 @@ default. Workers run in your checkouts, or in a Docker container whose GitHub to
 may publish: nothing, pull requests, or also a direct push to the default branch. A worker's
 result reaches the controller as a channel event; the controller summarises it, and you hear it
 as news in the voice conversation. If it asks you something after the conversation has ended,
-the question also goes to Telegram.
+the question also goes to Telegram. Optionally, a task that needs no repository, such as a
+question to look up, a calculation or a draft, gets a [work folder](#work-folders) of its own, on
+this computer or in a container.
 
 | Part | Code | Runs where | Role |
 |---|---|---|---|
@@ -286,6 +288,8 @@ have these states:
 | Voice + Telegram | `.secrets/telegram_token` and `.secrets/telegram_chat_id` | After 10 minutes without a voice call, questions and approvals also go to Telegram; results wait for the next call. `/stop` locks the kill switch |
 | Workers on this computer | default (`VOICE_GW_DOCKER` empty) | Runs in your checkouts as you |
 | Workers in Docker | `VOICE_GW_DOCKER=<container>` | Runs in the container; the level per repository comes from its GitHub token, or from `VOICE_GW_ACCESS` |
+| Work folders | `VOICE_GW_SCRATCH=1`; off by default | Tasks without a repository run in a new empty folder each, on this computer as you ([work folders](#work-folders)) |
+| Work folders in a container | also `VOICE_GW_SCRATCH_DOCKER=<container>` | Those runs in a container of their own that sees only the work folders, with no GitHub token |
 
 ### 4.5 Pushing from a read-only container
 
@@ -340,6 +344,8 @@ to a lost phone or a leaked token.
 | The controller at `unrestricted` | Everything your user can: any command, any file, `.secrets/` included, the web, subagents; your MCP servers and connectors after an approval | Nothing is blocked; a merge in the strict form and a confirmed `delete_path` still ask (see 5.3) |
 | A worker on this computer | Everything your user can, without approvals | Nothing is blocked; rules only observe (see 5.9) |
 | A worker in Docker | The mounted folder, the container's tokens, the network | Your other files, SSH keys, `gh` login; more on GitHub than its token allows |
+| A run in a work folder on this computer | Everything your user can, without approvals; the rules allow writes only in its folder | Nothing is blocked; rules only observe, as for any worker |
+| A run in a work folder in its container | The work folders, Claude Code's token, the network | Your other files, SSH keys, `gh` login, the repositories, any GitHub token |
 | Others on GitHub | Comment on a watched pull request: the news names them; the text of the repository's owner, members and collaborators reaches the controller, marked `trusted="no"` | Get anyone else's text to the controller through the watch; have a fork or someone else's pull request watched (see 8.4) |
 | The Telegram chat | Receive questions, approval requests and alerts; send `/stop`; turn the Funnel on and off | Anything else; other chats are ignored |
 
@@ -626,6 +632,68 @@ What applies to every worker run (`src/workers.mjs`):
 - **Docker itself:** whoever controls the gateway can control Docker, which on Linux is as good as
   root.
 
+#### Work folders
+
+Off by default; `VOICE_GW_SCRATCH=1`, or the setup assistant, turns them on. A task that needs no
+repository, such as a question to look up, research, a calculation, a draft or a conversion, then
+gets a work folder: a new empty folder of its own (`src/workspaces.mjs`). Each run in one is a
+worker run like any other, with the same options, denied tools and environment as above.
+
+- **Where.** In `VOICE_GW_SCRATCH_ROOT` (`~/voice-scratch`), as `<date>-<id>`, mode 0700. The
+  root must lie outside every git repository, this checkout and the repositories folder, and not be
+  the home folder itself; otherwise the gateway leaves work folders off and logs why
+  (`work folders off: …`).
+- **The tools.** The controller uses the same ones: `dispatch` with the worker `scratch/new` makes
+  a folder and answers with its name, `scratch/<id>`; follow-ups and answers go to that name and
+  continue in the same folder and Claude session. `list_workers` shows `scratch/new` and the last
+  used work folders; `worker_status` and `stop_worker` take their names. `direct`, `draft` and
+  `allow_dirty` have no effect there, and `dispatch` says so.
+- **Runs at a time.** New ones take any free slot of `VOICE_GW_MAX_WORKERS` and count against it,
+  as many as there are slots; in each folder one run at a time. The rest waits in the queue, as
+  for repositories.
+- **The same safety.** Only on your words from a recent voice request
+  ([5.4](#54-approvals-by-voice)); the kill switch stops their runs, empties their queue and makes no
+  new folder while locked; the queue, the folders and their sessions survive restarts in
+  `.state/workers.json`.
+- **Only that folder to write.** The rule on writes outside ([5.9](#59-the-kill-switch)) allows a
+  run in a work folder only its folder and its own Claude Code memory folder: not the temporary
+  folders and not `VOICE_GW_KILL_ALLOW_PATHS`. Its rules say so, and to name the files it made, push
+  nothing and change nothing elsewhere. So a run that writes a script to `/tmp` locks the switch at
+  `auto`.
+- **After a run** the gateway looks at the folder itself, whatever the worker wrote: the files it
+  made, changed and removed. There is no git, so there is no push decision. The result event
+  carries `files="2 files made, 1 changed"` instead of `git`, and a line with the names and where
+  the folder is.
+- **Removed** `VOICE_GW_SCRATCH_DAYS` (7) days after its last run, with its session, unless a run
+  goes, a task waits or a decision is open there. Folders in the root that the gateway did not make
+  stay, and so does everything while work folders are turned off. A run that began before they
+  were turned off is still followed where it runs.
+
+**In a container of their own** (`VOICE_GW_SCRATCH_DOCKER`, empty by default): for a protected
+environment, their runs run in a container from the worker image instead of on this computer.
+
+- **Started with** `scripts/start-workers-container.sh --scratch`, which the setup assistant runs:
+  `--user <uid>:<gid> --init --restart unless-stopped`, the root at `/scratch`
+  (`VOICE_GW_DOCKER_SCRATCH`), read-write or read-only while the kill switch is locked, its own
+  volume `voice-scratch-home` at `/home/worker`, and of the secrets only
+  `.secrets/worker/claude_token`, as a file of its own: no GitHub token, no repositories. A new
+  token counts once the container starts again.
+- **Not the workers' container.** The gateway and the script refuse its name; with workers in
+  Docker, the two are separate containers from the same image.
+- **Through `docker exec`.** The gateway makes a folder, lists it after a run and removes it in the
+  container, as it runs every git command there; on this computer it never walks or deletes what a
+  run could have laid out, such as a link to your home. Runs start and stop with `voice-run` and
+  `voice-stop`, as in the workers' container.
+- **The kill switch** stops it and takes its restart policy; the gateway stops it again if it runs
+  with a writable folder while locked.
+
+| | Work folders on this computer | In their container |
+|---|---|---|
+| Runs as | You, in the work folder | Your user id, in the work folder at `/scratch/<date>-<id>` |
+| Reaches | Everything your user can | The work folders, Claude Code's token, the network |
+| GitHub | Your `gh` login, which its rules forbid it to use for anything but reading | Nothing beyond what anyone can read |
+| Isolation | None; the rules only observe | The container |
+
 ### 5.6 Access levels and their detection
 
 In Docker, each repository gets a level (`src/access.mjs`). `list_workers` and `dispatch` show it
@@ -790,8 +858,8 @@ at every start.
 | Voice | "emergency stop" or "kill switch"; or the tool `emergency_stop`, which the voice AI calls for the same words in any language | In `send` and `ask` before anything reaches the controller: the message starts with the phrase, or has at most six words |
 | Telegram | `/stop` or a phrase | See 5.8 |
 | Rule: default branch | A push to the default branch, or a merge, without a direct dispatch at level `full`, in a repository with pull requests turned on | In the run's commands: `git push` to the default branch, `--all`, `--mirror`, `gh pr merge`, and `gh api` calls that merge (`PUT …/pulls/<n>/merge`, `POST …/merges`, the GraphQL mutations `mergePullRequest`, `enablePullRequestAutoMerge`, `mergeBranch`). With `gh`, every `VOICE_GW_KILL_CHECK` seconds and at the end: the default branch moved on GitHub, and the worker's repository holds the new head, or the new head merged a pull request of the run (below) |
-| Rule: outside | Writes outside the repository, `/tmp`, `/var/tmp` (and the system's temp folder on this computer), the run's own Claude Code memory folder (`~/.claude/projects/<repository path with - for every other character>/memory`, where auto memory writes; another project's is outside) and `VOICE_GW_KILL_ALLOW_PATHS`; writing to `/dev/null`, the standard streams, a terminal or `/dev/fd/N` is none | The file tools by path. Shell commands by explicit targets: redirections, `tee`, `cp`, `mv`, `rm`, `mkdir`, `touch`, `ln`, `chmod`, `chown`, `truncate`, `sed -i`, `dd of=`, also after `cd`; `$HOME` and `~` are expanded. The command line is read as a shell reads it: quoted text, comments, here-strings and heredoc bodies are data, so a `>` or `;` in a pattern, a commit message or a script written to a file is none; the commands in `$(…)`, backticks, `<(…)`, `>(…)`, `sh -c`, `eval` and a heredoc a shell reads are checked like any other, and so is a script written from a heredoc that the same call runs |
-| Rule: many changes | More than 500 file edits in a run; at its end more than 300 files or 30,000 lines changed | Edits as they happen; at the end the commits made during the run plus what is not committed. `VOICE_GW_KILL_MAX_*` |
+| Rule: outside | Writes outside the repository, `/tmp`, `/var/tmp` (and the system's temp folder on this computer), the run's own Claude Code memory folder (`~/.claude/projects/<repository path with - for every other character>/memory`, where auto memory writes; another project's is outside) and `VOICE_GW_KILL_ALLOW_PATHS`; for a run in a [work folder](#work-folders), writes outside that folder and its memory folder; writing to `/dev/null`, the standard streams, a terminal or `/dev/fd/N` is none | The file tools by path. Shell commands by explicit targets: redirections, `tee`, `cp`, `mv`, `rm`, `mkdir`, `touch`, `ln`, `chmod`, `chown`, `truncate`, `sed -i`, `dd of=`, also after `cd`; `$HOME` and `~` are expanded. The command line is read as a shell reads it: quoted text, comments, here-strings and heredoc bodies are data, so a `>` or `;` in a pattern, a commit message or a script written to a file is none; the commands in `$(…)`, backticks, `<(…)`, `>(…)`, `sh -c`, `eval` and a heredoc a shell reads are checked like any other, and so is a script written from a heredoc that the same call runs |
+| Rule: many changes | More than 500 file edits in a run; at its end more than 300 files or 30,000 lines changed; in a work folder, more than 300 files in it | Edits as they happen; at the end the commits made during the run plus what is not committed, or the files in the work folder. `VOICE_GW_KILL_MAX_*` |
 | Controller | `raise_alarm` with a reason | One more signal, never the only one |
 
 **Whose merge it is.** A merge on GitHub makes a commit that the worker's repository does not
@@ -817,9 +885,10 @@ pull requests turned off are exempt, as for pushes.
 - **Approvals:** open ones are denied, new ones are denied automatically.
 - **Workers:** every run stops, with every process it started, also a run that is ending, and so do
   worker processes that no run accounts for and a clone that is going. With Docker the container
-  stops and loses its restart policy.
+  stops and loses its restart policy, and so does the work folders' container.
   While locked, `scripts/start-workers-container.sh` mounts the folder read-only, and the gateway
-  stops a container with a writable `/repos` within `VOICE_GW_KILL_CHECK` seconds.
+  stops a container with a writable `/repos`, or a work folders' container with a writable
+  folder, within `VOICE_GW_KILL_CHECK` seconds.
 - **Alarm:** to Telegram at once, to every voice chat with its next call (`[ALARM]`), and to the
   controller.
 - **State:** saved in `.secrets/killswitch.json`, mode 0600; it survives restarts. A file that
@@ -831,6 +900,7 @@ pull requests turned off are exempt, as for pushes.
 node scripts/unlock.mjs --status   # what locked it
 node scripts/unlock.mjs            # asks you to type "unlock"
 scripts/start-workers-container.sh # Docker: start the container again
+scripts/start-workers-container.sh --scratch # and the work folders' container, if you use one
 ```
 
 It unlocks the running gateway through the admin socket, or removes the file. There is no way to
@@ -846,9 +916,10 @@ unlock by voice, Telegram or the controller.
 | `.secrets/gateway.env` | Settings from the setup assistant | 0600 |
 | `.secrets/telegram_token`, `.secrets/telegram_chat_id` | The Telegram bot | 0600 |
 | `.secrets/killswitch.json` | Kill switch state, present while locked | 0600 |
-| `.secrets/worker/claude_token`, `.secrets/worker/github_token` | The container's logins, mounted read-only into it | 0600, folder 0700 |
+| `.secrets/worker/claude_token`, `.secrets/worker/github_token` | The container's logins, mounted read-only into it; into the work folders' container only `claude_token` | 0600, folder 0700 |
 | `.state/` | Worker state, run output, open requests and decisions, watched pull requests, the watchdog's lock | 0700 when the gateway creates it |
-| `.state/tasks/`, `.state/workers.json` | Each run's output with every tool input and result; the workers' state, with the queue | 0600, folder 0700 |
+| `.state/tasks/`, `.state/workers.json` | Each run's output with every tool input and result; the workers' state, with the queue and the work folders | 0600, folder 0700 |
+| `~/voice-scratch/<date>-<id>` (`VOICE_GW_SCRATCH_ROOT`) | The work folders, with what their runs made | 0700, and the root too when the gateway or the start script makes it |
 | `.state/requests.json` | Voice requests and the answers, with what the voice client has read | 0600 |
 | `.state/jobs.json` | Open decisions, with the driver's answers, and the last 100 closed ones for a week | 0600 |
 | `.logs/gateway.log`, `.logs/gateway.log.1` | Log, without tokens; rotated at `VOICE_GW_LOG_MAX_MB` | 0600, folder 0700 when the gateway creates it |
@@ -904,7 +975,9 @@ is guarded as follows:
   of the workers ([5.5](#55-workers-on-this-computer-or-in-docker)) only keeps runs from starting
   in it. A process that clears its environment and leaves both the run's process group and the
   tree below it can survive a stop; on systems without `/proc`, such as macOS, so can one that
-  only leaves the group and the tree. **Only Docker isolates.**
+  only leaves the group and the tree. **Only Docker isolates.** The same holds for
+  [work folders](#work-folders) on this computer: their rule on writes is stricter, but a run there
+  can read and do everything your user can; in their container it reaches only the work folders.
 - **The container's scripts come with the image.** `voice-run` and `voice-stop` are copied into
   it when it is built; rebuild it (`docker build`, see `docker/Dockerfile`) for a newer version.
 - **In Docker,** the container can do what its token allows on GitHub, and reaches the network.
@@ -1025,6 +1098,7 @@ the `localhost` link).
 | Models | Model and effort for the controller (`--model`, `--effort` from `start-controller.sh`) and for every worker run, on the host and in Docker | Choices, or Claude Code's defaults |
 | Telegram | Checks the token (`getMe`), finds your private chat with `getUpdates` once you wrote to the bot, sends a test message | A token from [@BotFather](https://t.me/BotFather), one message to the bot |
 | Workers in Docker | Checks the GitHub token and shows the level per repository with the gateway's detection. Builds the image with its progress shown. Starts the container, sets git's name and email in it, and clones the chosen repositories inside it | A token from `claude setup-token`, optionally a GitHub token ([5.6](#56-access-levels-and-their-detection)), the repositories |
+| Work folders | Off by default. Turned on: checks their folder as the gateway does, and with a container of their own, builds the image if it is missing and starts the container with `start-workers-container.sh --scratch` ([work folders](#work-folders)) | The folder, the days they are kept, and for the container its name and the token from `claude setup-token` |
 | Watchdog | On Linux, writes and enables a systemd user service that starts the controller in tmux at boot, and turns on lingering for your user so that it keeps running without a login (if that is refused, it shows the `sudo` command); or starts it now in tmux. On macOS it writes a LaunchAgent that starts it in tmux at login, checks it with `plutil`, and with "start it now" loads it with `launchctl bootstrap`, which starts it (`kickstart` if it is loaded already); without, launchd loads it at the next login | Choices |
 | Plugin | Shows whether `voice@cc-voice-gateway` is on the organisation's channel allowlist; registers the marketplace if it is; otherwise shows the admin steps | The admin |
 | Finish | Writes `.secrets/` (5.10) and ends | – |
@@ -1319,7 +1393,8 @@ at most three short sentences, without code, paths or lists.
 | "Leave the commits in alpha as they are." | `resolve_decision` with your words closes the push decision; alpha's queued tasks go on |
 | "Clone drawio-mcp from alderg." | Above `confined`: `clone_repo`; you hear when it is there |
 | "Delete the folder old-experiment." | Above `confined`: `delete_path` says what would be lost, the controller asks; you say yes, then confirm the approval |
-| "Look up the release notes of the latest Claude Code." | Only at `unrestricted`: the controller uses the web itself |
+| "Look up the release notes of the latest Claude Code." | Only at `unrestricted`: the controller uses the web itself. With [work folders](#work-folders) on, at every level: a run in a new work folder looks it up |
+| "Rechne mir die Fahrtkosten nach Basel aus." / "Draft a reply to the landlord." | With work folders on: `dispatch` with `scratch/new`; you hear the result, and the files are in that folder at the desk. "Make it shorter." goes to the same folder |
 | "Is anyone reviewing pull request 12 in alpha?" / "Did the last CI run on main pass?" | The controller answers itself with read-only `gh` |
 | "Request a review for pull request 12 in alpha." | Only on your word: the worker reviews the diff and posts a review, or adds the person you name as reviewer |
 | "Fix the review comments on pull request 12." | Only on your word: the worker fixes them, runs the tests, pushes to the same branch, replies on each thread, and says what is left open |
@@ -1453,6 +1528,11 @@ setting with where it came from.
 | `VOICE_GW_CLAUDE_BIN` | `claude` | Claude Code for workers (inside the container in Docker mode) |
 | `VOICE_GW_GH_BIN` | `gh` | GitHub CLI on this computer |
 | `VOICE_GW_PR_DRAFT` | `0` | `1`: workers open their pull requests as drafts; `0`: ready for review |
+| `VOICE_GW_SCRATCH` | `0` | `1`: [work folders](#work-folders) for tasks without a repository; any other value counts as `0` |
+| `VOICE_GW_SCRATCH_ROOT` | `~/voice-scratch` | Where the work folders are made, on this computer; outside every git repository, this checkout and the repositories folder |
+| `VOICE_GW_SCRATCH_DAYS` | `7` | Days after its last run before a work folder is removed |
+| `VOICE_GW_SCRATCH_DOCKER` | empty | The work folders' container; empty: their runs run on this computer |
+| `VOICE_GW_DOCKER_SCRATCH` | `/scratch` | Where that container mounts `VOICE_GW_SCRATCH_ROOT` |
 | `VOICE_GW_PR_POLL` | `60` | Seconds between looks at a watched pull request |
 | `VOICE_GW_PR_WATCH_HOURS` | `24` | Hours before a watch ends |
 | `VOICE_GW_TELEGRAM_AFTER` | `600` | Seconds without a voice call before questions and approvals also go to Telegram ([5.8](#58-the-telegram-fallback)) |
@@ -1504,7 +1584,9 @@ do not set them.
 |---|---|---|
 | `VOICE_GW_DOCKER` | `voice-workers` | The container |
 | `VOICE_GW_DOCKER_FOLDER` | `~/docker-developer` | Host folder mounted at `/repos` |
-| `VOICE_GW_DOCKER_IMAGE` | `cc-voice-worker` | Image |
+| `VOICE_GW_SCRATCH_DOCKER` | `voice-scratch` | With `--scratch`: the work folders' container |
+| `VOICE_GW_SCRATCH_ROOT` | `~/voice-scratch` | With `--scratch`: the host folder mounted at `/scratch`, made if missing |
+| `VOICE_GW_DOCKER_IMAGE` | `cc-voice-worker` | Image, for both containers |
 | `VOICE_GW_DOCKER_REPOS` | `/repos` | Path inside the container |
 | `VOICE_CLEAN_ROOT` | The folder holding this repository | Where the clean clones are |
 | `VOICE_SECRETS` | `/run/secrets/voice` | Inside the container: where `voice-run` and the credential helper read the tokens |
@@ -1542,6 +1624,10 @@ do not set them.
 | `voice 403 … not an allowed address` for Claude's own calls | Anthropic calls from a range missing in `VOICE_GW_MCP_ALLOW`, or the tunnel does not put the caller's address last in `X-Forwarded-For` (then every call shows the same address). Add the range, or set `VOICE_GW_MCP_ALLOW=any`, and restart the controller. |
 | A Telegram alert about a request without a token, or a sign-in | It names the address. A request without a token from Anthropic's addresses comes with every new sign-in of the connector; if you did not connect it, nothing got in, and the pairing code keeps it so. A successful sign-in you did not make: `node scripts/pair.mjs list`, then `revoke`. |
 | A repository is missing from `list_workers` | Only folders directly in the worker root with a `.git` count. Check `VOICE_GW_WORKER_ROOT`. |
+| `work folders off: …` in the log, and no `scratch/new` in `list_workers` | `VOICE_GW_SCRATCH=1` is set, but the root is inside a git repository, this checkout or the repositories folder, or is the home folder (a home folder that is itself a git repository counts too), or `VOICE_GW_SCRATCH_DOCKER` names the workers' container. Choose another `VOICE_GW_SCRATCH_ROOT` or container, then restart the controller. |
+| `No work folder "scratch/…"` | It was removed `VOICE_GW_SCRATCH_DAYS` after its last run. Its files are gone with it; a new task starts with `scratch/new`. |
+| The kill switch locked on a run in a work folder | Such a run may write only in its folder; a script or a temporary file in `/tmp` is enough. Read the reason; the worker's rules ask it to keep everything in its folder. |
+| `The container voice-scratch does not answer` or `could not make …` | The work folders' container is stopped or was removed: `scripts/start-workers-container.sh --scratch`. |
 | The controller says it cannot clone or delete | The level is `confined`, or workers run in Docker; the log line `controller level …` says which. A new level counts from the next start of the start script: `--stop`, then start it again. |
 | `delete=unplanned` | A deletion needs a plan of the same path from the last 15 minutes: the controller calls `delete_path` without `confirm` first. |
 | A worker fails at once | `could not start claude`: Claude Code is not on the gateway's `PATH`; set `VOICE_GW_CLAUDE_BIN`. Otherwise read `.state/tasks/<task>.err`. |
@@ -1605,6 +1691,7 @@ src/
   oauth.mjs          sign-in: OAuth metadata, registration, pairing page, tokens
   ipguard.mjs        the door: access log, /mcp only from Anthropic's addresses, alerts on Telegram
   workers.mjs        workers: repositories, claude -p runs, the queue, the check after a run, results
+  workspaces.mjs     where a run works: a repository, or a work folder, with its rules and check
   ledger.mjs         open decisions for the driver, and the open items
   runners.mjs        where workers run: this computer, or the Docker container; a run's processes
   access.mjs         access levels in the container, from the GitHub token
@@ -1637,7 +1724,7 @@ scripts/
   channel-mode.mjs             plugin or development flag
   controller-settings.mjs      the session's --settings for its level
   settings.sh                  .secrets/gateway.env for the shell scripts
-  start-workers-container.sh   the worker container; read-only while locked
+  start-workers-container.sh   the worker container, or with --scratch the work folders'; read-only while locked
   fetch-from-container.sh      a branch from the container into a clean clone, as a bundle
   unlock.mjs                   unlock the kill switch, at the server only
   pair.mjs                     pairing codes, connections
