@@ -151,10 +151,16 @@ questions above.
   stop a run with `stop_worker`.
 - `worker_status` when the driver asks what a worker is doing.
 - When a run ends, its result arrives as `<channel source="voice" request_id="…" worker="…"
-  task="…" outcome="…" trusted="no">`. Summarise it in at most three sentences and reply with that
-  `request_id`: `done`, or `question` when the worker asks something. The driver hears it as
-  news. Their answer arrives as "(Answer to <id>) …": pass it to the same worker with `dispatch`,
-  which continues where it stopped.
+  task="…" outcome="…" git="…" trusted="no">`. Summarise it in at most three sentences and reply
+  with that `request_id`: `done`, or `question` when the worker asks something. The driver hears it
+  as news. Their answer arrives as "(Answer to <id>) …": pass it to the same worker with
+  `dispatch`, which continues where it stopped.
+- The `git` attribute is the gateway's own look at the checkout after the run, not the worker's
+  word: "clean", or commits on no remote, new uncommitted files, a checkout not back on its
+  starting branch. Tell the driver about anything but "clean", also when the worker said nothing
+  about it. `stop_worker` says the same after a stop.
+- A `done` reply may come back with a line about the gateway's own checkout: uncommitted changes
+  or commits on no remote. Mention it to the driver once, in a later answer.
 - What workers publish depends on the setup, which the first line of `list_workers` shows:
   - Without `docker=`, on this computer: workers commit on a `voice/` branch, push and open a draft
     pull request.

@@ -20,6 +20,7 @@ import { z } from 'zod'
 import { adminRequest } from '../src/admin.mjs'
 import { normalise, spokenByDriver } from '../src/channel.mjs'
 import { Store } from '../src/store.mjs'
+import { Workers, auditSummary, auditText } from '../src/workers.mjs'
 
 const GATEWAY = fileURLToPath(new URL('../src/gateway.mjs', import.meta.url))
 // Resolved: on macOS the temporary folder is behind a symlink (/var is
@@ -28,9 +29,12 @@ const TMP = realpathSync(mkdtempSync(join(tmpdir(), 'voice-gw-workers-')))
 const ROOT = join(TMP, 'Developer')
 const BIN = join(TMP, 'bin')
 const CALLS = join(TMP, 'claude-calls.jsonl')
+const SELF = join(TMP, 'gateway-checkout') // stands in for the gateway's own checkout
+const REMOTES = join(TMP, 'remotes') // bare repositories as remotes
 
 const FAKE_CLAUDE = `#!/usr/bin/env node
-import { appendFileSync, readFileSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
+import { appendFileSync, readFileSync, writeFileSync } from 'node:fs'
 const args = process.argv.slice(2)
 const input = readFileSync(0, 'utf8')
 appendFileSync(process.env.FAKE_CLAUDE_LOG, JSON.stringify({
@@ -45,6 +49,17 @@ out({ type: 'system', subtype: 'init' })
 out({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Bash', input: { command: 'npm test' } }] } })
 setTimeout(() => {
   if (/FAIL/.test(input)) { process.stderr.write('boom: something broke\\n'); process.exit(1) }
+  // COMMIT: a commit on a voice branch, not pushed; STAY: left on that
+  // branch; LEAVE: a new file, not committed.
+  const git = (...a) => execFileSync('git', a, { stdio: 'ignore' })
+  if (/COMMIT/.test(input)) {
+    git('checkout', '-q', '-b', 'voice/audit-' + process.pid)
+    writeFileSync('change-' + process.pid + '.txt', 'x')
+    git('add', '.')
+    git('-c', 'user.name=W', '-c', 'user.email=w@example.com', 'commit', '-q', '-m', 'change')
+    if (!/STAY/.test(input)) git('checkout', '-q', '-')
+  }
+  if (/LEAVE/.test(input)) writeFileSync('left-over.txt', 'x')
   out({ type: 'assistant', message: { content: [{ type: 'text', text: 'Looking at the tests.' }] } })
   const result = /QUESTION/.test(input)
     ? 'Should I also update the docs?'
@@ -102,16 +117,22 @@ function freePort() {
   })
 }
 
-function repo(name, { origin, dirty = false } = {}) {
-  const dir = join(ROOT, name)
+// pushed: the origin is a bare repository here, and main is pushed to it.
+function repo(name, { origin, dirty = false, pushed = false, dir = join(ROOT, name) } = {}) {
   mkdirSync(dir, { recursive: true })
   const run = (...args) => execFileSync('git', args, { cwd: dir, stdio: 'ignore' })
   run('init', '-q', '-b', 'main')
   writeFileSync(join(dir, 'README.md'), `# ${name}\n`)
   run('add', '.')
   run('-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-q', '-m', 'init')
+  if (pushed) {
+    origin = join(REMOTES, `${name}.git`)
+    execFileSync('git', ['init', '-q', '--bare', origin], { stdio: 'ignore' })
+  }
   if (origin) run('remote', 'add', 'origin', origin)
+  if (pushed) run('push', '-q', 'origin', 'main')
   if (dirty) writeFileSync(join(dir, 'notes.txt'), 'not committed\n')
+  return run
 }
 
 async function startGateway(env = {}) {
@@ -144,6 +165,7 @@ async function startGateway(env = {}) {
         VOICE_GW_MAX_WAIT: '3',
         VOICE_GW_DEFAULT_WAIT: '2',
         VOICE_GW_LOG_FILE: '',
+        VOICE_GW_SELF_CHECKOUT: SELF,
         FAKE_CLAUDE_LOG: CALLS,
         // As inside a Claude Code session; a worker must not inherit these.
         CLAUDECODE: '1',
@@ -187,6 +209,7 @@ before(async () => {
   repo('dirty', { origin: 'git@github.com:acme/dirty.git', dirty: true })
   repo('delta', { origin: 'git@github.com:acme/delta-direct.git' })
   mkdirSync(join(ROOT, 'not-a-repo'))
+  repo('gateway', { pushed: true, dir: SELF })
   // Settings as the setup assistant writes them; the environment wins.
   mkdirSync(join(TMP, 'secrets'), { recursive: true })
   writeFileSync(
@@ -407,6 +430,89 @@ test('a failed run reports what went wrong', async () => {
   const event = await workerEvent('gamma', run.id)
   assert.equal(event.meta.outcome, 'failed')
   assert.match(event.content, /Problem: boom: something broke/)
+})
+
+// --- the audit after a run --------------------------------------------------------
+
+test('after a run the gateway looks at git itself: commits on no remote, new files and the branch', async () => {
+  repo('epsilon', { pushed: true })
+  try {
+    const look = await dispatch('epsilon', 'Look at the README.')
+    const clean = await workerEvent('epsilon', look.id)
+    assert.equal(clean.meta.git, 'clean')
+    assert.match(clean.content, /^Git check by the gateway: clean, nothing left unpushed or uncommitted\.$/m)
+
+    // The worker says nothing about its commit; the gateway does.
+    const commit = await dispatch('epsilon', 'COMMIT: change it.')
+    const committed = await workerEvent('epsilon', commit.id)
+    assert.equal(committed.meta.git, '1 commit on no remote')
+    assert.match(committed.content, /^Git check by the gateway: 1 commit on no remote \(on voice\/audit-\d+\)\.$/m)
+    assert.match(committed.content, /^Result: All 12 tests pass\. Nothing changed\.$/m)
+    assert.ok(committed.content.indexOf('Git check') < committed.content.indexOf('Result:'), "the gateway's lines first")
+
+    // That commit was there before the next run: only the run's own count.
+    const more = await dispatch('epsilon', 'COMMIT STAY LEAVE: change more.')
+    const left = await workerEvent('epsilon', more.id)
+    assert.equal(left.meta.git, '1 commit on no remote, 1 new uncommitted file, not back on its starting branch')
+    assert.match(
+      left.content,
+      /^Git check by the gateway: 1 commit on no remote \(on voice\/audit-\d+\), 1 new uncommitted file \(left-over\.txt\), the checkout is on voice\/audit-\d+, not on main as at the start\.$/m,
+    )
+    assert.match((await controller('worker_status', { worker: 'epsilon' })).text, /^Git check by the gateway: 1 commit on no remote/m)
+  } finally {
+    rmSync(join(ROOT, 'epsilon'), { recursive: true, force: true })
+  }
+})
+
+test('stop_worker says what the gateway found in git after the stop', async () => {
+  const run = await dispatch('gamma', 'SLOW: a long look.')
+  assert.match(run.text, /dispatch=started/)
+  const stopped = await controller('stop_worker', { worker: 'gamma' })
+  // gamma has no remote: there is nowhere to push to, so no commit counts.
+  assert.match(stopped.text, /^\[worker=gamma stopped task=t[a-z0-9]{3}\] Stopped\. Git check by the gateway: clean/)
+})
+
+test('the result of a stopped or failed run has the last message; a finished one does not need it', () => {
+  const workers = Object.create(Workers.prototype) // resultText needs no state
+  const task = {
+    repo: 'alpha',
+    id: 't123',
+    task: 'Fix it.',
+    state: 'stopped',
+    startedAt: 0,
+    finishedAt: 120000,
+    lastText: 'Now running the slow integration tests.',
+    result: null,
+    error: 'stopped at the time limit of 60 minutes',
+    audit: { ok: false },
+  }
+  const stopped = workers.resultText(task)
+  assert.match(stopped, /^Git check by the gateway: not possible, git did not answer\.$/m)
+  assert.match(stopped, /^Last message: Now running the slow integration tests\.$/m)
+  assert.match(stopped, /^Problem: stopped at the time limit/m)
+  assert.doesNotMatch(workers.resultText({ ...task, state: 'done', result: 'Done.' }), /Last message/)
+  assert.doesNotMatch(workers.resultText({ ...task, state: 'failed', result: task.lastText }), /Last message/, 'said once')
+  assert.equal(auditSummary({ ok: false }), 'not checked')
+  assert.equal(auditText(null), null, 'a run from before the audit')
+})
+
+test("a done reply notes uncommitted changes and commits on no remote in the gateway's own checkout", async () => {
+  const id = /id=([a-z0-9]{4})/.exec(await voiceCall('send', { message: 'Anything new?' }))[1]
+  assert.equal((await controller('reply', { request_id: id, state: 'done', text: 'Nothing new.' })).text, 'sent')
+  const run = (...args) => execFileSync('git', args, { cwd: SELF, stdio: 'ignore' })
+  writeFileSync(join(SELF, 'scratch.txt'), 'x')
+  try {
+    const dirty = await controller('reply', { request_id: id, state: 'done', text: 'Still nothing new.' })
+    assert.equal(dirty.text, "sent\nThe gateway's own checkout has 1 uncommitted file, on main.")
+    run('add', '.')
+    run('-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-q', '-m', 'scratch')
+    const unpushed = await controller('reply', { request_id: id, state: 'done', text: 'Really nothing.' })
+    assert.equal(unpushed.text, "sent\nThe gateway's own checkout has 1 commit on no remote, on main.")
+    assert.equal((await controller('reply', { request_id: id, state: 'working', text: 'Looking.' })).text, 'sent', 'only after done')
+  } finally {
+    run('push', '-q', 'origin', 'main')
+  }
+  assert.equal((await controller('reply', { request_id: id, state: 'done', text: 'All clear.' })).text, 'sent')
 })
 
 test('unknown repositories and missing arguments are errors', async () => {

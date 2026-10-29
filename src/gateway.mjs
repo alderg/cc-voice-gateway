@@ -23,7 +23,7 @@ import { Auth } from './oauth.mjs'
 import { startAdmin } from './admin.mjs'
 import { startChannel } from './channel.mjs'
 import { startVoiceHttp } from './voice.mjs'
-import { Workers } from './workers.mjs'
+import { Workers, auditSummary, gitState, hostGit } from './workers.mjs'
 import { Restarter } from './restart.mjs'
 import { PullWatcher } from './pulls.mjs'
 import { TelegramCommands, TelegramFallback, loadTelegram } from './telegram.mjs'
@@ -148,25 +148,41 @@ function shutdown(reason, code = process.exitCode ?? 0) {
 // Restarting the controller by voice, through the watchdog (restart.mjs).
 const restarter = new Restarter({ store, workers, secretsDir: config.secretsDir })
 
+// The gateway's own checkout, each time the controller answers a request with
+// "done": uncommitted changes and commits on no remote get a line in the
+// reply's result, so that work on the gateway itself is not forgotten.
+async function selfCheck() {
+  if (!config.selfCheckout) return null
+  const state = await gitState(hostGit, config.selfCheckout)
+  if (!state || (!state.dirty.length && !state.unpushed.length)) return null
+  const parts = []
+  if (state.dirty.length) parts.push(`${state.dirty.length} uncommitted file${state.dirty.length === 1 ? '' : 's'}`)
+  if (state.unpushed.length) parts.push(`${state.unpushed.length} commit${state.unpushed.length === 1 ? '' : 's'} on no remote`)
+  return `The gateway's own checkout has ${parts.join(' and ')}, on ${state.branch || 'a detached HEAD'}.`
+}
+
 const channel = await startChannel(store, {
   permissionRelay: config.permissionRelay,
   workers,
   restarter,
   killswitch,
   folders,
+  selfCheck,
   level: config.controllerLevel,
   onClose: () => shutdown('stdio closed'),
 })
 
-// When a run ends, its result goes to the controller as a channel event, with
-// the pull requests it opened or worked on. The controller's reply to it
-// reaches the driver as news.
+// When a run ends, the gateway looks at its checkout (Workers.audit), and the
+// result goes to the controller as a channel event, with what the gateway saw
+// and the pull requests the run opened or worked on. The controller's reply
+// to it reaches the driver as news.
 const reporting = new Set()
 workers.on('finished', async task => {
   if (reporting.has(task.id)) return
   reporting.add(task.id)
   try {
     await channel.ready
+    await workers.audit(task)
     const opened = await pulls.fromRun(task).catch(error => {
       log('pull requests of', task.id, 'not checked:', error.message)
       return []
@@ -176,7 +192,8 @@ workers.on('finished', async task => {
       worker: { repo: task.repo, task: task.id },
     })
     // trusted="no": the result carries whatever the run read (channel.mjs).
-    request.meta = { worker: task.repo, task: task.id, outcome: task.state, trusted: 'no' } // for sending it again
+    // git: the audit in the gateway's words, without the run's.
+    request.meta = { worker: task.repo, task: task.id, outcome: task.state, git: auditSummary(task.audit), trusted: 'no' } // for sending it again
     if (opened.length) request.meta.pull_request = opened.map(pull => pull.number).join(',')
     await channel.push(request, request.meta)
     workers.markReported(task)

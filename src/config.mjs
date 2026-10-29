@@ -106,6 +106,9 @@ export const config = {
   ghBin: env.VOICE_GW_GH_BIN || 'gh',
   // Worker state and the output of every run.
   stateDir: env.VOICE_GW_STATE_DIR || join(ROOT, '.state'),
+  // The checkout the gateway looks at with git when the controller answers a
+  // request: its own. Empty: no look. Tests use a stand-in.
+  selfCheckout: env.VOICE_GW_SELF_CHECKOUT ?? ROOT,
 
   // Pull requests that workers open (pulls.mjs): how often the gateway looks
   // at their checks and reviews, in seconds, and for how many hours at most.

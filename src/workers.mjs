@@ -12,7 +12,10 @@
 //
 // The gateway checks the checkout before a run (uncommitted files, a run
 // already going, the cap on parallel runs) in code, not in the worker's
-// instructions. What the worker does with git is up to its instructions.
+// instructions. What the worker does with git is up to its instructions;
+// after the run the gateway looks again (audit): commits on no remote,
+// uncommitted files that were not there at the start, and the branch. The
+// controller gets that with the result, whatever the worker wrote.
 //
 // The run output holds every tool input and result, so .state/tasks and
 // .state/workers.json are for this user only (folders 0700, files 0600).
@@ -29,6 +32,7 @@ const POLL_MS = 1000
 const GITHUB_CACHE_MS = 10 * 60 * 1000 // what gh says about a repository
 const MAX_STEPS = 5
 const KEEP_TASKS = 40
+const MAX_UNPUSHED = 200 // commits on no remote that the audit lists
 const ID_ALPHABET = 'abcdefghjkmnpqrstuvwxyz23456789'
 
 // Claude Code sets these for its own child processes, the gateway included. A
@@ -78,6 +82,10 @@ summarise your result for them. Nobody can answer you during the run.
 - At the end, switch back to the starting branch, so the checkout is as the driver left it.
 - Run the tests that cover your change. Tasks that change nothing, such as questions or test runs, need no
   branch.
+- Before you end, look at git status and git log --branches --not --remotes. Never end a run with commits of
+  yours on no remote, or uncommitted changes of yours, without naming them in your result. Where the Publish
+  rule lets you push and you did not, end by asking whether to push. The gateway checks git after every run
+  and asks the driver about whatever is left.
 - Review requests, only when the task asks for one: if it names a person, add them as reviewer with
   gh pr edit --add-reviewer. Otherwise review the pull request's diff yourself and post your findings as one
   pull request review with gh api (event COMMENT, comments inline on the changed lines where possible, the
@@ -164,6 +172,76 @@ function workerEnv() {
   const env = { ...process.env }
   for (const name of SESSION_ENV) delete env[name]
   return env
+}
+
+// The files in the output of git status --porcelain.
+const changedFiles = status =>
+  (status ?? '')
+    .split('\n')
+    .filter(Boolean)
+    .map(line => line.slice(3))
+
+// What git says about a checkout: its branch, the uncommitted files, whether
+// it has a remote, and the commits that no remote branch has, each with the
+// branch it was found on (at most MAX_UNPUSHED). Without a remote there is
+// nowhere to push, so none count. null when git does not answer. git is a
+// runner's git(dir, ...args), on this computer or in the container.
+export async function gitState(git, dir) {
+  const [branch, status, remotes] = await Promise.all([
+    git(dir, 'branch', '--show-current'),
+    git(dir, 'status', '--porcelain'),
+    git(dir, 'remote'),
+  ])
+  if (status === null || remotes === null) return null
+  const remote = remotes.trim() !== ''
+  const log = remote
+    ? await git(dir, 'log', '--branches', '--not', '--remotes', '--source', `--max-count=${MAX_UNPUSHED}`, '--format=%h %S')
+    : ''
+  if (log === null) return null
+  const unpushed = log
+    .split('\n')
+    .filter(Boolean)
+    .map(line => {
+      const [hash, ...ref] = line.split(' ')
+      return { hash, branch: ref.join(' ') }
+    })
+  return { branch: branch?.trim() ?? '', dirty: changedFiles(status), remote, unpushed }
+}
+
+// git on this computer, for the gateway's own checkout.
+export const hostGit = (dir, ...args) => new HostRunner(dir).git(dir, ...args)
+
+const commits = n => `${plural(n, 'commit')} on no remote`
+const newFiles = n => plural(n, 'new uncommitted file')
+
+// The audit in a few words for the result event's git attribute, from a fixed
+// vocabulary: no branch or file name, which the run chose.
+export function auditSummary(audit) {
+  if (!audit?.ok) return 'not checked'
+  const parts = []
+  if (audit.unpushed.length) parts.push(commits(audit.unpushed.length))
+  if (audit.dirty.length) parts.push(newFiles(audit.dirty.length))
+  if (audit.startBranch && audit.branch !== audit.startBranch) parts.push('not back on its starting branch')
+  return parts.length ? parts.join(', ') : 'clean'
+}
+
+// The audit as a line of the result event, with the branches and files.
+export function auditText(audit) {
+  if (!audit) return null
+  if (!audit.ok) return 'Git check by the gateway: not possible, git did not answer.'
+  const parts = []
+  if (audit.unpushed.length) {
+    const branches = [...new Set(audit.unpushed.map(c => c.branch).filter(Boolean))]
+    parts.push(`${commits(audit.unpushed.length)}${branches.length ? ` (on ${branches.slice(0, 3).join(', ')})` : ''}`)
+  }
+  if (audit.dirty.length) {
+    const shown = audit.dirty.slice(0, 5).join(', ') + (audit.dirty.length > 5 ? ', …' : '')
+    parts.push(`${newFiles(audit.dirty.length)} (${preview(shown, 160)})`)
+  }
+  if (audit.startBranch && audit.branch !== audit.startBranch) {
+    parts.push(`the checkout is on ${audit.branch || 'a detached HEAD'}, not on ${audit.startBranch} as at the start`)
+  }
+  return `Git check by the gateway: ${parts.length ? parts.join(', ') : 'clean, nothing left unpushed or uncommitted'}.`
 }
 
 // The text of a tool result: a string, or a list of text blocks.
@@ -355,7 +433,7 @@ export class Workers extends EventEmitter {
       dir,
       slug, // owner/repo on GitHub, or null
       branch: branch?.trim() ?? '',
-      dirty: (status ?? '').split('\n').filter(Boolean).map(line => line.slice(3)),
+      dirty: changedFiles(status),
       origin: slug ?? origin,
       visibility: !origin ? 'none' : (access?.visibility ?? github?.visibility ?? 'unknown'),
       defaultBranch: access?.branch ?? github?.branch ?? null,
@@ -389,10 +467,22 @@ export class Workers extends EventEmitter {
       // or where pull requests are turned off, where it is the only way.
       if (direct && !facts.pushDirect && facts.access?.level !== 'full') return { status: 'refused', facts }
       if (facts.dirty.length && !allowDirty) return { status: 'dirty', files: facts.dirty }
+      facts.unpushed = await this.baseline(facts.dir)
       return this.start(facts, { task, words, fresh, direct })
     } finally {
       this.starting.delete(worker)
     }
+  }
+
+  git(dir, ...args) {
+    return this.runner.git(dir, ...args)
+  }
+
+  // The commits on no remote before a run, so that its audit tells the run's
+  // own from what was there already. null when git does not answer.
+  async baseline(dir) {
+    const state = await gitState((...args) => this.git(...args), dir)
+    return state ? state.unpushed.map(commit => commit.hash) : null
   }
 
   start(facts, { task, words, fresh, direct = false }) {
@@ -440,6 +530,11 @@ export class Workers extends EventEmitter {
       dir: facts.dir,
       slug: facts.slug ?? null, // owner/repo on GitHub, or null
       defaultBranch: facts.defaultBranch ?? null,
+      // For the audit at the end: the checkout as the run found it.
+      startBranch: facts.branch,
+      startDirty: facts.dirty,
+      unpushedBefore: facts.unpushed ?? null, // commit hashes; null: unknown
+      audit: null,
       pulls: [], // numbers of this repository's pull requests the run named
       startedAt: Date.now(),
       finishedAt: null,
@@ -609,6 +704,40 @@ export class Workers extends EventEmitter {
     if (unsaved) throw unsaved
   }
 
+  // --- after a run --------------------------------------------------------
+
+  // Looks at the run's checkout once it has ended, whatever the worker wrote:
+  // commits on no remote that were not there at its start, uncommitted files
+  // that were not there at its start, and whether it is back on its starting
+  // branch. Kept with the task, so that the result says the same after a
+  // gateway restart; { ok: false } when git does not answer.
+  async audit(task) {
+    if (task.audit) return task.audit
+    const now = await gitState((...args) => this.git(...args), task.dir ?? this.runner.dir(task.repo)).catch(() => null)
+    if (!now) {
+      task.audit = { ok: false, at: Date.now() }
+    } else {
+      const before = new Set(task.unpushedBefore ?? [])
+      const dirtyBefore = new Set(task.startDirty ?? [])
+      task.audit = {
+        ok: true,
+        at: Date.now(),
+        branch: now.branch,
+        startBranch: task.startBranch ?? null,
+        remote: now.remote,
+        unpushed: now.unpushed.filter(commit => !before.has(commit.hash)),
+        dirty: now.dirty.filter(file => !dirtyBefore.has(file)),
+      }
+    }
+    log('worker audit', task.repo, task.id, auditSummary(task.audit))
+    try {
+      this.save()
+    } catch (error) {
+      log('worker state not saved:', error.message) // the audit holds in this gateway
+    }
+    return task.audit
+  }
+
   // --- texts for the controller -------------------------------------------
 
   async listText() {
@@ -656,6 +785,7 @@ export class Workers extends EventEmitter {
     }
     lines.push(`Task: ${preview(task.task, 200)}`)
     if (task.steps.length) lines.push(`Last steps: ${task.steps.join('; ')}`)
+    if (task.audit) lines.push(auditText(task.audit))
     if (task.state === 'running' && task.lastText) lines.push(`Last message: ${task.lastText}`)
     if (task.result) lines.push(`Result: ${task.result}`)
     if (task.error && task.error !== task.result) lines.push(`Problem: ${task.error}`)
@@ -663,13 +793,20 @@ export class Workers extends EventEmitter {
   }
 
   // The channel event the controller gets when a run ends, with the pull
-  // requests it opened or worked on, as gh shows them (pulls.mjs).
+  // requests it opened or worked on, as gh shows them (pulls.mjs). The
+  // gateway's own lines come first, the worker's text after them. A run that
+  // was stopped or failed also gets the worker's last message, which may say
+  // how far it got.
   resultText(task, pulls = []) {
     const lines = [
       `Worker ${task.repo} finished task ${task.id}: ${task.state} after ${duration(task.finishedAt - task.startedAt)}.`,
       `Task: ${preview(task.task, 200)}`,
     ]
+    if (task.audit) lines.push(auditText(task.audit))
     if (task.result) lines.push(`Result: ${task.result}`)
+    if (task.state !== 'done' && task.lastText && task.lastText !== preview(task.result ?? '', 300)) {
+      lines.push(`Last message: ${task.lastText}`)
+    }
     if (task.error && task.error !== task.result) lines.push(`Problem: ${task.error}`)
     for (const pull of pulls) {
       lines.push(`Pull request: ${pull.number} in ${task.slug}, "${preview(pull.title, 80)}"${pull.isDraft ? ', a draft' : ''}.`)

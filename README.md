@@ -524,13 +524,25 @@ What applies to every worker run (`src/workers.mjs`):
   ([5.4](#54-approvals-by-voice)), a checkout with uncommitted changes until you agree, a second
   run in the same repository, and more than `VOICE_GW_MAX_WORKERS` runs. A run stops after
   `VOICE_GW_WORKER_TIMEOUT` minutes.
+- **After a run:** the gateway looks at the checkout with git itself, whatever the worker wrote
+  (`audit` in `src/workers.mjs`, on this computer or through `docker exec`): commits that no
+  remote branch has and that were not there when the run started, uncommitted files that were not
+  there either, and whether the checkout is back on its starting branch. Without a remote,
+  commits do not count. The result event carries it twice: in the attribute `git`, in the
+  gateway's words only ("clean", or "1 commit on no remote, 1 new uncommitted file"), and in a line
+  with the branches and files, before the worker's text. `worker_status` and `stop_worker` show it
+  too. A run that was stopped or failed also brings the worker's last message.
+- **The gateway's own checkout** gets the same look whenever the controller replies "done": if it
+  has uncommitted changes or commits on no remote, the reply's result says so in one line
+  (`VOICE_GW_SELF_CHECKOUT`). The reply itself goes out first.
 - **Not this repository.** On this computer the gateway's own checkout is no worker, even inside
   `VOICE_GW_WORKER_ROOT`: a run there could change the gateway, the confine hook and
   `controller/CLAUDE.md`. `VOICE_GW_WORKER_SELF=1` lists it anyway. In Docker, the container's
   clones are what counts.
 - **Rules for the run** (`WORKER_RULES`): branch `voice/<name>`, commit only its own changes, never
-  force-push, merge or delete branches, ask before pushing a public repository. These are rules,
-  not limits.
+  force-push, merge or delete branches, ask before pushing a public repository, never end with
+  commits on no remote or uncommitted changes without naming them and asking about the push. These
+  are rules, not limits; the check after the run is code.
 
 | | On this computer | In Docker |
 |---|---|---|
@@ -1243,6 +1255,7 @@ setting with where it came from.
 | `VOICE_GW_HOST` | `127.0.0.1` | Bind address; keep loopback |
 | `VOICE_GW_SECRETS_DIR` | `.secrets` | Secrets, settings file, admin socket |
 | `VOICE_GW_STATE_DIR` | `.state` | Worker state, run output, requests, pull request watches |
+| `VOICE_GW_SELF_CHECKOUT` | This checkout | The checkout whose uncommitted changes and commits on no remote a "done" reply mentions ([5.5](#55-workers-on-this-computer-or-in-docker)); empty: none. Tests use a stand-in |
 | `VOICE_GW_LOG_FILE` | `.logs/gateway.log` | Empty: stderr only |
 | `VOICE_GW_LOG_MAX_MB` | `10` | Past this size the log moves to `gateway.log.1`, replacing the one before |
 | `VOICE_GW_OAUTH_HOSTS` | `claude.ai,claude.com` | Hosts allowed in redirect addresses and client ID metadata documents |
@@ -1351,6 +1364,7 @@ do not set them.
 | The controller says it cannot clone or delete | The level is `confined`, or workers run in Docker; the log line `controller level …` says which. A new level counts from the next start of the start script: `--stop`, then start it again. |
 | `delete=unplanned` | A deletion needs a plan of the same path from the last 15 minutes: the controller calls `delete_path` without `confirm` first. |
 | A worker fails at once | `could not start claude`: Claude Code is not on the gateway's `PATH`; set `VOICE_GW_CLAUDE_BIN`. Otherwise read `.state/tasks/<task>.err`. |
+| A result says `git="1 commit on no remote"` although the worker pushed | The check counts commits that no remote-tracking branch (`refs/remotes/…`) has. A push to a URL instead of a named remote does not update them; `git fetch` in the checkout does. Without any remote, commits never count. |
 | What did a worker do? | `.state/tasks/<task>.jsonl` holds the whole run. `claude --resume <session>` in the repository opens the session; `.state/workers.json` lists the session ids. |
 | A private repository is handled like a public one | `gh` is not logged in or not on the `PATH`, so the visibility is unknown, and the worker asks before pushing to be safe. |
 | No news about checks or reviews on a worker's pull request | The log says why: `gh is not logged in`, or `stopped watching pull request … : nothing automatic runs` (often a draft that bot reviewers skip), `merged`, `closed` or `time limit`. Only pull requests on `voice/` branches that a run linked to are watched. `.state/pulls.json` lists the watches. |

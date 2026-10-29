@@ -27,6 +27,11 @@ import { CONTROLLER_STATES } from './store.mjs'
 import { log, preview } from './log.mjs'
 import { alarmText } from './killswitch.mjs'
 import { size } from './folders.mjs'
+import { auditText } from './workers.mjs'
+
+// How long a "done" reply waits for the look at the gateway's own checkout
+// before it answers without it.
+const SELF_CHECK_MS = 3000
 
 // Must match the key in controller/.mcp.json: Claude Code derives the
 // <channel source="..."> attribute and the tool prefix mcp__voice__ from it.
@@ -71,9 +76,12 @@ Where pull requests are turned off on GitHub (list_workers says "pull requests o
 brackets does, and dispatch says push=direct), workers commit and push straight to the default branch: tell
 the driver the change went to that branch, not that a pull request is out.
 When a run ends, a message arrives as <channel source="${CHANNEL_SOURCE}" request_id="..." worker="..." task="..."
-outcome="done|failed|stopped" trusted="no">. Summarise it for the driver like any answer and reply with that
+outcome="done|failed|stopped" git="..." trusted="no">. Summarise it for the driver like any answer and reply with that
 request_id: state "done", or "question" when the worker asks something. The driver hears it as news. Their answer arrives
 as a new message "(Answer to <id>) ...": pass it to the same worker with dispatch, as a follow-up.
+The git attribute is the gateway's own look at the checkout after the run, whatever the worker wrote: "clean", or
+commits on no remote, new uncommitted files, a checkout not back on its branch. Tell the driver about anything but
+"clean". A "done" reply may come back with a line about the gateway's own checkout; mention it to the driver once.
 When the run opened or updated a pull request, the tag also has pull_request="<number>": say only briefly
 that it is out, and which one. Never offer or suggest a review; details only when the driver asks.
 Checks and reviews that run on such a pull request by themselves arrive later as <channel source="${CHANNEL_SOURCE}"
@@ -232,7 +240,7 @@ const WORKER_TOOLS = [
   },
   {
     name: 'stop_worker',
-    description: "Stop a worker's running task.",
+    description: "Stop a worker's running task. The answer says what the gateway found in git after the stop.",
     inputSchema: { type: 'object', properties: { worker: WORKER_PROPERTY }, required: ['worker'] },
   },
 ]
@@ -419,9 +427,10 @@ async function workerTool(workers, name, args, spoken) {
   if (name === 'worker_status') return toolText(workers.statusText(worker))
   if (name === 'stop_worker') {
     const task = workers.stop(worker)
-    return toolText(
-      task ? `[worker=${worker} stopped task=${task.id}] Stopped.` : `[worker=${worker}] Nothing is running there.`,
-    )
+    if (!task) return toolText(`[worker=${worker}] Nothing is running there.`)
+    // A stopped run gets no result event; its audit comes with this answer.
+    const audit = await workers.audit(task)
+    return toolText(`[worker=${worker} stopped task=${task.id}] Stopped. ${auditText(audit)}`)
   }
   // dispatch
   if (typeof args.task !== 'string' || !args.task.trim()) return toolText('task is required.', true)
@@ -541,9 +550,23 @@ async function folderTool(folders, name, args, spoken) {
   return folderText(name, folders.remove(args.path))
 }
 
+// The look at the gateway's own checkout after a "done" (gateway.mjs): its
+// line, or null when there is nothing to say or it takes too long. It never
+// fails the reply.
+async function selfNote(selfCheck) {
+  if (!selfCheck) return null
+  let timer
+  const late = new Promise(resolve => (timer = setTimeout(() => resolve(null), SELF_CHECK_MS)))
+  try {
+    return await Promise.race([selfCheck().catch(() => null), late])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 export async function startChannel(
   store,
-  { permissionRelay, workers, restarter, killswitch, folders, level = 'confined', onClose } = {},
+  { permissionRelay, workers, restarter, killswitch, folders, selfCheck = null, level = 'confined', onClose } = {},
 ) {
   const experimental = { 'claude/channel': {} }
   if (permissionRelay) experimental['claude/channel/permission'] = {}
@@ -599,7 +622,9 @@ export async function startChannel(
       return toolText(`Unknown request_id "${request_id}". Use the request_id from the <channel> tag.`, true)
     }
     log('reply', `id=${updated.id}`, `state=${state}`, preview(text))
-    return toolText('sent')
+    // The answer is on its way already; the note only follows it.
+    const note = state === 'done' ? await selfNote(selfCheck) : null
+    return toolText(note ? `sent\n${note}` : 'sent')
   })
 
   if (permissionRelay) {
