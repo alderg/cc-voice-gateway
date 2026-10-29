@@ -173,8 +173,9 @@ export const queueList = (entries, { max = 5, repos = false } = {}) =>
     .join(', ') + (entries.length > max ? `, and ${entries.length - max} more` : '')
 
 // What the controller hears when a queued task could not start and left the
-// queue: the controller's own task and the gateway's reason, nothing that a
-// repository wrote. decision: the open decision it became.
+// queue: the controller's own task, which may quote a worker (so the event is
+// trusted="no"), and the gateway's reason. decision: the open decision it
+// became.
 export function parkedText(entry, why, status, decision = null) {
   const hint =
     status === 'dirty'
@@ -239,7 +240,10 @@ const changedFiles = status =>
 // branch it was found on (at most MAX_UNPUSHED). Without a remote there is
 // nowhere to push, so none count. null when git does not answer. git is a
 // runner's git(dir, ...args), on this computer or in the container.
-export async function gitState(git, dir) {
+// current: only the commits of the branch that is checked out, for the
+// gateway's own checkout, where other local branches (Claude Code's
+// worktrees, for example) are not the driver's to push.
+export async function gitState(git, dir, { current = false } = {}) {
   const [branch, status, remotes] = await Promise.all([
     git(dir, 'branch', '--show-current'),
     git(dir, 'status', '--porcelain'),
@@ -247,8 +251,9 @@ export async function gitState(git, dir) {
   ])
   if (status === null || remotes === null) return null
   const remote = remotes.trim() !== ''
+  const refs = current ? ['HEAD'] : ['--branches']
   const log = remote
-    ? await git(dir, 'log', '--branches', '--not', '--remotes', '--source', `--max-count=${MAX_UNPUSHED}`, '--format=%h %S')
+    ? await git(dir, 'log', ...refs, '--not', '--remotes', '--source', `--max-count=${MAX_UNPUSHED}`, '--format=%h %S')
     : ''
   if (log === null) return null
   const unpushed = log
@@ -275,6 +280,7 @@ export function auditSummary(audit) {
   if (audit.unpushed.length) parts.push(commits(audit.unpushed.length))
   if (audit.dirty.length) parts.push(newFiles(audit.dirty.length))
   if (audit.startBranch && audit.branch !== audit.startBranch) parts.push('not back on its starting branch')
+  if (audit.baseline === false) parts.push('its start not recorded')
   return parts.length ? parts.join(', ') : 'clean'
 }
 
@@ -282,6 +288,12 @@ export function auditSummary(audit) {
 export function auditText(audit) {
   if (!audit) return null
   if (!audit.ok) return 'Git check by the gateway: not possible, git did not answer.'
+  if (audit.baseline === false && !audit.unpushed.length && !audit.dirty.length) {
+    return (
+      'Git check by the gateway: the checkout as this run found it was not recorded, so no commit or file is ' +
+      `counted as the run's own; it is on ${audit.branch || 'a detached HEAD'}.`
+    )
+  }
   const parts = []
   if (audit.unpushed.length) {
     const branches = [...new Set(audit.unpushed.map(c => c.branch).filter(Boolean))]
@@ -552,7 +564,12 @@ export class Workers extends EventEmitter {
       // A push to the default branch only at level full, and only when asked;
       // or where pull requests are turned off, where it is the only way.
       if (direct && !facts.pushDirect && facts.access?.level !== 'full') return { status: 'refused', facts }
-      if (facts.dirty.length && !allowDirty) return { status: 'dirty', files: facts.dirty }
+      // The files the decisions it follows up are about are what a follow-up
+      // is for: neither a reason to ask again nor someone else's.
+      const decided = new Set(this.follows(worker, answers).flatMap(d => d.details?.files ?? []))
+      facts.followed = facts.dirty.filter(file => decided.has(file))
+      const foreign = facts.dirty.filter(file => !decided.has(file))
+      if (foreign.length && !allowDirty) return { status: 'dirty', files: foreign }
       facts.unpushed = await this.baseline(facts.dir)
       return this.start(facts, { task, words, fresh, direct, answers }, entry)
     } finally {
@@ -635,12 +652,14 @@ export class Workers extends EventEmitter {
     }
     if (entry) record.queued = entry.id // it waited in the queue as this
     // The follow-up for the driver's answer: the decisions it answers close
-    // now, and what they were about counts again in this run's audit.
+    // now, and what they were about counts again in this run's audit, so a
+    // follow-up that was to push and did not is caught. Only those still open
+    // until now: one the driver closed before ("keep it local") stays closed.
     const follows = this.follows(facts.name, answers)
     const closed = follows.filter(d => this.ledger.close(d, { outcome: `the follow-up task ${id} started`, by: 'dispatch' }))
-    if (follows.length) {
-      record.follows = follows.map(d => d.id)
-      record.carried = { commits: follows.flatMap(d => d.details?.commits ?? []), files: follows.flatMap(d => d.details?.files ?? []) }
+    if (closed.length) {
+      record.follows = closed.map(d => d.id)
+      record.carried = { commits: closed.flatMap(d => d.details?.commits ?? []), files: closed.flatMap(d => d.details?.files ?? []) }
     }
     child.on('error', error => this.finish(record, 'failed', `could not start ${error.path || this.claudeBin}: ${error.message}`))
     child.stdin.on('error', () => {}) // the run may end before it read everything
@@ -808,8 +827,10 @@ export class Workers extends EventEmitter {
   }
 
   // The kill switch empties the queue: nothing starts while it is locked,
-  // nor by itself after the unlock. Each task becomes an open decision.
-  // Returns the tasks that were queued.
+  // nor by itself after the unlock. Each task becomes an open decision, so
+  // that the driver hears of it; it names the repository (in the queued
+  // task) but does not hold it, so that new tasks there start after the
+  // unlock. Returns the tasks that were queued.
   parkAll() {
     const parked = this.state.queue
     if (!parked.length) return []
@@ -820,7 +841,8 @@ export class Workers extends EventEmitter {
       log('worker state not saved:', error.message)
     }
     for (const entry of parked) {
-      this.ledger?.add({ kind: 'other', repo: entry.worker, text: parkedDecision(entry, 'the kill switch locked'), details: { queued: entry } })
+      const text = parkedDecision(entry, 'the kill switch locked')
+      this.ledger?.add({ kind: 'other', text, details: { queued: entry } })
     }
     return parked
   }
@@ -957,9 +979,12 @@ export class Workers extends EventEmitter {
   // commits on no remote that were not there at its start, uncommitted files
   // that were not there at its start, and whether it is back on its starting
   // branch. What the decisions it follows up were about counts again: a
-  // follow-up that was to push and did not is caught too. Kept with the
-  // task, so that the result says the same after a gateway restart;
-  // { ok: false } when git does not answer. Then the decision (decide).
+  // follow-up that was to push and did not is caught too. Without a record
+  // of the start (a run of an older version, or git did not answer then),
+  // nothing else counts: the driver's own local branches and files are not
+  // the run's. Kept with the task, so that the result says the same after a
+  // gateway restart; { ok: false } when git does not answer. Then the
+  // decision (decide).
   async audit(task) {
     if (task.audit) return task.audit
     // Until it is done, the next queued task there waits.
@@ -971,15 +996,18 @@ export class Workers extends EventEmitter {
       task.audit = { ok: false, at: Date.now() }
     } else {
       const carried = new Set([...(task.carried?.commits ?? []), ...(task.carried?.files ?? [])])
-      const before = new Set(task.unpushedBefore ?? [])
-      const dirtyBefore = new Set(task.startDirty ?? [])
-      const counts = (seen, item) => !seen.has(item) || carried.has(item)
+      // A set of what was there at the start, or null when that is unknown.
+      const known = list => (Array.isArray(list) ? new Set(list) : null)
+      const before = known(task.unpushedBefore)
+      const dirtyBefore = known(task.startDirty)
+      const counts = (seen, item) => carried.has(item) || (seen !== null && !seen.has(item))
       task.audit = {
         ok: true,
         at: Date.now(),
         branch: now.branch,
         startBranch: task.startBranch ?? null,
         remote: now.remote,
+        baseline: before !== null && dirtyBefore !== null,
         unpushed: now.unpushed.filter(commit => counts(before, commit.hash)),
         dirty: now.dirty.filter(file => counts(dirtyBefore, file)),
       }
@@ -998,9 +1026,20 @@ export class Workers extends EventEmitter {
   // no remote (not at read-only, where commits stay in the container by
   // design) and new uncommitted files. It replaces an open one of an earlier
   // audit there. Its text names no branch or file: those come from the run.
+  // A commit the driver has decided about already (resolve_decision, or the
+  // controller's "done" to their answer) raises none again, unless this run
+  // was the follow-up that was to push it. Files need no such list: one left
+  // uncommitted is there at the next start, so it is no run's own any more.
   decide(task) {
     if (!this.ledger || task.decision !== undefined) return
-    const commits = task.audit.ok && task.access !== 'read-only' ? task.audit.unpushed : []
+    const carried = new Set(task.carried?.commits ?? [])
+    const decided = new Set(
+      this.ledger.decisions
+        .filter(d => d.repo === task.repo && d.state === 'closed' && ['driver', 'reply'].includes(d.closedBy))
+        .flatMap(d => d.details?.commits ?? []),
+    )
+    const fresh = commit => carried.has(commit.hash) || !decided.has(commit.hash)
+    const commits = task.audit.ok && task.access !== 'read-only' ? task.audit.unpushed.filter(fresh) : []
     const files = task.audit.ok ? task.audit.dirty : []
     task.decision = null
     if (!commits.length && !files.length) return
@@ -1126,6 +1165,9 @@ export function prompt({ task, words, facts, direct = false }) {
     internal: 'internal to the organisation',
     unknown: 'visibility unknown, treat it as public',
   }[facts.visibility]
+  // facts.followed: files of the decisions a follow-up answers (Workers.launch).
+  const followed = facts.followed ?? []
+  const others = facts.dirty.filter(file => !followed.includes(file))
   const lines = [
     task.trim(),
     '',
@@ -1134,8 +1176,11 @@ export function prompt({ task, words, facts, direct = false }) {
     'Checked by the gateway just now:',
     `- Repository: ${facts.origin ? `${facts.origin} (${visibility})` : 'no remote'}`,
     `- Starting branch: ${facts.branch || 'detached HEAD'}`,
-    `- Uncommitted files before you start: ${facts.dirty.length ? facts.dirty.join(', ') + ' (not yours, leave them alone)' : 'none'}`,
+    `- Uncommitted files before you start: ${others.length ? others.join(', ') + ' (not yours, leave them alone)' : 'none'}`,
   ]
+  if (followed.length) {
+    lines.push(`- Uncommitted files an earlier run left, which this task follows up: ${followed.join(', ')}`)
+  }
   const target = facts.defaultBranch || 'the default branch'
   if (facts.access) {
     const { level, reason } = facts.access

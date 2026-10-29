@@ -537,24 +537,32 @@ What applies to every worker run (`src/workers.mjs`):
   gets an event with `kind="queue"` and the reason, to ask you; nothing is dropped silently. The
   queue lives in `.state/workers.json` and survives restarts. `list_workers`, `worker_status` and
   the restart plan show it; `stop_worker` with `drop` drops one queued task by its id, or with
-  `"all"` every one of the repository, together with the running task. The kill switch empties it.
+  `"all"` every one of the repository, together with the running task. The kill switch empties it;
+  each of its tasks becomes an open decision that holds nothing, so new tasks start after the
+  unlock.
 - **After a run:** the gateway looks at the checkout with git itself, whatever the worker wrote
   (`audit` in `src/workers.mjs`, on this computer or through `docker exec`): commits that no
   remote branch has and that were not there when the run started, uncommitted files that were not
   there either, and whether the checkout is back on its starting branch. Without a remote,
-  commits do not count. The result event carries it twice: in the attribute `git`, in the
+  commits do not count. Without a record of the start (a run of an older version, or git did not
+  answer then), no commit or file counts as the run's own, and the check says so
+  (`git="its start not recorded"`). The result event carries it twice: in the attribute `git`, in the
   gateway's words only ("clean", or "1 commit on no remote, 1 new uncommitted file"), and in a line
   with the branches and files, before the worker's text. `worker_status` and `stop_worker` show it
   too. A run that was stopped or failed also brings the worker's last message. Commits on no remote
   (not at `read-only`, where they stay in the container by design) and new uncommitted files become
   an open push decision ([8.4](#84-voice-commands)): the controller has to ask you, and the
-  repository's queue waits until you decided. A follow-up that was to push and did not is caught
-  too: what its decision was about counts again in its own check.
+  repository's queue waits until you decided; after `stop_worker`, its answer names the decision.
+  A follow-up that was to push and did not is caught too: what the decisions it closed were about
+  counts again in its own check, and the files they are about need no `allow_dirty` and are not
+  called someone else's in its prompt. A commit you already decided to keep local raises no new
+  decision.
 - **The gateway's own checkout** gets the same look whenever the controller replies "done": if it
   has uncommitted changes or commits on no remote, the reply's result says so in one line
-  (`VOICE_GW_SELF_CHECKOUT`), and it becomes an open push decision, until you were asked. Once you
-  decided about exactly these files and commits, it stays quiet; once the checkout is clean, the
-  decision closes. The reply itself goes out first.
+  (`VOICE_GW_SELF_CHECKOUT`), and it becomes an open push decision, until you were asked. Only the
+  commits of the branch that is checked out count, not those of other local branches such as
+  Claude Code's worktrees. Once you decided about exactly these files and commits, it stays quiet;
+  once the checkout is clean, the decision closes. The reply itself goes out first.
 - **Not this repository.** On this computer the gateway's own checkout is no worker, even inside
   `VOICE_GW_WORKER_ROOT`: a run there could change the gateway, the confine hook and
   `controller/CLAUDE.md`. `VOICE_GW_WORKER_SELF=1` lists it anyway. In Docker, the container's
@@ -1233,22 +1241,27 @@ for something, the controller is told to tell you and let you decide.
 - **Every question is an open decision,** kept in `.state/jobs.json`: the controller's questions,
   of kind `push`, `merge`, `restart`, `delete` or `other`, and what the gateway raises itself: a
   push decision after a run that left commits on no remote or uncommitted files
-  ([5.5](#55-workers-on-this-computer-or-in-docker)), one for a queued task that could not start,
-  and one for the gateway's own checkout.
+  ([5.5](#55-workers-on-this-computer-or-in-docker)) or a stop, one for a queued task that could
+  not start or that the kill switch took out of the queue, and one for the gateway's own checkout.
 - **Pending, asked, answered, closed.** Your answer to the question ("(Answer to <id>) …") is kept
-  with it. It closes when the follow-up dispatch with your answer starts, when the controller
-  replies "done" to your answer, or with `resolve_decision` and your words.
+  with it, and a question back on your answer is the same decision. It closes when the follow-up
+  dispatch with your answer starts, when the controller replies "done" to your answer (unless that
+  follow-up still waits in the queue), or with `resolve_decision` and your words. When you decide
+  in a new request instead of answering, the controller closes it with `resolve_decision`.
 - **The controller has to ask.** It cannot reply "done" to a request whose decision was never put
   to you; the reply tool says why.
 - **The queue waits.** While a decision about a repository is open, its tasks wait
   (`dispatch=queued … reason=decision`); the follow-up for your answer goes first.
-- **Reminders.** A question you have not answered comes back to the controller after
-  `VOICE_GW_REMIND_MINUTES` (30), at most three times. It asks again, and you hear it as news.
+- **Reminders.** A decision you were never asked about, or a question you have not answered, comes
+  back to the controller after `VOICE_GW_REMIND_MINUTES` (30), at most three times, also one that
+  belongs to no request yet; none while the kill switch is locked. It asks you, and you hear it as
+  news.
 - **What is open?** `open_items` lists everything in one call. At every start of the controller
   session, the gateway sends it the same list as an event, so a restarted controller needs no
   memory files.
-- **Only known texts.** These lists hold what the gateway, the controller and you said, never text
-  from a repository, so they come without `trusted="no"`; of a worker result only its ids.
+- **Texts.** These lists hold what the gateway, the controller and you said; of a worker result
+  only its ids. The controller's tasks and questions may quote a worker or a pull request, so the
+  summary, reminder and queue events come with `trusted="no"`.
 
 **Pull requests and reviews:**
 
@@ -1312,7 +1325,7 @@ setting with where it came from.
 | `VOICE_GW_SECRETS_DIR` | `.secrets` | Secrets, settings file, admin socket |
 | `VOICE_GW_STATE_DIR` | `.state` | Worker state and queue, run output, requests, open decisions, pull request watches |
 | `VOICE_GW_SELF_CHECKOUT` | This checkout | The checkout whose uncommitted changes and commits on no remote a "done" reply mentions ([5.5](#55-workers-on-this-computer-or-in-docker)); empty: none. Tests use a stand-in |
-| `VOICE_GW_REMIND_MINUTES` | `30` | Minutes before a question you have not answered comes back to the controller as a reminder, at most three times ([8.4](#84-voice-commands)) |
+| `VOICE_GW_REMIND_MINUTES` | `30` | Minutes before a decision you were never asked about, or a question you have not answered, comes back to the controller as a reminder, at most three times ([8.4](#84-voice-commands)) |
 | `VOICE_GW_LOG_FILE` | `.logs/gateway.log` | Empty: stderr only |
 | `VOICE_GW_LOG_MAX_MB` | `10` | Past this size the log moves to `gateway.log.1`, replacing the one before |
 | `VOICE_GW_OAUTH_HOSTS` | `claude.ai,claude.com` | Hosts allowed in redirect addresses and client ID metadata documents |

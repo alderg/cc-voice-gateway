@@ -8,7 +8,7 @@
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { chmodSync, cpSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -47,19 +47,20 @@ const session_id = arg('--session-id') ?? arg('--resume')
 const out = message => process.stdout.write(JSON.stringify({ ...message, session_id }) + '\\n')
 out({ type: 'system', subtype: 'init' })
 out({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Bash', input: { command: 'npm test' } }] } })
+// At once, so that a stopped run has done it too. COMMIT: a commit on a voice
+// branch, not pushed; STAY: left on that branch; LEAVE: a new file, not
+// committed.
+const git = (...a) => execFileSync('git', a, { stdio: 'ignore' })
+if (/COMMIT/.test(input)) {
+  git('checkout', '-q', '-b', 'voice/audit-' + process.pid)
+  writeFileSync('change-' + process.pid + '.txt', 'x')
+  git('add', '.')
+  git('-c', 'user.name=W', '-c', 'user.email=w@example.com', 'commit', '-q', '-m', 'change')
+  if (!/STAY/.test(input)) git('checkout', '-q', '-')
+}
+if (/LEAVE/.test(input)) writeFileSync('left-over.txt', 'x')
 setTimeout(() => {
   if (/FAIL/.test(input)) { process.stderr.write('boom: something broke\\n'); process.exit(1) }
-  // COMMIT: a commit on a voice branch, not pushed; STAY: left on that
-  // branch; LEAVE: a new file, not committed.
-  const git = (...a) => execFileSync('git', a, { stdio: 'ignore' })
-  if (/COMMIT/.test(input)) {
-    git('checkout', '-q', '-b', 'voice/audit-' + process.pid)
-    writeFileSync('change-' + process.pid + '.txt', 'x')
-    git('add', '.')
-    git('-c', 'user.name=W', '-c', 'user.email=w@example.com', 'commit', '-q', '-m', 'change')
-    if (!/STAY/.test(input)) git('checkout', '-q', '-')
-  }
-  if (/LEAVE/.test(input)) writeFileSync('left-over.txt', 'x')
   out({ type: 'assistant', message: { content: [{ type: 'text', text: 'Looking at the tests.' }] } })
   const result = /QUESTION/.test(input)
     ? 'Should I also update the docs?'
@@ -455,7 +456,7 @@ test('a queued task that finds uncommitted changes at its turn leaves the queue,
   const parked = await waitUntil(() => gw.events.find(e => e.meta?.kind === 'queue' && e.meta.queued === id), 12000)
   assert.equal(parked.meta.worker, 'dirty')
   assert.equal(parked.meta.outcome, 'dirty')
-  assert.equal(parked.meta.trusted, undefined, "the gateway's reason and the controller's task, nothing from the repository")
+  assert.equal(parked.meta.trusted, 'no', 'the task is the controller\'s, which may quote a worker')
   const decision = parked.meta.decision
   assert.match(decision, /^d[a-z0-9]{3}$/)
   assert.equal(
@@ -614,8 +615,14 @@ const requestId = out => /id=([a-z0-9]{4})/.exec(out)[1]
 
 test("a done reply notes the gateway's own uncommitted changes and unpushed commits, as an open decision until asked", async () => {
   const id = requestId(await voiceCall('send', { message: 'Anything new?' }))
-  assert.equal((await controller('reply', { request_id: id, state: 'done', text: 'Nothing new.' })).text, 'sent')
   const run = (...args) => execFileSync('git', args, { cwd: SELF, stdio: 'ignore' })
+  // Other local branches, such as those of Claude Code's worktrees, do not count.
+  run('checkout', '-q', '-b', 'worktree-agent-test')
+  writeFileSync(join(SELF, 'agent.txt'), 'x')
+  run('add', '.')
+  run('-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-q', '-m', 'agent work')
+  run('checkout', '-q', 'main')
+  assert.equal((await controller('reply', { request_id: id, state: 'done', text: 'Nothing new.' })).text, 'sent')
   writeFileSync(join(SELF, 'scratch.txt'), 'x')
   try {
     const dirty = await controller('reply', { request_id: id, state: 'done', text: 'Still nothing new.' })
@@ -794,11 +801,12 @@ test('a question the driver does not answer gets a reminder, at most three times
     const asked = await controller('reply', { request_id: merge, state: 'question', text: 'Merge pull request 3, squashed? Yes or no?', kind: 'merge' })
     const decision = /decision (d[a-z0-9]{3}) \(merge\) until it is settled/.exec(asked.text)[1]
     const first = await waitUntil(() => reminders(decision)[0])
-    assert.equal(first.meta.trusted, undefined, "the controller's question, nothing from a repository")
+    assert.equal(first.meta.trusted, 'no', "the controller's question may quote a pull request")
     assert.match(
       first.content,
-      new RegExp(`^Reminder 1 of 3: the driver has not answered decision ${decision} \\(merge\\), asked just now: "Merge pull request 3, squashed\\? Yes or no\\?"\\. Ask again in one sentence: reply to this request_id with state "question" and decisions="${decision}"\\.`),
+      new RegExp(`^Reminder 1 of 3: decision ${decision} \\(merge\\): the driver has not answered it, asked just now: "Merge pull request 3, squashed\\? Yes or no\\?"\\. Ask again in one sentence: reply to this request_id with state "question" and decisions="${decision}"\\.`),
     )
+    assert.match(first.content, /If they decided in another request already, close it with resolve_decision and their words\.$/)
     // Asked again on the reminder, the driver hears it as news and answers it.
     await controller('reply', { request_id: first.meta.request_id, state: 'question', text: 'Still open: merge pull request 3?' })
     assert.match(await voiceCall('status'), /a question\): Still open: merge pull request 3\?/)
@@ -816,7 +824,37 @@ test('a question the driver does not answer gets a reminder, at most three times
     for (const [id, words] of [[decision, 'No, not yet'], [quiet, 'Restart the controller, please']]) {
       assert.match((await controller('resolve_decision', { id, outcome: 'not now', words })).text, /^\[decision=closed /)
     }
+
+    // A stop leaves a file: the decision belongs to no request yet. The
+    // answer names it and the queued task that waits for it, and a reminder
+    // brings it back, on which "done" is refused until it was asked.
+    repo('zeta', { pushed: true })
+    const slow = await dispatch('zeta', 'SLOW LEAVE: write the notes.')
+    const queued = queuedId((await dispatch('zeta', 'Then count the notes.', { allow_dirty: true })).text)
+    for (let i = 0; i < 100 && !existsSync(join(ROOT, 'zeta', 'left-over.txt')); i++) await new Promise(r => setTimeout(r, 50))
+    const stopped = await controller('stop_worker', { worker: 'zeta' })
+    const left = /decision=(d[a-z0-9]{3})/.exec(stopped.text)[1]
+    assert.equal(
+      stopped.text,
+      `[worker=zeta stopped task=${slow.id} queued=1 decision=${left}] Stopped. Git check by the gateway: 1 new ` +
+        `uncommitted file (left-over.txt). The gateway made it open decision ${left} (push: "zeta: task ${slow.id} ` +
+        'left 1 new uncommitted file. Commit and push them, or leave them as they are?"). Ask the driver about it ' +
+        `now, with state "question" and decisions="${left}". Queued there: ${queued} ("Then count the notes."). ` +
+        `They wait until decision ${left} is closed. To drop them, call stop_worker with drop="all", or with the id of one.`,
+    )
+    const nudge = await waitUntil(() => reminders(left)[0])
+    assert.equal(nudge.meta.trusted, 'no')
+    assert.match(nudge.content, new RegExp(`^Reminder 1 of 3: decision ${left} \\(push, zeta\\), raised just now, was never put to the driver: "zeta: task`))
+    assert.equal((await controller('reply', { request_id: nudge.meta.request_id, state: 'done', text: 'Nothing to do.' })).isError, true)
+    await controller('reply', { request_id: nudge.meta.request_id, state: 'question', text: 'The stopped run left a file in zeta. Keep it?' })
+    assert.match(await voiceCall('status'), /a question\): The stopped run left a file in zeta\. Keep it\?/, 'the driver hears it')
+    assert.match((await controller('open_items')).text, new RegExp(`^- ${left} push, zeta, asked just now on request ${nudge.meta.request_id}`, 'm'))
+    await voiceCall('send', { message: 'Keep the notes file in zeta.' })
+    const kept = await controller('resolve_decision', { id: left, outcome: 'keep it', words: 'Keep the notes file in zeta' })
+    assert.match(kept.text, new RegExp(`The tasks queued for zeta can start now, in their order: ${queued} `))
+    await waitUntil(() => gw.events.find(e => e.meta?.queued === queued))
   } finally {
+    rmSync(join(ROOT, 'zeta'), { recursive: true, force: true })
     await stopGateway()
     gw = await startGateway()
   }
@@ -853,7 +891,7 @@ test('a run survives a gateway restart and reports to the new gateway; the queue
   // First, everything open, so that the new session needs no memory files:
   // the question of the test before, the queue, what the restart ended.
   const summary = await waitUntil(() => gw.events.find(e => e.meta?.kind === 'summary'))
-  assert.equal(summary.meta.trusted, undefined, 'texts of the gateway, the controller and the driver only')
+  assert.equal(summary.meta.trusted, 'no', "the controller's texts may quote a worker or GitHub")
   assert.match(summary.content, /^The controller session has started\. What is open, as the gateway kept it; work from this, not from memory files:\n\[open decisions=1 queued=1 /)
   assert.match(summary.content, /^- d[a-z0-9]{3} other, gamma, asked .* on request [a-z0-9]{4}, no answer yet: Update the docs too\?$/m)
   assert.match(summary.content, new RegExp(`^- ${queued} for alpha, queued .*: "Afterwards, sum it up\\."$`, 'm'))

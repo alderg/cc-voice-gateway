@@ -77,7 +77,7 @@ test('reminders: after the time since the question or the last reminder, at most
   const minutes = n => d.askedAt + n * 60 * 1000
   assert.deepEqual(l.due(minutes(29)), [])
   assert.deepEqual(l.due(minutes(30)), [d])
-  assert.match(reminderText(d, 3, minutes(30)), /^Reminder 1 of 3: the driver has not answered decision d[a-z0-9]{3} \(restart\), asked 30 minutes ago: "Restart now\?"\. Ask again/)
+  assert.match(reminderText(d, 3, minutes(30)), /^Reminder 1 of 3: decision d[a-z0-9]{3} \(restart\): the driver has not answered it, asked 30 minutes ago: "Restart now\?"\. Ask again/)
   for (let i = 0; i < 3; i++) {
     d.remindedAt = minutes(30 * (i + 1)) - 1 // as if the reminder went out then
     d.reminders = i + 1
@@ -92,6 +92,44 @@ test('reminders: after the time since the question or the last reminder, at most
   assert.deepEqual(l.due(minutes(500)), [])
 })
 
+test('the answer belongs to the decision; "done" to it waits while its follow-up is queued', () => {
+  const l = ledger('answer')
+  const push = l.add({ kind: 'push', repo: 'alpha', text: 'alpha: task t1 left 1 commit on no remote.', requestId: 'r030' })
+  l.ask('r030', { text: 'Push it?' })
+  l.answer('r030', { text: 'Which one?', answerId: 'r031' })
+  assert.deepEqual(push.requests, ['r030', 'r031'])
+  assert.equal(l.ask('r031', { text: 'The one on voice/fix. Push it?' }).created, null, 'a question back is the same decision')
+  l.answer('r031', { text: 'Yes.', answerId: 'r032' })
+  // The follow-up for that answer waits in the queue: its start closes it.
+  assert.deepEqual(l.settle('r032', 'Queued.', { waiting: d => d.requests.includes('r031') }), [])
+  assert.equal(push.state, 'answered')
+  assert.deepEqual(l.settle('r032', 'Pushed.').map(d => d.id), [push.id])
+})
+
+test('a decision never asked gets reminders too, also one that belongs to no request; each says how to settle it', () => {
+  const l = ledger('pending', { remindMinutes: 30 })
+  const stopped = l.add({ kind: 'push', repo: 'alpha', text: 'alpha: task t9 left 1 new uncommitted file.' })
+  const minutes = n => stopped.createdAt + n * 60 * 1000
+  assert.deepEqual(l.due(minutes(29)), [])
+  assert.deepEqual(l.due(minutes(30)), [stopped])
+  assert.equal(
+    reminderText(stopped, 3, minutes(30)),
+    `Reminder 1 of 3: decision ${stopped.id} (push, alpha), raised 30 minutes ago, was never put to the driver: ` +
+      '"alpha: task t9 left 1 new uncommitted file.". Ask them now, in one sentence: reply to this request_id with ' +
+      `state "question" and decisions="${stopped.id}". The answer then arrives as "(Answer to <this request_id>) ...". ` +
+      '"done" on this request is refused until you asked.',
+  )
+  l.reminded(stopped, 'r040')
+  assert.deepEqual(stopped.requests, ['r040'], 'it belongs to the reminder now')
+  stopped.remindedAt = minutes(30) // as if the reminder went out then
+  assert.deepEqual(l.due(minutes(59)), [])
+  const { asked } = l.ask('r040', { text: 'A file is left in alpha. Commit it?' })
+  assert.deepEqual(asked, [stopped])
+  assert.match(reminderText(stopped, 3, minutes(40)), /If they decided in another request already, close it with resolve_decision and their words\.$/)
+  l.answer('r040', { text: 'Leave it.', answerId: 'r041' })
+  assert.deepEqual(l.due(minutes(500)), [], 'answered: no reminder')
+})
+
 test('a damaged decisions file is logged and skipped; closed decisions do not pile up', () => {
   const file = join(TMP, 'damaged', 'jobs.json')
   mkdirSync(join(TMP, 'damaged'))
@@ -101,6 +139,13 @@ test('a damaged decisions file is logged and skipped; closed decisions do not pi
   const l = new Ledger({ file, log: line => logged.push(line) })
   assert.deepEqual(l.decisions.map(d => d.id), ['dabc'])
   assert.match(logged.join('\n'), /skipped 3 unusable/)
+  // What a saved decision lacks gets its default: reminders count, nothing breaks.
+  const [restored] = l.decisions
+  assert.deepEqual([restored.reminders, restored.remindedAt, restored.askedAt, restored.details], [0, null, null, {}])
+  writeFileSync(file, JSON.stringify({ decisions: [{ ...good, state: 'asked', reminders: 'x', details: null }] }))
+  const asked = new Ledger({ file, log: quiet })
+  assert.deepEqual(asked.due(good.createdAt + 31 * 60 * 1000).map(d => d.id), ['dabc'])
+  assert.match(decisionLine(asked.decisions[0], good.createdAt + 60000), /^dabc push, alpha, asked 1 minute ago, no answer yet: x$/)
 
   writeFileSync(file, '{"decisions": [')
   const broken = []

@@ -167,10 +167,12 @@ const restarter = new Restarter({ store, workers, ledger, secretsDir: config.sec
 // decision, and the reply's result says so in a line until the driver was
 // asked, so that work on the gateway itself is not forgotten. Once the driver
 // decided about exactly these files and commits, nothing more; once the
-// checkout is clean, an open one closes.
+// checkout is clean, an open one closes. Only the commits of the branch that
+// is checked out count: other local branches, such as those of Claude Code's
+// worktrees, are not the driver's to push.
 async function selfCheck() {
   if (!config.selfCheckout) return null
-  const state = await gitState(hostGit, config.selfCheckout)
+  const state = await gitState(hostGit, config.selfCheckout, { current: true })
   if (!state) return null
   const open = ledger.open().filter(d => d.scope === 'gateway')
   if (!state.dirty.length && !state.unpushed.length) {
@@ -248,13 +250,13 @@ workers.on('finished', async task => {
 
 // A queued task that could not start when it was its turn has left the
 // queue; the controller hears why, and the driver through its answer. The
-// text holds the controller's task and the gateway's reason, nothing that a
-// repository wrote.
+// text holds the controller's task and the gateway's reason. trusted="no":
+// the task may quote what a worker or GitHub said.
 workers.on('parked', async (entry, why, status, decision) => {
   try {
     await channel.ready
     const request = store.createRequest(parkedText(entry, why, status, decision), { origin: 'worker' })
-    request.meta = { kind: 'queue', worker: entry.worker, queued: entry.id, outcome: status }
+    request.meta = { kind: 'queue', worker: entry.worker, queued: entry.id, outcome: status, trusted: 'no' }
     if (decision) {
       ledger.link(decision, request.id)
       request.meta.decision = decision.id
@@ -376,8 +378,8 @@ killswitch.on('tripped', async (state, event, first) => {
     // after the unlock by themselves.
     const list = queueList(parked, { max: 10, repos: true })
     const queue = parked.length
-      ? ` These queued tasks left the queue and will not start by themselves: ${list}. Tell the driver; after the ` +
-        'unlock they can have them dispatched again.'
+      ? ` These queued tasks left the queue and will not start by themselves: ${list}. Each is an open decision ` +
+        'now, which holds nothing. Tell the driver; after the unlock they can have them dispatched again.'
       : ''
     const request = store.createRequest(
       `${first ? 'Kill switch locked' : 'Kill switch triggered again'}: ${alarmText(state)} Do not try to get ` +
@@ -426,17 +428,18 @@ http = startVoiceHttp(store, channel, auth, config, { killswitch, onPortBusy: po
 
 // Once the session is connected: first one event with everything open, so
 // that a restarted controller knows it without memory files; its answer is
-// for the gateway only (origin "gateway": no news, no Telegram). The text
-// holds no text from a repository (ledger.mjs). Then the worker results the
-// previous session never answered go to this one, and after a restart by the
-// watchdog the driver hears on Telegram that the controller is ready again.
+// for the gateway only (origin "gateway": no news, no Telegram). trusted="no":
+// its tasks and questions are the controller's words, which may quote a
+// worker or GitHub (ledger.mjs). Then the worker results the previous session
+// never answered go to this one, and after a restart by the watchdog the
+// driver hears on Telegram that the controller is ready again.
 let connected = false
 channel.ready.then(async () => {
   connected = true
   try {
     const items = openItems({ ledger, workers, store, interrupted: store.interrupted })
     const summary = store.createRequest(startupText(items), { origin: 'gateway' })
-    await channel.push(summary, { kind: 'summary' })
+    await channel.push(summary, { kind: 'summary', trusted: 'no' })
   } catch (error) {
     log('start-up summary not delivered:', error.message)
   }
@@ -452,17 +455,19 @@ channel.ready.then(async () => {
   restarter.announceReady()
 })
 
-// A question the driver has not answered: a reminder event after
-// VOICE_GW_REMIND_MINUTES, at most three times. The controller asks again on
-// it, and the driver hears that as news (origin "worker"). The text is the
-// decision's, without text from a repository.
+// A decision never put to the driver, or a question they have not answered: a
+// reminder event after VOICE_GW_REMIND_MINUTES, at most three times; none
+// while the kill switch is locked. The controller asks on it, and the driver
+// hears that as news (origin "worker"). The reminder belongs to the decision
+// from then on, so a decision that belonged to no request (after stop_worker,
+// or from the kill switch) has one now. trusted="no", as for the summary.
 const reminders = setInterval(
   async () => {
-    if (!connected) return
+    if (!connected || killswitch.locked) return
     for (const decision of ledger.due()) {
       try {
         const request = store.createRequest(reminderText(decision, ledger.maxReminders), { origin: 'worker' })
-        request.meta = { kind: 'reminder', decision: decision.id }
+        request.meta = { kind: 'reminder', decision: decision.id, trusted: 'no' }
         if (decision.repo) request.meta.worker = decision.repo
         ledger.reminded(decision, request.id)
         await channel.push(request, request.meta)

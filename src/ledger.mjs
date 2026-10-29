@@ -14,17 +14,21 @@
 //
 // Its states: pending (raised, nobody asked the driver yet), asked (the
 // controller replied with state "question" on one of its requests), answered
-// (the driver answered that request: "(Answer to <id>) ..."), closed. It
-// closes with resolve_decision on the driver's words, when the follow-up
-// dispatch for the answer starts (workers.mjs), or when the controller
-// replies "done" to the answer. While a decision of a repository is open,
-// the queued tasks there wait. The controller cannot reply "done" to a
-// request whose decision it never asked about (channel.mjs). An asked
-// decision without an answer gets a reminder after VOICE_GW_REMIND_MINUTES,
-// at most three times (gateway.mjs).
+// (the driver answered that request: "(Answer to <id>) ..."; the answer's
+// request belongs to it from then on, so that a question back on it is the
+// same decision), closed. It closes with resolve_decision on the driver's
+// words, when the follow-up dispatch for the answer starts (workers.mjs), or
+// when the controller replies "done" to the answer, unless that follow-up
+// still waits in the queue. While a decision of a repository is open, the
+// queued tasks there wait. The controller cannot reply "done" to a request
+// whose decision it never asked about (channel.mjs). A decision not asked
+// yet, or asked and not answered, gets a reminder after
+// VOICE_GW_REMIND_MINUTES, at most three times (gateway.mjs): also one that
+// belongs to no request, such as the one a stop_worker raised.
 //
-// The texts are the gateway's, the controller's and the driver's answer,
-// never text from a repository, so what lists them needs no trusted="no".
+// The texts are the gateway's, the controller's and the driver's answer.
+// The controller's may quote what a worker or GitHub said, a pull request's
+// title for example, so the events that carry them are marked trusted="no".
 
 import { randomInt } from 'node:crypto'
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
@@ -59,6 +63,28 @@ const usable = d =>
   Array.isArray(d.requests) &&
   Number.isFinite(d.createdAt)
 
+// The fields a usable decision may lack, from an older version or edited by
+// hand, with what they mean when missing.
+const finite = (value, fallback) => (Number.isFinite(value) ? value : fallback)
+const normal = d => ({
+  repo: null,
+  scope: null,
+  question: null,
+  answer: null,
+  answeredBy: null,
+  outcome: null,
+  closedBy: null,
+  ...d,
+  requests: d.requests.filter(id => typeof id === 'string'),
+  updatedAt: finite(d.updatedAt, d.createdAt),
+  askedAt: finite(d.askedAt, d.state === 'asked' ? d.createdAt : null),
+  answeredAt: finite(d.answeredAt, d.state === 'answered' ? d.createdAt : null),
+  reminders: finite(d.reminders, 0),
+  remindedAt: finite(d.remindedAt, null),
+  closedAt: finite(d.closedAt, d.state === 'closed' ? d.createdAt : null),
+  details: d.details !== null && typeof d.details === 'object' ? d.details : {},
+})
+
 export class Ledger {
   constructor({ file = null, remindMinutes = 30, maxReminders = 3, log = defaultLog } = {}) {
     this.file = file
@@ -80,7 +106,7 @@ export class Ledger {
       return []
     }
     const all = Array.isArray(saved?.decisions) ? saved.decisions : []
-    const kept = all.filter(usable)
+    const kept = all.filter(usable).map(normal)
     if (kept.length < all.length) this.log(`decisions file ${this.file}: skipped ${all.length - kept.length} unusable`)
     return kept
   }
@@ -205,11 +231,14 @@ export class Ledger {
 
   // The driver answered a request ("(Answer to <id>) ..."): its open
   // decisions keep the answer, and wait for the controller to act on it.
+  // The answer's request belongs to them too: a question back on it asks the
+  // same decision, and the follow-up for an answer to that is theirs.
   answer(requestId, { text, answerId }) {
     const answered = this.forRequest(requestId)
     const now = Date.now()
     for (const d of answered) {
       Object.assign(d, { state: 'answered', answer: preview(text, 300), answeredAt: now, answeredBy: answerId, updatedAt: now })
+      if (answerId && !d.requests.includes(answerId)) d.requests.push(answerId)
     }
     if (answered.length) {
       this.save()
@@ -229,19 +258,24 @@ export class Ledger {
   }
 
   // The controller replied "done" to the request with the driver's answer:
-  // what that answer decided is settled. Returns the decisions it closed.
-  settle(answerId, outcome) {
+  // what that answer decided is settled, unless waiting(d) says that its
+  // follow-up still waits in the queue; that one closes it when it starts.
+  // Returns the decisions it closed.
+  settle(answerId, outcome, { waiting = () => false } = {}) {
     return this.open()
-      .filter(d => d.state === 'answered' && d.answeredBy === answerId)
+      .filter(d => d.state === 'answered' && d.answeredBy === answerId && !waiting(d))
       .map(d => this.close(d, { outcome, by: 'reply' }))
   }
 
-  // Asked and not answered, and quiet for the reminder time since the
-  // question or the last reminder; at most maxReminders times.
+  // Not asked yet, or asked and not answered, and quiet for the reminder
+  // time since it was raised or asked, or since the last reminder; at most
+  // maxReminders times.
   due(now = Date.now()) {
-    return this.open().filter(
-      d => d.state === 'asked' && d.reminders < this.maxReminders && now - Math.max(d.askedAt ?? 0, d.remindedAt ?? 0) >= this.remindMs,
-    )
+    return this.open().filter(d => {
+      if (!['pending', 'asked'].includes(d.state) || d.reminders >= this.maxReminders) return false
+      const since = d.state === 'asked' ? (d.askedAt ?? d.createdAt) : d.createdAt
+      return now - Math.max(since, d.remindedAt ?? 0) >= this.remindMs
+    })
   }
 
   reminded(decision, requestId) {
@@ -253,6 +287,10 @@ export class Ledger {
 }
 
 // --- texts for the controller ---------------------------------------------------
+
+// What a decision is about: its repository, the gateway's own checkout, or
+// the repository a queued task was for, without holding it (the kill switch).
+const place = d => d.repo ?? (d.scope === 'gateway' ? "the gateway's checkout" : (d.details?.queued?.worker ?? null))
 
 // The event at every start of the controller session: what is open, so that
 // a restarted controller knows it without memory files.
@@ -266,23 +304,34 @@ export function startupText(items) {
   )
 }
 
-// The reminder for a question the driver has not answered.
+// The reminder for a decision the driver was never asked about, or has not
+// answered.
 export function reminderText(d, max, now = Date.now()) {
-  const where = d.repo ? `, ${d.repo}` : ''
+  const where = place(d) ? `, ${place(d)}` : ''
+  const head = `Reminder ${d.reminders + 1} of ${max}: decision ${d.id} (${d.kind}${where})`
+  const how =
+    `reply to this request_id with state "question" and decisions="${d.id}". The answer then arrives as ` +
+    '"(Answer to <this request_id>) ...".'
+  if (d.state === 'pending') {
+    return (
+      `${head}, raised ${ago(d.createdAt, now)}, was never put to the driver: "${d.text}". Ask them now, in one ` +
+      `sentence: ${how} "done" on this request is refused until you asked.`
+    )
+  }
   return (
-    `Reminder ${d.reminders + 1} of ${max}: the driver has not answered decision ${d.id} (${d.kind}${where}), asked ` +
-    `${ago(d.askedAt, now)}: "${d.question ?? d.text}". Ask again in one sentence: reply to this request_id with ` +
-    `state "question" and decisions="${d.id}". The answer then arrives as "(Answer to <this request_id>) ...".`
+    `${head}: the driver has not answered it, asked ${ago(d.askedAt, now)}: "${d.question ?? d.text}". Ask again in ` +
+    `one sentence: ${how} If they decided in another request already, close it with resolve_decision and their words.`
   )
 }
 
 // One decision in a line: id, kind, where, state, then its text.
 export function decisionLine(d, now = Date.now()) {
-  const where = d.repo ?? (d.scope === 'gateway' ? "the gateway's checkout" : null)
+  const where = place(d)
   const last = d.requests.at(-1)
+  const reminded = d.reminders ? `, reminded ${plural(d.reminders, 'time')}` : ''
   const state = {
-    pending: last ? `not asked yet (request ${last})` : 'not asked yet',
-    asked: `asked ${ago(d.askedAt, now)} on request ${last}, no answer yet${d.reminders ? `, reminded ${plural(d.reminders, 'time')}` : ''}`,
+    pending: `${last ? `not asked yet (request ${last})` : 'not asked yet, on no request'}${reminded}`,
+    asked: `asked ${ago(d.askedAt, now)}${last ? ` on request ${last}` : ''}, no answer yet${reminded}`,
     answered: `answered ${ago(d.answeredAt, now)} ("${preview(d.answer ?? '', 120)}"), not closed yet`,
     closed: `closed: ${d.outcome}`,
   }[d.state]
@@ -291,8 +340,9 @@ export function decisionLine(d, now = Date.now()) {
 
 // Everything open, for open_items and the start-up summary: decisions, queued
 // tasks, runs going, voice requests not finished, events not answered yet.
-// interrupted: voice requests a restart ended (store.mjs). Only texts of the
-// gateway, the controller and the driver; of a worker's result only its ids.
+// interrupted: voice requests a restart ended (store.mjs). Texts of the
+// gateway, the controller and the driver, where the controller's may quote a
+// worker or GitHub; of a worker's result only its ids.
 export function openItems({ ledger, workers = null, store, interrupted = [], now = Date.now() }) {
   const decisions = ledger.open()
   const queued = workers?.queued() ?? []
