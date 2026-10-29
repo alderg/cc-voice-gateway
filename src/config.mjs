@@ -128,6 +128,12 @@ export const config = {
   scratch: env.VOICE_GW_SCRATCH === '1',
   scratchRoot: env.VOICE_GW_SCRATCH_ROOT || join(homedir(), 'voice-scratch'),
   scratchDays: num(env.VOICE_GW_SCRATCH_DAYS, 7),
+  // Their runs in a container of their own (docker/, started with
+  // scripts/start-workers-container.sh --scratch), which sees only the root,
+  // mounted at VOICE_GW_DOCKER_SCRATCH, and no GitHub token: its name.
+  // Empty: on this computer.
+  scratchDocker: env.VOICE_GW_SCRATCH_DOCKER || '',
+  dockerScratch: env.VOICE_GW_DOCKER_SCRATCH || '/scratch',
 
   // Pull requests that workers open: ready for review by default, so that
   // automatic reviews start at once; as drafts with VOICE_GW_PR_DRAFT=1

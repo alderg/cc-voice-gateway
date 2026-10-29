@@ -9,9 +9,9 @@
 
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
 import { EventEmitter } from 'node:events'
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:net'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -69,12 +69,48 @@ setTimeout(() => {
 }, /SLOW/.test(input) ? 4000 : 50)
 `
 
+// The stand-in for docker, as in docker.test.mjs: it runs what docker exec
+// would run in the container right here, where the container's folder is a
+// temporary one, and logs every call.
+const DOCKER_LOG = join(TMP, 'docker-calls.jsonl')
+const FAKE_DOCKER = `#!/usr/bin/env node
+import { spawn, spawnSync } from 'node:child_process'
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
+const argv = process.argv.slice(2)
+appendFileSync(process.env.FAKE_DOCKER_LOG, JSON.stringify(argv) + '\\n')
+const verb = argv.shift()
+if (['update', 'stop', 'rm', 'run'].includes(verb)) process.exit(0)
+if (verb === 'inspect') {
+  const mount = { Type: 'bind', Source: process.env.FAKE_DOCKER_FOLDER, Destination: process.env.FAKE_DOCKER_MOUNT, RW: true }
+  process.stdout.write(JSON.stringify([{ State: { Running: true }, Mounts: [mount] }]) + '\\n')
+  process.exit(0)
+}
+if (verb !== 'exec') process.exit(2)
+let cwd = process.cwd()
+while (argv[0]?.startsWith('-')) if (argv.shift() === '-w') cwd = argv.shift()
+argv.shift() // the container
+const [command, ...args] = argv
+const env = { ...process.env, CONTAINER_SIDE: '1' }
+const runs = process.env.FAKE_DOCKER_RUNS
+if (command === 'voice-run') {
+  const [task, run, ...rest] = args
+  mkdirSync(runs, { recursive: true })
+  writeFileSync(join(runs, task), String(process.pid))
+  spawn(run, rest, { cwd, stdio: 'inherit', env }).on('exit', code => process.exit(code ?? 1))
+} else if (command === 'voice-stop') {
+  try { process.kill(-Number(readFileSync(join(runs, args[0]), 'utf8')), 'SIGTERM') } catch {}
+} else {
+  process.exit(spawnSync(command, args, { cwd, stdio: 'inherit', env }).status ?? 1)
+}
+`
+
 before(() => {
   mkdirSync(BIN, { recursive: true })
   writeFileSync(join(BIN, 'claude'), FAKE_CLAUDE)
+  writeFileSync(join(BIN, 'docker'), FAKE_DOCKER)
   writeFileSync(join(BIN, 'gh'), '#!/bin/sh\nexit 1\n')
-  chmodSync(join(BIN, 'claude'), 0o755)
-  chmodSync(join(BIN, 'gh'), 0o755)
+  for (const name of ['claude', 'docker', 'gh']) chmodSync(join(BIN, name), 0o755)
   process.env.FAKE_CLAUDE_LOG = CALLS
 })
 
@@ -492,6 +528,8 @@ async function startGateway(env = {}) {
       VOICE_GW_LOG_FILE: '',
       VOICE_GW_SELF_CHECKOUT: '',
       VOICE_GW_SCRATCH: '',
+      VOICE_GW_SCRATCH_DOCKER: '',
+      VOICE_GW_DOCKER: '',
       VOICE_GW_MAX_WORKERS: '2',
       VOICE_GW_PR_DRAFT: '',
       ...env,
@@ -622,4 +660,126 @@ test('the gateway turns work folders off where their root is no place for them, 
   } finally {
     await gw.close()
   }
+})
+
+// --- in a container of their own --------------------------------------------------
+
+const dockerCalls = () =>
+  existsSync(DOCKER_LOG)
+    ? readFileSync(DOCKER_LOG, 'utf8')
+        .trim()
+        .split('\n')
+        .filter(Boolean)
+        .map(line => JSON.parse(line))
+    : []
+
+test('VOICE_GW_SCRATCH_DOCKER: made, run and looked at through docker exec in their own container; the kill switch stops it', async () => {
+  const mount = join(TMP, 'scratch-mount') // /scratch in the container, here as the fake container sees it
+  mkdirSync(mount, { recursive: true })
+  const uid = `${process.getuid()}:${process.getgid()}`
+  const gw = await startGateway({
+    VOICE_GW_SCRATCH: '1',
+    VOICE_GW_SCRATCH_DOCKER: 'voice-scratch',
+    VOICE_GW_DOCKER_SCRATCH: mount,
+    VOICE_GW_SCRATCH_ROOT: mount,
+    VOICE_GW_DOCKER_BIN: join(BIN, 'docker'),
+    VOICE_GW_KILL_CHECK: '1',
+    FAKE_DOCKER_LOG: DOCKER_LOG,
+    FAKE_DOCKER_FOLDER: mount,
+    FAKE_DOCKER_MOUNT: mount,
+    FAKE_DOCKER_RUNS: join(TMP, 'runs'),
+  })
+  try {
+    assert.match(gw.log(), new RegExp(`work folders on: a new folder per task in ${mount}, in the container voice-scratch, which sees only the work folders, removed 7 days`))
+    await until(() => /work folder container voice-scratch: work folders from host folder/.test(gw.log()))
+    assert.match(gw.log(), new RegExp(`work folder container voice-scratch: work folders from host folder ${mount}, running as ${uid}\\n`))
+    assert.doesNotMatch(gw.log(), /work folder container voice-scratch: (no host folder|it mounts)/)
+    assert.match(gw.claudeCode.getInstructions(), /a run in a new empty folder, in the container voice-scratch, which sees only the work folders\./)
+    assert.match((await gw.controller('list_workers')).text, /^scratch\/new: .*, in the container voice-scratch, which sees only the work folders; idle$/m)
+
+    await gw.say('Rechne mir die Fahrtkosten aus.')
+    const started = await gw.controller('dispatch', { worker: SCRATCH_NEW, task: 'MAKE: compute the travel costs.', words: 'Rechne mir die Fahrtkosten aus' })
+    const name = /worker=(scratch\/[a-z0-9]{4})/.exec(started.text)?.[1]
+    assert.ok(name, started.text)
+    const id = /task=(t[a-z0-9]{3})/.exec(started.text)[1]
+    const event = await until(() => gw.events.find(e => e.meta?.worker === name))
+    const [folder] = readdirSync(mount)
+    const dir = join(mount, folder)
+    const calls = dockerCalls()
+    assert.ok(calls.some(call => call.join(' ') === `exec voice-scratch mkdir -m 700 ${dir}`), 'made in the container')
+    const run = calls.find(call => call.includes('voice-run'))
+    assert.deepEqual(run.slice(0, 8), ['exec', '-i', '-w', dir, 'voice-scratch', 'voice-run', id, join(BIN, 'claude')])
+    assert.ok(calls.some(call => call[1] === 'voice-scratch' && call[2] === 'sh' && call.includes(dir)), 'looked at in the container')
+    const call = await until(() => callOf('MAKE: compute the travel costs.'))
+    assert.equal(call.cwd, dir)
+    assert.match(call.input, /^- It runs in the container voice-scratch, which sees only the work folders\.$/m)
+    assert.equal(event.meta.files, '2 files made')
+    assert.match(event.content, new RegExp(`^The work folder: ${dir} on this computer, mounted in the container voice-scratch\\. `, 'm'))
+    await gw.controller('reply', { request_id: event.meta.request_id, state: 'done', text: 'Die Kosten stehen im Bericht.' })
+
+    const before = dockerCalls().length
+    assert.match((await gw.controller('raise_alarm', { reason: 'A run reads what it should not.' })).text, /^\[killswitch=locked\]/)
+    await until(() => dockerCalls().slice(before).some(c => c.join(' ') === 'stop --time 10 voice-scratch'))
+    assert.ok(dockerCalls().slice(before).some(c => c.join(' ') === 'update --restart=no voice-scratch'))
+    await until(() => /kill switch: work folder container voice-scratch stopped/.test(gw.log()))
+    // Running again with its folder writable: stopped again.
+    await until(() => /work folder container voice-scratch runs with a writable mount of the work folders; stopping it/.test(gw.log()))
+    const folders = readdirSync(mount).length
+    assert.match((await gw.controller('dispatch', { worker: SCRATCH_NEW, task: 'x', words: 'Rechne mir die Fahrtkosten aus' })).text, /^\[dispatch=locked/)
+    assert.equal(readdirSync(mount).length, folders)
+  } finally {
+    await gw.close()
+  }
+})
+
+test('the gateway leaves work folders off when their container would be the worker container', async () => {
+  const gw = await startGateway({ VOICE_GW_SCRATCH: '1', VOICE_GW_SCRATCH_DOCKER: 'voice-workers', VOICE_GW_DOCKER: 'voice-workers', VOICE_GW_DOCKER_BIN: join(BIN, 'docker'), FAKE_DOCKER_LOG: DOCKER_LOG })
+  try {
+    assert.match(gw.log(), /work folders off: VOICE_GW_SCRATCH_DOCKER=voice-workers is the worker container; they need a container of their own/)
+    assert.doesNotMatch(gw.claudeCode.getInstructions(), /Work folders/)
+  } finally {
+    await gw.close()
+  }
+})
+
+test("start-workers-container.sh --scratch: only the work folders and Claude Code's token, read-only while locked", () => {
+  const script = fileURLToPath(new URL('../scripts/start-workers-container.sh', import.meta.url))
+  const secrets = join(TMP, 'start-secrets')
+  mkdirSync(join(secrets, 'worker'), { recursive: true })
+  const folder = join(TMP, 'start-scratch')
+  const start = (env = {}) =>
+    spawnSync('bash', [script, '--scratch'], {
+      encoding: 'utf8',
+      env: { PATH: process.env.PATH, HOME: TMP, FAKE_DOCKER_LOG: DOCKER_LOG, VOICE_GW_DOCKER_BIN: join(BIN, 'docker'), VOICE_GW_SECRETS_DIR: secrets, VOICE_GW_SCRATCH_ROOT: folder, ...env },
+    })
+  const lastRun = () => dockerCalls().findLast(call => call[0] === 'run')
+
+  const none = start()
+  assert.equal(none.status, 1)
+  assert.match(none.stderr, /no Claude Code token in .*worker\/claude_token/)
+  writeFileSync(join(secrets, 'worker', 'claude_token'), 'sk-ant-not-a-real-token\n', { mode: 0o600 })
+  writeFileSync(join(secrets, 'worker', 'github_token'), 'github_pat_not_for_this_container\n', { mode: 0o600 })
+
+  assert.equal(start().status, 0)
+  const run = lastRun()
+  assert.equal(run[run.indexOf('--name') + 1], 'voice-scratch')
+  assert.equal(run[run.indexOf('--restart') + 1], 'unless-stopped')
+  assert.ok(run.includes(`${folder}:/scratch:rw`))
+  assert.ok(run.includes('voice-scratch-home:/home/worker'), 'a home of its own')
+  assert.ok(run.includes(`${secrets}/worker/claude_token:/run/secrets/voice/claude_token:ro`))
+  assert.ok(!run.some(arg => /\/repos|github_token|voice-home:/.test(arg) || arg === `${secrets}/worker:/run/secrets/voice:ro`), run.join(' '))
+  assert.equal(statSync(folder).mode & 0o777, 0o700, 'made for this user only')
+  assert.equal(start({ VOICE_GW_SCRATCH_DOCKER: 'my-scratch' }).status, 0)
+  assert.equal(lastRun()[lastRun().indexOf('--name') + 1], 'my-scratch')
+
+  writeFileSync(join(secrets, 'killswitch.json'), JSON.stringify({ trigger: 'voice', reason: 'test', at: new Date().toISOString() }))
+  const locked = start()
+  assert.equal(locked.status, 0)
+  assert.match(locked.stderr, /the kill switch is locked; .* is mounted read-only/)
+  assert.ok(lastRun().includes(`${folder}:/scratch:ro`))
+  assert.equal(lastRun()[lastRun().indexOf('--restart') + 1], 'no')
+
+  const same = start({ VOICE_GW_DOCKER: 'voice-scratch' })
+  assert.equal(same.status, 1)
+  assert.match(same.stderr, /voice-scratch is the worker container/)
 })

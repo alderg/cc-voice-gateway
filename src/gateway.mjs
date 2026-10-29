@@ -32,6 +32,7 @@ import { PullWatcher } from './pulls.mjs'
 import { TelegramCommands, TelegramFallback, loadTelegram } from './telegram.mjs'
 import { KillSwitch, alarmText, offText } from './killswitch.mjs'
 import { RunGuard } from './guard.mjs'
+import { realpathSync } from 'node:fs'
 import { hostname } from 'node:os'
 import { DockerRunner, HostRunner } from './runners.mjs'
 import { ACCESS_LEVELS, GitHubAccess } from './access.mjs'
@@ -112,17 +113,44 @@ if (config.docker) {
 }
 // Work folders for tasks without a repository (workspaces.mjs): off unless
 // VOICE_GW_SCRATCH=1, and off with a log line where the root is no place
-// for them.
+// for them. On this computer, or with VOICE_GW_SCRATCH_DOCKER in a container
+// of their own, which mounts the root.
 let scratch = null
 if (config.scratch) {
-  const problem = scratchProblem(config.scratchRoot, { gateway: ROOT, workerRoot: config.docker ? null : config.workerRoot })
+  const where = scratchProblem(config.scratchRoot, { gateway: ROOT, workerRoot: config.docker ? null : config.workerRoot })
+  const problem =
+    config.scratchDocker && config.scratchDocker === config.docker
+      ? `VOICE_GW_SCRATCH_DOCKER=${config.scratchDocker} is the worker container; they need a container of their own`
+      : where && `VOICE_GW_SCRATCH_ROOT=${config.scratchRoot} ${where}`
   if (problem) {
-    log(`work folders off: VOICE_GW_SCRATCH_ROOT=${config.scratchRoot} ${problem}`)
+    log(`work folders off: ${problem}`)
   } else {
-    scratch = new ScratchFolders({ runner: new HostRunner(config.scratchRoot), root: config.scratchRoot, days: config.scratchDays })
+    const scratchRunner = config.scratchDocker
+      ? new DockerRunner({ container: config.scratchDocker, root: config.dockerScratch, dockerBin: config.dockerBin })
+      : new HostRunner(config.scratchRoot)
+    scratch = new ScratchFolders({ runner: scratchRunner, root: config.scratchRoot, days: config.scratchDays })
     log(`work folders on: a new folder per task in ${config.scratchRoot}, ${scratch.where()}, removed ${config.scratchDays} days after their last run`)
   }
 }
+if (scratch?.runner.container) {
+  const name = scratch.runner.container
+  scratch.runner.check().then(({ folder, user, warnings }) => {
+    log(`work folder container ${name}: work folders from host folder ${folder ?? '?'}, running as ${user ?? '?'}`)
+    for (const warning of warnings) log(`work folder container ${name}: ${warning}`)
+    const real = path => {
+      try {
+        return realpathSync(path)
+      } catch {
+        return path
+      }
+    }
+    if (folder && real(folder) !== real(config.scratchRoot)) {
+      log(`work folder container ${name}: it mounts ${folder}, not VOICE_GW_SCRATCH_ROOT=${config.scratchRoot}`)
+    }
+  })
+}
+// The containers the kill switch stops: the workers', and the work folders'.
+const containers = [config.docker ? runner : null, scratch?.runner.container ? scratch.runner : null].filter(Boolean)
 const workers = new Workers({
   runner,
   scratch,
@@ -386,9 +414,10 @@ async function lockdown(why) {
     store.resolvePermission(permission.code, 'deny')
     channel.sendVerdict(permission.code, 'deny').catch(() => {})
   }
-  if (config.docker) {
-    const ok = await runner.lockdown()
-    log(`kill switch: worker container ${config.docker} ${ok ? 'stopped' : 'not stopped (was it running?)'}`)
+  for (const container of containers) {
+    const ok = await container.lockdown()
+    const what = container === runner ? 'worker container' : 'work folder container'
+    log(`kill switch: ${what} ${container.container} ${ok ? 'stopped' : 'not stopped (was it running?)'}`)
   }
   return parked
 }
@@ -430,14 +459,18 @@ killswitch.on('tripped', async (state, event, first) => {
 if (killswitch.locked) lockdown('locked at startup').catch(lockdownFailed)
 
 // While locked, a worker container with a writable /repos is stopped, however
-// it was started.
-if (config.docker) {
+// it was started, and so is a work folder container with a writable mount.
+if (containers.length) {
   setInterval(async () => {
     if (!killswitch.locked) return
-    const mounts = await runner.mounts()
-    if (mounts?.running && mounts.writable) {
-      log(`kill switch: worker container ${config.docker} runs with a writable /repos; stopping it`)
-      await runner.lockdown()
+    for (const container of containers) {
+      const mounts = await container.mounts()
+      if (mounts?.running && mounts.writable) {
+        const what = container === runner ? 'worker container' : 'work folder container'
+        const mount = container === runner ? '/repos' : 'mount of the work folders'
+        log(`kill switch: ${what} ${container.container} runs with a writable ${mount}; stopping it`)
+        await container.lockdown()
+      }
     }
   }, config.killCheckSeconds * 1000).unref()
 }

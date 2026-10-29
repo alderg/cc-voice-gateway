@@ -1,7 +1,9 @@
 // Where the workers' repositories are and where git and claude run for them:
 // in the checkouts on this computer (HostRunner, the default), or in the
 // worker container (DockerRunner, when VOICE_GW_DOCKER names one; see
-// docker/). The gateway itself always runs here.
+// docker/). The gateway itself always runs here. Work folders
+// (workspaces.mjs) have a runner of their own: on this computer, or in a
+// container of their own from the same image (VOICE_GW_SCRATCH_DOCKER).
 //
 // In the container, the repositories live in a host folder mounted at /repos,
 // written as your user. Still, git on this computer never runs in that folder:
@@ -467,5 +469,38 @@ export class DockerRunner {
   stopStray(stray, name = 'SIGTERM') {
     if (stray.task) this.voiceStop(stray.task)
     signalAll(stray.pids, name)
+  }
+
+  // --- the folders of work folders (workspaces.mjs) ---------------------------
+  //
+  // As every git command for the container, inside it: on this computer the
+  // gateway never walks or removes what a run there could have laid out, a
+  // symbolic link to your home included.
+
+  // A new folder, for its user only; false when it is there already. Throws
+  // when the container does not answer.
+  async makeDir(dir) {
+    const { ok, stderr, error } = await this.exec(['mkdir', '-m', '700', dir])
+    if (ok) return true
+    if (/exists/i.test(stderr)) return false
+    throw new Error(`The container ${this.container} could not make ${dir} (${(stderr || error?.message || '').trim().split('\n')[0]})`)
+  }
+
+  // As HostRunner.files, with find in the container.
+  async files(dir, max = MAX_FILES) {
+    const list = '[ -d "$1" ] || exit 3; find "$1" -mindepth 1 ! -type d -printf "%P\\t%s\\t%T@\\n" | head -n "$2"'
+    const { ok, stdout } = await this.exec(['sh', '-c', list, 'sh', dir, String(max + 1)], 60000)
+    if (!ok) return null
+    return stdout
+      .split('\n')
+      .filter(Boolean)
+      .map(line => {
+        const [path, bytes, time] = line.split('\t')
+        return { path, bytes: Number(bytes), mtime: Math.round(Number(time) * 1000) }
+      })
+  }
+
+  async remove(dir) {
+    return (await this.exec(['rm', '-rf', '--', dir], 60000)).ok
   }
 }

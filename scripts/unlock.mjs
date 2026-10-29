@@ -65,7 +65,14 @@ try {
   rmSync(file, { force: true })
   console.log('Unlocked. The gateway was not running; it starts unlocked.')
 }
-// The lock stops the worker container; without one, there is nothing to start.
+// The lock stops the worker container and the work folders' one; without
+// them, there is nothing to start.
 if (config.docker) {
   console.log(`The worker container ${config.docker} stays stopped: start it again with scripts/start-workers-container.sh.`)
+}
+if (config.scratch && config.scratchDocker) {
+  console.log(
+    `The work folder container ${config.scratchDocker} stays stopped: start it again with ` +
+      'scripts/start-workers-container.sh --scratch.',
+  )
 }
