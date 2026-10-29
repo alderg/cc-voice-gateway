@@ -229,6 +229,7 @@ before(async () => {
       VOICE_GW_LOG_FILE: '',
       VOICE_GW_WORKER_MODEL: 'opus',
       VOICE_GW_WORKER_EFFORT: 'high',
+      VOICE_GW_PR_DRAFT: '', // the default, also where the controller's settings set it
       FAKE_DOCKER_LOG: join(TMP, 'docker-calls.jsonl'),
       FAKE_DOCKER_CONTAINER: CONTAINER,
       FAKE_DOCKER_DOWN: DOWN,
@@ -371,11 +372,55 @@ test('pull requests turned off, at level full: the rules and the prompt say to p
   const text = prompt({ task: 'Fix the typo.', words: 'Fix the typo', facts })
   assert.match(text, /^- Access level: full \(pull requests are turned off, main is not protected: direct push\)\.$/m)
   assert.match(text, /^- Pull requests: turned off on GitHub\. Commit on main and push it there, without a pull request\.$/m)
-  assert.doesNotMatch(text, /draft pull request|Direct push: yes/)
+  assert.doesNotMatch(text, /ready for review|draft pull request|Direct push: yes/)
   const rules = workerRules('full', { pushDirect: true })
   assert.match(rules, /push the default branch with git push, without a pull request/)
   assert.doesNotMatch(rules, /gh pr create/)
-  assert.match(workerRules('full'), /gh pr create --draft/, 'with pull requests on, full stays as it was')
+  assert.equal(workerRules('full', { pushDirect: true, draft: true }), rules, 'VOICE_GW_PR_DRAFT changes nothing there')
+  assert.match(workerRules('full'), /gh pr create, not as a draft\./, 'with pull requests on, full stays as it was')
+})
+
+// The Publish rules as they were before VOICE_GW_PR_DRAFT, word for word: on
+// this computer and at level pr, and at level full.
+const DRAFT_PUBLISH = `- Publish: push the branch and open a draft pull request against the starting branch with
+  gh pr create --draft. If the task says the repository is public or its visibility is unknown, do not push:
+  commit, then end by asking whether to publish, and push only in a follow-up after a yes. If the push is
+  rejected, say so and do not fork. Without a remote, only commit.
+`
+const DRAFT_PUBLISH_FULL = `- Publish: push the branch and open a draft pull request against the starting branch with
+  gh pr create --draft. Only if the task says "Direct push: yes", the driver explicitly asked for it: commit
+  on the default branch and push it there, without a pull request. If the task says the repository is public
+  or its visibility is unknown, do not push: commit, then end by asking whether to publish, and push only in
+  a follow-up after a yes. If the push is rejected, say so and do not fork. Without a remote, only commit.
+`
+
+test('VOICE_GW_PR_DRAFT: pull requests ready for review by default; with 1, drafts in the words from before', () => {
+  const ready = /open a pull request ready for review against the starting branch with\n  gh pr create, not as a draft\. /
+  for (const level of [undefined, 'pr', 'full']) {
+    assert.match(workerRules(level), ready, `${level ?? 'this computer'}: ready for review`)
+    assert.doesNotMatch(workerRules(level), /--draft|open a draft/)
+    assert.match(workerRules(level, { draft: false }), ready)
+  }
+  assert.ok(workerRules(undefined, { draft: true }).includes(DRAFT_PUBLISH), 'this computer: as before')
+  assert.ok(workerRules('pr', { draft: true }).includes(DRAFT_PUBLISH), 'pr: as before')
+  assert.ok(workerRules('full', { draft: true }).includes(DRAFT_PUBLISH_FULL), 'full: as before')
+  // Only the Publish rule differs; the rule about drafts in review requests stays either way.
+  const rest = rules => rules.split('\n- ').filter(rule => !rule.startsWith('Publish:'))
+  for (const level of [undefined, 'pr', 'full']) {
+    assert.deepEqual(rest(workerRules(level, { draft: true })), rest(workerRules(level)))
+    assert.match(workerRules(level), /If the pull request is a draft and that\n  blocks it, do not mark it ready yourself/)
+  }
+  // Nothing to open at read-only.
+  assert.equal(workerRules('read-only', { draft: true }), workerRules('read-only'))
+
+  // The prompt names the kind with the level.
+  const facts = level => ({ origin: 'acme/open', visibility: 'private', branch: 'main', dirty: [], access: { level, reason: 'r' } })
+  const access = (level, draft) => prompt({ task: 'Fix the typo.', words: 'Fix the typo', facts: facts(level), draft }).split('\n').find(line => line.startsWith('- Access level'))
+  assert.equal(access('pr'), '- Access level: pr (r). Push a voice/ branch and open a pull request ready for review.')
+  assert.equal(access('pr', true), '- Access level: pr (r). Push a voice/ branch and open a draft pull request.')
+  assert.equal(access('full'), '- Access level: full (r). Push a voice/ branch and open a pull request ready for review; a direct push only with "Direct push: yes".')
+  assert.equal(access('full', true), '- Access level: full (r). Push a voice/ branch and open a draft pull request; a direct push only with "Direct push: yes".')
+  assert.equal(access('read-only', true), '- Access level: read-only (r). Nothing leaves this container: no push, no pull request.')
 })
 
 test('access: cached per repository and token; a new token is checked again; errors never show the token', async () => {
@@ -429,9 +474,9 @@ test('Docker: runs go through voice-run in the container, with the rules of thei
   const guarded = await dispatch('guarded', 'Fix the typo.')
   assert.match(guarded.text, /access=pr\]/)
   call = await runOf('guarded', guarded.id)
-  assert.match(arg(call, '--append-system-prompt'), /Publish: push the branch and open a draft pull request against the starting branch with\n  gh pr create --draft\./)
-  assert.doesNotMatch(arg(call, '--append-system-prompt'), /Direct push/)
-  assert.match(call.input, /^- Access level: pr \(main is protected by a ruleset\)\. Push a voice\/ branch and open a draft pull request\.$/m)
+  assert.match(arg(call, '--append-system-prompt'), /Publish: push the branch and open a pull request ready for review against the starting branch with\n  gh pr create, not as a draft\./)
+  assert.doesNotMatch(arg(call, '--append-system-prompt'), /Direct push|--draft/)
+  assert.match(call.input, /^- Access level: pr \(main is protected by a ruleset\)\. Push a voice\/ branch and open a pull request ready for review\.$/m)
 
   const open = await dispatch('open', 'Fix the typo.')
   assert.match(open.text, /access=full\]/)

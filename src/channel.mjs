@@ -28,7 +28,7 @@ import { CONTROLLER_STATES } from './store.mjs'
 import { log, preview } from './log.mjs'
 import { alarmText, offText } from './killswitch.mjs'
 import { size } from './folders.mjs'
-import { auditText, queueList } from './workers.mjs'
+import { auditText, pullRequestKind, queueList } from './workers.mjs'
 import { DECISION_KINDS, decisionLine, openItems } from './ledger.mjs'
 
 // How long a "done" reply waits for the look at the gateway's own checkout
@@ -42,6 +42,10 @@ export const CHANNEL_NAME = 'voice'
 // development flag loads it, plugin:voice:voice when it runs as the plugin
 // (src/plugin.mjs).
 export const CHANNEL_SOURCE = process.env.VOICE_GW_CHANNEL_SOURCE || CHANNEL_NAME
+
+// What workers open: a pull request ready for review, or a draft with
+// VOICE_GW_PR_DRAFT=1.
+const PULL_REQUEST = pullRequestKind(config.prDraft)
 
 const INSTRUCTIONS = `
 Messages from the driver arrive as <channel source="${CHANNEL_SOURCE}" request_id="...">TEXT</channel>.
@@ -77,7 +81,7 @@ in mind to send again. stop_worker stops the running task, after which the next 
 parameter drops queued tasks. A queued task that cannot start when it is its turn comes back to you as an event
 with kind="queue": ask the driver what to do.
 With workers in Docker, list_workers shows each repository's access level: read-only keeps everything in the
-container, pr and full open a draft pull request. Only at full, and only when the driver explicitly asks for
+container, pr and full open ${PULL_REQUEST}. Only at full, and only when the driver explicitly asks for
 it, pass direct=true for a push straight to the default branch.
 Where pull requests are turned off on GitHub (list_workers says "pull requests off", or the reason in
 brackets does, and dispatch says push=direct), workers commit and push straight to the default branch: tell
@@ -268,9 +272,9 @@ const WORKER_TOOLS = [
     name: 'dispatch',
     description:
       "Hand a task to a repository's worker: a headless Claude Code run in its checkout, without approvals. " +
-      'For changes it commits on a voice/ branch, pushes and opens a draft pull request; on public repositories ' +
+      `For changes it commits on a voice/ branch, pushes and opens ${PULL_REQUEST}; on public repositories ` +
       'it asks before pushing. With workers in Docker, the access level in list_workers decides: read-only ' +
-      'keeps everything in the container, pr and full open a draft pull request. Returns at once; when the run ' +
+      `keeps everything in the container, pr and full open ${PULL_REQUEST}. Returns at once; when the run ` +
       'ends you get a channel event with that worker. While the repository is busy or every run slot is taken, ' +
       'the task is queued and starts by itself when it is its turn. By default the worker continues its previous ' +
       'session there, so follow-ups keep their context. It starts nothing unless "words" come from a recent voice ' +

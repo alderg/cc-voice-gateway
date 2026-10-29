@@ -6,7 +6,8 @@
 //              everything stays in the container, workers never push
 //   pr         the token can push and open pull requests, and the default
 //              branch is protected (branch protection or a ruleset): workers
-//              push a voice/ branch and open a draft pull request
+//              push a voice/ branch and open a pull request, ready for
+//              review, or a draft with VOICE_GW_PR_DRAFT=1 (workers.mjs)
 //   full       as pr, but the default branch is not protected: still a pull
 //              request by default, a direct push only when the driver asks
 //

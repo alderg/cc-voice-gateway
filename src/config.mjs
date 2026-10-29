@@ -119,8 +119,12 @@ export const config = {
   // answered gets a reminder, at most three times (ledger.mjs).
   remindMinutes: num(env.VOICE_GW_REMIND_MINUTES, 30),
 
-  // Pull requests that workers open (pulls.mjs): how often the gateway looks
-  // at their checks and reviews, in seconds, and for how many hours at most.
+  // Pull requests that workers open: ready for review by default, so that
+  // automatic reviews start at once; as drafts with VOICE_GW_PR_DRAFT=1
+  // (workers.mjs).
+  prDraft: env.VOICE_GW_PR_DRAFT === '1',
+  // How often the gateway looks at their checks and reviews (pulls.mjs), in
+  // seconds, and for how many hours at most.
   prPollSeconds: num(env.VOICE_GW_PR_POLL, 60),
   prWatchHours: num(env.VOICE_GW_PR_WATCH_HOURS, 24),
 

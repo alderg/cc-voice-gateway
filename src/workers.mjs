@@ -89,6 +89,17 @@ export const WORKER_DENY = [
   'EnterPlanMode',
 ]
 
+// How a worker opens a pull request (VOICE_GW_PR_DRAFT): ready for review by
+// default, so that automatic reviews start at once; as a draft with the
+// setting, in the words of the rules from before it.
+const OPEN_PR = {
+  ready: 'open a pull request ready for review against the starting branch with\n  gh pr create, not as a draft.',
+  draft: 'open a draft pull request against the starting branch with\n  gh pr create --draft.',
+}
+
+// The same for the controller and the worker's prompt.
+export const pullRequestKind = draft => (draft ? 'a draft pull request' : 'a pull request ready for review')
+
 export const WORKER_RULES = `
 You are a worker. The driver of a car gave this task by voice; a controller session passed it on and will
 summarise your result for them. Nobody can answer you during the run.
@@ -99,8 +110,7 @@ summarise your result for them. Nobody can answer you during the run.
   changes, create a branch voice/<short-name> and commit there. Commit only your own changes: never commit,
   stash, reset or discard files you did not change. Never commit to the starting branch or the default
   branch. Never force-push, merge or delete branches. A follow-up continues on the same voice branch.
-- Publish: push the branch and open a draft pull request against the starting branch with
-  gh pr create --draft. If the task says the repository is public or its visibility is unknown, do not push:
+- Publish: push the branch and ${OPEN_PR.ready} If the task says the repository is public or its visibility is unknown, do not push:
   commit, then end by asking whether to publish, and push only in a follow-up after a yes. If the push is
   rejected, say so and do not fork. Without a remote, only commit.
 - At the end, switch back to the starting branch, so the checkout is as the driver left it.
@@ -142,8 +152,7 @@ const CONTAINER_RULES = {
   stash, reset or discard files you did not change. Never commit to the starting branch or the default
   branch, unless the task says "Direct push: yes". Never force-push, merge or delete branches. A follow-up
   continues on the same voice branch.`,
-    Publish: `- Publish: push the branch and open a draft pull request against the starting branch with
-  gh pr create --draft. Only if the task says "Direct push: yes", the driver explicitly asked for it: commit
+    Publish: `- Publish: push the branch and ${OPEN_PR.ready} Only if the task says "Direct push: yes", the driver explicitly asked for it: commit
   on the default branch and push it there, without a pull request. If the task says the repository is public
   or its visibility is unknown, do not push: commit, then end by asking whether to publish, and push only in
   a follow-up after a yes. If the push is rejected, say so and do not fork. Without a remote, only commit.`,
@@ -166,16 +175,18 @@ const DIRECT_RULES = {
 
 // The worker's rules: as above on this computer and at level pr, with the
 // Git and Publish rules of the level otherwise, or of a direct push where
-// pull requests are turned off.
-export function workerRules(level, { pushDirect = false } = {}) {
+// pull requests are turned off. draft: pull requests as drafts.
+export function workerRules(level, { pushDirect = false, draft = false } = {}) {
   const replace = pushDirect ? DIRECT_RULES : CONTAINER_RULES[level]
-  if (!replace) return WORKER_RULES
-  return WORKER_RULES.split('\n- ')
-    .map((rule, i) => {
-      const name = /^(\w+):/.exec(rule)?.[1]
-      return i > 0 && replace[name] ? replace[name].slice(2) : rule
-    })
-    .join('\n- ')
+  const rules = replace
+    ? WORKER_RULES.split('\n- ')
+        .map((rule, i) => {
+          const name = /^(\w+):/.exec(rule)?.[1]
+          return i > 0 && replace[name] ? replace[name].slice(2) : rule
+        })
+        .join('\n- ')
+    : WORKER_RULES
+  return draft ? rules.replace(OPEN_PR.ready, OPEN_PR.draft) : rules
 }
 
 const plural = (n, unit) => `${n} ${unit}${n === 1 ? '' : 's'}`
@@ -355,6 +366,7 @@ export class Workers extends EventEmitter {
     ghBin = 'gh',
     model = '',
     effort = '',
+    prDraft = false,
     maxRuns = 2,
     timeoutMinutes = 60,
     resultGraceMs = RESULT_GRACE_MS,
@@ -372,6 +384,7 @@ export class Workers extends EventEmitter {
     this.ghBin = ghBin
     this.model = model // claude --model for every run; empty: Claude Code's default
     this.effort = effort // claude --effort
+    this.prDraft = prDraft // pull requests as drafts (VOICE_GW_PR_DRAFT=1)
     this.maxRuns = maxRuns
     this.timeoutMs = timeoutMinutes * 60 * 1000
     this.resultGraceMs = resultGraceMs
@@ -643,7 +656,7 @@ export class Workers extends EventEmitter {
       '--permission-prompts', 'none',
       '--strict-mcp-config',
       '--settings', JSON.stringify({ permissions: { deny: WORKER_DENY } }),
-      '--append-system-prompt', workerRules(facts.access?.level, { pushDirect: facts.pushDirect }),
+      '--append-system-prompt', workerRules(facts.access?.level, { pushDirect: facts.pushDirect, draft: this.prDraft }),
       ...(this.model ? ['--model', this.model] : []),
       ...(this.effort ? ['--effort', this.effort] : []),
       ...(previous ? ['--resume', sessionId] : ['--session-id', sessionId]),
@@ -702,7 +715,7 @@ export class Workers extends EventEmitter {
     }
     child.on('error', error => this.finish(record, 'failed', `could not start ${error.path || this.claudeBin}: ${error.message}`))
     child.stdin.on('error', () => {}) // the run may end before it read everything
-    child.stdin.end(prompt({ task, words, facts, direct }))
+    child.stdin.end(prompt({ task, words, facts, direct, draft: this.prDraft }))
     child.unref()
     this.state.tasks.push(record)
     this.state.repos[facts.name] = { sessionId }
@@ -1343,15 +1356,17 @@ export class Workers extends EventEmitter {
   }
 }
 
+// What the prompt says about the level; pull: the kind of pull request.
 const ACCESS_TEXT = {
-  'read-only': 'Nothing leaves this container: no push, no pull request.',
-  pr: 'Push a voice/ branch and open a draft pull request.',
-  full: 'Push a voice/ branch and open a draft pull request; a direct push only with "Direct push: yes".',
+  'read-only': () => 'Nothing leaves this container: no push, no pull request.',
+  pr: pull => `Push a voice/ branch and open ${pull}.`,
+  full: pull => `Push a voice/ branch and open ${pull}; a direct push only with "Direct push: yes".`,
 }
 
 // What the worker reads on stdin: the task in the controller's words, the
-// driver's own words, and what the gateway checked.
-export function prompt({ task, words, facts, direct = false }) {
+// driver's own words, and what the gateway checked. draft: pull requests as
+// drafts.
+export function prompt({ task, words, facts, direct = false, draft = false }) {
   const visibility = {
     public: 'public',
     private: 'private',
@@ -1377,7 +1392,8 @@ export function prompt({ task, words, facts, direct = false }) {
   const target = facts.defaultBranch || 'the default branch'
   if (facts.access) {
     const { level, reason } = facts.access
-    lines.push(`- Access level: ${level} (${reason}). ${facts.pushDirect ? '' : ACCESS_TEXT[level]}`.trimEnd())
+    const what = facts.pushDirect ? '' : (ACCESS_TEXT[level]?.(pullRequestKind(draft)) ?? '')
+    lines.push(`- Access level: ${level} (${reason}). ${what}`.trimEnd())
     if (direct && !facts.pushDirect) {
       lines.push(`- Direct push: yes. The driver explicitly asked to push straight to ${target}.`)
     }

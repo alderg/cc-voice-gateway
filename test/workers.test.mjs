@@ -167,6 +167,7 @@ async function startGateway(env = {}) {
         VOICE_GW_DEFAULT_WAIT: '2',
         VOICE_GW_LOG_FILE: '',
         VOICE_GW_SELF_CHECKOUT: SELF,
+        VOICE_GW_PR_DRAFT: '', // the default, also where the controller's settings set it
         FAKE_CLAUDE_LOG: CALLS,
         // As inside a Claude Code session; a worker must not inherit these.
         CLAUDECODE: '1',
@@ -386,8 +387,39 @@ test('pull requests turned off on GitHub: the worker commits on the default bran
   const alpha = await dispatch('alpha', 'Fix the typo.')
   assert.doesNotMatch(alpha.text, /push=direct/)
   await workerEvent('alpha', alpha.id)
-  assert.match(arg(lastCall(), '--append-system-prompt'), /gh pr create --draft/)
+  assert.match(arg(lastCall(), '--append-system-prompt'), /gh pr create, not as a draft\./)
   assert.doesNotMatch(lastCall().input, /Pull requests: turned off/)
+})
+
+test('pull requests ready for review by default; VOICE_GW_PR_DRAFT=1 brings back drafts, for the workers and the controller', async () => {
+  const description = async () => (await gw.claudeCode.listTools()).tools.find(tool => tool.name === 'dispatch').description
+  const rules = () => arg(lastCall(), '--append-system-prompt')
+  assert.match(await description(), /pushes and opens a pull request ready for review; /)
+  assert.match(await description(), /pr and full open a pull request ready for review\. /)
+  assert.doesNotMatch(await description(), /draft/)
+  assert.match(gw.claudeCode.getInstructions(), /pr and full open a pull request ready for review\. /)
+  const ready = await dispatch('alpha', 'Fix the typo in the changelog.')
+  await workerEvent('alpha', ready.id)
+  assert.match(rules(), /open a pull request ready for review against the starting branch with\n  gh pr create, not as a draft\. /)
+  assert.doesNotMatch(rules(), /--draft/)
+
+  await stopGateway()
+  gw = await startGateway({ VOICE_GW_PR_DRAFT: '1' })
+  try {
+    assert.match(await description(), /pushes and opens a draft pull request; /)
+    assert.match(await description(), /pr and full open a draft pull request\. /)
+    assert.doesNotMatch(await description(), /ready for review/)
+    assert.match(gw.claudeCode.getInstructions(), /pr and full open a draft pull request\. /)
+    const draft = await dispatch('alpha', 'Fix the other typo in the changelog.')
+    await workerEvent('alpha', draft.id)
+    assert.match(rules(), /- Publish: push the branch and open a draft pull request against the starting branch with\n  gh pr create --draft\. If the task says/)
+    assert.doesNotMatch(rules(), /ready for review/)
+    // the rule for review requests on a draft is there either way
+    assert.match(rules(), /If the pull request is a draft and that\n  blocks it, do not mark it ready yourself/)
+  } finally {
+    await stopGateway()
+    gw = await startGateway()
+  }
 })
 
 const queuedId = text => /queued=(q[a-z0-9]{3})/.exec(text)?.[1]

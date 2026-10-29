@@ -98,6 +98,7 @@ if (config.workerEffort && !EFFORTS.includes(config.workerEffort)) {
 if (config.workerModel || config.workerEffort) {
   log(`workers run with model ${config.workerModel || 'default'}, effort ${config.workerEffort || 'default'}`)
 }
+if (config.prDraft) log('workers open their pull requests as drafts (VOICE_GW_PR_DRAFT=1)')
 const runner = config.docker
   ? new DockerRunner({ container: config.docker, root: config.dockerRepos, dockerBin: config.dockerBin })
   : new HostRunner(config.workerRoot)
@@ -119,6 +120,7 @@ const workers = new Workers({
   ghBin: config.ghBin,
   model: config.workerModel,
   effort: EFFORTS.includes(config.workerEffort) ? config.workerEffort : '',
+  prDraft: config.prDraft,
   maxRuns: config.maxWorkers,
   timeoutMinutes: config.workerTimeoutMinutes,
 })

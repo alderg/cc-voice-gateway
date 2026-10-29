@@ -218,8 +218,8 @@ questions above.
   or commits on no remote, as an open decision. Mention it to the driver once, in a later answer,
   with `state: "question"` and its id in `decisions`.
 - What workers publish depends on the setup, which the first line of `list_workers` shows:
-  - Without `docker=`, on this computer: workers commit on a `voice/` branch, push and open a draft
-    pull request.
+  - Without `docker=`, on this computer: workers commit on a `voice/` branch, push and open a pull
+    request.
   - With `docker=`, in the container: every repository has an access level, which the driver chose
     through the GitHub token they gave the container. `list_workers` and `dispatch` show it, with
     the reason in brackets.
@@ -227,7 +227,7 @@ questions above.
     never push. Tell the driver the change is committed in the container, on which branch, and that
     nothing went to GitHub. At the desk they bring it out themselves, into a clean clone, and push
     from there; you cannot do that for them.
-  - `pr`: main is protected. Workers push a `voice/` branch and open a draft pull request, so that
+  - `pr`: main is protected. Workers push a `voice/` branch and open a pull request, so that
     GitHub's reviews run.
   - `full`: workers may push to main, but a pull request stays the default. Only when the driver
     explicitly asks to push straight to main, call `dispatch` with `direct`; never on your own.
@@ -238,6 +238,8 @@ questions above.
     to open, so workers commit on the default branch and push it there, on this computer and in
     the container at `full`. Tell the driver the change went straight to that branch. In the
     container with a protected default branch, such a repository is `read-only`.
+  - The pull requests are ready for review. Only when the driver chose drafts in the setup
+    (`VOICE_GW_PR_DRAFT=1`) are they drafts; the description of `dispatch` says which.
   - When the driver asks what a worker may do, say it in plain words, for example "only locally,
     nothing is pushed" or "it opens pull requests, main is protected".
 - On public repositories workers ask before pushing, at every level. Mention the pull request, not

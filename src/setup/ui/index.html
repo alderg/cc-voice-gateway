@@ -41,6 +41,11 @@
     <p class="guide">How many workers may run at once.</p>
     <label>Time limit per run (minutes) <input data-setting="VOICE_GW_WORKER_TIMEOUT" inputmode="numeric"></label>
     <p class="guide">A run is stopped after this.</p>
+    <label>Pull requests from workers
+      <select data-setting="VOICE_GW_PR_DRAFT"><option value="0">ready for review (default)</option><option value="1">drafts</option></select>
+    </label>
+    <p class="guide">Ready for review, automatic reviews start at once. A draft usually gets them only once it is
+      marked ready, and cannot be merged before.</p>
     <label>Approvals by voice
       <select data-setting="VOICE_GW_PERMISSION_RELAY"><option value="1">on</option><option value="0">off, only at the terminal</option></select>
     </label>
@@ -156,7 +161,7 @@
       <li><strong>read-only</strong>, nothing leaves the container: no token for public repositories; for private ones a
         <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noreferrer noopener">fine-grained token</a>
         with only the chosen repositories and Contents: Read-only. Not a classic token: its <code>repo</code> scope can also write.</li>
-      <li><strong>pr</strong>, draft pull requests: a
+      <li><strong>pr</strong>, pull requests: a
         <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noreferrer noopener">fine-grained token</a>
         with Contents and Pull requests: Read and write (Workflows only if workers should change workflow files), and the default branch protected by a
         <a href="https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/creating-rulesets-for-a-repository" target="_blank" rel="noreferrer noopener">ruleset</a>
