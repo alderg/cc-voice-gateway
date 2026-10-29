@@ -62,6 +62,13 @@ function gh(ghBin, args) {
 const words = segment =>
   (segment.match(/(?:'[^']*'|"[^"]*"|[^\s'"])+/g) ?? []).map(word => word.replace(/'([^']*)'|"([^"]*)"/g, '$1$2'))
 
+// The segment with quoted text blanked out, so that a > in a quoted pattern or
+// message is no redirection. A quoted redirection target stays, and so do
+// escaped quotes, which open nothing.
+const unquoted = segment =>
+  segment.replace(/\\.|(>>?\s*)?('[^']*'|"(?:[^"\\]|\\.)*")/gs, (all, redirect, quoted) =>
+    quoted === undefined || redirect ? all : ' '.repeat(quoted.length))
+
 // Segments of a command line: && || ; | and new lines.
 const segments = command => String(command).split(/&&|\|\||;|\n|\|/).map(s => s.trim()).filter(Boolean)
 
@@ -320,8 +327,8 @@ export class RunGuard {
   // Explicit write targets of one command: redirections and known commands.
   targets(segment, name, args) {
     const found = []
-    for (const match of segment.matchAll(/(?:^|[^<>&0-9])(?:[0-9]|&)?>>?\s*([^\s;&|<>]+)/g)) {
-      if (!match[1].startsWith('&')) found.push(match[1])
+    for (const match of unquoted(segment).matchAll(/(?:^|[^<>&0-9])(?:[0-9]|&)?>>?\s*((?:'[^']*'|"[^"]*"|[^\s;&|<>'"])+)/g)) {
+      if (!match[1].startsWith('&')) found.push(match[1].replace(/'([^']*)'|"([^"]*)"/g, '$1$2'))
     }
     const operands = args.filter(arg => !arg.startsWith('-'))
     if (['tee', 'rm', 'rmdir', 'mkdir', 'touch', 'truncate', 'shred', 'unlink'].includes(name)) found.push(...operands)

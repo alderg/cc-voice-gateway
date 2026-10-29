@@ -240,6 +240,9 @@ test('rule: writes outside the repository and the temporary folders', () => {
   inside.tool('Write', { file_path: '/tmp/scratch.txt', content: 'x' })
   inside.bash('npm test 2> /dev/null && mkdir -p build/out && cp a.txt build/out/ && cat /etc/hosts')
   inside.bash('rm "$UNKNOWN"/x') // a variable hides the target: not seen
+  // A > in quotes is no redirection: a sed pattern, a message.
+  inside.bash(`sed -n '/<section id="selection"/,/<\\/section>/p' index.html`)
+  inside.bash('echo "a > b" && grep -c "<div>" index.html > /tmp/count.txt')
   assert.deepEqual(inside.tripped, [], 'nothing outside')
   inside.guard.close()
 
@@ -251,6 +254,9 @@ test('rule: writes outside the repository and the temporary folders', () => {
     ['Bash', 'cp tool /usr/local/bin/tool', '/usr/local/bin/tool'],
     ['Bash', 'sed -i s/a/b/ ../other/config', '/work/other/config'],
     ['Bash', 'echo x | tee $HOME/.ssh/authorized_keys', `${homedir()}/.ssh/authorized_keys`],
+    ['Bash', 'echo x > "/etc/quoted target"', '/etc/quoted'],
+    ['Bash', "echo \\' > /etc/escaped \\'", '/etc/escaped'],
+    ['Bash', `echo '<b>' >> '/etc/after quotes'`, '/etc/after'],
   ]) {
     const run = guarded()
     if (kind === 'Write') run.tool('Write', { file_path: value, content: 'x' })
