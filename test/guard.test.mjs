@@ -262,6 +262,10 @@ const OUTSIDE = [
   ['cat <<EOF\n$(touch /etc/heredoc)\nEOF', '/etc/heredoc'],
   ['echo "a; b" ; touch /etc/after-quotes', '/etc/after-quotes'],
   ["git commit -m \"$(cat <<'EOF'\nmessage\nEOF\n)\" && touch /etc/after-message", '/etc/after-message'],
+  // A script written from a heredoc and run in the same call.
+  ["cat > /tmp/s.sh <<'EOF'\nset -e\nrm -rf /etc/from-script\nEOF\nsh /tmp/s.sh", '/etc/from-script'],
+  ["cat <<'EOF' > run.sh\necho x > /etc/from-run\nEOF\nchmod +x run.sh && ./run.sh", '/etc/from-run'],
+  ["tee /tmp/t.sh >/dev/null <<'EOF'\ntouch ~/.from-tee\nEOF\nbash /tmp/t.sh", '~/.from-tee'],
 ]
 
 

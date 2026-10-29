@@ -18,8 +18,9 @@
 //                   chmod, chown, truncate, sed -i, dd of=), after cd. The
 //                   command line is read as a shell reads it (parseShell):
 //                   quoted text, comments and heredocs are data; commands in
-//                   $(…), `…`, <(…), >(…), sh -c and a shell's heredoc are
-//                   commands. Devices such as /dev/null are no write.
+//                   $(…), `…`, <(…), >(…), sh -c, eval, a shell's heredoc and
+//                   a script written from a heredoc that the same call runs
+//                   are commands. Devices such as /dev/null are no write.
 //   many changes    more file edits in a run than maxEdits; at the end, more
 //                   files or lines changed than maxFiles or maxLines, counting
 //                   commits made during the run on any branch and what is not
@@ -113,7 +114,7 @@ class ShellParser {
     const pending = [] // heredocs, whose bodies begin with the next line
     let command = null
     let depth = 0 // subshells opened here
-    const current = at => (command ??= { type: 'command', words: [], writes: [], start: at, end: at })
+    const current = at => (command ??= { type: 'command', words: [], writes: [], heredocs: [], start: at, end: at })
     const finish = () => {
       if (!command) return
       command.text = src.slice(command.start, command.end).trim()
@@ -347,6 +348,7 @@ class ShellParser {
         if ((strip ? line.replace(/^\t+/, '') : line) === delimiter) break
         body += `${line}\n`
       }
+      command.heredocs.push(body) // a script it writes to a file may run later (RunGuard.shell)
       const { name, args } = commandOf(command.words)
       if (SHELLS.has(basename(name)) && !args.some(arg => /^-[a-zA-Z]*c[a-zA-Z]*$/.test(arg))) {
         const inner = new ShellParser(body).parse(0, null)
@@ -599,9 +601,12 @@ export class RunGuard {
   // The commands of a Bash call, as a shell runs them (parseShell), with the
   // folder each runs in: cd changes it for what follows, but not out of a
   // subshell or a substitution; after a cd whose target a variable hides,
-  // only absolute targets count. sh -c, bash -c and eval run their text.
+  // only absolute targets count. sh -c, bash -c and eval run their text, and
+  // a script that cat or tee wrote from a heredoc is checked as shell
+  // commands when the same call runs it, with a shell or by its path.
   shell(run, command, cwd = run.dir) {
     const outer = []
+    const scripts = new Map() // path -> script written from a heredoc in this call
     for (const event of parseShell(command)) {
       if (event.type === 'open') {
         outer.push(cwd)
@@ -636,6 +641,15 @@ export class RunGuard {
         const c = SHELLS.has(basename(name)) ? args.findIndex(arg => /^-[a-zA-Z]*c[a-zA-Z]*$/.test(arg)) : -1
         if (c >= 0 && args[c + 1] !== undefined) this.shell(run, args[c + 1], cwd)
         if (name === 'eval' && args.length) this.shell(run, args.join(' '), cwd)
+        if (event.heredocs.length && ['cat', 'tee'].includes(name)) {
+          for (const target of targets) {
+            const path = this.resolve(cwd, target)
+            if (path) scripts.set(path, event.heredocs.join(''))
+          }
+        }
+        const file = SHELLS.has(basename(name)) || ['source', '.'].includes(name) ? args.find(arg => !arg.startsWith('-')) : name
+        const script = file !== undefined && scripts.get(this.resolve(cwd, file))
+        if (script) this.shell(run, script, cwd)
       }
       for (const target of targets) {
         const path = this.resolve(cwd, target)
