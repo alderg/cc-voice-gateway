@@ -12,7 +12,8 @@
 //                   the default branch moved during the run, and the worker's
 //                   repository holds the new head, or the new head merged a
 //                   pull request of the run (mergedPull).
-//   outside         writes outside the repository, the temporary folders and
+//   outside         writes outside the repository (for a run in a worktree,
+//                   outside its worktree), the temporary folders and
 //                   the run's own Claude Code memory folder (memoryFolder):
 //                   the file tools by their path, shell commands by explicit
 //                   targets (redirections, tee, cp, mv, rm, mkdir, touch, ln,
@@ -41,6 +42,7 @@ import { homedir } from 'node:os'
 import { posix } from 'node:path'
 import { log as defaultLog, preview } from './log.mjs'
 import { tempFolders } from './platform.mjs'
+import { WORKTREES, listWorktrees } from './worktrees.mjs'
 
 // The Claude Code memory folder of a session in the given folder, where its
 // auto memory writes: <config>/projects/<folder with every character but
@@ -457,6 +459,9 @@ export class RunGuard {
     this.log = log
     this.allowedPaths = allowed // VOICE_GW_KILL_ALLOW_PATHS
     this.runs = new Map() // task id -> what the rules know about the run
+    // repository \0 branch -> the task whose git push named it last: with
+    // several runs in one repository, one run's branch is not another's.
+    this.pushedBy = new Map()
     this.ghWarned = false
     workers.on('started', task => this.started(task))
     workers.on('tool', (task, part) => this.tool(task, part))
@@ -510,8 +515,8 @@ export class RunGuard {
       runner,
       home,
       roots: scratch ? temp : roots, // where it may write besides its workspace and its memory folder
-      dir: task.dir ?? runner.dir(task.repo),
-      memory: null,
+      dir: task.dir ?? runner.dir(task.repo), // a run in a worktree: the worktree, not the checkout
+      memories: [],
       slug: task.slug ?? null,
       branch: task.defaultBranch ?? null,
       direct: (Boolean(task.direct) && task.access === 'full') || Boolean(task.pushDirect),
@@ -523,7 +528,11 @@ export class RunGuard {
       tripped: new Set(),
       checking: null,
     }
-    run.memory = memoryFolder(claudeConfig, run.dir)
+    // Claude Code may key the memory of a worktree by the repository it
+    // belongs to: both are the run's own.
+    run.memories = [run.dir, task.checkout].filter(Boolean).map(dir => memoryFolder(claudeConfig, dir))
+    run.worktree = Boolean(task.worktree)
+    run.checkout = task.checkout ?? null
     this.runs.set(task.id, run)
     run.ready = this.baseline(run)
   }
@@ -586,7 +595,10 @@ export class RunGuard {
       if (!head || head === run.head) return
       const moved = `${run.branch} on GitHub moved from ${short(run.head)} to ${short(head)} during the run`
       const local = await run.runner.git(run.dir, 'cat-file', '-e', `${head}^{commit}`)
-      if (local !== null) {
+      // A run next to it in the same repository that may push there: its
+      // worktree shares the objects, so the head is no sign of this run.
+      const direct = [...this.runs.values()].some(other => other !== run && other.repo === run.repo && other.direct)
+      if (local !== null && !direct) {
         this.violation(run, 'push to the default branch', `${moved}, and the worker's repository holds the new head`)
       } else {
         // A merge on GitHub makes a commit the worker does not have.
@@ -607,7 +619,9 @@ export class RunGuard {
   // the worker's repository since the run started), or it was opened during
   // the run from a voice/ branch. Not the run's: a merge of a pull request
   // that was there before the run and that the run did not push to, such as
-  // the driver's merge at the desk of an earlier worker's pull request.
+  // the driver's merge at the desk of an earlier worker's pull request; nor
+  // one of another run of the same repository, by the branch it pushed or
+  // the pull request it named (several runs per repository).
   async mergedPull(run, head) {
     const pulls = await gh(this.ghBin, ['api', `repos/${run.slug}/commits/${head}/pulls`])
     for (const pull of Array.isArray(pulls) ? pulls : []) {
@@ -616,13 +630,24 @@ export class RunGuard {
       const from = pull.head.repo?.full_name
       if (from && from.toLowerCase() !== run.slug.toLowerCase()) continue // from a fork
       const found = { number: pull.number, branch }
-      if (run.pushed.has(branch) || (await this.pushedSince(run, branch))) return { ...found, why: 'which the run pushed' }
+      if (run.pushed.has(branch)) return { ...found, why: 'which the run pushed' }
+      if (this.anotherRun(run, { branch, number: pull.number })) continue
+      if (await this.pushedSince(run, branch)) return { ...found, why: 'which the run pushed' }
       const opened = Date.parse(pull.created_at)
       if (branch.startsWith('voice/') && opened >= run.startedAt - CLOCK_SLACK_MS) {
         return { ...found, why: 'opened during the run' }
       }
     }
     return null
+  }
+
+  // Whether a pull request or a branch is another run's of the same
+  // repository: it named the pull request, or pushed the branch last.
+  anotherRun(run, { branch = null, number = null }) {
+    const pusher = branch ? this.pushedBy.get(`${run.repo}\0${branch}`) : null
+    if (pusher && pusher !== run.id) return true
+    const tasks = this.workers.state?.tasks ?? []
+    return number !== null && tasks.some(t => t.id !== run.id && t.repo === run.repo && (t.pulls ?? []).includes(number))
   }
 
   // Whether the worker's repository logged a push to the branch since the run
@@ -669,7 +694,10 @@ export class RunGuard {
           this.violation(run, 'push to the default branch', `the command ${shown}`)
         }
         if (push) {
-          for (const branch of push.branches) run.pushed.add(branch)
+          for (const branch of push.branches) {
+            run.pushed.add(branch)
+            if (branch !== 'HEAD') this.pushedBy.set(`${run.repo}\0${branch}`, run.id)
+          }
           // Whatever the command line says, GitHub has the last word, a moment later.
           setTimeout(() => this.checkHead(run), 5000).unref()
         }
@@ -751,16 +779,35 @@ export class RunGuard {
 
   allowed(run, path) {
     if (isDevice(path)) return true
-    return [run.dir, run.memory, ...run.roots].some(root => path === root || path.startsWith(root.replace(/\/$/, '') + '/'))
+    return [run.dir, ...run.memories, ...run.roots].some(root => path === root || path.startsWith(root.replace(/\/$/, '') + '/'))
   }
 
   // --- size ---------------------------------------------------------------------
 
+  // The refs whose commits since its start a run made: in a worktree, what
+  // its HEAD and the branches it pushed have; in the checkout every ref, but
+  // not what the worktrees of other runs of the repository have, nor the
+  // branches they pushed. Several runs in one repository share its refs.
+  async commitRefs(run) {
+    // Refs that may be gone (a branch never pushed) are left out by git.
+    const pushed = [...run.pushed].filter(b => b !== 'HEAD').map(b => `refs/remotes/origin/${b}`)
+    if (run.worktree) return ['--ignore-missing', 'HEAD', ...pushed]
+    const others = []
+    for (const [key, id] of this.pushedBy) {
+      const [repo, branch] = key.split('\0')
+      if (repo === run.repo && id !== run.id) others.push(`refs/remotes/origin/${branch}`, `refs/heads/${branch}`)
+    }
+    const worktrees = run.runner.gitRun ? await listWorktrees(run.runner, run.dir).catch(() => []) : []
+    for (const w of worktrees) if (w.head && w.dir.split('/').includes(WORKTREES)) others.push(w.head)
+    return others.length ? ['--ignore-missing', '--all', '--not', ...others] : ['--all']
+  }
+
   async checkSize(run) {
     if (run.scratch) return this.checkFiles(run)
     const since = Math.floor(run.startedAt / 1000)
+    const refs = await this.commitRefs(run)
     const [committed, pending, untracked] = await Promise.all([
-      run.runner.git(run.dir, 'log', '--all', `--since=@${since}`, '--numstat', '--format='),
+      run.runner.git(run.dir, 'log', ...refs, `--since=@${since}`, '--numstat', '--format='),
       run.runner.git(run.dir, 'diff', '--numstat', 'HEAD'),
       run.runner.git(run.dir, 'ls-files', '--others', '--exclude-standard'),
     ])

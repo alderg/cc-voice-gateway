@@ -21,11 +21,16 @@ import { log } from './log.mjs'
 // that there are more.
 export const MAX_FILES = 2000
 
-function run(command, args, timeout) {
+function run(command, args, timeout, env = undefined) {
   return new Promise(resolve => {
-    execFile(command, args, { timeout }, (error, stdout, stderr) => resolve({ ok: !error, stdout, stderr, error }))
+    execFile(command, args, { timeout, env, maxBuffer: 16 * 1024 * 1024 }, (error, stdout, stderr) =>
+      resolve({ ok: !error, stdout, stderr, error }),
+    )
   })
 }
+
+// git never asks for a password: a run's git, or the gateway's, would wait.
+const GIT_QUIET = { GIT_TERMINAL_PROMPT: '0' }
 
 // Whether a process still exists; EPERM means it does, as someone else's.
 export function alive(pid) {
@@ -239,6 +244,14 @@ export class HostRunner {
     return ok ? stdout : null
   }
 
+  // git with a time limit of its own and more in its environment, such as a
+  // run's marks, so that stopping the run reaches it: { ok, stdout, stderr }.
+  // For the worktrees (worktrees.mjs).
+  async gitRun(dir, args, { env = {}, timeout = 60000 } = {}) {
+    const { ok, stdout, stderr } = await run('git', ['-C', dir, ...args], timeout, { ...process.env, ...GIT_QUIET, ...env })
+    return { ok, stdout: stdout ?? '', stderr: stderr ?? '' }
+  }
+
   // Detached: its own process group, so stopping it reaches the commands it
   // started, and a controller restart does not end it. env carries the
   // run's marks (MARK).
@@ -368,6 +381,14 @@ export class DockerRunner {
   async git(dir, ...args) {
     const { ok, stdout } = await this.exec(['git', '-C', dir, ...args])
     return ok ? stdout : null
+  }
+
+  // As HostRunner.gitRun, in the container; the environment goes with
+  // docker exec -e, so that voice-stop finds a run's git by its mark.
+  async gitRun(dir, args, { env = {}, timeout = 60000 } = {}) {
+    const vars = Object.entries({ ...GIT_QUIET, ...env }).flatMap(([name, value]) => ['-e', `${name}=${value}`])
+    const { ok, stdout, stderr } = await run(this.dockerBin, ['exec', ...vars, this.container, 'git', '-C', dir, ...args], timeout)
+    return { ok, stdout: stdout ?? '', stderr: stderr ?? '' }
   }
 
   // Which host folder is mounted at /repos and as whom the container runs,

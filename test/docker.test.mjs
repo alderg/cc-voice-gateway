@@ -123,7 +123,14 @@ if (verb === 'inspect') {
 if (verb !== 'exec') process.exit(2)
 const env = { ...process.env, CONTAINER_SIDE: '1' }
 let cwd = process.cwd()
-while (argv[0]?.startsWith('-')) if (argv.shift() === '-w') cwd = argv.shift()
+while (argv[0]?.startsWith('-')) {
+  const flag = argv.shift()
+  if (flag === '-w') cwd = argv.shift()
+  else if (flag === '-e') {
+    const [name, ...value] = argv.shift().split('=')
+    env[name] = value.join('=')
+  }
+}
 const container = argv.shift()
 if (container !== process.env.FAKE_DOCKER_CONTAINER || existsSync(process.env.FAKE_DOCKER_DOWN)) {
   process.stderr.write('Error response from daemon: container ' + container + ' is not running\\n')
@@ -231,6 +238,7 @@ before(async () => {
       VOICE_GW_WORKER_EFFORT: 'high',
       VOICE_GW_PR_DRAFT: '', // the default, also where the controller's settings set it
       VOICE_GW_REMOTE_CONTROL: '1', // the controller's only, and not with the container's token
+      VOICE_GW_MAX_WORKERS_PER_REPO: '2', // a further run of a repository in a worktree in the container
       FAKE_DOCKER_LOG: join(TMP, 'docker-calls.jsonl'),
       FAKE_DOCKER_CONTAINER: CONTAINER,
       FAKE_DOCKER_DOWN: DOWN,
@@ -479,7 +487,7 @@ test('access: cached per repository and token; a new token is checked again; err
 
 test('Docker: list_workers shows the clones in the container with their access level', async () => {
   const { text } = await controller('list_workers')
-  assert.match(text, /^\[workers=5 running=0 max=2 docker=voice-workers\]/)
+  assert.match(text, /^\[workers=5 running=0 max=2 per_repo=2 docker=voice-workers\]/)
   assert.match(text, /^guarded: acme\/guarded, private, access pr \(main is protected by a ruleset\), branch main, clean, idle$/m)
   assert.match(text, /^open: acme\/open, private, access full \(main is not protected\), branch main, clean, idle$/m)
   assert.match(text, /^readonly: acme\/readonly, private, access read-only \(the token cannot push \(Contents is read-only\)\), /m)
@@ -610,6 +618,30 @@ test('Docker: stop_worker ends the run in the container with voice-stop', async 
       return true
     }
   })
+})
+
+test('Docker: a further run of a repository works in a worktree in the container, made and removed through docker exec', async () => {
+  const first = await dispatch('local', 'SLOW: the first, in the clone.')
+  assert.match(first.text, /dispatch=started/)
+  const second = await dispatch('local', 'The second, next to it.', { parallel: true })
+  assert.match(second.text, new RegExp(`^\\[dispatch=started worker=local task=${second.id} session=new worktree=${second.id} access=read-only\\] Started in a git worktree of its own`))
+  assert.match(second.text, new RegExp(`It runs next to ${first.id} \\("SLOW: the first, in the clone\\."\\)\\.`))
+  const wt = join(REPOS, '.voice-worktrees', 'local', second.id)
+  const event = await waitUntil(() => gw.events.find(e => e.meta?.task === second.id))
+  assert.equal(event.meta.worktree, second.id)
+  assert.equal(event.meta.git, 'clean')
+  const call = claudeCalls().find(c => c.input.startsWith('The second'))
+  assert.equal(call.cwd, wt)
+  assert.match(call.input, /^- Nothing is pushed from here: the branch stays in the clone when the gateway removes the worktree\.$/m)
+  // Every git command for it ran in the container, with the run's mark for voice-stop.
+  const add = dockerCalls().find(c => c.includes('worktree') && c.includes('add'))
+  assert.deepEqual(add.slice(0, 2), ['exec', '-e'])
+  assert.ok(add.includes(`VOICE_GW_TASK=${second.id}`))
+  assert.ok(add.includes(CONTAINER))
+  assert.deepEqual(dockerCalls().find(c => c.includes('voice-run') && c.includes(second.id)).slice(0, 4), ['exec', '-i', '-w', wt])
+  await waitUntil(() => !existsSync(wt))
+  assert.ok(dockerCalls().some(c => c.includes('worktree') && c.includes('remove')), 'removed in the container')
+  await controller('stop_worker', { worker: 'local', drop: 'all' })
 })
 
 test('Docker: a container that does not answer is an error for the controller, not a crash', async () => {

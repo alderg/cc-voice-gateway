@@ -290,7 +290,8 @@ export class Ledger {
 
 // What a decision is about: its repository, the gateway's own checkout, or
 // the repository a queued task was for, without holding it (the kill switch).
-const place = d => d.repo ?? (d.scope === 'gateway' ? "the gateway's checkout" : (d.details?.queued?.worker ?? null))
+const place = d =>
+  d.repo ?? (d.scope === 'gateway' ? "the gateway's checkout" : (d.details?.queued?.worker ?? d.details?.worker ?? null))
 
 // The event at every start of the controller session: what is open, so that
 // a restarted controller knows it without memory files.
@@ -364,8 +365,16 @@ export function openItems({ ledger, workers = null, store, interrupted = [], now
       'Queued tasks:',
       ...queued.map(entry => {
         const holds = held(entry).map(d => d.id)
+        // How it waits, when not behind the others (workers.mjs).
+        const marks = entry.requeued
+          ? `, resumes ${entry.continues} in its worktree`
+          : entry.after?.length
+            ? `, after ${entry.after.join(', ')}`
+            : entry.parallel
+              ? ', parallel'
+              : ''
         return (
-          `- ${entry.id} for ${entry.worker}, queued ${ago(entry.queuedAt, now)}` +
+          `- ${entry.id} for ${entry.worker}, queued ${ago(entry.queuedAt, now)}${marks}` +
           `${holds.length ? `, held by ${holds.join(', ')}` : ''}: "${preview(entry.task, 100)}"`
         )
       }),
@@ -374,7 +383,7 @@ export function openItems({ ledger, workers = null, store, interrupted = [], now
   if (running.length) {
     lines.push(
       'Runs going:',
-      ...running.map(t => `- ${t.repo} ${t.id}, started ${ago(t.startedAt, now)}: "${preview(t.task, 100)}"`),
+      ...running.map(t => `- ${t.repo} ${t.id}${t.worktree ? ' in a worktree' : ''}, started ${ago(t.startedAt, now)}: "${preview(t.task, 100)}"`),
     )
   }
   if (voice.length) {

@@ -23,6 +23,7 @@ import { lstatSync, readdirSync, realpathSync, rmSync } from 'node:fs'
 import { basename, dirname, isAbsolute, join, normalize, relative, sep } from 'node:path'
 import { ROOT } from './config.mjs'
 import { log as defaultLog, preview } from './log.mjs'
+import { WORKTREES } from './worktrees.mjs'
 
 const CLONE_TIMEOUT_MS = 30 * 60 * 1000
 const PLAN_VALID_MS = 15 * 60 * 1000 // a deletion needs a plan of the same path this recent
@@ -211,12 +212,19 @@ export class FolderTools extends EventEmitter {
     }
     if (inside(target, self) || inside(self, target)) return { status: 'self', path: rel }
     const shown = relative(root, target)
-    const repo = shown.split(sep)[0]
-    const running = this.workers?.running().find(task => task.repo === repo)
-    if (running || this.workers?.starting?.has(repo) || this.cloning.has(repo)) {
-      return { status: 'busy', path: shown, repo, task: running?.id ?? null }
+    // The worktrees of runs (worktrees.mjs) are in .voice-worktrees/<repository>/<id>:
+    // busy while a run of that repository works in one.
+    const parts = shown.split(sep)
+    const inWorktrees = parts[0] === WORKTREES
+    const repo = inWorktrees ? (parts[1] ?? null) : parts[0]
+    const running = this.workers
+      ?.running()
+      .find(task => (inWorktrees ? Boolean(task.worktree) && (!repo || task.repo === repo) : task.repo === repo))
+    if (running || (repo && (this.workers?.starting?.has(repo) || this.cloning.has(repo)))) {
+      return { status: 'busy', path: shown, repo: repo ?? WORKTREES, task: running?.id ?? null }
     }
-    return { status: 'ok', path: shown, target, stat, repo: join(root, repo) }
+    const top = inWorktrees ? parts.slice(0, 3).join(sep) : repo
+    return { status: 'ok', path: shown, target, stat, repo: join(root, top) }
   }
 
   async plan(path) {

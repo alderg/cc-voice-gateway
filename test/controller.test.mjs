@@ -201,7 +201,7 @@ test('controller settings: confined tools run without asking, deny rules, no byp
   // Seen in voice mode: an approval for every write is too much while driving.
   // The gateway's tools, by the name of the server in .mcp.json and as the
   // plugin's server (mcp__plugin_<plugin>_<server>__<tool>).
-  const names = ['reply', 'list_workers', 'dispatch', 'worker_status', 'stop_worker', 'open_items', 'resolve_decision', 'restart_controller', 'raise_alarm', 'clone_repo', 'delete_path']
+  const names = ['reply', 'list_workers', 'dispatch', 'worker_status', 'stop_worker', 'order_queue', 'open_items', 'resolve_decision', 'restart_controller', 'raise_alarm', 'clone_repo', 'delete_path']
   const voiceTools = [...names.map(t => `mcp__voice__${t}`), ...names.map(t => `mcp__plugin_voice_voice__${t}`)]
   assert.deepEqual(permissions.allow, [...voiceTools, 'Bash', 'Write', 'Edit', 'NotebookEdit'])
   assert.equal(permissions.ask, undefined)
@@ -557,7 +557,7 @@ test('confine hook: the gateway\'s tools pass under both names, and a few harmle
   allowed('mcp__plugin_voice_voice__reply', { request_id: 'abcd', state: 'done', text: 'ok' })
   // Exactly the tools the settings let run without asking.
   const voiceTools = SETTINGS.permissions.allow.filter(rule => rule.startsWith('mcp__'))
-  assert.equal(voiceTools.length, 22)
+  assert.equal(voiceTools.length, 24)
   for (const tool of voiceTools) allowed(tool, {})
   // ToolSearch loads deferred tools, the gateway's among them; the others
   // are the session's to-do list.

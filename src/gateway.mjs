@@ -18,7 +18,7 @@
 // And what is open, so that nothing is forgotten: decisions for the driver
 // (ledger.mjs), the queue (workers.mjs), the requests (store.mjs).
 
-import { CONTROLLER_LEVELS, EFFORTS, KILLSWITCH_MODES, ROOT, VERSION, config } from './config.mjs'
+import { CONTROLLER_LEVELS, EFFORTS, KILLSWITCH_MODES, ROOT, VERSION, config, limitValue } from './config.mjs'
 import { log } from './log.mjs'
 import { execFileSync } from 'node:child_process'
 import { Store } from './store.mjs'
@@ -26,7 +26,8 @@ import { Auth } from './oauth.mjs'
 import { startAdmin } from './admin.mjs'
 import { startChannel } from './channel.mjs'
 import { startVoiceHttp } from './voice.mjs'
-import { Workers, gitState, hostGit, parkedText, queueList } from './workers.mjs'
+import { Workers, gitState, hostGit, parkedText, planText, queueList } from './workers.mjs'
+import { SettingsWatcher, othersText } from './live.mjs'
 import { Restarter } from './restart.mjs'
 import { PullWatcher } from './pulls.mjs'
 import { TelegramCommands, TelegramFallback, loadTelegram } from './telegram.mjs'
@@ -102,6 +103,16 @@ if (config.workerModel || config.workerEffort) {
   log(`workers run with model ${config.workerModel || 'default'}, effort ${config.workerEffort || 'default'}`)
 }
 if (config.prDraft) log('workers open their pull requests as drafts (VOICE_GW_PR_DRAFT=1)')
+if (limitValue('VOICE_GW_MAX_WORKERS_PER_REPO', config.maxWorkersPerRepoSetting) === null) {
+  log(`VOICE_GW_MAX_WORKERS_PER_REPO=${config.maxWorkersPerRepoSetting} is no whole number from 1 to 100; 1 instead`)
+}
+// Both limits: every run of a repository counts toward the first. They also
+// change while the gateway runs, with the settings file (live.mjs).
+log(
+  `worker limits: ${config.maxWorkers} runs at a time (VOICE_GW_MAX_WORKERS), ${config.maxWorkersPerRepo} per repository ` +
+    `(VOICE_GW_MAX_WORKERS_PER_REPO)` +
+    (config.maxWorkersPerRepo > 1 ? '; further runs of a repository work in git worktrees of their own' : '; one after the other'),
+)
 const runner = config.docker
   ? new DockerRunner({ container: config.docker, root: config.dockerRepos, dockerBin: config.dockerBin })
   : new HostRunner(config.workerRoot)
@@ -168,6 +179,7 @@ const workers = new Workers({
   effort: EFFORTS.includes(config.workerEffort) ? config.workerEffort : '',
   prDraft: config.prDraft,
   maxRuns: config.maxWorkers,
+  maxPerRepo: config.maxWorkersPerRepo,
   timeoutMinutes: config.workerTimeoutMinutes,
 })
 const guard = new RunGuard({
@@ -211,6 +223,7 @@ const pulls = new PullWatcher({
 let http
 let admin
 let funnel = null
+let settings = null // the watch on the settings file (live.mjs)
 let shuttingDown = false
 function shutdown(reason, code = process.exitCode ?? 0) {
   if (shuttingDown) return
@@ -219,6 +232,7 @@ function shutdown(reason, code = process.exitCode ?? 0) {
   http?.close()
   admin?.close()
   workers.close() // runs go on; the next gateway picks them up
+  settings?.close()
   guard.close()
   telegramCommands?.close()
   funnel?.close()
@@ -300,7 +314,8 @@ workers.on('finished', async task => {
     // trusted="no": the result carries whatever the run read (channel.mjs).
     // git, or files for a work folder: the gateway's look, in its words,
     // without the run's.
-    request.meta = { worker: task.repo, task: task.id, outcome: task.state, ...workers.checkMeta(task), trusted: 'no' } // for sending it again
+    // worktree and requeued for a run in a worktree of its own (workers.mjs).
+    request.meta = { worker: task.repo, task: task.id, outcome: task.state, ...workers.checkMeta(task), ...workers.runMeta(task), trusted: 'no' } // for sending it again
     if (opened.length) request.meta.pull_request = opened.map(pull => pull.number).join(',')
     if (task.queued) request.meta.queued = task.queued // the id it had in the queue
     // What the audit found is an open decision; it belongs to this result.
@@ -512,6 +527,53 @@ http = startVoiceHttp(store, channel, auth, config, { killswitch, onPortBusy: po
 // never answered go to this one, and after a restart by the watchdog the
 // driver hears on Telegram that the controller is ready again.
 let connected = false
+
+// A higher limit of runs per repository than the queue was planned for, at
+// the start or in the settings file while the gateway runs: the controller
+// hears which queued tasks could now run next to others, and marks them
+// with order_queue, without the driver (planText). For the controller only
+// (origin "gateway"); trusted="no", as the tasks may quote a worker.
+let planning = Promise.resolve()
+function sendPlan(why, note = '') {
+  planning = planning.then(() => deliverPlan(why, note)) // one after the other: a plan goes once
+  return planning
+}
+
+async function deliverPlan(why, note) {
+  if (!workers.replan) return
+  try {
+    await channel.ready
+    const plan = workers.replan
+    if (!plan) return
+    const request = store.createRequest(planText(plan, why) + note, { origin: 'gateway' })
+    await channel.push(request, { kind: 'plan', trusted: 'no' })
+    workers.planned()
+  } catch (error) {
+    log('queue plan not delivered:', error.message)
+  }
+}
+
+// The worker limits while the gateway runs (live.mjs): a change in the
+// settings file applies at once. Runs going always run to the end.
+settings = new SettingsWatcher({
+  file: config.settingsFile,
+  limits: { VOICE_GW_MAX_WORKERS: workers.maxRuns, VOICE_GW_MAX_WORKERS_PER_REPO: workers.maxPerRepo },
+}).start()
+settings.on('change', ({ limits, changed, others }) => {
+  if (!Object.keys(changed).length) return
+  const { was, plan } = workers.setLimits({
+    maxRuns: limits.VOICE_GW_MAX_WORKERS,
+    maxPerRepo: limits.VOICE_GW_MAX_WORKERS_PER_REPO,
+  })
+  log(
+    `worker limits from the settings file, at once: ${workers.maxRuns} runs at a time (was ${was.maxRuns}), ` +
+      `${workers.maxPerRepo} per repository (was ${was.maxPerRepo})` +
+      (workers.maxPerRepo < was.maxPerRepo ? '; runs going run to the end, nothing new starts above the limit' : '') +
+      (plan ? '; the controller hears which queued tasks could run next to others' : ''),
+  )
+  if (plan) sendPlan('in the settings file just now, while the gateway runs', othersText(others))
+})
+
 channel.ready.then(async () => {
   connected = true
   try {
@@ -521,6 +583,7 @@ channel.ready.then(async () => {
   } catch (error) {
     log('start-up summary not delivered:', error.message)
   }
+  await sendPlan('since the queue was planned, before this start')
   for (const request of [...store.requests.values()].filter(r => r.resend)) {
     try {
       await channel.push(request, { ...request.meta, resent: 'yes' })

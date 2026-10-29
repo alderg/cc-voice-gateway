@@ -18,6 +18,11 @@ export function readSettings(file) {
   } catch {
     return {}
   }
+  return parseSettings(text)
+}
+
+// The settings in the file's text.
+export function parseSettings(text) {
   const settings = {}
   for (const raw of text.split('\n')) {
     const line = raw.replace(/\r$/, '')

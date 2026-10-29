@@ -121,7 +121,7 @@ function freePort() {
 // pushed: the origin is a bare repository here, and main is pushed to it.
 function repo(name, { origin, dirty = false, pushed = false, dir = join(ROOT, name) } = {}) {
   mkdirSync(dir, { recursive: true })
-  const run = (...args) => execFileSync('git', args, { cwd: dir, stdio: 'ignore' })
+  const run = (...args) => execFileSync('git', args, { cwd: dir, stdio: ['ignore', 'ignore', 'pipe'] })
   run('init', '-q', '-b', 'main')
   writeFileSync(join(dir, 'README.md'), `# ${name}\n`)
   run('add', '.')
@@ -1003,4 +1003,102 @@ test('a run survives a gateway restart and reports to the new gateway; the queue
   assert.match(event.content, /All 12 tests pass/)
   const next = await waitUntil(() => gw.events.find(e => e.meta?.queued === queued))
   assert.match(next.content, /^Task: Afterwards, sum it up\.$/m)
+})
+
+// --- several runs per repository ----------------------------------------------------
+
+// Polls an async look until it gives something.
+async function eventually(look, ms = 12000) {
+  for (const begun = Date.now(); Date.now() - begun < ms; await new Promise(r => setTimeout(r, 200))) {
+    const value = await look()
+    if (value) return value
+  }
+  throw new Error('timed out waiting')
+}
+
+test('several runs per repository: the plan at a start, order_queue, a worktree next to the run, the answer back to its run, the limits live', async () => {
+  repo('eta', { pushed: true })
+  const settingsFile = join(TMP, 'secrets', 'gateway.env')
+  const original = readFileSync(settingsFile, 'utf8')
+  const settings = extra => writeFileSync(settingsFile, original + extra)
+  try {
+    // Planned for one run per repository: one runs, two wait behind it.
+    const slow = await dispatch('eta', 'SLOW: the long one.')
+    const first = queuedId((await dispatch('eta', 'Then update the changelog.')).text)
+    const second = queuedId((await dispatch('eta', 'Then translate the README.')).text)
+    // Two per repository in the settings file, and the gateway starts again.
+    settings('VOICE_GW_MAX_WORKERS_PER_REPO=2\n')
+    await stopGateway()
+    gw = await startGateway()
+    const schema = (await gw.claudeCode.listTools()).tools.find(tool => tool.name === 'dispatch').inputSchema
+    for (const name of ['parallel', 'after', 'continues']) assert.ok(schema.properties[name], name)
+    assert.match(gw.claudeCode.getInstructions(), /parallel=true when the task needs none of their results and works on\s+other files/)
+    const plan = await waitUntil(() => gw.events.find(e => e.meta?.kind === 'plan'))
+    assert.equal(plan.meta.trusted, 'no', 'the tasks may quote a worker')
+    assert.match(plan.content, /^The limit of runs per repository went up from 1 to 2 since the queue was planned, before this start\./)
+    assert.match(plan.content, new RegExp(`^- eta: .*; queued, in their order: ${first} \\("Then update the changelog\\."\\), ${second} \\("Then translate the README\\."\\)$`, 'm'))
+    assert.ok(gw.events.findIndex(e => e.meta?.kind === 'summary') < gw.events.indexOf(plan), 'after the summary')
+    assert.match((await controller('list_workers')).text, /^\[workers=\d+ running=\d queued=\d max=2 per_repo=2\]/)
+    // The controller's own call, without the driver's words.
+    const ordered = await controller('order_queue', { worker: 'eta', id: second, parallel: true })
+    assert.match(ordered.text, new RegExp(`^\\[order=parallel worker=eta queued=${second}\\] Done: it may start next to the other runs and queued tasks of eta as soon as a run slot is free\\.`))
+    assert.equal((await controller('reply', { request_id: plan.meta.request_id, state: 'done', text: 'Marked.' })).isError, false)
+    const translated = await waitUntil(() => gw.events.find(e => e.meta?.queued === second), 12000)
+    const ranIn = calls().find(c => c.input.startsWith('Then translate')).cwd
+    assert.ok([join(ROOT, 'eta'), join(ROOT, '.voice-worktrees', 'eta', translated.meta.task)].includes(ranIn))
+    if (translated.meta.worktree) assert.match(translated.content, /^It ran in a worktree of its own \(.*\), next to the repository's other runs\./m)
+    await workerEvent('eta', slow.id)
+    await waitUntil(() => gw.events.find(e => e.meta?.queued === first), 12000)
+
+    // A dispatch while a run goes: what runs there, and how to let it run next to it.
+    const long = await dispatch('eta', 'SLOW: another long one.')
+    const behind = await dispatch('eta', 'Count the files.')
+    const behindId = queuedId(behind.text)
+    assert.match(
+      behind.text,
+      new RegExp(
+        `reason=busy\\] Queued, because task ${long.id} is running there\\. Running there: ${long.id} \\("SLOW: another long one\\."\\)\\. ` +
+          'It waits behind all of them\\. If it needs none of their results and works on other files, let it run next to them: ' +
+          `order_queue with worker="eta", id="${behindId}" and parallel=true;`,
+      ),
+    )
+    assert.match(behind.text, /In your confirmation, say in a few words whether it runs next to the others or what it waits for, and why\./)
+    const asking = await dispatch('eta', 'QUESTION: which docs?', { parallel: true })
+    assert.match(asking.text, new RegExp(`^\\[dispatch=started worker=eta task=${asking.id} session=new worktree=${asking.id}\\] Started in a git worktree of its own`))
+    assert.match(asking.text, new RegExp(`It runs next to ${long.id} \\("SLOW: another long one\\."\\)\\. In your confirmation, say in a few words that it runs in parallel\\.`))
+    // Its question, and the driver's answer: back to that run, in its worktree and session.
+    const asked = await workerEvent('eta', asking.id)
+    assert.equal(asked.meta.worktree, asking.id)
+    await controller('reply', { request_id: asked.meta.request_id, state: 'question', text: 'Which docs?' })
+    await voiceCall('send', { message: 'The user guide.', in_reply_to: asked.meta.request_id })
+    const follow = await controller('dispatch', { worker: 'eta', task: 'Update the user guide.', words: `(Answer to ${asked.meta.request_id}) The user guide.` })
+    assert.match(follow.text, new RegExp(`worktree=${asking.id}\\] Started in its worktree ${asking.id}, where it continues\\.`))
+    await workerEvent('eta', /task=(t[a-z0-9]{3})/.exec(follow.text)[1])
+    const call = calls().find(c => c.input.startsWith('Update the user guide.'))
+    assert.equal(call.cwd, join(ROOT, '.voice-worktrees', 'eta', asking.id))
+    assert.equal(arg(call, '--resume'), arg(calls().find(c => c.input.startsWith('QUESTION: which docs?')), '--session-id'), 'its session')
+    await waitUntil(() => gw.events.find(e => e.meta?.queued === behindId), 12000)
+
+    // While the gateway runs: three per repository in the file. The
+    // environment's VOICE_GW_MAX_WORKERS wins over the file's.
+    const third = await dispatch('eta', 'SLOW: a third long one.')
+    const tidy = queuedId((await dispatch('eta', 'Then tidy up.')).text)
+    settings('VOICE_GW_MAX_WORKERS_PER_REPO=3\nVOICE_GW_MAX_WORKERS=7\n')
+    const live = await waitUntil(() => gw.events.find(e => e.meta?.kind === 'plan' && /just now/.test(e.content)), 12000)
+    assert.match(live.content, /went up from 2 to 3 in the settings file just now, while the gateway runs\./)
+    assert.match(live.content, new RegExp(`queued, in their order: ${tidy} \\("Then tidy up\\."\\)`))
+    assert.match((await controller('list_workers')).text, /max=2 per_repo=3/, 'the environment wins')
+    await controller('reply', { request_id: live.meta.request_id, state: 'done', text: 'Left as it is.' })
+    // Lowered again: nothing for the controller to do.
+    settings('')
+    await eventually(async () => !/per_repo=/.test((await controller('list_workers')).text.split('\n')[0]))
+    await workerEvent('eta', third.id)
+    await waitUntil(() => gw.events.find(e => e.meta?.queued === tidy), 12000)
+  } finally {
+    writeFileSync(settingsFile, original)
+    await stopGateway()
+    gw = await startGateway()
+    rmSync(join(ROOT, 'eta'), { recursive: true, force: true })
+    rmSync(join(ROOT, '.voice-worktrees'), { recursive: true, force: true })
+  }
 })

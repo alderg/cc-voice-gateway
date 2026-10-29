@@ -162,6 +162,7 @@ test('declares the channel and permission capabilities and the reply tool', asyn
     'dispatch',
     'worker_status',
     'stop_worker',
+    'order_queue',
     'open_items',
     'resolve_decision',
     'restart_controller',

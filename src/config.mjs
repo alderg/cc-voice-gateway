@@ -41,6 +41,19 @@ const num = (value, fallback) => {
   return Number.isFinite(n) && n > 0 ? n : fallback
 }
 
+// The worker limits, which also apply while the gateway runs (live.mjs): how
+// many runs at a time in all, and in one repository. Their defaults, and
+// what a value may be: a whole number from 1 to MAX_LIMIT.
+export const WORKER_LIMITS = { VOICE_GW_MAX_WORKERS: 2, VOICE_GW_MAX_WORKERS_PER_REPO: 1 }
+export const MAX_LIMIT = 100
+
+// A limit's value, or null when it is none (empty means the default).
+export function limitValue(name, value) {
+  if (value === undefined || String(value).trim() === '') return WORKER_LIMITS[name]
+  const text = String(value).trim()
+  return /^\d+$/.test(text) && Number(text) >= 1 && Number(text) <= MAX_LIMIT ? Number(text) : null
+}
+
 export const config = {
   // The HTTP side only ever binds to loopback. The tunnel (Tailscale Funnel)
   // forwards public HTTPS traffic to it.
@@ -110,7 +123,15 @@ export const config = {
   // A dispatch starts a run only with the driver's own words from a voice
   // request of the last this many minutes (channel.mjs).
   dispatchWindowMinutes: num(env.VOICE_GW_DISPATCH_WINDOW, 30),
+  // Runs at a time, in all; every run of a repository counts. The limit that
+  // protects the subscription.
   maxWorkers: num(env.VOICE_GW_MAX_WORKERS, 2),
+  // Runs at a time in one repository: the first in its checkout, every
+  // further one in a git worktree of its own (worktrees.mjs). 1, the default,
+  // is one after the other. Both limits also change while the gateway runs,
+  // with the settings file (live.mjs).
+  maxWorkersPerRepo: limitValue('VOICE_GW_MAX_WORKERS_PER_REPO', env.VOICE_GW_MAX_WORKERS_PER_REPO) ?? 1,
+  maxWorkersPerRepoSetting: env.VOICE_GW_MAX_WORKERS_PER_REPO ?? '',
   // 0: no time limit.
   workerTimeoutMinutes: env.VOICE_GW_WORKER_TIMEOUT?.trim() === '0' ? 0 : num(env.VOICE_GW_WORKER_TIMEOUT, 360),
   claudeBin: env.VOICE_GW_CLAUDE_BIN || 'claude',
