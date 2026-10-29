@@ -10,6 +10,10 @@
 #
 # Funnel accepts the HTTPS ports 443, 8443 and 10000, but Claude's servers only
 # reached 443 in our tests, so that is the default.
+#
+# The tailscale command: VOICE_GW_TAILSCALE_BIN, else tailscale on the PATH
+# (Linux, Homebrew, or the macOS app's "Install CLI"), else the macOS app's
+# own command line.
 
 set -euo pipefail
 
@@ -17,6 +21,15 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 . "$ROOT/scripts/settings.sh"
 PORT="${VOICE_GW_PORT:-8787}"
 FUNNEL_PORT="${FUNNEL_PORT:-443}"
+MAC_APP=/Applications/Tailscale.app/Contents/MacOS/Tailscale
+if [ -n "${VOICE_GW_TAILSCALE_BIN:-}" ]; then
+  TAILSCALE=$VOICE_GW_TAILSCALE_BIN
+elif ! command -v tailscale >/dev/null 2>&1 && [ -x "$MAC_APP" ]; then
+  TAILSCALE=$MAC_APP
+else
+  TAILSCALE=tailscale
+fi
+tailscale() { command "$TAILSCALE" "$@"; }
 
 dns_name() {
   tailscale status --json | node -e '
@@ -43,6 +56,7 @@ case "${1:-start}" in
     if ! out="$(tailscale funnel --bg --https="$FUNNEL_PORT" "http://127.0.0.1:${PORT}" 2>&1)"; then
       echo "$out" >&2
       if grep -q 'Access denied' <<<"$out"; then
+        # Linux; the macOS app runs as your user and needs no operator.
         echo "Run 'sudo tailscale set --operator=\$USER' once, then this works without sudo." >&2
       fi
       exit 1

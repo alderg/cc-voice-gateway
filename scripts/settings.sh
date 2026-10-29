@@ -2,8 +2,13 @@
 # setup assistant writes (src/settings.mjs), as environment variables. A
 # variable that is already set wins. Every line is taken as NAME=value and
 # never executed; anything but VOICE_GW_ names is skipped.
+#
+# For bash 3.2 too, the /bin/bash of macOS: no mapfile, no associative arrays,
+# and every empty array expanded with the ${a[@]+...} guard for set -u.
 settings_from_file=() # the names load_settings set, for reload_settings and the log
-mapfile -t settings_outside < <(compgen -e -X '!VOICE_GW_*') # set before the first load: these win
+settings_outside=()   # set before the first load: these win
+for _name in $(compgen -e -X '!VOICE_GW_*'); do settings_outside+=("$_name"); done
+unset _name
 load_settings() {
   local line name
   settings_path=${VOICE_GW_SECRETS_DIR:-$ROOT/.secrets}/gateway.env

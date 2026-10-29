@@ -57,7 +57,8 @@ fi
 cd "$clean"
 [[ $branch != -* ]] && git check-ref-format "refs/heads/$branch" || fail "not a branch name: $branch"
 
-tmp=$(mktemp -d "${TMPDIR:-/tmp}/voice-bundle.XXXXXX")
+tmp=${TMPDIR:-/tmp}
+tmp=$(mktemp -d "${tmp%/}/voice-bundle.XXXXXX") # GNU and BSD mktemp; macOS's TMPDIR ends with a slash
 trap 'rm -rf "${tmp:?}"' EXIT
 bundle=$tmp/branch.bundle
 

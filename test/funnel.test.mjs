@@ -1,10 +1,12 @@
 // The Tailscale Funnel on demand (src/funnel.mjs): /funnel on, off and status
 // from Telegram, with an answer to each, an answer to a command that came too
 // late, and the Funnel off by itself after the idle time. A small script plays
-// scripts/funnel.sh, a local server the Telegram Bot API.
+// scripts/funnel.sh, a local server the Telegram Bot API; scripts/funnel.sh
+// itself runs with a stand-in for tailscale.
 
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { createServer as createNetServer } from 'node:net'
@@ -246,6 +248,42 @@ test('auto-off: after the idle time without a voice call, with a message how to 
   } finally {
     funnel.close()
   }
+})
+
+// --- scripts/funnel.sh ----------------------------------------------------------------
+
+test('scripts/funnel.sh: state and url from tailscale\'s JSON, with the tailscale of VOICE_GW_TAILSCALE_BIN', () => {
+  const dir = join(TMP, 'tailscale')
+  mkdirSync(dir, { recursive: true })
+  const fake = join(dir, 'Tailscale') // as the macOS app's command line is called
+  writeFileSync(fake, `#!/bin/sh\necho "$*" >> "${dir}/calls"\ncase "$1" in status) cat "${dir}/status.json" ;; funnel) cat "${dir}/funnel.json" ;; esac\n`)
+  chmodSync(fake, 0o755)
+  writeFileSync(join(dir, 'status.json'), JSON.stringify({ Self: { DNSName: 'sky.tail1234.ts.net.' } }))
+  const serve = proxy => ({
+    AllowFunnel: { 'sky.tail1234.ts.net:443': true },
+    Web: { 'sky.tail1234.ts.net:443': { Handlers: { '/': { Proxy: proxy } } } },
+  })
+  const funnel = command =>
+    spawnSync('bash', [fileURLToPath(new URL('../scripts/funnel.sh', import.meta.url)), command], {
+      encoding: 'utf8',
+      env: { ...process.env, VOICE_GW_TAILSCALE_BIN: fake, VOICE_GW_SECRETS_DIR: join(dir, 'no-secrets'), VOICE_GW_PORT: '8787' },
+    })
+  writeFileSync(join(dir, 'funnel.json'), JSON.stringify(serve('http://127.0.0.1:8787')))
+  assert.equal(funnel('state').stdout, 'on\n')
+  writeFileSync(join(dir, 'funnel.json'), JSON.stringify(serve('http://127.0.0.1:9999')))
+  assert.equal(funnel('state').stdout, 'off\n', 'another port is not the gateway')
+  writeFileSync(join(dir, 'funnel.json'), '{}')
+  assert.equal(funnel('state').stdout, 'off\n')
+  const url = funnel('url')
+  assert.equal(url.status, 0, url.stderr)
+  assert.equal(url.stdout, 'https://sky.tail1234.ts.net/mcp\n')
+  assert.deepEqual(readFileSync(join(dir, 'calls'), 'utf8').trim().split('\n'), [
+    'funnel status --json',
+    'funnel status --json',
+    'funnel status --json',
+    'status --json',
+  ])
+  assert.equal(funnel('nonsense').status, 2)
 })
 
 // --- through the gateway ------------------------------------------------------------

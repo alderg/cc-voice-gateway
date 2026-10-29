@@ -61,6 +61,11 @@
 #
 # For an always-on setup run it inside tmux:
 #   tmux new -s voice scripts/start-controller.sh
+#
+# Linux and macOS. It runs with bash 3.2, the /bin/bash of macOS, and with the
+# BSD tools there; on macOS it keeps the Mac from idle sleep (caffeinate) while
+# it runs. The autostart the setup assistant writes is a systemd user service
+# on Linux and a LaunchAgent on macOS; both start it in tmux.
 
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd -P)
@@ -109,10 +114,13 @@ log() {
 
 # Who started or stopped this script, for the log: the autostart's service, or
 # the user, process and terminal it came from. The service's own processes
-# only: its ExecStart's tmux, or systemd for ExecStop; the session and workers
-# below it inherit its INVOCATION_ID too.
+# only. On Linux the systemd user service: its ExecStart's tmux, or systemd
+# for ExecStop; the session and workers below it inherit its INVOCATION_ID
+# too. On macOS the LaunchAgent, whose tmux starts this script: launchd names
+# its job in XPC_SERVICE_NAME, which the processes below inherit as well, and
+# it has no stop command, so a stop never comes from it.
 invoker() {
-  local unit=cc-voice-gateway.service parent tty
+  local unit=cc-voice-gateway.service agent=com.drawio.cc-voice-gateway parent tty
   if [ -n "${INVOCATION_ID:-}" ] &&
     [ "$(systemctl --user show -p InvocationID --value "$unit" 2>/dev/null)" = "$INVOCATION_ID" ] &&
     { [ "$(systemctl --user show -p MainPID --value "$unit" 2>/dev/null)" = "$PPID" ] ||
@@ -121,8 +129,12 @@ invoker() {
     return
   fi
   parent=$(ps -o args= -p "$PPID" 2>/dev/null | cut -c1-80 || true)
+  if [ "${1:-}" != stop ] && [ "${XPC_SERVICE_NAME:-}" = "$agent" ] && [[ $parent == *tmux* ]]; then
+    echo "the LaunchAgent $agent"
+    return
+  fi
   tty=$(ps -o tty= -p $$ 2>/dev/null | tr -d ' ' || true)
-  [ "$tty" != '?' ] || tty=
+  case $tty in '?' | '??' | -) tty= ;; esac # no terminal: ? on Linux, ?? on macOS
   echo "$(id -un) from ${parent:-process $PPID}${tty:+ on $tty}"
 }
 
@@ -185,7 +197,7 @@ if [ "${1:-}" = --status ] || [ "${1:-}" = --stop ]; then
     echo "start-controller: running (watchdog $pid, session ${session:-starting})"
     exit 0
   fi
-  by=$(invoker)
+  by=$(invoker stop)
   log "stop requested by $by"
   echo "$by" >"$STOP"
   [ -n "$session" ] && kill -TERM "$session" 2>/dev/null || true
@@ -311,6 +323,15 @@ monitor_pid=
 stopping=0
 trap 'stopping=1' INT TERM HUP
 trap '[ -n "$monitor_pid" ] && kill "$monitor_pid" 2>/dev/null; release_lock' EXIT
+
+# On macOS, a Mac asleep does not answer the car: no idle sleep while the
+# watchdog runs (caffeinate ends with it, -s only on power). A closed laptop
+# lid without an external display still sends it to sleep.
+# VOICE_GW_CAFFEINATE=0 leaves sleep to the energy settings.
+if [ "${VOICE_GW_CAFFEINATE:-1}" != 0 ] && [ "$(uname -s 2>/dev/null)" = Darwin ] && command -v caffeinate >/dev/null 2>&1; then
+  caffeinate -i -s -w $$ </dev/null >/dev/null 2>&1 &
+  log "caffeinate: this Mac does not go to sleep by itself while the watchdog runs (VOICE_GW_CAFFEINATE=0 turns it off)"
+fi
 
 restarts=() # times of the restarts within the window
 pause_ms=$backoff_ms

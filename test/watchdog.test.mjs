@@ -10,10 +10,10 @@
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const SCRIPT = fileURLToPath(new URL('../scripts/start-controller.sh', import.meta.url))
@@ -106,7 +106,8 @@ function setup(plan, { secrets = true, env = {} } = {}) {
         : [],
     env: {
       // Not the settings of a gateway that runs this test, from its own environment.
-      ...Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith('VOICE_GW_') && name !== 'INVOCATION_ID')),
+      // Nor the autostart's marks (systemd's INVOCATION_ID, launchd's job name).
+      ...Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith('VOICE_GW_') && !['INVOCATION_ID', 'XPC_SERVICE_NAME'].includes(name))),
       PATH: `${BIN}:${process.env.PATH}`,
       VOICE_GW_STATE_DIR: join(dir, 'state'),
       VOICE_GW_LOG_FILE: log,
@@ -315,6 +316,64 @@ test('VOICE_GW_WATCHDOG=0 starts claude directly, as before', async () => {
   assert.equal(out.status, 3, 'no restart, the exit code passes through')
   assert.equal(c.starts().length, 1)
   assert.ok(!existsSync(join(c.dir, 'state')), 'no lock')
+})
+
+// --- macOS ------------------------------------------------------------------------
+
+// Commands that play macOS here: uname says what to, caffeinate notes how it
+// was called.
+function macBin(name, system) {
+  const dir = join(TMP, name)
+  mkdirSync(dir, { recursive: true })
+  writeFileSync(join(dir, 'uname'), `#!/bin/sh\necho ${system}\n`)
+  writeFileSync(join(dir, 'caffeinate'), `#!/bin/sh\necho "$*" >> "${join(dir, 'caffeinate.log')}"\n`)
+  chmodSync(join(dir, 'uname'), 0o755)
+  chmodSync(join(dir, 'caffeinate'), 0o755)
+  const calls = () => (existsSync(join(dir, 'caffeinate.log')) ? readFileSync(join(dir, 'caffeinate.log'), 'utf8').trim().split('\n') : [])
+  return { path: `${dir}:${BIN}:${process.env.PATH}`, calls }
+}
+
+test('macOS: no idle sleep while the watchdog runs (caffeinate), unless VOICE_GW_CAFFEINATE=0; not on Linux', async () => {
+  const mac = macBin('darwin-bin', 'Darwin')
+  const c = setup([{ exit: 0 }], { env: { PATH: mac.path } })
+  assert.equal((await run(c)).status, 0)
+  const watchdog = /watchdog: starting the controller session \(watchdog (\d+),/.exec(c.log())?.[1]
+  assert.deepEqual(mac.calls(), [`-i -s -w ${watchdog}`], 'until the watchdog ends')
+  assert.match(c.log(), /watchdog: caffeinate: this Mac does not go to sleep by itself while the watchdog runs \(VOICE_GW_CAFFEINATE=0 turns it off\)/)
+
+  const off = setup([{ exit: 0 }], { env: { PATH: mac.path, VOICE_GW_CAFFEINATE: '0' } })
+  assert.equal((await run(off)).status, 0)
+  assert.equal(mac.calls().length, 1, 'turned off')
+  assert.doesNotMatch(off.log(), /caffeinate/)
+
+  const linux = macBin('linux-bin', 'Linux')
+  const l = setup([{ exit: 0 }], { env: { PATH: linux.path } })
+  assert.equal((await run(l)).status, 0)
+  assert.deepEqual(linux.calls(), [])
+  assert.doesNotMatch(l.log(), /caffeinate/)
+})
+
+test('macOS: started by the LaunchAgent\'s tmux, the log says so; a stop never comes from it', async () => {
+  const user = process.env.USER ?? process.env.LOGNAME
+  const agent = { XPC_SERVICE_NAME: 'com.drawio.cc-voice-gateway' } // launchd names its job so
+  // launchd's tmux runs the script: here a bash called tmux, which stays its parent.
+  const tmux = join(TMP, 'tmux-bin', 'tmux')
+  mkdirSync(dirname(tmux), { recursive: true })
+  symlinkSync(['/bin/bash', '/usr/bin/bash', '/usr/local/bin/bash'].find(existsSync), tmux)
+  const viaTmux = (c, args = '') => spawn(tmux, ['-c', `"$0"${args}; exit $?`, SCRIPT], { env: c.env, stdio: 'ignore' })
+
+  const c = setup([{ run: true }, { exit: 0 }], { env: agent })
+  const done = exited(viaTmux(c))
+  await waitUntil(() => existsSync(join(c.dir, 'state', 'controller.lock', 'claude.pid')))
+  assert.equal(await exited(viaTmux(c, ' --stop')), 0)
+  assert.equal(await done, 0)
+  assert.match(c.log(), /watchdog: starting the controller session \(watchdog \d+, started by the LaunchAgent com\.drawio\.cc-voice-gateway\)/)
+  assert.match(c.log(), new RegExp(`watchdog: stop requested by ${user} from \\S*tmux`), 'launchd has no stop command')
+
+  // Its name alone, as in any shell below that tmux, is not the LaunchAgent.
+  const d = setup([{ exit: 0 }], { env: agent })
+  assert.equal((await run(d)).status, 0)
+  assert.match(d.log(), new RegExp(`started by ${user} from \\S*node`))
 })
 
 // --- the Telegram message ---------------------------------------------------------
