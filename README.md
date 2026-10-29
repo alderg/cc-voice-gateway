@@ -1403,6 +1403,25 @@ at most three short sentences, without code, paths or lists.
 | "Emergency stop!" | The kill switch locks before anything reaches the controller ([5.9](#59-the-kill-switch)) |
 | "Restart the controller." | Restart through the watchdog after your yes ([8.3](#83-restarting-the-controller-by-voice)) |
 
+**Work folders by voice**, once they are turned on ([work folders](#work-folders)), for a task
+that needs no repository:
+
+- **Start one** by saying the task without naming a repository: "Rechne mir die Fahrtkosten nach
+  Basel aus." or "Draft a reply to the landlord." The controller sends what needs no repository to
+  a new work folder and tells you it is on its way. To be sure, say so: "In a new work folder:
+  compare the three phone plans." or "Neuer Arbeitsordner: …". At `unrestricted` that is how you
+  get a run instead of the controller answering itself.
+- **Follow up** in the same conversation: "Make it shorter." or "Und jetzt als Tabelle." continues
+  in the same folder and Claude session. Later, name its topic, "the folder with the travel costs":
+  the controller looks among the last work folders with `worker_status`. Something new, or "a new
+  work folder", gets a folder of its own.
+- **While it runs:** "What is the work folder doing?" and "Stop the work folder." work as for a
+  repository. When every run slot is taken, it waits in the queue.
+- **The result** comes as news: what the files hold, not where. At the desk they are in
+  `~/voice-scratch/<date>-<id>` (`VOICE_GW_SCRATCH_ROOT`), for seven days after the last run
+  (`VOICE_GW_SCRATCH_DAYS`); copy out what you want to keep. There is no git, so no branch, no pull
+  request and no question about pushing.
+
 **Your words.** The controller passes your words with every dispatch. If they are not from a voice
 request of the last `VOICE_GW_DISPATCH_WINDOW` minutes, the gateway starts nothing and the
 controller asks you first ([5.4](#54-approvals-by-voice)). When a worker result or a review asks
