@@ -17,6 +17,7 @@ import { dirname, join, resolve } from 'node:path'
 import { createInterface } from 'node:readline/promises'
 import { fileURLToPath } from 'node:url'
 import { adminRequest } from '../src/admin.mjs'
+import { config } from '../src/config.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const secrets = process.env.VOICE_GW_SECRETS_DIR || join(ROOT, '.secrets')
@@ -64,4 +65,7 @@ try {
   rmSync(file, { force: true })
   console.log('Unlocked. The gateway was not running; it starts unlocked.')
 }
-console.log('A worker container stays stopped: start it again with scripts/start-workers-container.sh.')
+// The lock stops the worker container; without one, there is nothing to start.
+if (config.docker) {
+  console.log(`The worker container ${config.docker} stays stopped: start it again with scripts/start-workers-container.sh.`)
+}
