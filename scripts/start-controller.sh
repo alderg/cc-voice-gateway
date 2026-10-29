@@ -79,6 +79,7 @@
 #   scripts/start-controller.sh --status           is it running? With the gateway:
 #                                                  its process, how long, its port
 #   VOICE_GW_WATCHDOG=0 scripts/start-controller.sh   without the watchdog
+#   --announce-restart <reason>, --processes      for scripts/restart-everything.sh
 #
 # For an always-on setup run it inside tmux:
 #   tmux new -s voice scripts/start-controller.sh
@@ -363,6 +364,50 @@ release_lock() {
   if [ "$(cat "$LOCK/pid" 2>/dev/null || true)" = $$ ]; then rm -rf "${LOCK:?}"; fi
   rm -f "$STOP"
 }
+
+# --- for scripts/restart-everything.sh ------------------------------------------
+
+# --announce-restart <reason>: a restart on purpose begins that is no restart
+# of the service and none by voice. The note for the watchdogs, as --stop
+# leaves it for a restart of the service: the stopping one sends the shutdown
+# message "for the restart", the next one's gateway the ready message with
+# the reason. And "a restart was requested" on Telegram, with what the start
+# may wait for at the terminal.
+if [ "${1:-}" = --announce-restart ]; then
+  reason=${2:-a restart}
+  (umask 077 && mkdir -p "$STATE")
+  printf '%s %s\n' "$(date +%s)" "$reason" >"$RESTARTING"
+  log "$reason was requested by $(invoker stop)"
+  case $(node "$ROOT/scripts/channel-mode.mjs" 2>/dev/null || echo development) in
+    plugin*) announce_restart "$reason was requested" plugin ;;
+    *) announce_restart "$reason was requested" development ;;
+  esac
+  exit 0
+fi
+
+# --processes: what of this checkout runs, one per line: "watchdog <pid>" and
+# "session <pid>" from the lock, while they run; "lock stale" for a lock no
+# watchdog holds; "gateway <pid> <ppid> <script>" (gateway_processes); "port
+# <port> answers" or "port <port> silent"; "listener <pid>" for each process
+# listening on the port (lsof, or ss on Linux), whoever it is.
+if [ "${1:-}" = --processes ]; then
+  pid=$(running_pid)
+  [ -n "$pid" ] && echo "watchdog $pid"
+  session=$(cat "$LOCK/claude.pid" 2>/dev/null || true)
+  if [ -n "$session" ] && kill -0 "$session" 2>/dev/null && ps -p "$session" -o args= 2>/dev/null | grep -q claude; then
+    echo "session $session"
+  fi
+  [ -d "$LOCK" ] && [ -z "$pid" ] && echo "lock stale"
+  gateway_processes | while read -r gpid gppid _ script; do echo "gateway $gpid $gppid $script"; done
+  gateway_port
+  if healthy; then echo "port $port answers"; else echo "port $port silent"; fi
+  if command -v lsof >/dev/null 2>&1; then
+    { lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null || true; } | sort -u | sed 's/^/listener /'
+  elif command -v ss >/dev/null 2>&1; then
+    { ss -ltnpH "sport = :$port" 2>/dev/null || true; } | grep -o 'pid=[0-9]*' | sort -u | sed 's/^pid=/listener /'
+  fi
+  exit 0
+fi
 
 # --- --stop and --status ----------------------------------------------------
 

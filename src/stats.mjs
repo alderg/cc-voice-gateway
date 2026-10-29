@@ -65,7 +65,7 @@ export function emptyPeriod(since = 0) {
     since,
     upMs: 0,
     starts: 0,
-    restarts: { crash: 0, requested: 0, service: 0 }, // what each start came after
+    restarts: { crash: 0, requested: 0, service: 0, everything: 0 }, // what each start came after
     voice: { requests: 0, conversations: 0, questions: 0, answers: 0, answerMs: [], maxAnswerMs: 0, approvals: 0, allowed: 0, denied: 0 },
     decisions: { raised: 0, byGateway: 0, kinds: map(), closed: 0, closeMs: [], closedBy: map() },
     runs: {
@@ -184,6 +184,7 @@ function restartKind(reason) {
   if (!reason) return null
   if (/^a crash\b/.test(reason)) return 'crash'
   if (/^a restart of the service\b/.test(reason)) return 'service'
+  if (/^a restart of everything\b/.test(reason)) return 'everything' // scripts/restart-everything.sh
   if (/^a restart requested\b/.test(reason)) return 'requested'
   return null
 }
@@ -670,6 +671,7 @@ export function detailsLines(p, { allTime = false, total = null } = {}) {
     t.restarts.crash && `${t.restarts.crash} after a crash`,
     t.restarts.requested && `${t.restarts.requested} after a restart by voice`,
     t.restarts.service && `${t.restarts.service} after a restart of the service`,
+    t.restarts.everything && `${t.restarts.everything} after a restart of everything`,
   ].filter(Boolean)
   const starts = `${plural(t.starts, 'start')} since ${day(t.since)}${after.length ? `, of them ${listed(after)}` : ''}`
   lines.push(allTime ? `Running: ${span(p.upMs)} in all; ${starts}.` : `Running: ${span(p.upMs)}, since ${when(p.since)}; ${starts}.`)

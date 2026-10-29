@@ -1374,6 +1374,12 @@ first start after saving may still use the development flag; the one after it us
 
 ## 8. Operation
 
+> [!TIP]
+> **If anything stops working: run `scripts/restart-everything.sh`.** Nothing to check first,
+> no questions: it stops everything of this gateway, ends what is left of it, starts it again
+> and waits until the gateway answers, saying each step in a line
+> ([details](#restarting-everything)).
+
 ### 8.1 Starting and stopping
 
 ```bash
@@ -1448,6 +1454,44 @@ the gateway lives and ends with the session. Do not drop the user settings with
 `--setting-sources`: Claude Code then reports channels as not enabled for the organisation. Your
 plugins, hooks and allow rules therefore load into the controller; the confine hook blocks every
 tool that is not on its list ([confinement](#53-the-controllers-confinement)).
+
+#### Restarting everything
+
+`scripts/restart-everything.sh` is for when something no longer works and you do not want to find
+out what first. It asks nothing, and works the same with the autostart and without it:
+
+1. **What runs.** `--status`, then each worker run going and what the restart does to it, and the
+   queued tasks, which stay queued.
+2. **"A restart was requested"** on Telegram, as for every restart on purpose; the stopping
+   watchdog then sends the shutdown message with the statistics, and the next gateway the ready
+   message ([8.2](#82-the-watchdog)). No other messages.
+3. **Down.** The systemd user service (`systemctl --user stop`), or on macOS, where the LaunchAgent
+   has no stop of its own, and in tmux, the watchdog with `start-controller.sh --stop`.
+4. **What is left, of this checkout only:** the watchdog and the controller session that its lock
+   names, gateway processes of this checkout (by the resolved path of `src/plugin.mjs` or
+   `src/gateway.mjs`), each with SIGTERM and after five seconds SIGKILL, and a lock no watchdog
+   holds. A process on the gateway's port that is not this gateway is named, not touched. Other
+   Claude Code sessions, other projects and whatever it cannot attribute to this checkout stay as
+   they are.
+5. **The containers,** with workers in Docker or work folders in a container of their own: started
+   with `scripts/start-workers-container.sh` only when one does not run, and not while the kill
+   switch is locked. A running one is left as it is.
+6. **Up.** The service, the LaunchAgent (`launchctl kickstart`, or `bootstrap` when it is not
+   loaded), or a new tmux session `voice` (a new window in it, if a session of that name stays).
+7. **Until it runs:** `--status` once a second, until the watchdog runs and the gateway's port
+   answers, at most `VOICE_GW_RESTART_WAIT` seconds (120). It ends with that status, or with what
+   still fails and where to look: `journalctl --user -u cc-voice-gateway`, the LaunchAgent's log,
+   `tmux attach -t voice`, the gateway's log; with the development flag, the warning waits for
+   Enter at the terminal.
+
+**Worker runs.** On Linux the service's stop ends the runs on this computer with it, as they are
+its processes (`KillMode` control-group, systemd's default), as every `systemctl --user restart`
+does. After the start the gateway sends a run in a worktree back to the queue, where it resumes,
+and reports a run in a repository's checkout as failed; that one is not queued again. Under tmux
+and the LaunchAgent, and in a container, runs keep going, and the new gateway follows them. Run
+from inside the service, a window of its tmux session for example, the script first moves itself
+out with `systemd-run --user --scope`, or the stop would end it too. Its lines go to the gateway's
+log as well, as `restart-everything:`.
 
 #### Remote Control from the Claude app
 
@@ -1536,6 +1580,7 @@ the controller is ready again. A crash keeps its single message, then the ready 
 | A crash, or a gateway that stopped answering | "the controller session crashed (exit code 1) and starts again in 5 s, without a confirmation. A message follows when it is ready." | – | "the controller is ready again, after a crash (exit code 1)." |
 | By voice, `restart_controller` ([8.3](#83-restarting-the-controller-by-voice)) | "a restart was requested by voice; the controller restarts now. A message follows when it is ready." | "the gateway is shutting down now for the restart. Its statistics: …" | "… after a restart requested by voice." |
 | The autostart's service, `systemctl --user restart cc-voice-gateway` | "a restart of the service cc-voice-gateway.service was requested; the controller restarts now. …" | the same | "… after a restart of the service cc-voice-gateway.service." |
+| `scripts/restart-everything.sh` ([8.1](#restarting-everything)) | "a restart of everything (scripts/restart-everything.sh) was requested; the controller restarts now. …" | the same | "… after a restart of everything (scripts/restart-everything.sh)." |
 | A stop: `--stop`, `systemctl --user stop`, quitting the session | – | "the gateway is shutting down now (stopped at the computer). Its statistics: …", or "(the service cc-voice-gateway.service was stopped)", "(the controller session was ended at the terminal)" | – |
 
 Each starts with "cc-voice-gateway on <host>:". The second comes from the watchdog, from the file
@@ -2047,6 +2092,7 @@ docker/              Dockerfile, voice-run, voice-stop, git-credential-voice
 scripts/
   setup.mjs                    the setup assistant
   start-controller.sh          controller with its channel, under the watchdog
+  restart-everything.sh        everything of this gateway down and up again, for when something no longer works
   channel-mode.mjs             plugin or development flag
   controller-settings.mjs      the session's --settings for its level
   chrome-onboarding.mjs        Claude in Chrome's notice for the first start, marked as seen

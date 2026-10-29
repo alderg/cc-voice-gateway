@@ -319,7 +319,7 @@ test('the file: all time across a restart and a crash, this running time from ze
   assert.equal(current.runs.ended, 0)
   assert.equal(current.starts, 1)
   assert.deepEqual([total.starts, total.runs.ended, total.runs.done, total.runs.failed], [3, 2, 1, 1])
-  assert.deepEqual(total.restarts, { crash: 1, requested: 1, service: 0 })
+  assert.deepEqual(total.restarts, { crash: 1, requested: 1, service: 0, everything: 0 })
   assert.equal(total.upMs, 3 * HOUR, 'two hours, then one until the crash, then this start')
   assert.deepEqual(Object.keys(total.repos).sort(), ['alpha', 'beta'])
   assert.equal(total.since, Date.UTC(2026, 9, 29, 8, 0), 'since the first start')

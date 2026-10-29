@@ -15,6 +15,7 @@ import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
+import { createServer as createTcpServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -334,6 +335,202 @@ test("--status shows the gateway: the session's child, how long it runs, whether
     await stopAll(c, script)
     leftover.kill()
     other.kill()
+  }
+})
+
+// --- scripts/restart-everything.sh ------------------------------------------------
+
+// Stand-ins for tmux, systemctl, systemd-run, launchctl and uname, first on
+// the PATH: no test reaches the real service, LaunchAgent or tmux session.
+// They note how they were called; tmux, systemctl start and launchctl
+// kickstart start the start script in the background, as the real ones do.
+function restartBin(c, { service = false, mac = false } = {}) {
+  const dir = join(c.dir, 'restart-bin')
+  mkdirSync(dir, { recursive: true })
+  const calls = join(c.dir, 'calls.log')
+  const script = (name, body) => {
+    writeFileSync(join(dir, name), `#!/bin/sh\necho "${name} $*" >> "${calls}"\n${body}\n`)
+    chmodSync(join(dir, name), 0o755)
+  }
+  const background = '( "$START" </dev/null >/dev/null 2>&1 & )'
+  script('tmux', `case "$1" in
+  has-session) exit 1 ;;
+  new-session) ${background} ;;
+esac`)
+  script('systemd-run', 'echo "systemd-run is not for tests" >&2; exit 1')
+  script('systemctl', service
+    ? `state="${c.dir}/service"
+case "$*" in
+  *LoadState*) echo loaded ;;
+  *KillMode*) echo control-group ;;
+  *is-active*) cat "$state" 2>/dev/null || echo inactive ;;
+  *InvocationID*) echo test-invocation ;;
+  *MainPID*) echo "\${FAKE_MAIN_PID:-0}" ;;
+  *list-jobs*) [ -f "$state.job" ] && echo "4711 cc-voice-gateway.service $(cat "$state.job") running" ;;
+  *" stop "*) echo stop > "$state.job"; FAKE_MAIN_PID=$$ INVOCATION_ID=test-invocation "$START" --stop >/dev/null 2>&1; rm -f "$state.job"; echo inactive > "$state" ;;
+  *" start "*) echo active > "$state"; ${background} ;;
+esac
+exit 0`
+    : 'case "$*" in *LoadState*) echo not-found ;; esac\nexit 0')
+  if (mac) {
+    script('uname', 'echo Darwin')
+    script('launchctl', `case "$1" in
+  print) exit 0 ;;
+  kickstart) ${background} ;;
+esac`)
+  }
+  return { path: `${dir}:${c.env.PATH}`, calls: () => (existsSync(calls) ? readFileSync(calls, 'utf8') : '') }
+}
+
+const RESTART_REASON = 'a restart of everything (scripts/restart-everything.sh)'
+
+// A case for the emergency script: a checkout of its own, a watchdog running
+// there, and the stand-ins.
+async function emergency(plan, { service = false, mac = false, wait = '20', gateway = true } = {}) {
+  const root = ownCheckout()
+  const start = join(root, 'scripts', 'start-controller.sh')
+  const port = await freePort()
+  const c = setup(plan, { env: { VOICE_GW_PORT: String(port), FAKE_ROOT: root, START: start, VOICE_GW_RESTART_WAIT: wait, VOICE_GW_RESTART_MOVED: '1' } })
+  const bin = restartBin(c, { service, mac })
+  c.env.PATH = bin.path
+  if (mac) {
+    c.env.HOME = join(c.dir, 'home')
+    mkdirSync(join(c.env.HOME, 'Library', 'LaunchAgents'), { recursive: true })
+    writeFileSync(join(c.env.HOME, 'Library', 'LaunchAgents', 'com.drawio.cc-voice-gateway.plist'), '<plist/>')
+  }
+  if (service) writeFileSync(join(c.dir, 'service'), 'active\n')
+  return { c, root, start, port, bin, script: join(root, 'scripts', 'restart-everything.sh'), gateway }
+}
+
+async function running(e) {
+  const first = spawn(e.start, [], { env: e.c.env, stdio: 'ignore' })
+  await waitUntil(() => existsSync(join(e.c.dir, 'state', 'controller.lock', 'claude.pid')))
+  return first
+}
+
+test('restart-everything under tmux: says what it stops, ends what is left of this checkout only, starts again, and waits until the gateway answers', async () => {
+  const e = await emergency([{ run: true, stats: true }, { gateway: true }])
+  const { c } = e
+  const forever = 'setInterval(() => {}, 1000)'
+  const before = telegram.messages.length
+  await running(e)
+  // Worker runs on this computer keep running under tmux.
+  writeFileSync(join(c.dir, 'state', 'workers.json'), JSON.stringify({
+    tasks: [{ id: 't1aa', repo: 'alpha', kind: 'repo', state: 'running', startedAt: Date.now() - 5 * 60000, container: null }],
+    queue: [{ id: 'q1bb', worker: 'alpha' }],
+  }))
+  const leftover = spawn(process.execPath, ['-e', forever, join(e.root, 'src', 'plugin.mjs')], { stdio: 'ignore' })
+  const other = spawn(process.execPath, ['-e', forever, join(ROOT, 'src', 'plugin.mjs')], { stdio: 'ignore' })
+  try {
+    const out = await runCommand(e.script, [], c.env)
+    assert.equal(out.status, 0, out.stdout + out.stderr)
+    const lines = out.stdout.trim().split('\n')
+    assert.match(lines[0], new RegExp(`^restarting everything of the gateway in ${e.root.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}, started by `))
+    assert.ok(lines.includes('no autostart: the controller runs in the tmux session "voice"'), out.stdout)
+    assert.match(out.stdout, /^before: running \(watchdog \d+, session \d+\)$/m)
+    assert.match(out.stdout, /^worker run t1aa in alpha, running for 5 min: it keeps running; the gateway after the start follows it$/m)
+    assert.match(out.stdout, /^1 queued task: it stays queued and starts by itself after the start$/m)
+    assert.ok(lines.includes('stopped the watchdog and the controller session'), out.stdout)
+    assert.ok(lines.includes(`ending a gateway of this checkout left over (src/plugin.mjs) (process ${leftover.pid})`), out.stdout)
+    assert.ok(lines.includes('starting the controller in the tmux session "voice"'), out.stdout)
+    assert.match(out.stdout, /^now: running \(watchdog \d+, session \d+\)$/m)
+    assert.match(out.stdout, new RegExp(`^now: gateway process \\d+ \\(src/plugin\\.mjs\\), running for less than a minute; port ${e.port} answers$`, 'm'))
+    assert.equal(lines.at(-1), 'everything runs again')
+    assert.equal(other.exitCode, null, "another checkout's process is not touched")
+    await waitUntil(() => leftover.exitCode !== null || leftover.signalCode !== null)
+    assert.match(e.bin.calls(), /^tmux new-session -d -s voice .*start-controller\.sh$/m)
+    assert.doesNotMatch(e.bin.calls(), /^systemd-run/m)
+    // The restart's messages, no others: requested, then the statistics; the
+    // next gateway says that it is ready, with the reason the next watchdog found.
+    const sent = texts(before, c)
+    assert.equal(sent.length, 2, sent.join('\n---\n'))
+    assert.match(sent[0], new RegExp(`^${RESTART_REASON.replace(/[()]/g, '\\$&')} was requested; the controller restarts now\\.`))
+    assert.match(sent[1], /^the gateway is shutting down now for the restart\. Its statistics:/)
+    assert.equal(c.starts().at(-1).restarted, RESTART_REASON)
+    assert.match(c.log(), /restart-everything: restarting everything of the gateway/)
+    assert.match(c.log(), /restart-everything: everything runs again/)
+  } finally {
+    await stopAll(c, e.start)
+    leftover.kill()
+    other.kill()
+  }
+})
+
+test('restart-everything with the systemd service: worker runs end with its stop, and what happens to each; stop, then start', async () => {
+  const e = await emergency([{ run: true, stats: true }, { gateway: true }], { service: true })
+  const { c } = e
+  const before = telegram.messages.length
+  await running(e)
+  writeFileSync(join(c.dir, 'state', 'workers.json'), JSON.stringify({
+    tasks: [
+      { id: 't1aa', repo: 'alpha', kind: 'repo', state: 'running', startedAt: Date.now(), container: null },
+      { id: 't2bb', repo: 'alpha', kind: 'repo', state: 'running', startedAt: Date.now(), container: null, worktree: 't2bb' },
+      { id: 't3cc', repo: 'beta', kind: 'repo', state: 'done', startedAt: Date.now(), container: null },
+    ],
+    queue: [],
+  }))
+  try {
+    const out = await runCommand(e.script, [], c.env)
+    assert.equal(out.status, 0, out.stdout + out.stderr)
+    assert.match(out.stdout, /^the autostart: the systemd user service cc-voice-gateway\.service$/m)
+    assert.match(out.stdout, /^worker run t1aa in alpha, running for less than a minute: the stop of the service ends it; after the start the gateway reports it as failed, and it is not queued again$/m)
+    assert.match(out.stdout, /^worker run t2bb in a worktree of alpha, running for less than a minute: the stop of the service ends it; after the start it goes back to the queue and resumes in its worktree$/m)
+    assert.doesNotMatch(out.stdout, /t3cc/)
+    assert.match(out.stdout, /^stopping the service cc-voice-gateway\.service$/m)
+    assert.match(out.stdout, /^starting the service cc-voice-gateway\.service$/m)
+    assert.match(out.stdout, /^everything runs again$/m)
+    const calls = e.bin.calls()
+    assert.ok(calls.indexOf('systemctl --user stop cc-voice-gateway.service') < calls.indexOf('systemctl --user start cc-voice-gateway.service'))
+    const sent = texts(before, c)
+    assert.equal(sent.length, 2, sent.join('\n---\n'))
+    assert.match(sent[0], / was requested; the controller restarts now\./)
+    assert.match(sent[1], /^the gateway is shutting down now for the restart\./, 'the service was stopped, for the restart')
+    assert.match(c.log(), /watchdog: stop requested by the service cc-voice-gateway\.service/)
+    assert.equal(c.starts().at(-1).restarted, RESTART_REASON)
+  } finally {
+    await stopAll(c, e.start)
+  }
+})
+
+test('restart-everything on macOS: the LaunchAgent has no stop of its own; --stop, then kickstart', async () => {
+  const e = await emergency([{ run: true }, { gateway: true }], { mac: true })
+  const { c } = e
+  await running(e)
+  try {
+    const out = await runCommand(e.script, [], c.env)
+    assert.equal(out.status, 0, out.stdout + out.stderr)
+    assert.match(out.stdout, /^the autostart: the LaunchAgent com\.drawio\.cc-voice-gateway$/m)
+    assert.match(out.stdout, /^stopped the watchdog and the controller session$/m)
+    assert.match(out.stdout, /^starting the LaunchAgent com\.drawio\.cc-voice-gateway$/m)
+    assert.match(e.bin.calls(), new RegExp(`^launchctl kickstart gui/${process.getuid()}/com\\.drawio\\.cc-voice-gateway$`, 'm'))
+    assert.match(out.stdout, /^everything runs again$/m)
+  } finally {
+    await stopAll(c, e.start)
+  }
+})
+
+test("restart-everything: a stale lock goes; another program on the gateway's port is named, not touched, and the end says what fails", async () => {
+  const e = await emergency([{ run: true }], { wait: '2' })
+  const { c } = e
+  mkdirSync(join(c.dir, 'state', 'controller.lock'), { recursive: true })
+  writeFileSync(join(c.dir, 'state', 'controller.lock', 'pid'), '999999')
+  // Not HTTP: it holds the port and answers no /healthz.
+  const squatter = createTcpServer(socket => socket.destroy())
+  await new Promise(resolve => squatter.listen(e.port, '127.0.0.1', resolve))
+  try {
+    const out = await runCommand(e.script, [], c.env)
+    assert.equal(out.status, 1, out.stdout + out.stderr)
+    assert.match(out.stdout, /^before: not running$/m)
+    assert.match(out.stdout, /^removed the lock a watchdog left behind$/m)
+    assert.match(out.stdout, new RegExp(`^the gateway's port ${e.port} is taken by process ${process.pid} \\(.*\\), which is not this gateway: not touched; the gateway cannot start until it is free$`, 'm'))
+    assert.match(out.stdout, /^now: running \(watchdog \d+, session \d+\)$/m)
+    assert.equal(
+      out.stdout.trim().split('\n').at(-1),
+      `the gateway cannot start while process ${process.pid} holds its port ${e.port}: end it (lsof -nP -iTCP:${e.port} -sTCP:LISTEN), then run this script again`,
+    )
+  } finally {
+    squatter.close()
+    await stopAll(c, e.start)
   }
 })
 
