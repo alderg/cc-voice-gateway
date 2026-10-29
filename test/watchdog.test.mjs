@@ -33,8 +33,9 @@ const lock = process.env.VOICE_GW_WATCHDOG_LOCK
 const restarted = lock && existsSync(lock + '/restarted') ? readFileSync(lock + '/restarted', 'utf8').trim() : null
 const settings = Object.fromEntries(Object.entries(process.env)
   .filter(([name]) => name.startsWith('VOICE_GW_TEST_') || name === 'VOICE_GW_CONTROLLER_LEVEL'))
+const fromFile = process.env.VOICE_GW_SETTINGS_FROM_FILE ?? null
 const note = event => appendFileSync(process.env.FAKE_CLAUDE_LOG, JSON.stringify({
-  pid: process.pid, event, step, lock: lock ?? null, mode: process.env.VOICE_GW_CHANNEL_MODE ?? null, restarted, settings,
+  pid: process.pid, event, step, lock: lock ?? null, mode: process.env.VOICE_GW_CHANNEL_MODE ?? null, restarted, settings, fromFile,
 }) + '\\n')
 note('start')
 // what the setup assistant does meanwhile: new settings, for the next start
@@ -254,7 +255,11 @@ test('every start reads the settings file again; the environment still wins, and
     { restart: true, settings: 'VOICE_GW_TEST_A=2\nVOICE_GW_TEST_C=file\nVOICE_GW_CONTROLLER_LEVEL=unrestricted\n' },
     { exit: 1, settings: 'VOICE_GW_TEST_C=file\n' },
     { exit: 0 },
-  ], { env: { VOICE_GW_TEST_C: 'outside' } })
+  ], {
+    // TEST_B came from the file of a start script above this one, as its
+    // list says: it is read from the file again, and does not win.
+    env: { VOICE_GW_TEST_C: 'outside', VOICE_GW_TEST_B: 'stale', VOICE_GW_SETTINGS_FROM_FILE: 'VOICE_GW_TEST_B' },
+  })
   writeFileSync(join(c.dir, 'secrets', 'gateway.env'), 'VOICE_GW_TEST_A=1\nVOICE_GW_TEST_B=1\nVOICE_GW_CONTROLLER_LEVEL=clone-delete\n')
   const out = await run(c)
   assert.equal(out.status, 0, out.stderr)
@@ -263,9 +268,14 @@ test('every start reads the settings file again; the environment still wins, and
     { VOICE_GW_TEST_A: '2', VOICE_GW_TEST_C: 'outside', VOICE_GW_CONTROLLER_LEVEL: 'clone-delete' },
     { VOICE_GW_TEST_C: 'outside', VOICE_GW_CONTROLLER_LEVEL: 'clone-delete' },
   ], 'changed and removed lines count from the next start, a requested restart or a crash')
+  // The gateway learns which values it can take from the file, so that only
+  // those set outside win over it, also while it runs (src/live.mjs); not the
+  // level, which stays as this script took it.
+  assert.deepEqual(c.starts().map(s => s.fromFile), ['VOICE_GW_TEST_A VOICE_GW_TEST_B', 'VOICE_GW_TEST_A', ''])
   const lines = c.log().split('\n').filter(line => / watchdog: settings from /.test(line))
   assert.equal(lines.length, 3, 'one line per start')
   assert.match(lines[0], /settings from \S*gateway\.env: VOICE_GW_CONTROLLER_LEVEL=clone-delete VOICE_GW_TEST_A=1 VOICE_GW_TEST_B=1; from the environment, which wins: .*VOICE_GW_TEST_C=outside.*; gateway port 1$/)
+  assert.doesNotMatch(lines[0], /TEST_B=stale|which wins: .*VOICE_GW_SETTINGS_FROM_FILE/)
   assert.match(lines[2], /settings from \S*gateway\.env: VOICE_GW_CONTROLLER_LEVEL=clone-delete; from the environment/)
 })
 

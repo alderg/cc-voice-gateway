@@ -4,8 +4,9 @@
 // which the setup assistant writes; once a change has settled, it reads the
 // file again and applies the limits (gateway.mjs, Workers.setLimits). Every
 // other setting counts from the next start of the controller, and the log
-// says so. As at the start, a value set in the environment (for example in
-// controller/.mcp.json) wins over the file.
+// says so. As at the start, a value set in the environment from outside (for
+// example in controller/.mcp.json) wins over the file; one the watchdog's
+// start script exported from the file does not (settings.mjs).
 //
 // Robust on purpose: a file that cannot be read, is gone, or looks half
 // written (a last line without its end) keeps the limits as they are; a
@@ -16,12 +17,13 @@ import { EventEmitter } from 'node:events'
 import { readFileSync, unwatchFile, watchFile } from 'node:fs'
 import { MAX_LIMIT, WORKER_LIMITS, limitValue } from './config.mjs'
 import { log as defaultLog } from './log.mjs'
-import { parseSettings } from './settings.mjs'
+import { environmentWins, parseSettings } from './settings.mjs'
 
 export class SettingsWatcher extends EventEmitter {
-  // limits: the limits in force, by setting name; env: the environment,
-  // whose values win.
-  constructor({ file, limits, env = process.env, intervalMs = 1000, settleMs = 1500, log = defaultLog }) {
+  // limits: the limits in force, by setting name; env: the environment;
+  // wins: whether its value of a name wins over the file's (config.mjs), by
+  // default as environmentWins decides it against the file at the start.
+  constructor({ file, limits, env = process.env, wins = null, intervalMs = 1000, settleMs = 1500, log = defaultLog }) {
     super()
     this.file = file
     this.env = env
@@ -34,6 +36,7 @@ export class SettingsWatcher extends EventEmitter {
     // The file as it was at the start, for what changed.
     const first = this.read()
     this.last = first.settings ?? (first.text !== undefined ? parseSettings(first.text) : {})
+    this.wins = wins ?? environmentWins(env, this.last)
     this.listener = (now, before) => {
       if (now.mtimeMs !== before.mtimeMs || now.size !== before.size || now.ino !== before.ino) this.changed()
     }
@@ -91,7 +94,7 @@ export class SettingsWatcher extends EventEmitter {
     const changed = {}
     for (const name of Object.keys(WORKER_LIMITS)) {
       const before = this.last[name]
-      if (this.env[name] !== undefined) {
+      if (this.wins(name)) {
         if (settings[name] !== before) {
           this.log(`${name} changed in the settings file, but the environment sets it to ${this.env[name]}, which wins: it stays ${this.limits[name]}`)
         }

@@ -33,6 +33,7 @@ const { Store } = await import('../src/store.mjs')
 const { answeredTask } = await import('../src/channel.mjs')
 const { RunGuard } = await import('../src/guard.mjs')
 const { SettingsWatcher } = await import('../src/live.mjs')
+const { environmentWins } = await import('../src/settings.mjs')
 
 // The stand-in for claude. Words in the task:
 //   HOLD:<name>  waits until the file holds/<name> is there
@@ -843,6 +844,63 @@ test('the settings file while the gateway runs: the limits change, the environme
   assert.ok(lines.some(line => /settings file changed: VOICE_GW_PORT take effect at the next start of the controller/.test(line)))
   assert.equal(changes.length, 3)
   watcher.close()
+})
+
+test("only values set from outside win over the file: not those the start script exported from it, as its list says", () => {
+  const file = join(TMP, 'outside.env')
+  writeFileSync(file, 'VOICE_GW_MAX_WORKERS=5\nVOICE_GW_MAX_WORKERS_PER_REPO=2\n')
+  const lines = []
+  const watcher = env =>
+    new SettingsWatcher({
+      file,
+      env,
+      limits: { VOICE_GW_MAX_WORKERS: Number(env.VOICE_GW_MAX_WORKERS ?? 2), VOICE_GW_MAX_WORKERS_PER_REPO: 2 },
+      log: (...args) => lines.push(args.join(' ')),
+    })
+  // Under the watchdog (scripts/settings.sh): MAX_WORKERS came from the file,
+  // as the list says; PER_REPO was set outside, not listed.
+  const listed = watcher({
+    VOICE_GW_MAX_WORKERS: '5',
+    VOICE_GW_MAX_WORKERS_PER_REPO: '2',
+    VOICE_GW_SETTINGS_FROM_FILE: 'VOICE_GW_MAX_WORKERS',
+  })
+  writeFileSync(file, 'VOICE_GW_MAX_WORKERS=3\nVOICE_GW_MAX_WORKERS_PER_REPO=4\n')
+  assert.deepEqual(listed.reload().changed, { VOICE_GW_MAX_WORKERS: 3 }, "the file's own value changes")
+  assert.ok(lines.some(line => /VOICE_GW_MAX_WORKERS_PER_REPO changed in the settings file, but the environment sets it to 2, which wins/.test(line)))
+  listed.close()
+
+  // Without the list (started by Claude Code or by hand): a value equal to
+  // the file's at the start is the file's; another one was set outside.
+  writeFileSync(file, 'VOICE_GW_MAX_WORKERS=5\nVOICE_GW_MAX_WORKERS_PER_REPO=2\n')
+  const unlisted = watcher({ VOICE_GW_MAX_WORKERS: '5', VOICE_GW_MAX_WORKERS_PER_REPO: '7' })
+  writeFileSync(file, 'VOICE_GW_MAX_WORKERS=3\nVOICE_GW_MAX_WORKERS_PER_REPO=4\n')
+  assert.deepEqual(unlisted.reload().changed, { VOICE_GW_MAX_WORKERS: 3 })
+  writeFileSync(file, 'VOICE_GW_MAX_WORKERS=4\nVOICE_GW_MAX_WORKERS_PER_REPO=4\n')
+  assert.deepEqual(unlisted.reload().changed, { VOICE_GW_MAX_WORKERS: 4 }, 'compared with the file at the start, not the last change')
+  unlisted.close()
+
+  // controller/.mcp.json always wins, listed or not.
+  const pinned = environmentWins({ VOICE_GW_MAX_WORKERS: '5', VOICE_GW_SETTINGS_FROM_FILE: 'VOICE_GW_MAX_WORKERS' }, {}, ['VOICE_GW_MAX_WORKERS'])
+  assert.equal(pinned('VOICE_GW_MAX_WORKERS'), true)
+  assert.equal(pinned('VOICE_GW_SETTINGS_FROM_FILE'), false, 'the list is no setting')
+  assert.equal(pinned('VOICE_GW_PORT'), false, 'not set at all')
+
+  // The same at the gateway's start (config.mjs).
+  const secrets = join(TMP, 'outside-secrets')
+  mkdirSync(secrets, { recursive: true })
+  writeFileSync(join(secrets, 'gateway.env'), 'VOICE_GW_MAX_WORKERS=3\n')
+  const mcp = join(TMP, 'outside-mcp.json')
+  const configUrl = new URL('../src/config.mjs', import.meta.url).href
+  const maxWorkers = extra => {
+    const env = { ...process.env, VOICE_GW_SECRETS_DIR: secrets, VOICE_GW_MCP_JSON: mcp, VOICE_GW_MAX_WORKERS: '5', ...extra }
+    const script = `const { config } = await import(${JSON.stringify(configUrl)}); console.log(config.maxWorkers)`
+    return execFileSync(process.execPath, ['--input-type=module', '-e', script], { env, encoding: 'utf8' }).trim()
+  }
+  assert.equal(maxWorkers({ VOICE_GW_SETTINGS_FROM_FILE: 'VOICE_GW_MAX_WORKERS VOICE_GW_PORT' }), '3', 'exported from the file: the file is newer')
+  assert.equal(maxWorkers({ VOICE_GW_SETTINGS_FROM_FILE: 'VOICE_GW_PORT' }), '5', 'set outside')
+  assert.equal(maxWorkers({}), '5', 'no list, and not the same as the file: set outside')
+  writeFileSync(mcp, JSON.stringify({ mcpServers: { voice: { env: { VOICE_GW_MAX_WORKERS: '5' } } } }))
+  assert.equal(maxWorkers({ VOICE_GW_SETTINGS_FROM_FILE: 'VOICE_GW_MAX_WORKERS' }), '5', 'controller/.mcp.json wins')
 })
 
 // --- the rules ----------------------------------------------------------------------------------

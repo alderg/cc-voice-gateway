@@ -1676,8 +1676,11 @@ Once a change has settled for a second or two, it reads the file again and appli
 `VOICE_GW_MAX_WORKERS` and `VOICE_GW_MAX_WORKERS_PER_REPO` without a restart, as it would at a
 start: raised per repository, the controller hears which queued tasks could now run next to
 others; lowered, runs going run to the end and nothing new starts above the limit. Every other
-changed setting is logged as counting from the next start. A value set in the environment still
-wins over the file, and the log says so. A file that cannot be read, is gone or looks half written
+changed setting is logged as counting from the next start. A value set in the environment from
+outside still wins over the file, and the log says so; one the watchdog's start script exported
+from the file does not, as it lists those names in `VOICE_GW_SETTINGS_FROM_FILE`
+(`scripts/settings.sh`). Without that list, when Claude Code or you start the gateway yourself, a
+value in the environment that equals the file's at the start counts as the file's. A file that cannot be read, is gone or looks half written
 (its last line without an end) keeps the limits as they are; a value that is no whole number from
 1 to 100 is ignored, with a log line. The setup assistant says when a running gateway takes its
 limits at once.
@@ -1760,8 +1763,9 @@ limits at once.
 | `VOICE_GW_MANAGED_SETTINGS` | `/etc/claude-code/managed-settings.json`, on macOS `/Library/Application Support/ClaudeCode/managed-settings.json` | Managed settings file on this computer |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Where Claude Code keeps `remote-settings.json` and the marketplaces |
 
-The start script exports `VOICE_GW_CHANNEL_MODE` and `VOICE_GW_WATCHDOG_LOCK` for the gateway;
-do not set them.
+The start script exports `VOICE_GW_CHANNEL_MODE`, `VOICE_GW_WATCHDOG_LOCK` and
+`VOICE_GW_SETTINGS_FROM_FILE` (the names it took from the settings file at that start) for the
+gateway; do not set them.
 
 **Container and fetch helper** (`scripts/start-workers-container.sh`,
 `scripts/fetch-from-container.sh`, `docker/`):

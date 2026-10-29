@@ -18,7 +18,8 @@
 // And what is open, so that nothing is forgotten: decisions for the driver
 // (ledger.mjs), the queue (workers.mjs), the requests (store.mjs).
 
-import { CONTROLLER_LEVELS, EFFORTS, KILLSWITCH_MODES, ROOT, VERSION, config, limitValue } from './config.mjs'
+import { CONTROLLER_LEVELS, EFFORTS, KILLSWITCH_MODES, ROOT, VERSION, WORKER_LIMITS, config, environmentWinsOver, limitValue } from './config.mjs'
+import { FROM_FILE } from './settings.mjs'
 import { log } from './log.mjs'
 import { execFileSync } from 'node:child_process'
 import { Store } from './store.mjs'
@@ -558,7 +559,14 @@ async function deliverPlan(why, note) {
 settings = new SettingsWatcher({
   file: config.settingsFile,
   limits: { VOICE_GW_MAX_WORKERS: workers.maxRuns, VOICE_GW_MAX_WORKERS_PER_REPO: workers.maxPerRepo },
+  wins: environmentWinsOver, // only values set from outside win (settings.mjs)
 }).start()
+if (process.env[FROM_FILE] === undefined && Object.keys(WORKER_LIMITS).some(name => process.env[name] !== undefined)) {
+  log(
+    `settings: the environment does not say which values came from the settings file (${FROM_FILE}, set by ` +
+      "scripts/settings.sh); a worker limit there counts as the file's while it equals the file's value at the start",
+  )
+}
 settings.on('change', ({ limits, changed, others }) => {
   if (!Object.keys(changed).length) return
   const { was, plan } = workers.setLimits({

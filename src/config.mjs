@@ -3,12 +3,13 @@
 // Everything is read from environment variables so the gateway can be started
 // by Claude Code (from .mcp.json) without any command line arguments, and from
 // the settings file the setup assistant writes, .secrets/gateway.env
-// (settings.mjs). The environment wins.
+// (settings.mjs). A value set in the environment from outside wins; one the
+// watchdog's start script exported from the file is the file's.
 
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { SETTINGS_FILE_NAME, readSettings } from './settings.mjs'
+import { SETTINGS_FILE_NAME, environmentWins, mcpEnvNames, readSettings } from './settings.mjs'
 
 export const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 export const VERSION = '0.1.0'
@@ -34,7 +35,20 @@ export const ANTHROPIC_RANGES = ['160.79.104.0/21']
 
 const secretsDir = process.env.VOICE_GW_SECRETS_DIR || join(ROOT, '.secrets')
 const settingsFile = join(secretsDir, SETTINGS_FILE_NAME)
-const env = { ...readSettings(settingsFile), ...process.env }
+const fileSettings = readSettings(settingsFile)
+// Only values set from outside win over the file: not those the watchdog's
+// start script exported from it (settings.mjs); those named in
+// controller/.mcp.json always do. Also for the settings that change while
+// the gateway runs (live.mjs).
+export const environmentWinsOver = environmentWins(
+  process.env,
+  fileSettings,
+  mcpEnvNames(process.env.VOICE_GW_MCP_JSON || join(ROOT, 'controller', '.mcp.json')),
+)
+const env = {
+  ...fileSettings,
+  ...Object.fromEntries(Object.entries(process.env).filter(([name]) => environmentWinsOver(name) || !Object.hasOwn(fileSettings, name))),
+}
 
 const num = (value, fallback) => {
   const n = Number(value)
