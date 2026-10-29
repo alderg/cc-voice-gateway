@@ -21,6 +21,7 @@ import { HostRunner } from '../runners.mjs'
 import { SETTINGS_FILE_NAME, formatSettings, readSettings } from '../settings.mjs'
 import { Telegram } from '../telegram.mjs'
 import { githubSlug } from '../workers.mjs'
+import { scratchProblem } from '../workspaces.mjs'
 import { MARKETPLACE, PLUGIN, channelMode } from '../../scripts/channel-mode.mjs'
 
 export const MODELS = ['fable', 'opus', 'sonnet', 'haiku']
@@ -44,6 +45,10 @@ export function fields(root) {
     VOICE_GW_MAX_WORKERS: { default: '2', valid: INT(1, 10) },
     VOICE_GW_WORKER_TIMEOUT: { default: '60', valid: INT(5, 1440) },
     VOICE_GW_PR_DRAFT: { default: '0', valid: ONE_OF('0', '1') },
+    VOICE_GW_SCRATCH: { default: '0', valid: ONE_OF('0', '1') },
+    VOICE_GW_SCRATCH_ROOT: { default: join(homedir(), 'voice-scratch'), valid: PATH },
+    VOICE_GW_SCRATCH_DAYS: { default: '7', valid: INT(1, 365) },
+    VOICE_GW_SCRATCH_DOCKER: { default: '', valid: NAME },
     VOICE_GW_PERMISSION_RELAY: { default: '1', valid: ONE_OF('1', '0') },
     VOICE_GW_CONTROLLER_LEVEL: { default: 'confined', valid: ONE_OF(...CONTROLLER_LEVELS) },
     VOICE_GW_KILLSWITCH: { default: 'auto', valid: ONE_OF(...KILLSWITCH_MODES) },
@@ -500,11 +505,24 @@ export function createSetup({
         if (/[\r\n\0]/.test(String(docker[key] ?? '')) || String(docker[key] ?? '').length > 200) problems.push(`Docker: ${key} is not valid`)
       }
     }
+    // Work folders: a root the gateway takes, and a container of their own.
+    const scratch = values.VOICE_GW_SCRATCH === '1'
+    if (scratch) {
+      const folder = String(values.VOICE_GW_SCRATCH_ROOT || FIELDS.VOICE_GW_SCRATCH_ROOT.default)
+      const workerRoot = docker ? null : String(values.VOICE_GW_WORKER_ROOT || FIELDS.VOICE_GW_WORKER_ROOT.default)
+      const problem = PATH(folder) && scratchProblem(folder, { gateway: root, workerRoot, home })
+      if (problem) problems.push(`Work folders: ${folder} ${problem}`)
+    }
+    const scratchDocker = scratch && values.VOICE_GW_SCRATCH_DOCKER ? String(values.VOICE_GW_SCRATCH_DOCKER) : null
+    if (scratchDocker) {
+      if (!secret('claudeToken')) problems.push('Work folders: their container needs a token from claude setup-token (section 5)')
+      if (docker && scratchDocker === values.VOICE_GW_DOCKER) problems.push('Work folders: their container needs a name of its own, not the worker container\'s')
+    }
     if (body.telegram?.enabled && !(secret('telegramToken') && secret('telegramChatId'))) {
       problems.push('Telegram: check the token and send the test message first')
     }
     if (problems.length) throw fail(problems.join('; '))
-    return { values, docker }
+    return { values, docker, scratchDocker }
   }
 
   function settingsText(values, docker) {
@@ -522,7 +540,7 @@ export function createSetup({
     ])
   }
 
-  function writeFiles({ values, docker, telegramOn }, line) {
+  function writeFiles({ values, docker, scratchDocker, telegramOn }, line) {
     secureFolder(secretsDir)
     const written = []
     const put = (file, value) => {
@@ -539,10 +557,12 @@ export function createSetup({
       for (const file of removed) rmSync(file)
       if (removed.length) line(`Telegram turned off: removed ${removed.map(file => file.slice(secretsDir.length + 1)).join(', ')}`)
     }
-    if (docker) {
+    // Claude Code's token for either container; the GitHub token only for
+    // the workers'.
+    if (docker || scratchDocker) {
       secureFolder(workerSecrets)
       if (draft.claudeToken) put(files.claudeToken, draft.claudeToken)
-      if (draft.githubToken) put(files.githubToken, draft.githubToken)
+      if (docker && draft.githubToken) put(files.githubToken, draft.githubToken)
     }
     put(settingsFile, settingsText(values, docker))
     // Saved files from before get the same modes.
@@ -596,6 +616,35 @@ export function createSetup({
       }
     }
     return ok
+  }
+
+  // The container of the work folders, from the worker image: the start
+  // script with --scratch, which mounts only the folder and Claude Code's
+  // token.
+  async function setUpScratchDocker(values, line) {
+    const container = values.VOICE_GW_SCRATCH_DOCKER
+    const image = values.VOICE_GW_DOCKER_IMAGE || FIELDS.VOICE_GW_DOCKER_IMAGE.default
+    const folder = values.VOICE_GW_SCRATCH_ROOT || FIELDS.VOICE_GW_SCRATCH_ROOT.default
+    if ((await output(bin.docker, ['image', 'inspect', image])).code !== 0) {
+      line(`the image ${image} is not there yet; building it`)
+      if (!(await build(image, line))) return false
+    }
+    line(`starting the container ${container} with ${folder} as /scratch, for the work folders`)
+    const started = await runCommand(join(root, 'scripts', 'start-workers-container.sh'), ['--scratch'], {
+      env: {
+        ...env,
+        VOICE_GW_SCRATCH_DOCKER: container,
+        VOICE_GW_SCRATCH_ROOT: folder,
+        VOICE_GW_DOCKER: values.VOICE_GW_DOCKER || '',
+        VOICE_GW_DOCKER_IMAGE: image,
+        VOICE_GW_DOCKER_BIN: bin.docker,
+        VOICE_GW_SECRETS_DIR: secretsDir,
+      },
+      onLine: line,
+      timeoutMs: 120000,
+    })
+    if (started !== 0) line('the container for the work folders did not start')
+    return started === 0
   }
 
   // The tmux the autostart runs, by its full path: launchd does not search
@@ -772,12 +821,13 @@ export function createSetup({
 
   async function finish({ body, server }) {
     if (finishing) throw fail('The setup is already being written.', 409)
-    const { values, docker } = validate(body)
+    const { values, docker, scratchDocker } = validate(body)
     const telegramOn = Boolean(body.telegram?.enabled)
     finishing = startJob('writing the setup', async line => {
-      writeFiles({ values, docker, telegramOn }, line)
+      writeFiles({ values, docker, scratchDocker, telegramOn }, line)
       let ok = true
       if (docker) ok = (await setUpDocker(values, docker, line)) && ok
+      if (scratchDocker) ok = (await setUpScratchDocker(values, line)) && ok
       if (body.watchdog?.autostart || body.watchdog?.startNow) ok = (await setUpWatchdog(body.watchdog, line)) && ok
       if (body.plugin?.register && channelMode({ env, root }).mode === 'plugin-register') {
         const code = await runCommand(bin.claude, ['plugin', 'marketplace', 'add', root], { env, onLine: line, timeoutMs: 60000 })

@@ -144,18 +144,23 @@
       <label>Image <input data-setting="VOICE_GW_DOCKER_IMAGE"></label>
       <p class="guide">Built from <code>docker/</code> for your user id.</p>
     </div>
+  </div>
 
+  <div id="claude-login" hidden>
     <h3>Claude Code's login in the container</h3>
     <p class="guide">
       On this computer run <code>claude setup-token</code>, sign in, and paste the long-lived token it prints
-      (it starts with <code>sk-ant-</code>). <a href="https://code.claude.com/docs/en/authentication" target="_blank" rel="noreferrer noopener">About setup-token</a>
+      (it starts with <code>sk-ant-</code>). The work folders' container (section 6) uses it too.
+      <a href="https://code.claude.com/docs/en/authentication" target="_blank" rel="noreferrer noopener">About setup-token</a>
     </p>
     <div class="row">
       <input id="claude-token" type="password" autocomplete="off" spellcheck="false" placeholder="token from claude setup-token">
       <button id="claude-check">Take token</button>
       <span id="claude-token-state" class="state"></span>
     </div>
+  </div>
 
+  <div id="docker-more" hidden>
     <h3>GitHub token: it sets what workers may do</h3>
     <ul class="guide">
       <li><strong>read-only</strong>, nothing leaves the container: no token for public repositories; for private ones a
@@ -211,8 +216,32 @@
   </div>
 </section>
 
+<section id="s-scratch">
+  <h2>6. Work folders <span class="opt">optional</span></h2>
+  <p class="guide">For tasks that need no repository: a question to look up, research, a calculation, a draft, a
+    conversion. Each gets a new empty folder of its own, the only place its run may write, and the files it makes stay
+    there for you. Off by default: then workers only work in your repositories.</p>
+  <label><input type="checkbox" id="scratch-on"> Turn work folders on</label>
+  <div id="scratch" hidden>
+    <div class="grid">
+      <label>Folder <input data-setting="VOICE_GW_SCRATCH_ROOT"></label>
+      <p class="guide">A new folder in it per task. Outside every git repository, this checkout and the repositories folder.</p>
+      <label>Kept for (days) <input data-setting="VOICE_GW_SCRATCH_DAYS" inputmode="numeric"></label>
+      <p class="guide">A work folder is removed this long after its last run.</p>
+    </div>
+    <label><input type="checkbox" id="scratch-docker-on"> Run them in a container of their own</label>
+    <p class="guide">A protected environment: a container from the worker image that sees only the work folders, with
+      Claude Code's token (section 5) and no GitHub token; not your files, SSH keys or logins. Without it they run on
+      this computer as you, and only the kill switch's rules watch where they write.</p>
+    <div id="scratch-docker" hidden class="grid">
+      <label>Container <input id="scratch-docker-name" data-setting="VOICE_GW_SCRATCH_DOCKER"></label>
+      <p class="guide">Its name, for example voice-scratch; not the workers' container. Finishing starts it.</p>
+    </div>
+  </div>
+</section>
+
 <section id="s-watchdog">
-  <h2>6. Keeping the controller running</h2>
+  <h2>7. Keeping the controller running</h2>
   <p class="guide">
     <code>scripts/start-controller.sh</code> runs the controller under a watchdog that starts it again after a
     crash, in a tmux session. On its first start Claude Code asks a few questions at the terminal:
@@ -235,7 +264,7 @@
 </section>
 
 <section id="s-plugin">
-  <h2>7. The channel as a plugin</h2>
+  <h2>8. The channel as a plugin</h2>
   <p id="plugin-status"></p>
   <div id="plugin-register-box" hidden>
     <label><input type="checkbox" id="plugin-register" checked> Register this repository as the marketplace now</label>
@@ -259,7 +288,7 @@
 </section>
 
 <section id="s-finish">
-  <h2>8. Write the setup</h2>
+  <h2>9. Write the setup</h2>
   <p class="guide">Writes the settings and the secrets into <code>.secrets</code> (folder 0700, files 0600), then sets up what you chose above. The assistant ends by itself afterwards.</p>
   <div class="row">
     <button id="finish" class="primary">Write the setup</button>

@@ -401,6 +401,9 @@ test('the start: checks, current settings, repositories and the plugin, without 
   assert.equal(data.settings.VOICE_GW_PORT, '8787')
   assert.equal(data.settings.VOICE_GW_KILLSWITCH, 'auto', 'the kill switch locks by itself, by default')
   assert.equal(data.settings.VOICE_GW_PR_DRAFT, '0', 'pull requests ready for review, by default')
+  assert.equal(data.settings.VOICE_GW_SCRATCH, '0', 'work folders off, by default')
+  assert.equal(data.settings.VOICE_GW_SCRATCH_DOCKER, '', 'and on this computer when turned on')
+  assert.equal(data.settings.VOICE_GW_SCRATCH_DAYS, '7')
   assert.deepEqual(data.secrets, { telegramToken: null, telegramChatId: null, githubToken: null, claudeToken: null })
   assert.deepEqual(data.git, { name: 'Test Driver', email: 'driver@example.com' })
   assert.equal(data.plugin.mode, 'development')
@@ -473,13 +476,25 @@ test('Docker: the image is built with progress on the page, and nothing secret i
 test('finishing: invalid input is refused before anything is written', async () => {
   const { call } = flow.page
   const refused = await call('/api/finish', {
-    settings: { VOICE_GW_PORT: '80', VOICE_GW_WORKER_MODEL: 'x; rm -rf /', VOICE_GW_KILLSWITCH: 'sometimes', VOICE_GW_PR_DRAFT: 'yes', NOPE: '1' },
+    settings: {
+      VOICE_GW_PORT: '80',
+      VOICE_GW_WORKER_MODEL: 'x; rm -rf /',
+      VOICE_GW_KILLSWITCH: 'sometimes',
+      VOICE_GW_PR_DRAFT: 'yes',
+      VOICE_GW_SCRATCH: 'yes',
+      VOICE_GW_SCRATCH_DAYS: '0',
+      VOICE_GW_SCRATCH_DOCKER: 'a b',
+      NOPE: '1',
+    },
   })
   assert.equal(refused.status, 400)
   assert.match(refused.data.error, /VOICE_GW_PORT: not a valid value/)
   assert.match(refused.data.error, /VOICE_GW_WORKER_MODEL: not a valid value/)
   assert.match(refused.data.error, /VOICE_GW_KILLSWITCH: not a valid value/)
   assert.match(refused.data.error, /VOICE_GW_PR_DRAFT: not a valid value/)
+  for (const name of ['VOICE_GW_SCRATCH', 'VOICE_GW_SCRATCH_DAYS', 'VOICE_GW_SCRATCH_DOCKER']) {
+    assert.match(refused.data.error, new RegExp(`${name}: not a valid value`))
+  }
   assert.match(refused.data.error, /unknown setting NOPE/)
   assert.ok(!existsSync(SECRETS), 'nothing written')
 })
@@ -606,6 +621,79 @@ test('finishing with Telegram turned off removes its saved files, and keeps ever
   assert.ok(!existsSync(join(secrets, 'telegram_chat_id')))
   assert.equal(statSync(join(secrets, 'worker', 'github_token')).mode & 0o777, 0o600, 'a saved secret gets mode 0600')
   assert.deepEqual(readSettings(join(secrets, 'gateway.env')), { VOICE_GW_KILL_MAX_EDITS: '900' }, 'other settings stay; Docker is off')
+})
+
+test("finishing with work folders: their folder checked; in a container of their own with only Claude Code's token", async () => {
+  const secrets = join(TMP, 'secrets-scratch')
+  const folder = join(TMP, 'voice-scratch')
+  // A setup writes once; each finish here is a run of the assistant of its own.
+  let setup
+  const fresh = () => (setup = createSetup({ root: ROOT, secretsDir: secrets, env: setupEnv(), home: HOME, platform: 'linux', say }))
+  const finish = async settings => {
+    const { job } = await fresh().api['POST /api/finish']({ body: { settings, telegram: { enabled: false }, docker: { enabled: false } } })
+    let state
+    for (let i = 0; i < 250 && (state = setup.api['GET /api/jobs/:id']({ id: job })).state === 'running'; i++) await sleep(20)
+    return state
+  }
+  const runs = () => calls().filter(c => c.command === 'docker' && c.argv[0] === 'run')
+
+  // Refused before anything is written: a folder inside the gateway's checkout or a repository, a
+  // container without Claude Code's token.
+  await assert.rejects(finish({ VOICE_GW_SCRATCH: '1', VOICE_GW_SCRATCH_ROOT: join(ROOT, 'scratch') }), /Work folders: .*\/scratch is inside the gateway's own checkout/)
+  await assert.rejects(finish({ VOICE_GW_SCRATCH: '1', VOICE_GW_SCRATCH_ROOT: join(DEV, 'alpha', 'notes') }), /is inside the git repository .*\/alpha/)
+  await assert.rejects(
+    finish({ VOICE_GW_SCRATCH: '1', VOICE_GW_SCRATCH_ROOT: folder, VOICE_GW_SCRATCH_DOCKER: 'voice-scratch' }),
+    /Work folders: their container needs a token from claude setup-token/,
+  )
+  assert.ok(!existsSync(secrets), 'nothing written')
+
+  // On this computer: only the settings.
+  const before = runs().length
+  const host = await finish({ VOICE_GW_SCRATCH: '1', VOICE_GW_SCRATCH_ROOT: folder, VOICE_GW_SCRATCH_DOCKER: '' })
+  assert.equal(host.state, 'done', host.lines.join('\n'))
+  assert.deepEqual(readSettings(join(secrets, 'gateway.env')), { VOICE_GW_SCRATCH: '1', VOICE_GW_SCRATCH_ROOT: folder })
+  assert.equal(runs().length, before, 'no container')
+  assert.ok(!existsSync(join(secrets, 'worker')))
+
+  // In a container of their own, with the token from the page.
+  await fresh().api['POST /api/claude/token']({ body: { token: CLAUDE_TOKEN } })
+  const { job } = await setup.api['POST /api/finish']({
+    body: {
+      settings: { VOICE_GW_SCRATCH: '1', VOICE_GW_SCRATCH_ROOT: folder, VOICE_GW_SCRATCH_DAYS: '3', VOICE_GW_SCRATCH_DOCKER: 'voice-scratch', VOICE_GW_DOCKER: '' },
+      telegram: { enabled: false },
+      docker: { enabled: false },
+    },
+  })
+  let boxed
+  for (let i = 0; i < 250 && (boxed = setup.api['GET /api/jobs/:id']({ id: job })).state === 'running'; i++) await sleep(20)
+  assert.equal(boxed.state, 'done', boxed.lines.join('\n'))
+  assert.match(boxed.lines.join('\n'), new RegExp(`starting the container voice-scratch with ${folder} as /scratch, for the work folders`))
+  assert.deepEqual(readSettings(join(secrets, 'gateway.env')), {
+    VOICE_GW_SCRATCH: '1',
+    VOICE_GW_SCRATCH_ROOT: folder,
+    VOICE_GW_SCRATCH_DAYS: '3',
+    VOICE_GW_SCRATCH_DOCKER: 'voice-scratch',
+  })
+  assert.equal(readFileSync(join(secrets, 'worker', 'claude_token'), 'utf8'), CLAUDE_TOKEN)
+  assert.equal(statSync(join(secrets, 'worker', 'claude_token')).mode & 0o777, 0o600)
+  assert.ok(!existsSync(join(secrets, 'worker', 'github_token')), 'no GitHub token for it')
+  const run = runs().at(-1).argv
+  assert.equal(run[run.indexOf('--name') + 1], 'voice-scratch')
+  assert.ok(run.includes(`${folder}:/scratch:rw`))
+  assert.ok(run.includes(`${join(secrets, 'worker', 'claude_token')}:/run/secrets/voice/claude_token:ro`))
+  assert.ok(!run.some(arg => arg.includes('/repos')))
+
+  // Not the workers' container.
+  await fresh().api['POST /api/claude/token']({ body: { token: CLAUDE_TOKEN } })
+  await assert.rejects(
+    setup.api['POST /api/finish']({
+      body: {
+        settings: { VOICE_GW_SCRATCH: '1', VOICE_GW_SCRATCH_ROOT: folder, VOICE_GW_SCRATCH_DOCKER: 'voice-workers', VOICE_GW_DOCKER: 'voice-workers' },
+        docker: { enabled: true, repos: [] },
+      },
+    }),
+    /their container needs a name of its own/,
+  )
 })
 
 test('the autostart: lingering already on is left alone, and a refused one leaves the step done, with the sudo command', async () => {

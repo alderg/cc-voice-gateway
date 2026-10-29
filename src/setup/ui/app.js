@@ -181,6 +181,20 @@ function showKillSwitchWarning() {
   $('#killswitch-warning').hidden = !text
 }
 
+// The work folders in a container of their own, when they are on.
+const scratchDocker = () => $('#scratch-on').checked && $('#scratch-docker-on').checked
+
+// What the two containers need on the page: the workers' everything, Claude
+// Code's token for either.
+function showContainers() {
+  const docker = $('#docker-on').checked
+  $('#docker').hidden = !docker
+  $('#docker-more').hidden = !docker
+  $('#claude-login').hidden = !docker && !scratchDocker()
+  $('#scratch').hidden = !$('#scratch-on').checked
+  $('#scratch-docker').hidden = !scratchDocker()
+}
+
 function fillSettings() {
   for (const element of $$('[data-setting]')) {
     const value = state.settings[element.dataset.setting]
@@ -194,8 +208,11 @@ function fillSettings() {
   if (!$('#funnel-idle-on').checked) idle.value = '90'
   idle.disabled = !$('#funnel-idle-on').checked
   $('#docker-on').checked = Boolean(state.settings.VOICE_GW_DOCKER)
-  $('#docker').hidden = !$('#docker-on').checked
   if (!$('#docker-name').value) $('#docker-name').value = 'voice-workers'
+  $('#scratch-on').checked = state.settings.VOICE_GW_SCRATCH === '1'
+  $('#scratch-docker-on').checked = Boolean(state.settings.VOICE_GW_SCRATCH_DOCKER)
+  if (!$('#scratch-docker-name').value) $('#scratch-docker-name').value = 'voice-scratch'
+  showContainers()
   $('#telegram-on').checked = Boolean(state.secrets.telegramToken && state.secrets.telegramChatId)
   $('#git-name').value = state.git.name
   $('#git-email').value = state.git.email
@@ -335,7 +352,7 @@ action('#docker-build', '#build-state', async () => {
   return 'Built.'
 })
 
-$('#docker-on').addEventListener('change', () => ($('#docker').hidden = !$('#docker-on').checked))
+for (const id of ['#docker-on', '#scratch-on', '#scratch-docker-on']) $(id).addEventListener('change', showContainers)
 $('#controller-level').addEventListener('change', showLevelWarning)
 $('#killswitch-mode').addEventListener('change', showKillSwitchWarning)
 $('#funnel-idle-on').addEventListener('change', () => ($('#funnel-idle').disabled = !$('#funnel-idle-on').checked))
@@ -349,6 +366,8 @@ function collect() {
   }
   const docker = $('#docker-on').checked
   if (!docker) settings.VOICE_GW_DOCKER = ''
+  settings.VOICE_GW_SCRATCH = $('#scratch-on').checked ? '1' : '0'
+  if (!scratchDocker()) settings.VOICE_GW_SCRATCH_DOCKER = ''
   return {
     settings,
     telegram: { enabled: $('#telegram-on').checked },
