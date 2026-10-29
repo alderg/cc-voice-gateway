@@ -1388,6 +1388,15 @@ either case.
   `VOICE_GW_CONTROLLER_EFFORT`, `--chrome` with `VOICE_GW_CONTROLLER_CHROME=1`, and
   `--remote-control "Voice controller"` with `VOICE_GW_REMOTE_CONTROL=1`
   ([below](#remote-control-from-the-claude-app)); options given to the script come last and win.
+- **Claude in Chrome's notice for the first start:** at the first interactive start with
+  `--chrome`, Claude Code shows a notice about Claude in Chrome before the session starts ("Enter to
+  confirm · Esc to cancel") and waits for a key, so a start by the watchdog or the autostart would
+  hang there. Before every start with Chrome on, `scripts/chrome-onboarding.mjs` therefore marks it
+  as seen: `hasCompletedClaudeInChromeOnboarding` in Claude Code's `~/.claude.json`
+  (`$CLAUDE_CONFIG_DIR/.claude.json` if set), the key Claude Code sets itself once it has shown the
+  notice. Only that key, only when it is missing, under Claude Code's own lock on the file. If it
+  cannot (no such file yet, not valid JSON, locked for 5 s), the log line `watchdog: chrome: …` and
+  a Telegram message say that the start may wait for Enter at the terminal.
 - **The channel,** chosen by `scripts/channel-mode.mjs` before every start:
   - **plugin**, when the organisation's managed settings (`~/.claude/remote-settings.json`, or the
     managed settings file on this computer) name `voice@cc-voice-gateway` in
@@ -1485,11 +1494,15 @@ a voice request and an approval with the app open.
 | One watchdog at a time | lock in `.state/controller.lock` | – |
 | Settings read again before every start, so a restart takes a change; the controller level, `VOICE_GW_SECRETS_DIR`, `VOICE_GW_STATE_DIR`, `VOICE_GW_LOG_FILE` and the watchdog's own settings stay until the start script starts again | – | `.secrets/gateway.env` |
 | Log | `watchdog:` lines in `.logs/gateway.log`: who started and who stopped it (the autostart's service or LaunchAgent, or user, process and terminal), and each start's settings with where they came from | – |
-| Telegram on each restart and when it gives up | if the two Telegram files exist | – |
+| Telegram on each restart and when it gives up, and at a start whose Claude in Chrome notice could not be marked as seen | if the two Telegram files exist | – |
 | macOS: no idle sleep while it runs (`caffeinate -i -s`, ended with the watchdog) | on | `VOICE_GW_CAFFEINATE` |
 
 With the development flag, a restarted session waits for the channel warning to be answered at the
-terminal (`tmux attach -t voice`, Enter); with the plugin it does not.
+terminal (`tmux attach -t voice`, Enter); with the plugin it does not. Claude in Chrome's notice for
+the first start would wait there too, at a start by the watchdog or the autostart alike; the start
+script marks it as seen beforehand ([8.1](#81-starting-and-stopping)). Only when that fails do the
+log and Telegram say that the start may wait for Enter at the terminal, and the crash message then
+does not promise a start without a confirmation.
 
 ### 8.3 Restarting the controller by voice
 
@@ -1748,7 +1761,7 @@ limits at once.
 |---|---|---|
 | `VOICE_GW_CONTROLLER_MODEL` | Claude Code's default | `--model` for the controller |
 | `VOICE_GW_CONTROLLER_EFFORT` | Claude Code's default | `--effort` for the controller |
-| `VOICE_GW_CONTROLLER_CHROME` | `0` | `1`: `--chrome` for the controller, so it can use Claude in Chrome: a Chrome with the Claude extension, signed in, open on a desktop of the same user (a remote desktop session that stays when you disconnect works) |
+| `VOICE_GW_CONTROLLER_CHROME` | `0` | `1`: `--chrome` for the controller, so it can use Claude in Chrome: a Chrome with the Claude extension, signed in, open on a desktop of the same user (a remote desktop session that stays when you disconnect works). Before each start the script marks Claude in Chrome's notice for the first start as seen, so that the session does not wait at the terminal ([8.1](#81-starting-and-stopping)) |
 | `VOICE_GW_REMOTE_CONTROL` | `0` | `1`: `--remote-control "Voice controller"` for the controller, to follow and steer it at claude.ai/code and in the Claude app ([Remote Control](#remote-control-from-the-claude-app)); not the workers, whose headless runs Remote Control does not connect. Any other value counts as `0`. The gateway reads it too, to say so in its log |
 | `VOICE_GW_WATCHDOG` | `1` | `0`: start without the watchdog |
 | `VOICE_GW_WATCHDOG_INTERVAL` | `30` | Seconds between health checks |
@@ -1863,6 +1876,7 @@ gateway; do not set them.
 | No worker shows up in the Claude app | Expected: only the controller connects. Worker runs are headless (`claude -p`), which Remote Control does not connect ([Remote Control](#remote-control-from-the-claude-app)); ask the controller what a worker does, or read `.state/tasks/<task>.jsonl`. |
 | "Restart the controller" and the controller says it cannot restart itself | It was not started by `scripts/start-controller.sh` with the watchdog. Restart it at the computer. |
 | Voice requests stop arriving after a crash | The watchdog started the session again, and the development-channel warning waits: `tmux attach -t voice`, then Enter. `grep watchdog .logs/gateway.log` shows what happened. |
+| After a start with `VOICE_GW_CONTROLLER_CHROME=1` the controller does not come up, and its terminal shows "Claude in Chrome" with "Enter to confirm · Esc to cancel" | Claude in Chrome's notice for the first start; Enter or Esc goes on (`tmux attach -t voice`), and Claude Code does not show it again. The start script marks it as seen beforehand; the log line `watchdog: chrome: …` says why it could not. |
 | `the controller is already running (watchdog …)` | A watchdog runs already, for example in another tmux window. `scripts/start-controller.sh --status`; `--stop` ends it. |
 | `watchdog: giving up …` | The session kept crashing, for example because the login expired. Look at the controller terminal, fix the cause, and start it again. |
 | After a reboot the controller runs only while you are logged in, and stops when your SSH session ends | Lingering is off for your user: `loginctl enable-linger`, or `sudo loginctl enable-linger $USER` if that is refused. The setup assistant turns it on with the autostart. |
@@ -1918,6 +1932,7 @@ scripts/
   start-controller.sh          controller with its channel, under the watchdog
   channel-mode.mjs             plugin or development flag
   controller-settings.mjs      the session's --settings for its level
+  chrome-onboarding.mjs        Claude in Chrome's notice for the first start, marked as seen
   settings.sh                  .secrets/gateway.env for the shell scripts
   start-workers-container.sh   the worker container, or with --scratch the work folders'; read-only while locked
   fetch-from-container.sh      a branch from the container into a clean clone, as a bundle

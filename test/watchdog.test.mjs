@@ -320,6 +320,47 @@ test('a session whose gateway never answered is left alone, for example while th
   assert.equal(await done, 0)
 })
 
+// The channel as the plugin, registered from this repository: no confirmation
+// for it at the start.
+function asPlugin(c) {
+  const root = fileURLToPath(new URL('..', import.meta.url)).replace(/\/$/, '')
+  mkdirSync(join(c.dir, 'claude-config', 'plugins'), { recursive: true })
+  writeFileSync(
+    join(c.dir, 'claude-config', 'plugins', 'known_marketplaces.json'),
+    JSON.stringify({ 'cc-voice-gateway': { source: { source: 'directory', path: root }, installLocation: root } }),
+  )
+}
+
+test('Claude in Chrome: marked as seen, a restart needs no confirmation; if it cannot be, Telegram says to confirm at the terminal', async () => {
+  const env = { VOICE_GW_CONTROLLER_CHROME: '1', VOICE_GW_CHANNEL: 'plugin' }
+  let before = telegram.messages.length
+  const marked = setup([{ exit: 1 }, { exit: 0 }], { env })
+  asPlugin(marked)
+  writeFileSync(join(marked.dir, 'claude-config', '.claude.json'), '{}')
+  assert.equal((await run(marked)).status, 0)
+  assert.ok(marked.starts().every(s => s.mode === 'plugin'))
+  let sent = telegram.messages.slice(before).map(m => m.text)
+  assert.equal(sent.length, 1, 'only the crash')
+  assert.match(sent[0], /crashed \(exit code 1\) and starts again in 0\.05 s, without a confirmation\. A message follows when it is ready\./)
+  assert.equal(marked.log().match(/ chrome: marked /g)?.length, 1, 'marked at the first start, quiet at the second')
+
+  // Claude Code's config does not exist yet: at each start the log and
+  // Telegram say that the notice may wait, and the crash message promises no
+  // start without a confirmation.
+  before = telegram.messages.length
+  const unmarked = setup([{ exit: 1 }, { exit: 0 }], { env })
+  asPlugin(unmarked)
+  assert.equal((await run(unmarked)).status, 0)
+  sent = telegram.messages.slice(before).map(m => m.text)
+  assert.equal(sent.length, 3, 'at both starts, and for the crash')
+  for (const text of [sent[0], sent[2]]) {
+    assert.match(text, /the controller session starts with Claude in Chrome, whose notice for the first start could not be marked as seen \(\S*\.claude\.json does not exist yet: .*\)\. If it shows, the session waits for Enter at the terminal \(tmux attach -t voice\), and voice requests do not arrive until then\./)
+  }
+  assert.match(sent[1], /crashed \(exit code 1\) and starts again in 0\.05 s\. A message follows when it is ready\./)
+  assert.doesNotMatch(sent[1], /without a confirmation/)
+  assert.equal(unmarked.log().match(/watchdog: chrome: Claude in Chrome's notice for the first start could not be marked as seen, since .*; if Claude Code shows it, the session waits for Enter at the terminal \(tmux attach -t voice\)/g)?.length, 2)
+})
+
 test('VOICE_GW_WATCHDOG=0 starts claude directly, as before', async () => {
   const c = setup([{ exit: 3 }], { env: { VOICE_GW_WATCHDOG: '0' } })
   const out = await run(c)

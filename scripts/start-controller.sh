@@ -25,6 +25,13 @@
 # VOICE_GW_REMOTE_CONTROL=1 Remote Control (--remote-control): the session can
 # then be followed and steered from claude.ai/code and the Claude app.
 #
+# Claude in Chrome shows a notice at the first interactive start with --chrome,
+# before the session starts, and waits for Enter or Esc at the terminal. So
+# before every start with it, scripts/chrome-onboarding.mjs marks that notice
+# as seen in Claude Code's own config (~/.claude.json), where Claude Code notes
+# it too. If that fails, the log and a Telegram message say that the start may
+# wait for Enter at the terminal.
+#
 # The session runs in manual mode, whatever defaultMode the user settings set.
 # controller/.claude/settings.json lets Bash, Write and Edit run without asking,
 # because its confine hook limits them, and denies tools that reach beyond this
@@ -48,7 +55,8 @@
 # good. One watchdog at a time. Restarts go to the gateway's log, and to
 # Telegram if .secrets/telegram_token and .secrets/telegram_chat_id exist.
 # With the development flag, a restart waits for the warning to be answered at
-# the terminal; see the README, "The watchdog". The
+# the terminal, and so does a start whose Claude in Chrome notice could not be
+# marked as seen; see the README, "The watchdog". The
 # controller can also ask for a restart (restart_controller, src/restart.mjs):
 # that one starts again at once and does not count as a crash. Before every
 # start the watchdog reads .secrets/gateway.env again, so that a restart takes
@@ -150,6 +158,7 @@ settings_line() {
 }
 
 # A Telegram message, if the Telegram secrets exist; never shows the token.
+host=$(hostname 2>/dev/null || echo 'this computer')
 notify() {
   local result
   result=$(node "$ROOT/scripts/telegram-notify.mjs" "$1" 2>&1) || true
@@ -217,6 +226,28 @@ cd "$CONTROLLER"
 
 # --- the channel ----------------------------------------------------------
 
+# Claude in Chrome's notice at the first start with --chrome waits for Enter
+# at the terminal: marked as seen beforehand (scripts/chrome-onboarding.mjs),
+# so that no unattended start hangs on it. Quiet when it was seen already. If
+# it cannot be marked, the log and Telegram say that this start may wait at
+# the terminal, and chrome_confirm=1 keeps the next crash message from
+# promising a start without a confirmation.
+chrome_confirm=0
+chrome_onboarding() {
+  local line
+  line=$(node "$ROOT/scripts/chrome-onboarding.mjs" 2>/dev/null || echo 'failed the check did not run (scripts/chrome-onboarding.mjs)')
+  chrome_confirm=0
+  case $line in
+    seen) ;;
+    marked)
+      log "chrome: marked Claude in Chrome's notice for the first start as seen in Claude Code's config, so that the session does not wait for Enter at the terminal" ;;
+    *)
+      chrome_confirm=1
+      log "chrome: Claude in Chrome's notice for the first start could not be marked as seen, since ${line#failed }; if Claude Code shows it, the session waits for Enter at the terminal (tmux attach -t voice)"
+      notify "cc-voice-gateway on $host: the controller session starts with Claude in Chrome, whose notice for the first start could not be marked as seen (${line#failed }). If it shows, the session waits for Enter at the terminal (tmux attach -t voice), and voice requests do not arrive until then." ;;
+  esac
+}
+
 # Sets claude_args and channel_mode for the next start, and says why.
 choose_channel() {
   local line
@@ -263,7 +294,12 @@ choose_channel() {
   # options given to this script come later and win.
   if [ -n "${VOICE_GW_CONTROLLER_MODEL:-}" ]; then claude_args+=(--model "$VOICE_GW_CONTROLLER_MODEL"); fi
   if [ -n "${VOICE_GW_CONTROLLER_EFFORT:-}" ]; then claude_args+=(--effort "$VOICE_GW_CONTROLLER_EFFORT"); fi
-  if [ "${VOICE_GW_CONTROLLER_CHROME:-0}" = 1 ]; then claude_args+=(--chrome); fi
+  if [ "${VOICE_GW_CONTROLLER_CHROME:-0}" = 1 ]; then
+    claude_args+=(--chrome)
+    chrome_onboarding
+  else
+    chrome_confirm=0
+  fi
   # Remote Control, under a fixed name, so that a voice request does not
   # become the session's title in the app. Only this session gets it: Claude
   # Code connects interactive sessions, not the workers' claude -p runs. Without
@@ -347,7 +383,6 @@ fi
 restarts=() # times of the restarts within the window
 pause_ms=$backoff_ms
 next="starting the controller session (watchdog $$, started by $(invoker))"
-host=$(hostname 2>/dev/null || echo 'this computer')
 export VOICE_GW_WATCHDOG_LOCK=$LOCK # for the gateway: restart requests, readiness
 
 while :; do
@@ -416,8 +451,11 @@ while :; do
   log "the controller session ended unexpectedly ($reason) after ${lasted} s: restart ${#restarts[@]} of at most $max_restarts within $window_s s, in $(seconds "$pause_ms") s"
   printf 'a crash (%s)\n' "$reason" >"$LOCK/restarted"
   next="starting the controller session again (restart ${#restarts[@]})"
-  if [ "$channel_mode" = plugin ]; then
+  if [ "$channel_mode" = plugin ] && [ "$chrome_confirm" = 0 ]; then
     notify "cc-voice-gateway on $host: the controller session crashed ($reason) and starts again in $(seconds "$pause_ms") s, without a confirmation. A message follows when it is ready."
+  elif [ "$channel_mode" = plugin ]; then
+    # Its start says whether Claude in Chrome's notice may wait at the terminal.
+    notify "cc-voice-gateway on $host: the controller session crashed ($reason) and starts again in $(seconds "$pause_ms") s. A message follows when it is ready."
   else
     notify "cc-voice-gateway on $host: the controller session crashed ($reason) and starts again in $(seconds "$pause_ms") s. Confirm the development channel at the terminal (tmux attach -t voice), otherwise voice requests do not arrive."
   fi

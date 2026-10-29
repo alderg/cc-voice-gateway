@@ -10,10 +10,11 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync, spawnSync } from 'node:child_process'
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { markChromeOnboarding } from '../scripts/chrome-onboarding.mjs'
 import { CONTROLLER_DENY, UNRESTRICTED_ALLOW } from '../scripts/controller-settings.mjs'
 
 const SCRIPT = fileURLToPath(new URL('../scripts/start-controller.sh', import.meta.url))
@@ -24,8 +25,9 @@ const SETTINGS = JSON.parse(readFileSync(join(CONTROLLER, '.claude', 'settings.j
 
 // Runs the start script with a stub claude that prints where it ran and its
 // arguments, and notes every call. setup() prepares Claude Code's config
-// folder: managed settings, known marketplaces.
-function runWithStub(args = [], setup = () => {}, { level = '' } = {}) {
+// folder: managed settings, known marketplaces, its .claude.json, which comes
+// back as claudeJson.
+function runWithStub(args = [], setup = () => {}, { level = '', env = {} } = {}) {
   const bin = mkdtempSync(join(tmpdir(), 'voice-gw-stub-'))
   try {
     const stub = join(bin, 'claude')
@@ -46,12 +48,14 @@ function runWithStub(args = [], setup = () => {}, { level = '' } = {}) {
         CLAUDE_CONFIG_DIR: config,
         VOICE_GW_MANAGED_SETTINGS: join(bin, 'no-managed-settings.json'),
         VOICE_GW_CONTROLLER_LEVEL: level, // empty: the default, confined
+        ...env,
       },
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
     })
     const [cwd, ...argv] = out.trimEnd().split('\n')
-    return { cwd, argv, log: readFileSync(join(bin, 'log'), 'utf8'), calls: readFileSync(join(bin, 'calls'), 'utf8').trim().split('\n') }
+    const claudeJson = existsSync(join(config, '.claude.json')) ? JSON.parse(readFileSync(join(config, '.claude.json'), 'utf8')) : null
+    return { cwd, argv, log: readFileSync(join(bin, 'log'), 'utf8'), calls: readFileSync(join(bin, 'calls'), 'utf8').trim().split('\n'), claudeJson }
   } finally {
     rmSync(bin, { recursive: true, force: true })
   }
@@ -138,6 +142,111 @@ test('VOICE_GW_REMOTE_CONTROL in the config: 1 is on, from the environment or th
     for (const value of ['0', '', 'yes', 'true', 'on', ' 1', '2']) assert.equal(remoteControl(value), 'false', JSON.stringify(value))
   } finally {
     rmSync(secrets, { recursive: true, force: true })
+  }
+})
+
+// Claude Code's global config in its config folder, as Claude Code writes it.
+const withClaudeJson = data => config => writeFileSync(join(config, '.claude.json'), JSON.stringify(data, null, 2))
+const chrome = value => ({ env: { VOICE_GW_CONTROLLER_CHROME: value } })
+
+test('start-controller.sh with VOICE_GW_CONTROLLER_CHROME=1: --chrome, with Claude in Chrome\'s notice for the first start marked as seen beforehand', () => {
+  // Seen at a restart by the autostart with Claude Code 2.1.310: the notice
+  // waited a quarter of an hour for Enter at the terminal, and no voice
+  // request arrived meanwhile.
+  const config = { numStartups: 7, oauthAccount: { emailAddress: 'driver@example.com' }, projects: { '/x': { hasTrustDialogAccepted: true } } }
+  const on = runWithStub(['--debug'], withClaudeJson(config), chrome('1'))
+  assert.ok(on.argv.includes('--chrome'))
+  assert.equal(on.argv.at(-1), '--debug', 'options given to the script still come last')
+  assert.deepEqual(on.claudeJson, { ...config, hasCompletedClaudeInChromeOnboarding: true }, 'that key, nothing else')
+  assert.match(on.log, /watchdog: chrome: marked Claude in Chrome's notice for the first start as seen in Claude Code's config, so that the session does not wait for Enter at the terminal/)
+
+  // Once marked, every further start stays quiet.
+  const again = runWithStub([], withClaudeJson({ ...config, hasCompletedClaudeInChromeOnboarding: true }), chrome('1'))
+  assert.ok(again.argv.includes('--chrome'))
+  assert.doesNotMatch(again.log, / chrome: /)
+
+  // Nothing to mark it in: the log says that the start may wait at the terminal.
+  const missing = runWithStub([], () => {}, chrome('1'))
+  assert.ok(missing.argv.includes('--chrome'), 'it starts all the same')
+  assert.equal(missing.claudeJson, null, 'no config made up')
+  assert.match(missing.log, /watchdog: chrome: Claude in Chrome's notice for the first start could not be marked as seen, since \S*\.claude\.json does not exist yet: .*; if Claude Code shows it, the session waits for Enter at the terminal \(tmux attach -t voice\)/)
+
+  for (const value of ['0', 'yes']) {
+    const off = runWithStub([], withClaudeJson(config), chrome(value))
+    assert.ok(!off.argv.includes('--chrome'), value)
+    assert.deepEqual(off.claudeJson, config, 'untouched')
+    assert.doesNotMatch(off.log, / chrome: /)
+  }
+})
+
+test('chrome-onboarding: sets its key once, keeps the file\'s form, mode and link, and leaves nothing behind', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'voice-gw-chrome-'))
+  try {
+    // A config kept elsewhere and linked, as some keep their dotfiles.
+    const target = join(dir, 'dotfiles', 'claude.json')
+    mkdirSync(dirname(target))
+    const text = '{\n  "numStartups": 3,\n  "oauthAccount": {\n    "emailAddress": "driver@example.com"\n  }\n}'
+    writeFileSync(target, text)
+    chmodSync(target, 0o640)
+    symlinkSync(target, join(dir, '.claude.json'))
+    const env = { CLAUDE_CONFIG_DIR: dir }
+    assert.deepEqual(await markChromeOnboarding({ env }), { state: 'marked' })
+    assert.equal(readFileSync(target, 'utf8'), text.replace(/\n}$/, ',\n  "hasCompletedClaudeInChromeOnboarding": true\n}'))
+    assert.ok(lstatSync(join(dir, '.claude.json')).isSymbolicLink(), 'the link stays')
+    assert.equal(statSync(target).mode & 0o777, 0o640)
+    assert.deepEqual(readdirSync(dir).sort(), ['.claude.json', 'dotfiles'], 'no lock left')
+    assert.deepEqual(readdirSync(dirname(target)), ['claude.json'], 'no temporary file left')
+
+    const written = statSync(target).mtimeMs
+    assert.deepEqual(await markChromeOnboarding({ env }), { state: 'seen' })
+    assert.equal(statSync(target).mtimeMs, written, 'not written again')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('chrome-onboarding: waits while Claude Code holds its lock, takes over one left behind, and writes nothing it cannot read', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'voice-gw-chrome-'))
+  const file = join(dir, '.claude.json')
+  const lock = `${file}.lock` // Claude Code's, made by proper-lockfile
+  const env = { CLAUDE_CONFIG_DIR: dir }
+  try {
+    // A running session holds it: wait, then give up without writing.
+    writeFileSync(file, '{}')
+    mkdirSync(lock)
+    const held = await markChromeOnboarding({ env, waitMs: 300 })
+    assert.equal(held.state, 'failed')
+    assert.match(held.why, /^another Claude Code process held the lock on \S*\.claude\.json for 0\.3 s$/)
+    assert.equal(readFileSync(file, 'utf8'), '{}')
+    assert.ok(existsSync(lock), 'not taken from its holder')
+
+    // Released meanwhile: it goes on.
+    setTimeout(() => rmSync(lock, { recursive: true }), 150)
+    assert.deepEqual(await markChromeOnboarding({ env, waitMs: 5000 }), { state: 'marked' })
+    assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')), { hasCompletedClaudeInChromeOnboarding: true })
+
+    // Left behind by a process that died: older than proper-lockfile's 10 s.
+    writeFileSync(file, '{}')
+    mkdirSync(lock)
+    const old = new Date(Date.now() - 60000)
+    utimesSync(lock, old, old)
+    assert.deepEqual(await markChromeOnboarding({ env, waitMs: 300 }), { state: 'marked' })
+    assert.ok(!existsSync(lock))
+
+    // Not valid JSON, no object, or no file at all: nothing written or made.
+    for (const broken of ['{"numStartups": 3,', '[]']) {
+      writeFileSync(file, broken)
+      const result = await markChromeOnboarding({ env })
+      assert.equal(result.state, 'failed', broken)
+      assert.match(result.why, /\.claude\.json (is not valid JSON|holds no JSON object)$/)
+      assert.equal(readFileSync(file, 'utf8'), broken)
+    }
+    const none = await markChromeOnboarding({ env: { CLAUDE_CONFIG_DIR: join(dir, 'none') } })
+    assert.equal(none.state, 'failed')
+    assert.match(none.why, /\.claude\.json does not exist yet: Claude Code has not run here as this user$/)
+    assert.ok(!existsSync(join(dir, 'none')))
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
   }
 })
 
