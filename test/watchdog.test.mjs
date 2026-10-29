@@ -4,7 +4,8 @@
 //
 // A fake claude follows a plan, one step per start: exit with a code, run
 // until stopped, or serve the gateway's /healthz for a while and then stop
-// answering; with stats, it saves the statistics as the gateway does, at its
+// answering, or start a gateway of this checkout as its child that serves
+// /healthz (for --status); with stats, it saves the statistics as the gateway does, at its
 // start and its end (src/stats.mjs), for the message when the gateway shuts
 // down. A local HTTP server stands in for the Telegram Bot API; no test
 // reaches the real one, and the real .state, log and .secrets stay untouched.
@@ -12,7 +13,7 @@
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -21,6 +22,7 @@ import { fileURLToPath } from 'node:url'
 process.env.VOICE_GW_LOG_FILE = ''
 const { Stats } = await import('../src/stats.mjs')
 
+const ROOT = fileURLToPath(new URL('..', import.meta.url)).replace(/\/$/, '')
 const SCRIPT = fileURLToPath(new URL('../scripts/start-controller.sh', import.meta.url))
 const NOTIFY = fileURLToPath(new URL('../scripts/telegram-notify.mjs', import.meta.url))
 const TMP = mkdtempSync(join(tmpdir(), 'voice-gw-watchdog-'))
@@ -28,6 +30,7 @@ const BIN = join(TMP, 'bin')
 const TOKEN = '123456789:TEST-token-never-in-a-log'
 
 const FAKE_CLAUDE = `#!/usr/bin/env node
+import { spawn } from 'node:child_process'
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 const planFile = process.env.FAKE_CLAUDE_PLAN
@@ -56,7 +59,8 @@ const saveStats = ended => {
 saveStats(false)
 // what the setup assistant does meanwhile: new settings, for the next start
 if ('settings' in step) writeFileSync(process.env.VOICE_GW_SECRETS_DIR + '/gateway.env', step.settings)
-process.on('SIGTERM', () => { note('SIGTERM'); saveStats(true); process.exit(143) })
+let gateway = null
+process.on('SIGTERM', () => { note('SIGTERM'); saveStats(true); gateway?.kill(); process.exit(143) })
 if (step.restart) {
   // what the gateway does for restart_controller: a note for the watchdog, then SIGTERM
   writeFileSync(lock + '/restart', JSON.stringify({ by: 'voice', at: new Date().toISOString() }))
@@ -66,6 +70,11 @@ if (step.restart) {
   // the gateway answers for a while, then no longer, while the session goes on
   const server = createServer((req, res) => res.end('ok')).listen(Number(process.env.VOICE_GW_PORT), '127.0.0.1')
   setTimeout(() => server.close(), step.serve)
+  setInterval(() => {}, 1000)
+} else if (step.gateway) {
+  // the plugin's server of this checkout, by its path, as Claude Code starts it
+  const serve = "require('http').createServer((q, r) => r.end('ok')).listen(Number(process.env.VOICE_GW_PORT), '127.0.0.1')"
+  gateway = spawn(process.execPath, ['-e', serve, process.env.FAKE_ROOT + '/src/plugin.mjs'], { stdio: 'ignore' })
   setInterval(() => {}, 1000)
 } else if (step.run) {
   setInterval(() => {}, 1000)
@@ -148,6 +157,7 @@ function setup(plan, { secrets = true, env = {} } = {}) {
       FAKE_CLAUDE_PLAN: join(dir, 'plan.json'),
       FAKE_CLAUDE_LOG: join(dir, 'claude.jsonl'),
       FAKE_STATS: STATS,
+      FAKE_ROOT: ROOT,
       CLAUDE_CONFIG_DIR: join(dir, 'claude-config'),
       VOICE_GW_MANAGED_SETTINGS: join(dir, 'no-managed-settings.json'),
       ...env,
@@ -241,7 +251,10 @@ test('one watchdog at a time; --status and --stop, after which nothing restarts'
   const second = await run(c)
   assert.equal(second.status, 1)
   assert.match(second.stderr, new RegExp(`the controller is already running \\(watchdog ${first.pid}\\)`))
-  assert.match((await run(c, ['--status'])).stdout, new RegExp(`running \\(watchdog ${first.pid}, session \\d+\\)`))
+  const status = (await run(c, ['--status'])).stdout.split('\n')
+  assert.match(status[0], new RegExp(`^start-controller: running \\(watchdog ${first.pid}, session \\d+\\)$`), 'the first line as before')
+  // Other test files start gateways of this checkout meanwhile: only the shape here.
+  assert.match(status[1], /^start-controller: (no gateway process of this checkout|gateway process .*); port 1 does not answer$/)
 
   const stop = await run(c, ['--stop'])
   assert.equal(stop.status, 0, stop.stderr)
@@ -253,7 +266,75 @@ test('one watchdog at a time; --status and --stop, after which nothing restarts'
   assert.match(c.log(), new RegExp(`watchdog: stop requested by ${user} from \\S*node`), 'who stopped it')
   assert.match(c.log(), new RegExp(`the controller session was stopped by ${user} from \\S*node.* \\(exit code 143\\): not restarting`))
   assert.ok(!existsSync(join(c.dir, 'state', 'controller.lock')), 'the lock is gone')
-  assert.match((await run(c, ['--status'])).stdout, /not running/)
+  assert.match((await run(c, ['--status'])).stdout, /^start-controller: not running\n/)
+})
+
+async function freePort() {
+  return new Promise(resolve => {
+    const probe = createServer().listen(0, '127.0.0.1', () => {
+      const { port } = probe.address()
+      probe.close(() => resolve(port))
+    })
+  })
+}
+
+// A checkout of its own: real folders, the scripts linked in. Its gateway
+// processes are its own, not those that other test files start meanwhile
+// from this one, and the emergency script ends only those.
+let checkouts = 0
+function ownCheckout() {
+  const root = join(TMP, `checkout-${++checkouts}`)
+  for (const dir of ['scripts', 'src', 'controller']) mkdirSync(join(root, dir), { recursive: true })
+  for (const file of readdirSync(join(ROOT, 'scripts'))) symlinkSync(join(ROOT, 'scripts', file), join(root, 'scripts', file))
+  symlinkSync(join(ROOT, 'controller', '.mcp.json'), join(root, 'controller', '.mcp.json'))
+  return realpathSync(root)
+}
+
+// Ends what a failed test left running, by the lock and the processes it names.
+async function stopAll(c, script) {
+  await runCommand(script, ['--stop'], c.env)
+}
+
+test("--status shows the gateway: the session's child, how long it runs, whether its port answers; one left over; not another checkout's", async () => {
+  const root = ownCheckout()
+  const script = join(root, 'scripts', 'start-controller.sh')
+  const port = await freePort()
+  const c = setup([{ gateway: true }], { env: { VOICE_GW_PORT: String(port), FAKE_ROOT: root } })
+  const first = spawn(script, [], { env: c.env, stdio: 'ignore' })
+  const done = exited(first)
+  const forever = 'setInterval(() => {}, 1000)'
+  // A gateway whose session is gone, started by the development flag's
+  // relative path from controller/; and one of another checkout, this one.
+  const leftover = spawn(process.execPath, ['-e', forever, '../src/gateway.mjs'], { cwd: join(root, 'controller'), stdio: 'ignore' })
+  const other = spawn(process.execPath, ['-e', forever, join(ROOT, 'src', 'plugin.mjs')], { stdio: 'ignore' })
+  try {
+    await waitUntil(() => existsSync(join(c.dir, 'state', 'controller.lock', 'claude.pid')))
+    const session = Number(readFileSync(join(c.dir, 'state', 'controller.lock', 'claude.pid'), 'utf8'))
+    let status = ''
+    for (let i = 0; i < 50 && !/ answers$/m.test(status); i++) {
+      status = (await runCommand(script, ['--status'], c.env)).stdout
+      if (!/ answers$/m.test(status)) await new Promise(resolve => setTimeout(resolve, 100))
+    }
+    const [head, gateway] = status.trim().split('\n')
+    assert.equal(head, `start-controller: running (watchdog ${first.pid}, session ${session})`)
+    assert.match(gateway, /^start-controller: gateway process /)
+    assert.match(gateway, /process \d+ \(src\/plugin\.mjs\), running for less than a minute;/, "the session's own")
+    assert.match(gateway, new RegExp(`process ${leftover.pid} \\(src/gateway\\.mjs, of no session of the watchdog\\), running for less than a minute;`))
+    assert.match(gateway, new RegExp(`; port ${port} answers$`))
+    assert.doesNotMatch(gateway, new RegExp(`process ${other.pid}\\b`), "another checkout's is not this one's")
+
+    assert.equal((await runCommand(script, ['--stop'], c.env)).status, 0)
+    assert.equal(await done, 0)
+    const after = (await runCommand(script, ['--status'], c.env)).stdout.trim().split('\n')
+    assert.deepEqual(after, [
+      'start-controller: not running',
+      `start-controller: gateway process ${leftover.pid} (src/gateway.mjs, of no session of the watchdog), running for less than a minute; port ${port} does not answer`,
+    ])
+  } finally {
+    await stopAll(c, script)
+    leftover.kill()
+    other.kill()
+  }
 })
 
 test('a restart the controller asked for starts again at once, does not count, and leaves a note', async () => {

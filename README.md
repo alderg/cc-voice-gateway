@@ -1378,10 +1378,24 @@ first start after saving may still use the development flag; the one after it us
 
 ```bash
 tmux new -s voice scripts/start-controller.sh   # start, with the watchdog
-scripts/start-controller.sh --status            # running?
+scripts/start-controller.sh --status            # running? The watchdog, the session, the gateway
 scripts/start-controller.sh --stop              # stop session and watchdog
 VOICE_GW_WATCHDOG=0 scripts/start-controller.sh # without the watchdog
 ```
+
+`--status` answers in two lines, the first as it always did:
+
+```text
+start-controller: running (watchdog 1489647, session 1489724)
+start-controller: gateway process 1493320 (src/plugin.mjs), running for 1 h 48 min; port 8787 answers
+```
+
+The second names the gateway's process, `src/plugin.mjs` with the plugin and `src/gateway.mjs`
+with the development flag, how long it runs, and whether its port (`VOICE_GW_PORT`, 8787)
+answers `/healthz`. It counts only processes of this checkout, by the resolved path of their
+script, never those of another checkout or worktree. A gateway whose session is gone shows as "of
+no session of the watchdog", also after "not running"; "no gateway process of this checkout"
+says that none runs, and "port … answers" then means that something else answers there.
 
 With the autostart, the service or LaunchAgent only starts tmux; `--stop` ends the controller in
 either case.

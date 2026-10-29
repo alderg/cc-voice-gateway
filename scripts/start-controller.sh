@@ -76,7 +76,8 @@
 #
 #   scripts/start-controller.sh [claude options]   start, with the watchdog
 #   scripts/start-controller.sh --stop             stop the watchdog and the session
-#   scripts/start-controller.sh --status           is it running?
+#   scripts/start-controller.sh --status           is it running? With the gateway:
+#                                                  its process, how long, its port
 #   VOICE_GW_WATCHDOG=0 scripts/start-controller.sh   without the watchdog
 #
 # For an always-on setup run it inside tmux:
@@ -232,6 +233,106 @@ service_job() {
     awk -v unit="$SERVICE" '$2 == unit { print $3; exit }'
 }
 
+# --- the gateway: its port and its processes -------------------------------
+
+# Before every start: the settings may have changed it.
+gateway_port() {
+  port=${VOICE_GW_PORT:-$(node -e '
+    try {
+      const config = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))
+      process.stdout.write(String(config.mcpServers?.voice?.env?.VOICE_GW_PORT ?? 8787))
+    } catch { process.stdout.write("8787") }' "$CONTROLLER/.mcp.json")}
+}
+
+healthy() {
+  node -e 'fetch(process.argv[1], { signal: AbortSignal.timeout(5000) }).then(r => process.exit(r.ok ? 0 : 1), () => process.exit(1))' \
+    "http://127.0.0.1:$port/healthz" </dev/null >/dev/null 2>&1
+}
+
+# A process's working folder: /proc on Linux, lsof on macOS.
+process_cwd() {
+  if [ -e "/proc/$1/cwd" ]; then
+    readlink "/proc/$1/cwd" 2>/dev/null || true
+  else
+    { lsof -a -p "$1" -d cwd -Fn 2>/dev/null || true; } | sed -n 's/^n//p' | head -n 1
+  fi
+}
+
+# A path as an absolute one, symlinks of its folder resolved; a relative one
+# from the folder $2. Empty when that is unknown or gone.
+resolved() {
+  local path=$1
+  case $path in
+    /*) ;;
+    *) [ -n "${2:-}" ] || return 0; path=$2/$path ;;
+  esac
+  (cd "$(dirname "$path")" 2>/dev/null && printf '%s/%s\n' "$(pwd -P)" "$(basename "$path")") || true
+}
+
+# The processes of this checkout's gateway, one per line: "pid ppid elapsed
+# script". node with src/plugin.mjs, the plugin's server, or src/gateway.mjs,
+# which the development flag starts as ../src/gateway.mjs from controller/,
+# of this checkout by their resolved path: another checkout's, a worktree's
+# included, is not this one's.
+gateway_processes() {
+  (
+    set -f # the words of a command line are no patterns
+    { ps -A -o pid= -o ppid= -o etime= -o args= 2>/dev/null || true; } | while read -r pid ppid etime args; do
+      case $args in *src/plugin.mjs* | *src/gateway.mjs*) ;; *) continue ;; esac
+      case ${args%% *} in node | */node | node[0-9]* | */node[0-9]*) ;; *) continue ;; esac
+      for word in $args; do
+        case $word in
+          *src/plugin.mjs | *src/gateway.mjs)
+            script=$(resolved "$word" "$(process_cwd "$pid")")
+            if [ "$script" = "$ROOT/src/plugin.mjs" ] || [ "$script" = "$ROOT/src/gateway.mjs" ]; then
+              echo "$pid $ppid $etime ${script#"$ROOT"/}"
+            fi
+            break
+            ;;
+        esac
+      done
+    done
+  )
+}
+
+# ps's elapsed time ([[dd-]hh:]mm:ss) in words: 45 min, 5 h 20 min, 3 days.
+elapsed() {
+  num awk -v t="$1" 'BEGIN {
+    d = 0
+    if (index(t, "-")) { d = substr(t, 1, index(t, "-") - 1); t = substr(t, index(t, "-") + 1) }
+    n = split(t, p, ":")
+    m = int((p[n] + 60 * p[n - 1] + (n > 2 ? 3600 * p[n - 2] : 0) + 86400 * d) / 60 + 0.5)
+    if (m < 1) print "less than a minute"
+    else if (m < 60) print m " min"
+    else if (m >= 72 * 60) print int(m / 1440 + 0.5) " days"
+    else if (m >= 600 || m % 60 == 0) print int(m / 60 + 0.5) " h"
+    else print int(m / 60) " h " m % 60 " min"
+  }'
+}
+
+# The gateway in one line, for --status: its process, the session's child
+# ($1), or one of this checkout that belongs to no session of the watchdog;
+# how long it runs; whether its port answers.
+gateway_line() {
+  local session=${1:-} pid ppid etime script found=() answers joined
+  gateway_port
+  while read -r pid ppid etime script; do
+    [ -n "$pid" ] || continue
+    if [ -n "$session" ] && [ "$ppid" = "$session" ]; then
+      found+=("process $pid ($script), running for $(elapsed "$etime")")
+    else
+      found+=("process $pid ($script, of no session of the watchdog), running for $(elapsed "$etime")")
+    fi
+  done < <(gateway_processes)
+  if healthy; then answers="port $port answers"; else answers="port $port does not answer"; fi
+  if [ "${#found[@]}" = 0 ]; then
+    echo "start-controller: no gateway process of this checkout; $answers"
+  else
+    joined=$(printf '%s; ' "${found[@]}")
+    echo "start-controller: gateway ${joined%; }; $answers"
+  fi
+}
+
 # --- lock -------------------------------------------------------------------
 
 running_pid() {
@@ -265,15 +366,24 @@ release_lock() {
 
 # --- --stop and --status ----------------------------------------------------
 
+# --status: the first line as ever, "running (watchdog …, session …)" or "not
+# running"; the second the gateway (gateway_line), also when the watchdog does
+# not run, for a gateway left over.
 if [ "${1:-}" = --status ] || [ "${1:-}" = --stop ]; then
   pid=$(running_pid)
-  if [ -z "$pid" ]; then
-    echo "start-controller: not running"
-    exit 0
-  fi
   session=$(cat "$LOCK/claude.pid" 2>/dev/null || true)
   if [ "$1" = --status ]; then
-    echo "start-controller: running (watchdog $pid, session ${session:-starting})"
+    if [ -n "$pid" ]; then
+      echo "start-controller: running (watchdog $pid, session ${session:-starting})"
+    else
+      echo "start-controller: not running"
+      session=
+    fi
+    gateway_line "$session"
+    exit 0
+  fi
+  if [ -z "$pid" ]; then
+    echo "start-controller: not running"
     exit 0
   fi
   by=$(invoker stop)
@@ -395,20 +505,6 @@ if [ "${VOICE_GW_WATCHDOG:-1}" = 0 ]; then
 fi
 
 # --- the gateway's health ---------------------------------------------------
-
-# Before every start: the settings may have changed it.
-gateway_port() {
-  port=${VOICE_GW_PORT:-$(node -e '
-    try {
-      const config = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))
-      process.stdout.write(String(config.mcpServers?.voice?.env?.VOICE_GW_PORT ?? 8787))
-    } catch { process.stdout.write("8787") }' "$CONTROLLER/.mcp.json")}
-}
-
-healthy() {
-  node -e 'fetch(process.argv[1], { signal: AbortSignal.timeout(5000) }).then(r => process.exit(r.ok ? 0 : 1), () => process.exit(1))' \
-    "http://127.0.0.1:$port/healthz" </dev/null >/dev/null 2>&1
-}
 
 # Runs next to the session: once the gateway has answered, enough failed
 # checks in a row end the session, which the watchdog then restarts. Before
