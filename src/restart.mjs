@@ -8,9 +8,10 @@
 // again at once: a requested restart, without a pause, not counted as a crash.
 //
 // What survives: worker runs, which are detached and report to the next
-// gateway; voice requests, which the store keeps in .state/requests.json (an
-// unfinished one ends with a note, see store.mjs). Open approvals belong to
-// the old session and are gone.
+// gateway; queued tasks, which wait in .state/workers.json; voice requests,
+// which the store keeps in .state/requests.json (an unfinished one ends with
+// a note, see store.mjs). Open approvals belong to the old session and are
+// gone.
 //
 // After any restart by the watchdog, the next gateway finds its note
 // ("restarted") and, once the session is connected, tells the driver on
@@ -69,9 +70,11 @@ export class Restarter {
       return `[restart=unavailable] This session cannot restart itself: ${watchdog.why}. Tell the driver; they can restart it at the computer.`
     }
     const runs = this.workers?.running() ?? []
+    const queued = this.workers?.queued() ?? []
     const open = this.store.openRequests()
     const lines = [
-      `[restart=plan watchdog=yes channel=${this.channelMode || 'unknown'} workers=${runs.length} requests=${open.length}]`,
+      `[restart=plan watchdog=yes channel=${this.channelMode || 'unknown'} workers=${runs.length} ` +
+        `queued=${queued.length} requests=${open.length}]`,
       'Restarting ends this session; the watchdog starts it again at once, as a requested restart.',
     ]
     if (runs.length) {
@@ -82,6 +85,13 @@ export class Restarter {
       )
     } else {
       lines.push('No worker runs are going.')
+    }
+    if (queued.length) {
+      const list = queued.slice(0, 5).map(entry => `${entry.id} for ${entry.worker} ("${preview(entry.task, 50)}")`)
+      lines.push(
+        `Queued tasks: ${list.join('; ')}${queued.length > 5 ? `; and ${queued.length - 5} more` : ''}. They stay ` +
+          'queued and start by themselves after the restart, in their order.',
+      )
     }
     lines.push(
       open.length

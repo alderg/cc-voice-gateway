@@ -521,9 +521,20 @@ What applies to every worker run (`src/workers.mjs`):
 - **Environment:** the controller session's variables (`CLAUDECODE`, its messaging socket and
   token, the session id) are removed, so a worker cannot reach the controller.
 - **Before a run:** the gateway refuses a dispatch without your words from a recent voice request
-  ([5.4](#54-approvals-by-voice)), a checkout with uncommitted changes until you agree, a second
-  run in the same repository, and more than `VOICE_GW_MAX_WORKERS` runs. A run stops after
-  `VOICE_GW_WORKER_TIMEOUT` minutes.
+  ([5.4](#54-approvals-by-voice)) and a checkout with uncommitted changes until you agree. A
+  second run in the same repository, or one more than `VOICE_GW_MAX_WORKERS` runs, waits in the
+  queue instead. A run stops after `VOICE_GW_WORKER_TIMEOUT` minutes.
+- **The queue:** `dispatch` answers `dispatch=queued` with the task's id (`q…`), its position and
+  why: `busy` (a run is going there), `queue` (tasks queued there go first) or `full` (no run
+  slot). Your words are checked when it is queued, not again. The gateway starts queued tasks by
+  itself, in their order and one repository at a time, once the repository is idle, its last result
+  has reached the controller and a slot is free; the result event names the queue id
+  (`queued="q…"`). At its turn a task goes through the same checks as any dispatch: kill switch,
+  origin, `direct`, uncommitted changes. One that fails them leaves the queue, and the controller
+  gets an event with `kind="queue"` and the reason, to ask you; nothing is dropped silently. The
+  queue lives in `.state/workers.json` and survives restarts. `list_workers`, `worker_status` and
+  the restart plan show it; `stop_worker` with `drop` drops one queued task by its id, or with
+  `"all"` every one of the repository, together with the running task. The kill switch empties it.
 - **After a run:** the gateway looks at the checkout with git itself, whatever the worker wrote
   (`audit` in `src/workers.mjs`, on this computer or through `docker exec`): commits that no
   remote branch has and that were not there when the run started, uncommitted files that were not
@@ -740,7 +751,8 @@ pull requests turned off are exempt, as for pushes.
 **Effects**, at once:
 
 - **No new work:** `dispatch` answers `locked`, also a dispatch whose checks were still running
-  when the switch tripped; `send` and `ask` hand nothing over.
+  when the switch tripped; `send` and `ask` hand nothing over. The queue is emptied, and the
+  controller's alarm names its tasks: they do not start after the unlock by themselves.
 - **Approvals:** open ones are denied, new ones are denied automatically.
 - **Workers:** every run stops, and so does a clone that is going. With Docker the container stops
   and loses its restart policy.
@@ -774,7 +786,7 @@ unlock by voice, Telegram or the controller.
 | `.secrets/killswitch.json` | Kill switch state, present while locked | 0600 |
 | `.secrets/worker/claude_token`, `.secrets/worker/github_token` | The container's logins, mounted read-only into it | 0600, folder 0700 |
 | `.state/` | Worker state, run output, open requests, watched pull requests, the watchdog's lock | 0700 when the gateway creates it |
-| `.state/tasks/`, `.state/workers.json` | Each run's output with every tool input and result; the workers' state | 0600, folder 0700 |
+| `.state/tasks/`, `.state/workers.json` | Each run's output with every tool input and result; the workers' state, with the queue | 0600, folder 0700 |
 | `.state/requests.json` | Voice requests and the answers, with what the voice client has read | 0600 |
 | `.logs/gateway.log`, `.logs/gateway.log.1` | Log, without tokens; rotated at `VOICE_GW_LOG_MAX_MB` | 0600, folder 0700 when the gateway creates it |
 
@@ -1153,6 +1165,7 @@ terminal (`tmux attach -t voice`, Enter); with the plugin it does not.
 What survives:
 
 - **Worker runs:** detached; the new gateway follows them and reports their results.
+- **Queued tasks:** in `.state/workers.json`; the new gateway starts them in their order.
 - **Requests:** kept in `.state/requests.json`. Answers given before the restart stay deliverable.
   An unfinished request ends with a note to say it again. A worker result the old controller had
   not answered goes to the new one again.
@@ -1176,8 +1189,10 @@ at most three short sentences, without code, paths or lists.
 | "Ask the alpha worker whether the tests pass." | `dispatch`; the controller confirms, the result follows as news |
 | "Tell the alpha worker to fix the typo in the README." | The worker commits on a `voice/` branch, pushes and opens a draft pull request (in Docker: depends on the level); you hear that it is out |
 | "Tell it to add a test for that too." | A follow-up in the same worker session, on the same branch |
-| "What is the alpha worker doing?" | `worker_status` |
-| "Stop the alpha worker." | `stop_worker` |
+| "Then also update the changelog in alpha." (while alpha works) | `dispatch=queued`: it starts by itself after the run, and you hear its result |
+| "What is the alpha worker doing?" | `worker_status`, with the queue there |
+| "Stop the alpha worker." | `stop_worker`; the next queued task there starts |
+| "Forget the changelog task." / "Stop alpha and drop the rest." | `stop_worker` with `drop` and the task's id, or with `"all"` |
 | "Clone drawio-mcp from alderg." | Above `confined`: `clone_repo`; you hear when it is there |
 | "Delete the folder old-experiment." | Above `confined`: `delete_path` says what would be lost, the controller asks; you say yes, then confirm the approval |
 | "Look up the release notes of the latest Claude Code." | Only at `unrestricted`: the controller uses the web itself |
@@ -1364,6 +1379,8 @@ do not set them.
 | The controller says it cannot clone or delete | The level is `confined`, or workers run in Docker; the log line `controller level …` says which. A new level counts from the next start of the start script: `--stop`, then start it again. |
 | `delete=unplanned` | A deletion needs a plan of the same path from the last 15 minutes: the controller calls `delete_path` without `confirm` first. |
 | A worker fails at once | `could not start claude`: Claude Code is not on the gateway's `PATH`; set `VOICE_GW_CLAUDE_BIN`. Otherwise read `.state/tasks/<task>.err`. |
+| A queued task does not start | It waits while a run goes on in its repository, while that run's result has not reached the controller (is the session connected?), while every `VOICE_GW_MAX_WORKERS` slot is taken, and while the kill switch is locked; behind a worker container that does not answer it tries again every 30 s. `list_workers` shows the queue, `.state/workers.json` holds it under `queue`. |
+| An event with `kind="queue"` | A queued task could not start at its turn and left the queue: uncommitted changes, the origin changed in the container, a `direct` push not allowed, or the repository is gone. The controller asks you; dispatched again, it starts from the beginning. |
 | A result says `git="1 commit on no remote"` although the worker pushed | The check counts commits that no remote-tracking branch (`refs/remotes/…`) has. A push to a URL instead of a named remote does not update them; `git fetch` in the checkout does. Without any remote, commits never count. |
 | What did a worker do? | `.state/tasks/<task>.jsonl` holds the whole run. `claude --resume <session>` in the repository opens the session; `.state/workers.json` lists the session ids. |
 | A private repository is handled like a public one | `gh` is not logged in or not on the `PATH`, so the visibility is unknown, and the worker asks before pushing to be safe. |

@@ -389,24 +389,81 @@ test('pull requests turned off on GitHub: the worker commits on the default bran
   assert.doesNotMatch(lastCall().input, /Pull requests: turned off/)
 })
 
-test('one run per repository, two at a time; stop ends a run without an event', async () => {
+const queuedId = text => /queued=(q[a-z0-9]{3})/.exec(text)?.[1]
+
+test('one run per repository, two at a time; the rest waits in the queue; stop ends a run without an event', async () => {
   const slow = await dispatch('alpha', 'SLOW: run everything.')
   assert.match(slow.text, /dispatch=started/)
-  assert.match((await dispatch('alpha', 'Something else.')).text, /^\[dispatch=busy worker=alpha task=t/)
+  const busy = await dispatch('alpha', 'Something else.')
+  assert.match(busy.text, new RegExp(`^\\[dispatch=queued worker=alpha queued=q[a-z0-9]{3} position=1 reason=busy\\] Queued, because task ${slow.id} is running there\\. It starts by itself`))
+  const second = queuedId(busy.text)
   assert.match((await dispatch('gamma', 'SLOW: another run.')).text, /dispatch=started/)
-  assert.match((await dispatch('beta-public', 'A third run.')).text, /^\[dispatch=full running=2\]/)
-  assert.match((await controller('list_workers')).text, /^alpha: .*running t[a-z0-9]{3} for/m)
-  assert.match((await controller('worker_status', { worker: 'alpha' })).text, /state=running/)
+  const full = await dispatch('beta-public', 'A third run.')
+  assert.match(full.text, /^\[dispatch=queued worker=beta-public queued=q[a-z0-9]{3} position=1 reason=full\] Queued, because every run slot is taken \(alpha, gamma\)\./)
+  const third = queuedId(full.text)
+  const list = (await controller('list_workers')).text
+  assert.match(list, /^\[workers=5 running=2 queued=2 max=2\]/)
+  assert.match(list, new RegExp(`^alpha: .*running ${slow.id} for .*; queued: ${second} \\("Something else\\."\\)$`, 'm'))
+  assert.match((await controller('worker_status', { worker: 'alpha' })).text, new RegExp(`state=running[^]*\\nQueued: ${second} `))
 
-  assert.match((await controller('stop_worker', { worker: 'alpha' })).text, /^\[worker=alpha stopped task=t/)
+  const stopped = await controller('stop_worker', { worker: 'alpha' })
+  assert.match(stopped.text, new RegExp(`^\\[worker=alpha stopped task=${slow.id} queued=1\\] Stopped\\. Git check by the gateway: clean`))
+  assert.match(stopped.text, new RegExp(`Queued there: ${second} \\("Something else\\."\\)\\. The next starts by itself`))
+  // The queued task starts by itself, and its result says which it was.
+  const next = await waitUntil(() => gw.events.find(e => e.meta?.queued === second))
+  assert.equal(next.meta.worker, 'alpha')
+  assert.match(next.content, /^Task: Something else\.$/m)
+  // Then a slot is free for the one that waited for it.
+  await waitUntil(() => gw.events.find(e => e.meta?.queued === third))
+
   assert.match((await controller('stop_worker', { worker: 'gamma' })).text, /stopped/)
   assert.match((await controller('stop_worker', { worker: 'gamma' })).text, /Nothing is running there/)
-  assert.match((await controller('worker_status', { worker: 'alpha' })).text, /state=stopped/)
   await new Promise(r => setTimeout(r, 1500))
   assert.ok(!gw.events.some(e => e.meta?.task === slow.id), 'the controller stopped it and needs no event')
   for (const call of calls().filter(c => c.input.startsWith('SLOW'))) {
     assert.throws(() => process.kill(call.pid, 0), { code: 'ESRCH' }, 'the run is really gone')
   }
+})
+
+test('stop_worker drops queued tasks: one by its id while the run goes on, or all of them with the run', async () => {
+  const slow = await dispatch('alpha', 'SLOW: run it all again.')
+  const first = queuedId((await dispatch('alpha', 'Then count the files.')).text)
+  const second = await dispatch('alpha', 'Then list the branches.')
+  assert.match(second.text, /position=2 reason=busy/)
+  assert.match(second.text, /, in position 2\./)
+
+  const one = await controller('stop_worker', { worker: 'alpha', drop: first })
+  assert.match(one.text, new RegExp(`^\\[worker=alpha dropped=${first}\\] Dropped the queued task ${first} \\("Then count the files\\."\\); nothing else changed\\. Queued there: ${queuedId(second.text)} `))
+  assert.match((await controller('worker_status', { worker: 'alpha' })).text, /state=running/, 'the run goes on')
+  const unknown = await controller('stop_worker', { worker: 'alpha', drop: 'qzzz' })
+  assert.equal(unknown.isError, true)
+  assert.match(unknown.text, /No queued task "qzzz" there/)
+
+  const all = await controller('stop_worker', { worker: 'alpha', drop: 'all' })
+  assert.match(all.text, new RegExp(`^\\[worker=alpha stopped task=${slow.id} dropped=1\\] Stopped\\. .*Dropped from the queue: ${queuedId(second.text)} \\("Then list the branches\\."\\)\\.$`))
+  assert.match((await controller('list_workers')).text, /^alpha: .*, idle, last task t[a-z0-9]{3} stopped .* ago$/m)
+  await new Promise(r => setTimeout(r, 1500))
+  assert.ok(!calls().some(c => /^Then (count|list)/.test(c.input)), 'neither ran')
+})
+
+test('a queued task that finds uncommitted changes at its turn leaves the queue, and the controller hears why', async () => {
+  const slow = await dispatch('dirty', 'SLOW: look around.', { allow_dirty: true })
+  assert.match(slow.text, /dispatch=started/)
+  const queued = await dispatch('dirty', 'Update the changelog.')
+  const id = queuedId(queued.text)
+  assert.ok(id, queued.text)
+  const parked = await waitUntil(() => gw.events.find(e => e.meta?.kind === 'queue' && e.meta.queued === id), 12000)
+  assert.equal(parked.meta.worker, 'dirty')
+  assert.equal(parked.meta.outcome, 'dirty')
+  assert.equal(parked.meta.trusted, undefined, "the gateway's reason and the controller's task, nothing from the repository")
+  assert.equal(
+    parked.content,
+    `The queued task ${id} for dirty did not start: the checkout has 1 uncommitted file. It has left the queue. ` +
+      'Task: "Update the changelog.". Tell the driver and ask what to do. If the driver says to go ahead anyway, ' +
+      'dispatch it again with allow_dirty and their words.',
+  )
+  assert.doesNotMatch((await controller('list_workers')).text, /queued/)
+  assert.ok(!calls().some(c => c.input.startsWith('Update the changelog.')))
 })
 
 test('run output and the worker state are for this user only, also a folder from before', async () => {
@@ -671,11 +728,14 @@ test('news: a waiting get_reply returns with it; questions and late answers coun
   assert.match(await voiceCall('status'), /News from Claude Code \(id=[a-z0-9]{4}\): Sorry, four files\./)
 })
 
-test('a run survives a gateway restart and reports to the new gateway', async () => {
+test('a run survives a gateway restart and reports to the new gateway; the queue goes on there', async () => {
   const run = await dispatch('alpha', 'SLOW: a long task.')
+  const queued = queuedId((await dispatch('alpha', 'Afterwards, sum it up.')).text)
   await stopGateway()
   gw = await startGateway()
   const event = await workerEvent('alpha', run.id)
   assert.equal(event.meta.outcome, 'done')
   assert.match(event.content, /All 12 tests pass/)
+  const next = await waitUntil(() => gw.events.find(e => e.meta?.queued === queued))
+  assert.match(next.content, /^Task: Afterwards, sum it up\.$/m)
 })

@@ -700,6 +700,7 @@ test('a rule: a push to main in a run locks it, and every running worker stops',
   const slowId = /task=(t[a-z0-9]{3})/.exec(slow.text)[1]
   await waitUntil(() => existsSync(join(TMP, 'claude-calls.jsonl')) && readFileSync(join(TMP, 'claude-calls.jsonl'), 'utf8').includes('SLOW'))
   const slowPid = JSON.parse(readFileSync(join(TMP, 'claude-calls.jsonl'), 'utf8').trim().split('\n').findLast(l => l.includes('SLOW'))).pid
+  const queued = /queued=(q[a-z0-9]{3})/.exec((await gw.dispatch('beta', 'Then tidy up the docs.')).text)[1]
   await gw.dispatch('alpha', 'PUSHMAIN: push it.')
 
   const state = await waitUntil(async () => (await killswitchState()).state)
@@ -716,7 +717,12 @@ test('a rule: a push to main in a run locks it, and every running worker stops',
       return true
     }
   })
+  // The queue is emptied, and the controller hears which tasks left it.
+  const alarm = await waitUntil(() => gw.events.findLast(e => e.meta?.kind === 'killswitch' && e.meta.trigger === 'rule'))
+  assert.match(alarm.content, new RegExp(`These queued tasks left the queue and will not start by themselves: ${queued} for beta \\("Then tidy up the docs\\."\\)\\.`))
   await unlockByAdmin()
+  await sleep(1500)
+  assert.ok(!readFileSync(join(TMP, 'claude-calls.jsonl'), 'utf8').includes('Then tidy up the docs.'), 'not after the unlock either')
 })
 
 test('locked at startup with a worker state that cannot be saved: logged, and the gateway stays up and locked', async () => {

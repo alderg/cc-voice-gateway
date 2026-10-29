@@ -10,6 +10,10 @@
 // .state/tasks/<id>.jsonl, so they survive a gateway restart, which comes with
 // every controller restart; the gateway follows the file and the process id.
 //
+// A task for a repository whose worker is busy, or while every run slot is
+// taken, waits in a queue in .state/workers.json and starts by itself when
+// it is its turn (pump), so nobody has to remember to send it again.
+//
 // The gateway checks the checkout before a run (uncommitted files, a run
 // already going, the cap on parallel runs) in code, not in the worker's
 // instructions. What the worker does with git is up to its instructions;
@@ -33,6 +37,7 @@ const GITHUB_CACHE_MS = 10 * 60 * 1000 // what gh says about a repository
 const MAX_STEPS = 5
 const KEEP_TASKS = 40
 const MAX_UNPUSHED = 200 // commits on no remote that the audit lists
+const PAUSE_MS = 30 * 1000 // the queue waits this long when the worker container does not answer
 const ID_ALPHABET = 'abcdefghjkmnpqrstuvwxyz23456789'
 
 // Claude Code sets these for its own child processes, the gateway included. A
@@ -157,11 +162,40 @@ export function workerRules(level, { pushDirect = false } = {}) {
 const plural = (n, unit) => `${n} ${unit}${n === 1 ? '' : 's'}`
 const originName = slug => slug ?? 'no GitHub remote'
 
+// Queued tasks in a list, first the next: q2ab ("Run the tests."), …; with
+// the repositories when they are not all the same.
+export const queueList = (entries, { max = 5, repos = false } = {}) =>
+  entries
+    .slice(0, max)
+    .map(entry => `${entry.id}${repos ? ` for ${entry.worker}` : ''} ("${preview(entry.task, 50)}")`)
+    .join(', ') + (entries.length > max ? `, and ${entries.length - max} more` : '')
+
+// What the controller hears when a queued task could not start and left the
+// queue: the controller's own task and the gateway's reason, nothing that a
+// repository wrote.
+export function parkedText(entry, why, status) {
+  const hint =
+    status === 'dirty'
+      ? 'If the driver says to go ahead anyway, dispatch it again with allow_dirty and their words.'
+      : 'If the driver still wants it, dispatch it again with their words.'
+  return (
+    `The queued task ${entry.id} for ${entry.worker} did not start: ${why}. It has left the queue. ` +
+    `Task: "${preview(entry.task, 200)}". Tell the driver and ask what to do. ${hint}`
+  )
+}
+
 function duration(ms) {
   const seconds = Math.round(ms / 1000)
   if (seconds < 90) return plural(seconds, 'second')
   return plural(Math.round(seconds / 60), 'minute')
 }
+
+// A saved queue entry the gateway can start. Anything else in the file, from
+// an older version or edited by hand, is left out.
+const queuable = entry =>
+  entry !== null &&
+  typeof entry === 'object' &&
+  ['id', 'worker', 'task', 'words'].every(key => typeof entry[key] === 'string' && entry[key] !== '')
 
 export function githubSlug(url) {
   const match = /github\.com[:/]([^/\s]+\/[^/\s]+?)(?:\.git)?\/?$/.exec(url ?? '')
@@ -287,6 +321,9 @@ export class Workers extends EventEmitter {
     this.timeoutMs = timeoutMinutes * 60 * 1000
     this.github = new Map() // owner/repo -> { at, info: { visibility, pulls, branch } }
     this.starting = new Set() // repositories between the checks and the start
+    this.auditing = new Set() // repositories whose checkout the audit looks at
+    this.pumping = false // a queued task is being started
+    this.pausedUntil = 0 // the queue waits for the worker container
     this.followed = new Map() // task id -> { offset, partial }
     this.state = this.load()
     // Also a folder an older version left with the default mode.
@@ -309,14 +346,16 @@ export class Workers extends EventEmitter {
 
   // origins: in the container, the GitHub slug the gateway saw first per
   // repository (pinOrigin), without a prototype, as the names are folder names.
+  // queue: the tasks waiting for their turn, in order.
   load() {
     const origins = data => Object.assign(Object.create(null), data?.origins)
     try {
       const data = JSON.parse(readFileSync(this.stateFile, 'utf8'))
-      return { repos: data.repos ?? {}, tasks: data.tasks ?? [], origins: origins(data) }
+      const queue = (Array.isArray(data.queue) ? data.queue : []).filter(queuable)
+      return { repos: data.repos ?? {}, tasks: data.tasks ?? [], origins: origins(data), queue }
     } catch (error) {
       if (error.code !== 'ENOENT') log('worker state unreadable, starting empty:', error.message)
-      return { repos: {}, tasks: [], origins: origins(null) }
+      return { repos: {}, tasks: [], origins: origins(null), queue: [] }
     }
   }
 
@@ -338,11 +377,11 @@ export class Workers extends EventEmitter {
     clearInterval(this.timer)
   }
 
-  newTaskId() {
+  newTaskId(prefix = 't') {
     for (;;) {
-      let id = 't'
+      let id = prefix
       for (let i = 0; i < 3; i++) id += ID_ALPHABET[randomInt(ID_ALPHABET.length)]
-      if (!this.state.tasks.some(t => t.id === id)) return id
+      if (!this.state.tasks.some(t => t.id === id) && !this.state.queue.some(q => q.id === id)) return id
     }
   }
 
@@ -447,15 +486,23 @@ export class Workers extends EventEmitter {
 
   // --- runs ---------------------------------------------------------------
 
-  async dispatch({ worker, task, words, fresh = false, allowDirty = false, direct = false }) {
+  // A task on the driver's words, which the caller has checked (channel.mjs).
+  // It starts at once, or waits in the queue: behind a run in the same
+  // repository, behind tasks queued there before it, or for a free run slot.
+  // request: the id of the voice request with the words.
+  async dispatch({ worker, task, words, fresh = false, allowDirty = false, direct = false, request = null }) {
     if (this.killswitch?.locked) return { status: 'locked', state: this.killswitch.state }
     const names = await this.repos()
     if (!names.includes(worker)) return { status: 'unknown', names }
-    const busy = this.running().find(t => t.repo === worker)
-    if (busy || this.starting.has(worker)) return { status: 'busy', task: busy ?? null }
-    if (this.running().length + this.starting.size >= this.maxRuns) {
-      return { status: 'full', running: this.running() }
-    }
+    const job = { worker, task, words, fresh, allowDirty, direct, request }
+    const why = this.waiting(worker) ?? (this.slotsFull() ? 'full' : this.queued(worker).length ? 'queue' : null)
+    if (why) return this.enqueue(job, why)
+    return this.launch(job)
+  }
+
+  // The checks before a run, and the start: for a dispatch, and for a queued
+  // task when it is its turn (entry).
+  async launch({ worker, task, words, fresh = false, allowDirty = false, direct = false }, entry = null) {
     this.starting.add(worker)
     try {
       const facts = await this.inspect(worker)
@@ -468,7 +515,7 @@ export class Workers extends EventEmitter {
       if (direct && !facts.pushDirect && facts.access?.level !== 'full') return { status: 'refused', facts }
       if (facts.dirty.length && !allowDirty) return { status: 'dirty', files: facts.dirty }
       facts.unpushed = await this.baseline(facts.dir)
-      return this.start(facts, { task, words, fresh, direct })
+      return this.start(facts, { task, words, fresh, direct }, entry)
     } finally {
       this.starting.delete(worker)
     }
@@ -485,8 +532,9 @@ export class Workers extends EventEmitter {
     return state ? state.unpushed.map(commit => commit.hash) : null
   }
 
-  start(facts, { task, words, fresh, direct = false }) {
+  start(facts, { task, words, fresh, direct = false }, entry = null) {
     if (this.killswitch?.locked) return { status: 'locked', state: this.killswitch.state }
+    if (entry && !this.state.queue.some(waiting => waiting.id === entry.id)) return { status: 'dropped' }
     const previous = fresh ? null : this.state.repos[facts.name]?.sessionId
     const sessionId = previous || randomUUID()
     const id = this.newTaskId()
@@ -546,14 +594,17 @@ export class Workers extends EventEmitter {
       error: null,
       reported: false,
     }
+    if (entry) record.queued = entry.id // it waited in the queue as this
     child.on('error', error => this.finish(record, 'failed', `could not start ${error.path || this.claudeBin}: ${error.message}`))
     child.stdin.on('error', () => {}) // the run may end before it read everything
     child.stdin.end(prompt({ task, words, facts, direct }))
     child.unref()
     this.state.tasks.push(record)
     this.state.repos[facts.name] = { sessionId }
+    if (entry) this.state.queue = this.state.queue.filter(waiting => waiting.id !== entry.id)
     this.save()
-    log('worker start', facts.name, id, previous ? 'resumed session' : 'new session', preview(task, 60))
+    const queued = entry ? [`queued as ${entry.id}`] : []
+    log('worker start', facts.name, id, previous ? 'resumed session' : 'new session', ...queued, preview(task, 60))
     this.emit('started', record)
     return { status: 'started', task: record, facts }
   }
@@ -590,6 +641,142 @@ export class Workers extends EventEmitter {
     return stopped
   }
 
+  // --- the queue ----------------------------------------------------------
+
+  // Queued tasks start in the order they came, one repository at a time,
+  // once the repository is idle and its last result has reached the
+  // controller, and a run slot is free. The driver's words were checked when
+  // a task was queued. One that cannot start when it is its turn (uncommitted
+  // changes, the origin changed in the container, a direct push no longer
+  // allowed, the repository gone) leaves the queue with its reason, and the
+  // controller hears about it ('parked'): none is dropped silently.
+
+  queued(repo = null) {
+    return this.state.queue.filter(entry => repo === null || entry.worker === repo)
+  }
+
+  slotsFull() {
+    return this.running().length + this.starting.size >= this.maxRuns
+  }
+
+  // 'busy' while a repository cannot take a run: one is going or starting,
+  // or the last one is still being checked or reported. Otherwise null.
+  waiting(repo) {
+    const last = this.lastTask(repo)
+    if (last?.state === 'running' || this.starting.has(repo) || this.auditing.has(repo)) return 'busy'
+    if (last && !last.reported) return 'busy'
+    return null
+  }
+
+  enqueue(job, reason) {
+    const entry = { id: this.newTaskId('q'), ...job, queuedAt: Date.now() }
+    this.state.queue.push(entry)
+    try {
+      this.save()
+    } catch (error) {
+      this.state.queue.pop() // not kept, so not queued
+      throw error
+    }
+    log('worker queued', job.worker, entry.id, reason, preview(job.task, 60))
+    return {
+      status: 'queued',
+      entry,
+      reason, // busy, queue (others before it), full (no run slot)
+      position: this.queued(job.worker).indexOf(entry) + 1,
+      task: this.running().find(t => t.repo === job.worker) ?? null,
+      running: this.running(),
+    }
+  }
+
+  // Starts the next queued task that can start; poll() calls it every
+  // second. Only the first task of a repository may start, and nothing
+  // starts while the kill switch is locked.
+  async pump() {
+    if (this.pumping || !this.state.queue.length || this.killswitch?.locked || Date.now() < this.pausedUntil) return
+    this.pumping = true
+    try {
+      const seen = new Set()
+      for (const entry of [...this.state.queue]) {
+        if (seen.has(entry.worker)) continue
+        seen.add(entry.worker)
+        if (this.slotsFull()) return
+        if (this.waiting(entry.worker)) continue
+        await this.startQueued(entry)
+        return
+      }
+    } catch (error) {
+      log('queued task not started:', error.message)
+    } finally {
+      this.pumping = false
+    }
+  }
+
+  async startQueued(entry) {
+    let names
+    try {
+      names = await this.repos()
+    } catch (error) {
+      this.pausedUntil = Date.now() + PAUSE_MS
+      log('queue waits:', error.message)
+      return
+    }
+    // Meanwhile a dispatch may have taken the slot, or the controller dropped it.
+    if (!this.queued(entry.worker).includes(entry) || this.slotsFull() || this.waiting(entry.worker)) return
+    if (!names.includes(entry.worker)) return this.park(entry, 'the repository is gone')
+    let result
+    try {
+      result = await this.launch(entry, entry)
+    } catch (error) {
+      log('queued task', entry.id, 'could not start:', error.message)
+      return this.park(entry, 'it could not start; the gateway log says why')
+    }
+    // locked: it waits; dropped: the controller took it out meanwhile.
+    if (['started', 'locked', 'dropped'].includes(result.status)) return
+    const why = {
+      origin: 'the origin of the repository changed in the container; it needs a look at the desk',
+      refused: 'a direct push needs access level full, and the repository is not at full',
+      dirty: `the checkout has ${plural(result.files?.length ?? 0, 'uncommitted file')}`,
+    }[result.status]
+    this.park(entry, why ?? `it could not start (${result.status})`, result.status)
+  }
+
+  // Takes a queued task out of the queue because it cannot start.
+  park(entry, why, status = 'gone') {
+    this.state.queue = this.state.queue.filter(waiting => waiting.id !== entry.id)
+    try {
+      this.save()
+    } catch (error) {
+      log('worker state not saved:', error.message)
+    }
+    log('queued task left the queue', entry.worker, entry.id, why)
+    this.emit('parked', entry, why, status)
+  }
+
+  // The kill switch empties the queue: nothing starts while it is locked,
+  // nor by itself after the unlock. Returns the tasks that were queued.
+  parkAll() {
+    const parked = this.state.queue
+    if (!parked.length) return []
+    this.state.queue = []
+    try {
+      this.save()
+    } catch (error) {
+      log('worker state not saved:', error.message)
+    }
+    return parked
+  }
+
+  // On the controller's word: one queued task by its id, or every one of a
+  // repository ("all"). Returns those dropped.
+  drop(repo, which) {
+    const dropped = this.queued(repo).filter(entry => which === 'all' || entry.id === which)
+    if (!dropped.length) return []
+    this.state.queue = this.state.queue.filter(entry => !dropped.includes(entry))
+    this.save()
+    log('dropped from the queue', repo, dropped.map(entry => entry.id).join(', '))
+    return dropped
+  }
+
   // --- following runs -----------------------------------------------------
 
   poll() {
@@ -607,6 +794,7 @@ export class Workers extends EventEmitter {
       }
     }
     for (const task of this.unreported()) this.emit('finished', task)
+    this.pump()
   }
 
   follow(task) {
@@ -713,7 +901,11 @@ export class Workers extends EventEmitter {
   // gateway restart; { ok: false } when git does not answer.
   async audit(task) {
     if (task.audit) return task.audit
-    const now = await gitState((...args) => this.git(...args), task.dir ?? this.runner.dir(task.repo)).catch(() => null)
+    // Until it is done, the next queued task there waits.
+    this.auditing.add(task.repo)
+    const now = await gitState((...args) => this.git(...args), task.dir ?? this.runner.dir(task.repo))
+      .catch(() => null)
+      .finally(() => this.auditing.delete(task.repo))
     if (!now) {
       task.audit = { ok: false, at: Date.now() }
     } else {
@@ -744,8 +936,10 @@ export class Workers extends EventEmitter {
     const names = await this.repos()
     const facts = await Promise.all(names.map(name => this.inspect(name)))
     const container = this.runner.container
+    const queued = this.queued().length
     const lines = [
-      `[workers=${names.length} running=${this.running().length} max=${this.maxRuns}${container ? ` docker=${container}` : ''}]`,
+      `[workers=${names.length} running=${this.running().length}${queued ? ` queued=${queued}` : ''} max=${this.maxRuns}` +
+        `${container ? ` docker=${container}` : ''}]`,
     ]
     for (const f of facts) {
       const where = f.moved
@@ -767,16 +961,25 @@ export class Workers extends EventEmitter {
 
   stateText(repo) {
     const task = this.lastTask(repo)
-    if (!task) return 'idle'
+    const queued = this.queued(repo)
+    const queue = queued.length ? `; queued: ${queueList(queued)}` : ''
+    if (!task) return `idle${queue}`
     if (task.state === 'running') {
-      return `running ${task.id} for ${duration(Date.now() - task.startedAt)} ("${preview(task.task, 50)}")`
+      return `running ${task.id} for ${duration(Date.now() - task.startedAt)} ("${preview(task.task, 50)}")${queue}`
     }
-    return `idle, last task ${task.id} ${task.state} ${duration(Date.now() - task.finishedAt)} ago`
+    return `idle, last task ${task.id} ${task.state} ${duration(Date.now() - task.finishedAt)} ago${queue}`
+  }
+
+  // The queue of a repository in one line, for stop_worker.
+  queueText(repo) {
+    const queued = this.queued(repo)
+    return queued.length ? `Queued there: ${queueList(queued)}.` : 'Nothing is queued there.'
   }
 
   statusText(repo) {
     const task = this.lastTask(repo)
-    if (!task) return `[worker=${repo} state=idle] No task yet.`
+    const queued = this.queued(repo)
+    if (!task) return `[worker=${repo} state=idle] No task yet.${queued.length ? ` Queued: ${queueList(queued)}.` : ''}`
     const lines = []
     if (task.state === 'running') {
       lines.push(`[worker=${repo} state=running task=${task.id} elapsed=${Math.round((Date.now() - task.startedAt) / 1000)}s]`)
@@ -789,6 +992,7 @@ export class Workers extends EventEmitter {
     if (task.state === 'running' && task.lastText) lines.push(`Last message: ${task.lastText}`)
     if (task.result) lines.push(`Result: ${task.result}`)
     if (task.error && task.error !== task.result) lines.push(`Problem: ${task.error}`)
+    if (queued.length) lines.push(`Queued: ${queueList(queued)}.`)
     return lines.join('\n')
   }
 

@@ -23,7 +23,7 @@ import { Auth } from './oauth.mjs'
 import { startAdmin } from './admin.mjs'
 import { startChannel } from './channel.mjs'
 import { startVoiceHttp } from './voice.mjs'
-import { Workers, auditSummary, gitState, hostGit } from './workers.mjs'
+import { Workers, auditSummary, gitState, hostGit, parkedText, queueList } from './workers.mjs'
 import { Restarter } from './restart.mjs'
 import { PullWatcher } from './pulls.mjs'
 import { TelegramCommands, TelegramFallback, loadTelegram } from './telegram.mjs'
@@ -195,12 +195,28 @@ workers.on('finished', async task => {
     // git: the audit in the gateway's words, without the run's.
     request.meta = { worker: task.repo, task: task.id, outcome: task.state, git: auditSummary(task.audit), trusted: 'no' } // for sending it again
     if (opened.length) request.meta.pull_request = opened.map(pull => pull.number).join(',')
+    if (task.queued) request.meta.queued = task.queued // the id it had in the queue
     await channel.push(request, request.meta)
     workers.markReported(task)
   } catch (error) {
     log('worker result not delivered:', error.message)
   } finally {
     reporting.delete(task.id)
+  }
+})
+
+// A queued task that could not start when it was its turn has left the
+// queue; the controller hears why, and the driver through its answer. The
+// text holds the controller's task and the gateway's reason, nothing that a
+// repository wrote.
+workers.on('parked', async (entry, why, status) => {
+  try {
+    await channel.ready
+    const request = store.createRequest(parkedText(entry, why, status), { origin: 'worker' })
+    request.meta = { kind: 'queue', worker: entry.worker, queued: entry.id, outcome: status }
+    await channel.push(request, request.meta)
+  } catch (error) {
+    log('queue news not delivered:', error.message)
   }
 })
 
@@ -269,10 +285,13 @@ log(`${ipGuard.describe()}; suspicious requests ${telegram ? 'reported on Telegr
 
 // --- the kill switch's effects, in code ---------------------------------------
 
-// No new tasks (Workers.dispatch and the voice tools check the switch), every
-// run and the worker container stop, open approvals are denied. An error here
-// is logged; the lock holds whatever happens, and so does the gateway.
+// No new tasks (Workers.dispatch and the voice tools check the switch), the
+// queue is emptied, every run and the worker container stop, open approvals
+// are denied. An error here is logged; the lock holds whatever happens, and
+// so does the gateway. Returns the tasks that were queued.
 async function lockdown(why) {
+  const parked = workers.parkAll()
+  if (parked.length) log('kill switch emptied the queue:', parked.map(entry => `${entry.worker} ${entry.id}`).join(', '))
   try {
     const stopped = workers.stopAll(`kill switch (${why})`)
     if (stopped.length) log('kill switch stopped', stopped.map(task => `${task.repo} ${task.id}`).join(', '))
@@ -289,12 +308,13 @@ async function lockdown(why) {
     const ok = await runner.lockdown()
     log(`kill switch: worker container ${config.docker} ${ok ? 'stopped' : 'not stopped (was it running?)'}`)
   }
+  return parked
 }
 
 const lockdownFailed = error => log('kill switch: lockdown incomplete, still locked:', error.message)
 
 killswitch.on('tripped', async (state, event, first) => {
-  await lockdown(event.trigger).catch(lockdownFailed)
+  const parked = (await lockdown(event.trigger).catch(lockdownFailed)) ?? []
   // Telegram at once; every voice chat hears it with its next call (voice.mjs).
   const when = new Date(event.at).toISOString().replace('T', ' ').slice(0, 16)
   telegram
@@ -307,9 +327,16 @@ killswitch.on('tripped', async (state, event, first) => {
   // The controller hears it too; its acknowledgement is not news.
   try {
     await channel.ready
+    // The queue's tasks are the controller's own words; they do not start
+    // after the unlock by themselves.
+    const list = queueList(parked, { max: 10, repos: true })
+    const queue = parked.length
+      ? ` These queued tasks left the queue and will not start by themselves: ${list}. Tell the driver; after the ` +
+        'unlock they can have them dispatched again.'
+      : ''
     const request = store.createRequest(
       `${first ? 'Kill switch locked' : 'Kill switch triggered again'}: ${alarmText(state)} Do not try to get ` +
-        'around it. Reply "done".',
+        `around it.${queue} Reply "done".`,
       { origin: 'alarm' },
     )
     await channel.push(request, { kind: 'killswitch', trigger: event.trigger })

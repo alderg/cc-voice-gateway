@@ -337,12 +337,16 @@ test('restart_controller: first what would happen, running workers included; the
     const started = await g.controller('dispatch', { worker: 'alpha', task: 'SLOW: a long task.', words: 'SLOW: a long task.' })
     const task = /task=(t[a-z0-9]{3})/.exec(started)[1]
     await g.controller('reply', { request_id: said, state: 'done', text: 'It is on its way.' })
+    await g.call('send', { message: 'And then the README.' })
+    const queued = await g.controller('dispatch', { worker: 'alpha', task: 'Then fix the README.', words: 'And then the README.' })
+    const entry = /queued=(q[a-z0-9]{3})/.exec(queued)[1]
     await g.call('send', { message: 'Restart the controller.' })
 
     const plan = await g.controller('restart_controller')
-    assert.match(plan, /^\[restart=plan watchdog=yes channel=plugin workers=1 requests=1\]/)
+    assert.match(plan, /^\[restart=plan watchdog=yes channel=plugin workers=1 queued=1 requests=2\]/)
     assert.match(plan, new RegExp(`Worker runs going: alpha \\(task ${task}, running for less than a minute: "SLOW: a long task\\."\\)\\. They keep running outside this session and report their results to the restarted controller`))
-    assert.match(plan, /Open voice requests: 1\. Answers already given stay deliverable; a request not finished yet ends with a note/)
+    assert.match(plan, new RegExp(`Queued tasks: ${entry} for alpha \\("Then fix the README\\."\\)\\. They stay queued and start by themselves after the restart`))
+    assert.match(plan, /Open voice requests: 2\. Answers already given stay deliverable; a request not finished yet ends with a note/)
     assert.match(plan, /loads as the allowlisted plugin, so the session is back within about half a minute, without a confirmation/)
     assert.match(plan, /Only after a yes: reply "done" to the driver first, then call restart_controller with confirm=true\./)
     assert.equal(existsSync(join(lock, 'restart')), false, 'a plan restarts nothing')
