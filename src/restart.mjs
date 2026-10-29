@@ -8,10 +8,11 @@
 // again at once: a requested restart, without a pause, not counted as a crash.
 //
 // What survives: worker runs, which are detached and report to the next
-// gateway; queued tasks, which wait in .state/workers.json; voice requests,
-// which the store keeps in .state/requests.json (an unfinished one ends with
-// a note, see store.mjs). Open approvals belong to the old session and are
-// gone.
+// gateway; queued tasks, which wait in .state/workers.json; open decisions,
+// in .state/jobs.json; voice requests, which the store keeps in
+// .state/requests.json (an unfinished one ends with a note, a question stays
+// open, see store.mjs). The restarted controller gets all of it in its
+// start-up summary. Open approvals belong to the old session and are gone.
 //
 // After any restart by the watchdog, the next gateway finds its note
 // ("restarted") and, once the session is connected, tells the driver on
@@ -35,6 +36,7 @@ export class Restarter {
   constructor({
     store,
     workers = null,
+    ledger = null,
     lockDir = process.env.VOICE_GW_WATCHDOG_LOCK || '',
     channelMode = process.env.VOICE_GW_CHANNEL_MODE || '',
     secretsDir,
@@ -43,6 +45,7 @@ export class Restarter {
   }) {
     this.store = store
     this.workers = workers
+    this.ledger = ledger
     this.lockDir = lockDir
     this.channelMode = channelMode
     this.secretsDir = secretsDir
@@ -71,10 +74,11 @@ export class Restarter {
     }
     const runs = this.workers?.running() ?? []
     const queued = this.workers?.queued() ?? []
+    const decisions = this.ledger?.open() ?? []
     const open = this.store.openRequests()
     const lines = [
       `[restart=plan watchdog=yes channel=${this.channelMode || 'unknown'} workers=${runs.length} ` +
-        `queued=${queued.length} requests=${open.length}]`,
+        `queued=${queued.length} decisions=${decisions.length} requests=${open.length}]`,
       'Restarting ends this session; the watchdog starts it again at once, as a requested restart.',
     ]
     if (runs.length) {
@@ -93,10 +97,18 @@ export class Restarter {
           'queued and start by themselves after the restart, in their order.',
       )
     }
+    if (decisions.length) {
+      const list = decisions.slice(0, 5).map(d => `${d.id} (${d.kind}${d.repo ? `, ${d.repo}` : ''}, ${d.state})`)
+      lines.push(
+        `Open decisions: ${list.join(', ')}${decisions.length > 5 ? `, and ${decisions.length - 5} more` : ''}. They ` +
+          "are kept, with the driver's answers, and the restarted controller gets them in its start-up summary.",
+      )
+    }
     lines.push(
       open.length
         ? `Open voice requests: ${open.length}. Answers already given stay deliverable; a request not finished yet ends ` +
-            'with a note that the controller restarted, so the driver has to say it again. Open approvals are dropped.'
+            'with a note that the controller restarted, so the driver has to say it again, while a question to the ' +
+            'driver stays open. Open approvals are dropped.'
         : 'No voice request is open.',
     )
     lines.push(

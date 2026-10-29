@@ -66,6 +66,8 @@ const GATEWAY_TOOLS = [
   'dispatch',
   'worker_status',
   'stop_worker',
+  'open_items',
+  'resolve_decision',
   'restart_controller',
   'raise_alarm',
   'clone_repo',

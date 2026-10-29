@@ -14,6 +14,8 @@
 // approvals after the voice mode ended, and for alarms. At the controller
 // levels clone-delete and unrestricted, also cloning and deleting in the
 // worker root (folders.mjs). Over all of it, the kill switch (killswitch.mjs).
+// And what is open, so that nothing is forgotten: decisions for the driver
+// (ledger.mjs), the queue (workers.mjs), the requests (store.mjs).
 
 import { CONTROLLER_LEVELS, EFFORTS, ROOT, VERSION, config } from './config.mjs'
 import { log } from './log.mjs'
@@ -35,6 +37,7 @@ import { ACCESS_LEVELS, GitHubAccess } from './access.mjs'
 import { FolderTools, clonedText } from './folders.mjs'
 import { FunnelSwitch, staleText } from './funnel.mjs'
 import { Alerts, IpGuard } from './ipguard.mjs'
+import { Ledger, openItems, reminderText, startupText } from './ledger.mjs'
 
 // The first line of every start: which code runs, so the log tells after a
 // restart whether the new commit is in.
@@ -50,7 +53,17 @@ function commit() {
 }
 log(`cc-voice-gateway ${VERSION} starting, commit ${commit()}, pid ${process.pid}, node ${process.version}`)
 
-const store =new Store({ permissionTtlSeconds: config.permissionTtlSeconds, file: config.requestsFile })
+// Open decisions keep their requests past the retention time.
+const ledger = new Ledger({ file: config.jobsFile, remindMinutes: config.remindMinutes })
+const store = new Store({ permissionTtlSeconds: config.permissionTtlSeconds, file: config.requestsFile, keep: id => ledger.needs(id) })
+// The driver's answer to a question: the decisions of its request keep it.
+store.on('answer', request => {
+  try {
+    ledger.answer(request.answers, { text: request.text.replace(/^\(Answer to [^)]*\)\s*/, ''), answerId: request.id })
+  } catch (error) {
+    log('answer not kept with its decisions:', error.message)
+  }
+})
 const killswitch = new KillSwitch({ file: config.killSwitchFile })
 if (killswitch.locked) {
   log(`kill switch is locked since ${killswitch.state.at} by ${killswitch.state.trigger}: ${killswitch.state.reason}`)
@@ -88,6 +101,7 @@ const workers = new Workers({
     ? new GitHubAccess({ tokenFile: config.githubTokenFile, apiBase: config.githubApi, forced: config.access })
     : null,
   killswitch,
+  ledger,
   stateDir: config.stateDir,
   claudeBin: config.claudeBin,
   ghBin: config.ghBin,
@@ -146,19 +160,39 @@ function shutdown(reason, code = process.exitCode ?? 0) {
 }
 
 // Restarting the controller by voice, through the watchdog (restart.mjs).
-const restarter = new Restarter({ store, workers, secretsDir: config.secretsDir })
+const restarter = new Restarter({ store, workers, ledger, secretsDir: config.secretsDir })
 
 // The gateway's own checkout, each time the controller answers a request with
-// "done": uncommitted changes and commits on no remote get a line in the
-// reply's result, so that work on the gateway itself is not forgotten.
+// "done": uncommitted changes and commits on no remote become a push
+// decision, and the reply's result says so in a line until the driver was
+// asked, so that work on the gateway itself is not forgotten. Once the driver
+// decided about exactly these files and commits, nothing more; once the
+// checkout is clean, an open one closes.
 async function selfCheck() {
   if (!config.selfCheckout) return null
   const state = await gitState(hostGit, config.selfCheckout)
-  if (!state || (!state.dirty.length && !state.unpushed.length)) return null
+  if (!state) return null
+  const open = ledger.open().filter(d => d.scope === 'gateway')
+  if (!state.dirty.length && !state.unpushed.length) {
+    for (const d of open) ledger.close(d, { outcome: 'the checkout is clean now', by: 'gateway' })
+    return null
+  }
+  const fingerprint = [...state.dirty, ...state.unpushed.map(commit => commit.hash)].sort().join(' ')
+  const last = ledger.decisions.findLast(d => d.scope === 'gateway')
   const parts = []
   if (state.dirty.length) parts.push(`${state.dirty.length} uncommitted file${state.dirty.length === 1 ? '' : 's'}`)
   if (state.unpushed.length) parts.push(`${state.unpushed.length} commit${state.unpushed.length === 1 ? '' : 's'} on no remote`)
-  return `The gateway's own checkout has ${parts.join(' and ')}, on ${state.branch || 'a detached HEAD'}.`
+  const what = `The gateway's own checkout has ${parts.join(' and ')}, on ${state.branch || 'a detached HEAD'}`
+  let decision = last?.details?.fingerprint === fingerprint ? last : null
+  if (decision && decision.state !== 'pending') return null // asked or decided already
+  if (!decision) {
+    decision = ledger.add({ kind: 'push', scope: 'gateway', text: `${what}. Commit and push them, or leave them?`, details: { fingerprint } })
+    for (const d of open) ledger.close(d, { outcome: `replaced by ${decision.id}`, by: 'gateway' })
+  }
+  return (
+    `${what}: open decision ${decision.id}. Tell the driver once, in a later answer (state "question", ` +
+    `decisions="${decision.id}").`
+  )
 }
 
 const channel = await startChannel(store, {
@@ -167,6 +201,7 @@ const channel = await startChannel(store, {
   restarter,
   killswitch,
   folders,
+  ledger,
   selfCheck,
   level: config.controllerLevel,
   onClose: () => shutdown('stdio closed'),
@@ -196,6 +231,12 @@ workers.on('finished', async task => {
     request.meta = { worker: task.repo, task: task.id, outcome: task.state, git: auditSummary(task.audit), trusted: 'no' } // for sending it again
     if (opened.length) request.meta.pull_request = opened.map(pull => pull.number).join(',')
     if (task.queued) request.meta.queued = task.queued // the id it had in the queue
+    // What the audit found is an open decision; it belongs to this result.
+    const decision = task.decision ? ledger.get(task.decision) : null
+    if (decision && decision.state !== 'closed') {
+      ledger.link(decision, request.id)
+      request.meta.decision = decision.id
+    }
     await channel.push(request, request.meta)
     workers.markReported(task)
   } catch (error) {
@@ -209,11 +250,15 @@ workers.on('finished', async task => {
 // queue; the controller hears why, and the driver through its answer. The
 // text holds the controller's task and the gateway's reason, nothing that a
 // repository wrote.
-workers.on('parked', async (entry, why, status) => {
+workers.on('parked', async (entry, why, status, decision) => {
   try {
     await channel.ready
-    const request = store.createRequest(parkedText(entry, why, status), { origin: 'worker' })
+    const request = store.createRequest(parkedText(entry, why, status, decision), { origin: 'worker' })
     request.meta = { kind: 'queue', worker: entry.worker, queued: entry.id, outcome: status }
+    if (decision) {
+      ledger.link(decision, request.id)
+      request.meta.decision = decision.id
+    }
     await channel.push(request, request.meta)
   } catch (error) {
     log('queue news not delivered:', error.message)
@@ -379,10 +424,22 @@ async function portBusy() {
 admin = await startAdmin(auth, config.adminSocket, { killswitch })
 http = startVoiceHttp(store, channel, auth, config, { killswitch, onPortBusy: portBusy, guard: ipGuard })
 
-// Once the session is connected: worker results the previous session never
-// answered go to this one, and after a restart by the watchdog the driver
-// hears on Telegram that the controller is ready again.
+// Once the session is connected: first one event with everything open, so
+// that a restarted controller knows it without memory files; its answer is
+// for the gateway only (origin "gateway": no news, no Telegram). The text
+// holds no text from a repository (ledger.mjs). Then the worker results the
+// previous session never answered go to this one, and after a restart by the
+// watchdog the driver hears on Telegram that the controller is ready again.
+let connected = false
 channel.ready.then(async () => {
+  connected = true
+  try {
+    const items = openItems({ ledger, workers, store, interrupted: store.interrupted })
+    const summary = store.createRequest(startupText(items), { origin: 'gateway' })
+    await channel.push(summary, { kind: 'summary' })
+  } catch (error) {
+    log('start-up summary not delivered:', error.message)
+  }
   for (const request of [...store.requests.values()].filter(r => r.resend)) {
     try {
       await channel.push(request, { ...request.meta, resent: 'yes' })
@@ -394,6 +451,29 @@ channel.ready.then(async () => {
   }
   restarter.announceReady()
 })
+
+// A question the driver has not answered: a reminder event after
+// VOICE_GW_REMIND_MINUTES, at most three times. The controller asks again on
+// it, and the driver hears that as news (origin "worker"). The text is the
+// decision's, without text from a repository.
+const reminders = setInterval(
+  async () => {
+    if (!connected) return
+    for (const decision of ledger.due()) {
+      try {
+        const request = store.createRequest(reminderText(decision, ledger.maxReminders), { origin: 'worker' })
+        request.meta = { kind: 'reminder', decision: decision.id }
+        if (decision.repo) request.meta.worker = decision.repo
+        ledger.reminded(decision, request.id)
+        await channel.push(request, request.meta)
+      } catch (error) {
+        log('reminder not delivered:', error.message)
+      }
+    }
+  },
+  Math.max(1000, Math.min(60000, (config.remindMinutes * 60000) / 4)),
+)
+reminders.unref()
 
 // The SDK's stdio transport does not notice when Claude Code goes away (it only
 // listens for data and errors). Without this, a crashed or killed session

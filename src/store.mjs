@@ -31,11 +31,14 @@ export const RESTART_NOTE =
 export class Store extends EventEmitter {
   // With a file, the requests survive a restart of the gateway, which comes
   // with every restart of the controller session. Approvals do not: they
-  // belong to the session that asked.
-  constructor({ permissionTtlSeconds = 900, file = null, log = defaultLog } = {}) {
+  // belong to the session that asked. keep(id): whether a request must stay
+  // past the retention time, because an open decision belongs to it
+  // (ledger.mjs).
+  constructor({ permissionTtlSeconds = 900, file = null, keep = () => false, log = defaultLog } = {}) {
     super()
     this.setMaxListeners(0) // one listener per waiting long-poll
     this.log = log
+    this.keep = keep
     this.permissionTtlMs = permissionTtlSeconds * 1000
     this.requests = new Map()
     this.permissions = new Map()
@@ -43,6 +46,7 @@ export class Store extends EventEmitter {
     this.startedAt = Date.now()
     this.voiceCalls = 0 // voice tool calls in progress
     this.voiceSeenAt = null // start or end of the last voice tool call
+    this.interrupted = [] // ids of voice requests that the restore ended with the note
     this.file = file
     this.saveTimer = null
     if (file) {
@@ -53,8 +57,9 @@ export class Store extends EventEmitter {
 
   // Answers given before the restart stay deliverable. A voice request the old
   // session had not finished ends with a note, since the new session knows
-  // nothing of it. A worker result the controller never answered is marked
-  // for sending again (gateway.mjs).
+  // nothing of it; a question to the driver stays open, since its decision
+  // is kept (ledger.mjs) and the new session hears of it. A worker result
+  // the controller never answered is marked for sending again (gateway.mjs).
   restore() {
     let saved
     try {
@@ -76,9 +81,10 @@ export class Store extends EventEmitter {
         continue
       }
       request.closed = request.closed === true
-      if (request.origin === 'voice' && request.state !== 'done') {
+      if (request.origin === 'voice' && request.state !== 'done' && request.state !== 'question') {
         request.updates.push({ at: Date.now(), state: 'done', text: RESTART_NOTE })
         request.state = 'done'
+        this.interrupted.push(request.id)
       }
       if (request.origin === 'worker' && !request.updates.length) request.resend = true
       this.requests.set(request.id, request)
@@ -87,6 +93,7 @@ export class Store extends EventEmitter {
       this.log(`requests file ${this.file}: skipped ${skipped} unusable entr${skipped === 1 ? 'y' : 'ies'}`)
     }
     this.prune()
+    this.interrupted = this.interrupted.filter(id => this.requests.has(id))
     // The restart counts as a voice call, so the voice client gets the usual
     // time to pick up what is left before the Telegram fallback sends it.
     if (this.requests.size) this.voiceSeenAt = Date.now()
@@ -126,11 +133,13 @@ export class Store extends EventEmitter {
 
   // --- requests from the voice client or from workers ---------------------
 
-  createRequest(text, { origin = 'voice', worker = null } = {}) {
+  // answers: for the driver's answer to a question, the id of the question's
+  // request; the 'answer' event tells the open decisions (gateway.mjs).
+  createRequest(text, { origin = 'voice', worker = null, answers = null } = {}) {
     const request = {
       id: this.newId(),
       text,
-      origin, // voice | worker
+      origin, // voice | worker (its answers are news) | alarm, gateway (for the controller only)
       worker, // { repo, task } for a worker result
       state: 'sent',
       createdAt: Date.now(),
@@ -138,8 +147,10 @@ export class Store extends EventEmitter {
       cursor: 0, // index of the first update the voice client has not seen
       closed: false, // the voice client has received state done
     }
+    if (answers) request.answers = answers
     this.requests.set(request.id, request)
     this.prune()
+    if (answers) this.emit('answer', request)
     this.changed()
     return request
   }
@@ -313,7 +324,7 @@ export class Store extends EventEmitter {
   prune() {
     const cutoff = Date.now() - REQUEST_RETENTION_MS
     for (const [id, request] of this.requests) {
-      if (request.createdAt < cutoff) this.requests.delete(id)
+      if (request.createdAt < cutoff && !this.keep(id)) this.requests.delete(id)
     }
   }
 }

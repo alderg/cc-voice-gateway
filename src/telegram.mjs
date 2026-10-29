@@ -301,7 +301,8 @@ export class TelegramFallback {
   flush() {
     let marked = false
     for (const request of this.store.requests.values()) {
-      if (request.origin === 'alarm') continue // the kill switch sends its own alarm
+      // The kill switch sends its own alarm; the start-up summary is for the controller.
+      if (request.origin === 'alarm' || request.origin === 'gateway') continue
       // Done: answered, finished without the driver or ended by a restart. A
       // question in it needs nobody any more.
       if (request.state === 'done') continue

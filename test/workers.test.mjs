@@ -456,14 +456,28 @@ test('a queued task that finds uncommitted changes at its turn leaves the queue,
   assert.equal(parked.meta.worker, 'dirty')
   assert.equal(parked.meta.outcome, 'dirty')
   assert.equal(parked.meta.trusted, undefined, "the gateway's reason and the controller's task, nothing from the repository")
+  const decision = parked.meta.decision
+  assert.match(decision, /^d[a-z0-9]{3}$/)
   assert.equal(
     parked.content,
     `The queued task ${id} for dirty did not start: the checkout has 1 uncommitted file. It has left the queue. ` +
       'Task: "Update the changelog.". Tell the driver and ask what to do. If the driver says to go ahead anyway, ' +
-      'dispatch it again with allow_dirty and their words.',
+      `dispatch it again with allow_dirty and their words. It is open decision ${decision} now, and other tasks ` +
+      'for dirty wait until it is closed: the follow-up for the answer closes it, or resolve_decision.',
   )
-  assert.doesNotMatch((await controller('list_workers')).text, /queued/)
+  assert.match((await controller('list_workers')).text, new RegExp(`^dirty: .*, idle, last task .*; open decisions: ${decision} \\(other, pending\\)$`, 'm'))
   assert.ok(!calls().some(c => c.input.startsWith('Update the changelog.')))
+
+  // Only the driver's words close it.
+  const refused = await controller('resolve_decision', { id: decision, outcome: 'let it go', words: 'the checkout has 1 uncommitted file' })
+  assert.match(refused.text, new RegExp(`^\\[decision=needs_driver id=${decision}\\] Nothing closed\\.`))
+  await voiceCall('send', { message: 'Forget the changelog for now.' })
+  const closed = await controller('resolve_decision', { id: decision, outcome: 'let it go', words: 'Forget the changelog for now' })
+  assert.equal(closed.text, `[decision=closed id=${decision}] Closed: let it go.`)
+  const again = await controller('resolve_decision', { id: decision, outcome: 'again', words: 'Forget the changelog for now' })
+  assert.equal(again.isError, true)
+  assert.match(again.text, new RegExp(`^\\[decision=unknown id=${decision}\\] No open decision with that id\\.`))
+  assert.equal((await controller('reply', { request_id: parked.meta.request_id, state: 'done', text: 'Left out.' })).isError, false)
 })
 
 test('run output and the worker state are for this user only, also a folder from before', async () => {
@@ -491,31 +505,74 @@ test('a failed run reports what went wrong', async () => {
 
 // --- the audit after a run --------------------------------------------------------
 
-test('after a run the gateway looks at git itself: commits on no remote, new files and the branch', async () => {
+test('after a run the gateway looks at git itself; what is left becomes a push decision the driver is asked', async () => {
   repo('epsilon', { pushed: true })
   try {
     const look = await dispatch('epsilon', 'Look at the README.')
     const clean = await workerEvent('epsilon', look.id)
     assert.equal(clean.meta.git, 'clean')
+    assert.equal(clean.meta.decision, undefined)
     assert.match(clean.content, /^Git check by the gateway: clean, nothing left unpushed or uncommitted\.$/m)
 
-    // The worker says nothing about its commit; the gateway does.
+    // The worker says nothing about its commit; the gateway does, and makes it a decision.
     const commit = await dispatch('epsilon', 'COMMIT: change it.')
     const committed = await workerEvent('epsilon', commit.id)
     assert.equal(committed.meta.git, '1 commit on no remote')
+    const decision = committed.meta.decision
+    assert.match(decision, /^d[a-z0-9]{3}$/)
     assert.match(committed.content, /^Git check by the gateway: 1 commit on no remote \(on voice\/audit-\d+\)\.$/m)
+    assert.match(committed.content, new RegExp(`^The gateway made it open decision ${decision}: ask the driver whether to push`, 'm'))
     assert.match(committed.content, /^Result: All 12 tests pass\. Nothing changed\.$/m)
     assert.ok(committed.content.indexOf('Git check') < committed.content.indexOf('Result:'), "the gateway's lines first")
 
-    // That commit was there before the next run: only the run's own count.
-    const more = await dispatch('epsilon', 'COMMIT STAY LEAVE: change more.')
-    const left = await workerEvent('epsilon', more.id)
-    assert.equal(left.meta.git, '1 commit on no remote, 1 new uncommitted file, not back on its starting branch')
+    // "done" is refused until the driver was asked; the answer is kept with it.
+    const id = committed.meta.request_id
+    const refused = await controller('reply', { request_id: id, state: 'done', text: 'All tests pass.' })
+    assert.equal(refused.isError, true)
+    assert.equal(
+      refused.text,
+      `Not sent: decision ${decision} (push: "epsilon: task ${commit.id} left 1 commit on no remote. Push them, or leave ` +
+        'them as they are?") belongs to this request, and the driver was never asked. Ask with state "question", or ' +
+        'close it with resolve_decision if the driver has decided already.',
+    )
+    const asked = await controller('reply', { request_id: id, state: 'question', text: 'The tests pass, but a commit is not pushed. Push it?' })
+    assert.equal(asked.text, `sent\nDecision ${decision} counts as asked; the driver's answer will be kept with it.`)
+    await voiceCall('send', { message: 'Yes, push it.', in_reply_to: id })
+    assert.match((await controller('open_items')).text, new RegExp(`^- ${decision} push, epsilon, answered just now \\("Yes, push it\\."\\), not closed yet: epsilon: task`, 'm'))
+
+    // The follow-up for the answer starts and closes it. It commits again and
+    // does not push: both commits count, the one it was to push too.
+    const followUp = await controller('dispatch', { worker: 'epsilon', task: 'COMMIT STAY LEAVE: push it.', words: `(Answer to ${id}) Yes, push it.` })
+    assert.match(followUp.text, new RegExp(`^\\[dispatch=started worker=epsilon task=t[a-z0-9]{3} session=continued\\] Started on branch main\\. It follows up the driver's answer: decision ${decision} closed\\.`))
+    const left = await workerEvent('epsilon', /task=(t[a-z0-9]{3})/.exec(followUp.text)[1])
+    assert.equal(left.meta.git, '2 commits on no remote, 1 new uncommitted file, not back on its starting branch')
     assert.match(
       left.content,
-      /^Git check by the gateway: 1 commit on no remote \(on voice\/audit-\d+\), 1 new uncommitted file \(left-over\.txt\), the checkout is on voice\/audit-\d+, not on main as at the start\.$/m,
+      /^Git check by the gateway: 2 commits on no remote \(on voice\/audit-\d+, voice\/audit-\d+\), 1 new uncommitted file \(left-over\.txt\), the checkout is on voice\/audit-\d+, not on main as at the start\.$/m,
     )
-    assert.match((await controller('worker_status', { worker: 'epsilon' })).text, /^Git check by the gateway: 1 commit on no remote/m)
+    assert.match((await controller('worker_status', { worker: 'epsilon' })).text, /^Git check by the gateway: 2 commits on no remote/m)
+    const open = left.meta.decision
+    assert.ok(open && open !== decision)
+
+    // While it is open, the next task for epsilon waits for it.
+    const held = await dispatch('epsilon', 'Count the files.', { allow_dirty: true })
+    const queued = queuedId(held.text)
+    assert.match(held.text, new RegExp(`^\\[dispatch=queued worker=epsilon queued=${queued} position=1 reason=decision\\] Queued, because an open decision about epsilon holds its tasks: ${open} push, epsilon, not asked yet \\(request ${left.meta.request_id}\\): epsilon: task`))
+    assert.match(held.text, new RegExp(`Ask the driver about it \\(reply with state "question" and decisions="${open}"\\)`))
+    const items = (await controller('open_items')).text
+    assert.match(items, /^\[open decisions=\d+ queued=1 running=0 /)
+    assert.match(items, new RegExp(`^- ${queued} for epsilon, queued just now, held by ${open}: "Count the files\\."$`, 'm'))
+    assert.match(items, /^Answer the driver from this/m)
+    await new Promise(r => setTimeout(r, 1500))
+    assert.ok(!calls().some(c => c.input.startsWith('Count the files.')), 'held')
+
+    // The driver's word settles it; then the task starts by itself.
+    await voiceCall('send', { message: 'Leave the commits in epsilon as they are.' })
+    const closed = await controller('resolve_decision', { id: open, outcome: 'keep them local', words: 'Leave the commits in epsilon as they are' })
+    assert.equal(closed.text, `[decision=closed id=${open}] Closed: keep them local. The tasks queued for epsilon can start now, in their order: ${queued} ("Count the files.").`)
+    const counted = await waitUntil(() => gw.events.find(e => e.meta?.queued === queued))
+    assert.equal(counted.meta.git, 'clean', 'what was there before it is not its own')
+    assert.equal((await controller('reply', { request_id: left.meta.request_id, state: 'done', text: 'Kept local.' })).isError, false)
   } finally {
     rmSync(join(ROOT, 'epsilon'), { recursive: true, force: true })
   }
@@ -553,23 +610,46 @@ test('the result of a stopped or failed run has the last message; a finished one
   assert.equal(auditText(null), null, 'a run from before the audit')
 })
 
-test("a done reply notes uncommitted changes and commits on no remote in the gateway's own checkout", async () => {
-  const id = /id=([a-z0-9]{4})/.exec(await voiceCall('send', { message: 'Anything new?' }))[1]
+const requestId = out => /id=([a-z0-9]{4})/.exec(out)[1]
+
+test("a done reply notes the gateway's own uncommitted changes and unpushed commits, as an open decision until asked", async () => {
+  const id = requestId(await voiceCall('send', { message: 'Anything new?' }))
   assert.equal((await controller('reply', { request_id: id, state: 'done', text: 'Nothing new.' })).text, 'sent')
   const run = (...args) => execFileSync('git', args, { cwd: SELF, stdio: 'ignore' })
   writeFileSync(join(SELF, 'scratch.txt'), 'x')
   try {
     const dirty = await controller('reply', { request_id: id, state: 'done', text: 'Still nothing new.' })
-    assert.equal(dirty.text, "sent\nThe gateway's own checkout has 1 uncommitted file, on main.")
+    const decision = /open decision (d[a-z0-9]{3})/.exec(dirty.text)?.[1]
+    assert.equal(
+      dirty.text,
+      `sent\nThe gateway's own checkout has 1 uncommitted file, on main: open decision ${decision}. Tell the driver ` +
+        `once, in a later answer (state "question", decisions="${decision}").`,
+    )
+    assert.match((await controller('reply', { request_id: id, state: 'done', text: 'Again.' })).text, new RegExp(decision), 'until asked')
+    assert.equal((await controller('reply', { request_id: id, state: 'working', text: 'Looking.' })).text, 'sent', 'only after done')
+
+    // Asked on another request; the driver's answer, and the "done" to it, settle it.
+    const other = requestId(await voiceCall('send', { message: 'What else is open?' }))
+    const asked = await controller('reply', { request_id: other, state: 'question', text: 'A file in the gateway is not committed. Commit it?', decisions: decision })
+    assert.equal(asked.text, `sent\nDecision ${decision} counts as asked; the driver's answer will be kept with it.`)
+    assert.equal((await controller('reply', { request_id: id, state: 'done', text: 'Quiet now.' })).text, 'sent', 'asked: said once')
+    const answer = requestId(await voiceCall('send', { message: 'Leave it, I do it at the desk.', in_reply_to: other }))
+    const settled = await controller('reply', { request_id: answer, state: 'done', text: 'Fine, it stays as it is.' })
+    assert.equal(settled.text, `sent\nClosed with this answer: decision ${decision}.`)
+    assert.equal((await controller('reply', { request_id: id, state: 'done', text: 'Still quiet.' })).text, 'sent', 'decided: no more')
+
+    // Something new in the checkout is a new decision.
     run('add', '.')
     run('-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-q', '-m', 'scratch')
     const unpushed = await controller('reply', { request_id: id, state: 'done', text: 'Really nothing.' })
-    assert.equal(unpushed.text, "sent\nThe gateway's own checkout has 1 commit on no remote, on main.")
-    assert.equal((await controller('reply', { request_id: id, state: 'working', text: 'Looking.' })).text, 'sent', 'only after done')
+    assert.match(unpushed.text, /^sent\nThe gateway's own checkout has 1 commit on no remote, on main: open decision d[a-z0-9]{3}\./)
+    assert.doesNotMatch(unpushed.text, new RegExp(decision))
   } finally {
     run('push', '-q', 'origin', 'main')
   }
+  // Clean again: what was open about it closes.
   assert.equal((await controller('reply', { request_id: id, state: 'done', text: 'All clear.' })).text, 'sent')
+  assert.doesNotMatch((await controller('open_items')).text, /the gateway's checkout/)
 })
 
 test('unknown repositories and missing arguments are errors', async () => {
@@ -705,6 +785,43 @@ test("the gateway's own checkout is no worker on this computer, unless VOICE_GW_
 })
 
 
+test('a question the driver does not answer gets a reminder, at most three times; an answer to it counts', async () => {
+  await stopGateway()
+  gw = await startGateway({ VOICE_GW_REMIND_MINUTES: '0.02' }) // 1.2 seconds
+  const reminders = decision => gw.events.filter(e => e.meta?.kind === 'reminder' && e.meta.decision === decision)
+  try {
+    const merge = requestId(await voiceCall('send', { message: 'Merge pull request 3 in alpha.' }))
+    const asked = await controller('reply', { request_id: merge, state: 'question', text: 'Merge pull request 3, squashed? Yes or no?', kind: 'merge' })
+    const decision = /decision (d[a-z0-9]{3}) \(merge\) until it is settled/.exec(asked.text)[1]
+    const first = await waitUntil(() => reminders(decision)[0])
+    assert.equal(first.meta.trusted, undefined, "the controller's question, nothing from a repository")
+    assert.match(
+      first.content,
+      new RegExp(`^Reminder 1 of 3: the driver has not answered decision ${decision} \\(merge\\), asked just now: "Merge pull request 3, squashed\\? Yes or no\\?"\\. Ask again in one sentence: reply to this request_id with state "question" and decisions="${decision}"\\.`),
+    )
+    // Asked again on the reminder, the driver hears it as news and answers it.
+    await controller('reply', { request_id: first.meta.request_id, state: 'question', text: 'Still open: merge pull request 3?' })
+    assert.match(await voiceCall('status'), /a question\): Still open: merge pull request 3\?/)
+    await voiceCall('send', { message: 'No, not yet.', in_reply_to: first.meta.request_id })
+    assert.match((await controller('open_items')).text, new RegExp(`^- ${decision} merge, answered just now \\("No, not yet\\."\\), not closed yet: Merge pull request 3`, 'm'))
+    await new Promise(r => setTimeout(r, 2500))
+    assert.equal(reminders(decision).length, 1, 'answered: no more reminders')
+
+    // Never answered: three reminders, then quiet.
+    const restart = requestId(await voiceCall('send', { message: 'Restart the controller, please.' }))
+    const quiet = /decision (d[a-z0-9]{3})/.exec((await controller('reply', { request_id: restart, state: 'question', text: 'Restart now?', kind: 'restart' })).text)[1]
+    await waitUntil(() => reminders(quiet).length >= 3, 10000)
+    await new Promise(r => setTimeout(r, 2500))
+    assert.equal(reminders(quiet).length, 3)
+    for (const [id, words] of [[decision, 'No, not yet'], [quiet, 'Restart the controller, please']]) {
+      assert.match((await controller('resolve_decision', { id, outcome: 'not now', words })).text, /^\[decision=closed /)
+    }
+  } finally {
+    await stopGateway()
+    gw = await startGateway()
+  }
+})
+
 test('news: a waiting get_reply returns with it; questions and late answers count too', async () => {
   // A worker's question while the driver waits for something else.
   const waiting = /id=([a-z0-9]{4})/.exec(await voiceCall('send', { message: 'Something long.' }))[1]
@@ -733,6 +850,18 @@ test('a run survives a gateway restart and reports to the new gateway; the queue
   const queued = queuedId((await dispatch('alpha', 'Afterwards, sum it up.')).text)
   await stopGateway()
   gw = await startGateway()
+  // First, everything open, so that the new session needs no memory files:
+  // the question of the test before, the queue, what the restart ended.
+  const summary = await waitUntil(() => gw.events.find(e => e.meta?.kind === 'summary'))
+  assert.equal(summary.meta.trusted, undefined, 'texts of the gateway, the controller and the driver only')
+  assert.match(summary.content, /^The controller session has started\. What is open, as the gateway kept it; work from this, not from memory files:\n\[open decisions=1 queued=1 /)
+  assert.match(summary.content, /^- d[a-z0-9]{3} other, gamma, asked .* on request [a-z0-9]{4}, no answer yet: Update the docs too\?$/m)
+  assert.match(summary.content, new RegExp(`^- ${queued} for alpha, queued .*: "Afterwards, sum it up\\."$`, 'm'))
+  assert.match(summary.content, /^Ended by the restart \(the driver heard to say them again\):\n(- [a-z0-9]{4}: ".*"\n)*- [a-z0-9]{4}: "Afterwards, sum it up\."$/m)
+  assert.ok(gw.events.indexOf(summary) === 0, 'before anything else')
+  // Its answer is for the gateway: no news for the driver.
+  await controller('reply', { request_id: summary.meta.request_id, state: 'done', text: 'Noted the open items.' })
+  assert.doesNotMatch(await voiceCall('status'), /Noted the open items/)
   const event = await workerEvent('alpha', run.id)
   assert.equal(event.meta.outcome, 'done')
   assert.match(event.content, /All 12 tests pass/)

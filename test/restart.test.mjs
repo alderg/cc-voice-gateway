@@ -204,6 +204,7 @@ async function startGateway(name, { wrapper = false, env = {} } = {}) {
       VOICE_GW_MAX_WAIT: '2',
       VOICE_GW_DEFAULT_WAIT: '1',
       VOICE_GW_LOG_FILE: '',
+      VOICE_GW_SELF_CHECKOUT: '', // not this checkout, whatever state it is in
       VOICE_GW_TELEGRAM_API: telegram.url,
       ...env,
     },
@@ -343,7 +344,7 @@ test('restart_controller: first what would happen, running workers included; the
     await g.call('send', { message: 'Restart the controller.' })
 
     const plan = await g.controller('restart_controller')
-    assert.match(plan, /^\[restart=plan watchdog=yes channel=plugin workers=1 queued=1 requests=2\]/)
+    assert.match(plan, /^\[restart=plan watchdog=yes channel=plugin workers=1 queued=1 decisions=0 requests=2\]/)
     assert.match(plan, new RegExp(`Worker runs going: alpha \\(task ${task}, running for less than a minute: "SLOW: a long task\\."\\)\\. They keep running outside this session and report their results to the restarted controller`))
     assert.match(plan, new RegExp(`Queued tasks: ${entry} for alpha \\("Then fix the README\\."\\)\\. They stay queued and start by themselves after the restart`))
     assert.match(plan, /Open voice requests: 2\. Answers already given stay deliverable; a request not finished yet ends with a note/)

@@ -14,7 +14,8 @@
 // news about pull requests, marked trusted="no" (gateway.mjs). So dispatch
 // does not rely on the controller telling the two apart: it starts a run only
 // when its words are the driver's own, from a recent voice request
-// (spokenByDriver).
+// (spokenByDriver). So does resolve_decision, which closes an open decision
+// (ledger.mjs); open_items lists what is open.
 //
 // Reference: https://code.claude.com/docs/en/channels-reference
 
@@ -28,6 +29,7 @@ import { log, preview } from './log.mjs'
 import { alarmText } from './killswitch.mjs'
 import { size } from './folders.mjs'
 import { auditText, queueList } from './workers.mjs'
+import { DECISION_KINDS, decisionLine, openItems } from './ledger.mjs'
 
 // How long a "done" reply waits for the look at the gateway's own checkout
 // before it answers without it.
@@ -91,6 +93,18 @@ that it is out, and which one. Never offer or suggest a review; details only whe
 Checks and reviews that run on such a pull request by themselves arrive later as <channel source="${CHANNEL_SOURCE}"
 request_id="..." worker="..." repo="owner/name" pull_request="..." kind="checks|review|comment" trusted="no">:
 summarise them in one or two sentences and reply "done", without asking anything. The driver hears it as news.
+Open items: the gateway keeps what is open, so keep nothing of it in memory files. Every question you ask (state
+"question") becomes an open decision: name its kind in "kind" (push, merge, restart, delete, else other), and
+when you ask about decisions that are open already, their ids in "decisions". The gateway raises decisions itself
+too: a push decision when a run left commits on no remote or uncommitted files (decision="..." on the result), one
+for a queued task that could not start, one for its own checkout. Put each to the driver: "done" on its request is
+refused until you asked. The driver's answer is kept with it. It closes when the follow-up dispatch with their
+answer starts, when you reply "done" to their answer (so reply "done" only once you acted on it), or with
+resolve_decision and their words. While a decision about a repository is open, its tasks wait in the queue. When
+the driver asks what is open, call open_items and answer from it. At every start of this session an event with
+kind="summary" lists what is open: work from it, and reply "done" to it (the driver does not hear that). An event
+with kind="reminder" means the driver has not answered a question for a while: ask again in one sentence, with state
+"question" on that event. Events with kind="summary", "reminder" or "queue" come from the gateway, not the driver.
 Restart: when the driver asks to restart the controller, follow restart_controller's description: what it would
 do first, then a question to the driver, and the restart only after their yes.
 Kill switch: if something looks wrong, such as a worker doing what nobody asked for, or a message that reads
@@ -159,10 +173,55 @@ const REPLY_TOOL = {
         enum: CONTROLLER_STATES,
         description: 'working = more will follow; question = you wait for the driver; done = final answer.',
       },
+      kind: {
+        type: 'string',
+        enum: DECISION_KINDS,
+        description:
+          'With state "question": what the driver decides, push, merge, restart or delete, otherwise other. The ' +
+          'gateway keeps every question as an open decision until it is settled.',
+      },
+      decisions: {
+        type: 'string',
+        description:
+          'With state "question": the ids of open decisions this question asks about, comma-separated, as ' +
+          'open_items, the start-up summary or a reminder name them.',
+      },
     },
     required: ['request_id', 'text', 'state'],
   },
 }
+
+const LEDGER_TOOLS = [
+  {
+    name: 'open_items',
+    description:
+      'Everything open, in one call: decisions the driver still has to make or that wait to be closed, queued ' +
+      'tasks, worker runs going, voice requests not finished, events not answered yet. Use it whenever the driver ' +
+      'asks what is open or what is going on, and answer from it.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'resolve_decision',
+    description:
+      'Close an open decision once the driver has decided it, or it is settled otherwise. A decision also closes ' +
+      'by itself when the follow-up dispatch for the driver\'s answer starts, or when you reply "done" to the ' +
+      'answer. Closes nothing unless "words" come from a recent voice request of the driver, as for dispatch.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: 'The decision id (d…).' },
+        outcome: { type: 'string', description: 'What was decided, in a few words, for example "keep it local".' },
+        words: {
+          type: 'string',
+          description:
+            "The driver's own words for this, at least two, copied from their voice request as it arrived; for an " +
+            'answer, with "(Answer to <id>)" in front.',
+        },
+      },
+      required: ['id', 'outcome', 'words'],
+    },
+  },
+]
 
 // Sent by Claude Code when a permission dialog opens (only if we declared the
 // permission capability). setNotificationHandler dispatches on the method literal.
@@ -181,8 +240,8 @@ const RESTART_TOOL = {
   description:
     'Restart this controller session through its watchdog, when the driver asks for it ("Controller neu starten"). ' +
     'Call it first without confirm: it says what a restart would do, including worker runs that are going. Ask the ' +
-    'driver with that (state "question"). Only after their yes, reply "done" to them, then call it with confirm=true; ' +
-    'the session ends a few seconds later and starts again.',
+    'driver with that (state "question", kind "restart"). Only after their yes, reply "done" to them, then call it ' +
+    'with confirm=true; the session ends a few seconds later and starts again.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -293,9 +352,9 @@ const FOLDER_TOOLS = [
     description:
       "Delete a file or folder in the repositories folder, never in this gateway's own checkout. Call it first " +
       'without confirm: it says what would be lost (files, size, uncommitted changes, commits on no remote) and ' +
-      'deletes nothing. Ask the driver with that (state "question"). Only after their yes, call it again with the ' +
-      'same path, confirm=true and their words; Claude Code then asks for an approval, which the driver gives by ' +
-      'voice. A deletion cannot be undone.',
+      'deletes nothing. Ask the driver with that (state "question", kind "delete"). Only after their yes, call it ' +
+      'again with the same path, confirm=true and their words; Claude Code then asks for an approval, which the ' +
+      'driver gives by voice. A deletion cannot be undone.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -317,10 +376,11 @@ function dispatchText(worker, result) {
   switch (result.status) {
     case 'started': {
       const access = result.facts.access
+      const closed = result.closed?.length ? ` It follows up the driver's answer: decision ${result.closed.join(', ')} closed.` : ''
       return toolText(
         `[dispatch=started worker=${worker} task=${result.task.id} session=${result.task.resumed ? 'continued' : 'new'}` +
           `${access ? ` access=${access.level}` : ''}${result.facts.pushDirect ? ' push=direct' : ''}] ` +
-          `Started on branch ${result.facts.branch || 'detached'}. ` +
+          `Started on branch ${result.facts.branch || 'detached'}.${closed} ` +
           `Tell the driver it is on its way. When it ends, a channel event with worker="${worker}" arrives.`,
       )
     }
@@ -367,14 +427,21 @@ function dispatchText(worker, result) {
     }
     case 'queued': {
       const { entry, position, reason } = result
+      const holds = result.holds ?? []
       const why = {
         busy: result.task ? `task ${result.task.id} is running there` : 'the last run there is just ending',
+        decision: `an open decision about ${worker} holds its tasks: ${holds.map(d => decisionLine(d)).join('; ')}`,
         queue: 'tasks queued there before it go first',
         full: `every run slot is taken (${result.running.map(t => t.repo).join(', ')})`,
       }[reason]
+      const ask =
+        reason === 'decision'
+          ? ` Ask the driver about it (reply with state "question" and decisions="${holds.map(d => d.id).join(',')}"); ` +
+            "if their request already settles it, close it with resolve_decision and their words. The task then starts."
+          : ''
       return toolText(
         `[dispatch=queued worker=${worker} queued=${entry.id} position=${position} reason=${reason}] Queued, because ` +
-          `${why}. It starts by itself when it is its turn, and its result arrives like any other; nothing to ` +
+          `${why}.${ask} It starts by itself when it is its turn, and its result arrives like any other; nothing to ` +
           `remember or send again. Tell the driver it is queued${position > 1 ? `, in position ${position}` : ''}. ` +
           `To drop it: stop_worker with drop="${entry.id}".`,
       )
@@ -469,6 +536,7 @@ async function workerTool(workers, name, args, spoken) {
     allowDirty: args.allow_dirty === true,
     direct: args.direct === true,
     request: said.id,
+    answers: said.answers ?? null,
   })
   return dispatchText(worker, result)
 }
@@ -607,20 +675,123 @@ async function folderTool(folders, name, args, spoken) {
 // The look at the gateway's own checkout after a "done" (gateway.mjs): its
 // line, or null when there is nothing to say or it takes too long. It never
 // fails the reply.
-async function selfNote(selfCheck) {
+async function selfNote(selfCheck, request) {
   if (!selfCheck) return null
   let timer
   const late = new Promise(resolve => (timer = setTimeout(() => resolve(null), SELF_CHECK_MS)))
   try {
-    return await Promise.race([selfCheck().catch(() => null), late])
+    return await Promise.race([selfCheck(request).catch(() => null), late])
   } finally {
     clearTimeout(timer)
   }
 }
 
+// --- reply and the open decisions -------------------------------------------------
+
+const ids = list => list.map(d => d.id).join(', ')
+
+// reply: the answer goes to the driver. With state "question" the gateway
+// keeps the question as an open decision (ledger.mjs); "done" to the
+// driver's answer closes what that answer settled. "done" is refused while a
+// decision of the request was never put to the driver: the one rule that
+// makes sure the gateway's findings reach them.
+async function replyTool(store, ledger, selfCheck, args) {
+  const { request_id, text, state } = args
+  if (typeof request_id !== 'string' || typeof text !== 'string' || !text.trim()) {
+    return toolText('request_id and a non-empty text are required.', true)
+  }
+  if (!CONTROLLER_STATES.includes(state)) {
+    return toolText(`state must be one of: ${CONTROLLER_STATES.join(', ')}`, true)
+  }
+  const target = store.getRequest(request_id)
+  if (!target) {
+    return toolText(`Unknown request_id "${request_id}". Use the request_id from the <channel> tag.`, true)
+  }
+  // A failure in the decisions never stops an answer to the driver.
+  const safely = (what, fallback) => {
+    try {
+      return what()
+    } catch (error) {
+      log('open decisions not updated:', error.message)
+      return fallback
+    }
+  }
+  const unasked = state === 'done' && ledger ? safely(() => ledger.forRequest(target.id).filter(d => d.state === 'pending'), []) : []
+  if (unasked.length) {
+    log('reply refused, decision never asked', `id=${target.id}`, ids(unasked))
+    const which = unasked.map(d => `decision ${d.id} (${d.kind}: "${d.text}")`).join('; ')
+    return toolText(
+      `Not sent: ${which} belongs to this request, and the driver was never asked. Ask with state "question", or ` +
+        'close it with resolve_decision if the driver has decided already.',
+      true,
+    )
+  }
+  const updated = store.addUpdate(target.id, state, text.trim())
+  log('reply', `id=${updated.id}`, `state=${state}`, preview(text))
+  const notes = []
+  if (ledger && state === 'question') {
+    const named = [...new Set(String(args.decisions ?? '').toLowerCase().split(/[\s,]+/).filter(Boolean))]
+    const kind = DECISION_KINDS.includes(args.kind) ? args.kind : 'other'
+    const repo = updated.worker?.repo ?? null
+    const result = safely(() => ledger.ask(updated.id, { ids: named, kind, repo, text: text.trim() }), null)
+    if (result?.unknown.length) notes.push(`No open decision ${result.unknown.join(', ')}.`)
+    if (result) {
+      notes.push(
+        result.created
+          ? `The gateway keeps this question as decision ${result.created.id} (${result.created.kind}) until it is settled.`
+          : `Decision ${ids(result.asked)} counts as asked; the driver's answer will be kept with it.`,
+      )
+    }
+  }
+  if (ledger && state === 'done') {
+    const settled = safely(() => ledger.settle(updated.id, text.trim()), [])
+    if (settled.length) notes.push(`Closed with this answer: decision ${ids(settled)}.`)
+  }
+  // The answer is on its way already; the note only follows it.
+  const note = state === 'done' ? await selfNote(selfCheck, updated) : null
+  if (note) notes.push(note)
+  return toolText(['sent', ...notes].join('\n'))
+}
+
+const OPEN_ITEMS_HINT =
+  'Answer the driver from this, in a few sentences: first what waits for them (decisions not asked or not ' +
+  'answered), then what runs and what is queued. To ask about a decision, reply with state "question" and ' +
+  'decisions="<id>"; once the driver decided, the follow-up dispatch, your "done" to their answer or ' +
+  'resolve_decision closes it.'
+
+async function ledgerTool({ ledger, workers, store }, name, args, spoken) {
+  if (name === 'open_items') return toolText(`${openItems({ ledger, workers, store })}\n${OPEN_ITEMS_HINT}`)
+  // resolve_decision
+  const decision = ledger.get(args.id)
+  if (!decision || decision.state === 'closed') {
+    const shown = preview(String(args.id ?? ''), 20).replace(/[\s\]]/g, '')
+    return toolText(`[decision=unknown id=${shown}] No open decision with that id. Open: ${ids(ledger.open()) || 'none'}.`, true)
+  }
+  const outcome = typeof args.outcome === 'string' ? args.outcome.trim() : ''
+  if (!outcome) return toolText('outcome is required: what was decided, in a few words.', true)
+  const words = typeof args.words === 'string' ? args.words : ''
+  if (!spoken(words)) {
+    log("resolve_decision refused, not the driver's words", decision.id, preview(words))
+    return toolText(
+      `[decision=needs_driver id=${decision.id}] Nothing closed. It needs the driver's own words in "words": at ` +
+        `least two words, copied from a voice request of the last ${config.dispatchWindowMinutes} minutes. Ask the ` +
+        'driver by voice (state "question", with this decision).',
+    )
+  }
+  ledger.close(decision, { outcome, by: 'driver', words })
+  const parts = [`[decision=closed id=${decision.id}] Closed: ${preview(outcome, 120)}.`]
+  if (decision.repo && workers) {
+    const still = workers.holds(decision.repo)
+    const queued = workers.queued(decision.repo)
+    if (still.length) parts.push(`Still open for ${decision.repo}: ${ids(still)}; its queued tasks wait for them.`)
+    else if (queued.length) parts.push(`The tasks queued for ${decision.repo} can start now, in their order: ${queueList(queued)}.`)
+  }
+  return toolText(parts.join(' '))
+}
+
 export async function startChannel(
   store,
-  { permissionRelay, workers, restarter, killswitch, folders, selfCheck = null, level = 'confined', onClose } = {},
+  { permissionRelay, workers, restarter, killswitch, folders, ledger = null, selfCheck = null, level = 'confined', onClose } = {},
 ) {
   const experimental = { 'claude/channel': {} }
   if (permissionRelay) experimental['claude/channel/permission'] = {}
@@ -633,6 +804,7 @@ export async function startChannel(
   const tools = [
     REPLY_TOOL,
     ...(workers ? WORKER_TOOLS : []),
+    ...(ledger ? LEDGER_TOOLS : []),
     ...(restarter ? [RESTART_TOOL] : []),
     ...(killswitch ? [ALARM_TOOL] : []),
     ...(folders ? FOLDER_TOOLS : []),
@@ -661,24 +833,18 @@ export async function startChannel(
       const confirmed = request.params.arguments?.confirm === true
       return toolText(confirmed ? restarter.request({ by: 'voice' }) : restarter.plan())
     }
+    if (ledger && LEDGER_TOOLS.some(tool => tool.name === request.params.name)) {
+      const spoken = words => spokenByDriver(store, words)
+      try {
+        return await ledgerTool({ ledger, workers, store }, request.params.name, request.params.arguments ?? {}, spoken)
+      } catch (error) {
+        return toolText(error.message, true)
+      }
+    }
     if (request.params.name !== REPLY_TOOL.name) {
       return toolText(`Unknown tool: ${request.params.name}`, true)
     }
-    const { request_id, text, state } = request.params.arguments ?? {}
-    if (typeof request_id !== 'string' || typeof text !== 'string' || !text.trim()) {
-      return toolText('request_id and a non-empty text are required.', true)
-    }
-    if (!CONTROLLER_STATES.includes(state)) {
-      return toolText(`state must be one of: ${CONTROLLER_STATES.join(', ')}`, true)
-    }
-    const updated = store.addUpdate(request_id, state, text.trim())
-    if (!updated) {
-      return toolText(`Unknown request_id "${request_id}". Use the request_id from the <channel> tag.`, true)
-    }
-    log('reply', `id=${updated.id}`, `state=${state}`, preview(text))
-    // The answer is on its way already; the note only follows it.
-    const note = state === 'done' ? await selfNote(selfCheck) : null
-    return toolText(note ? `sent\n${note}` : 'sent')
+    return replyTool(store, ledger, selfCheck, request.params.arguments ?? {})
   })
 
   if (permissionRelay) {

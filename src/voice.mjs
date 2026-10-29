@@ -213,10 +213,11 @@ function buildVoiceServer(store, channel, settings, { killswitch = null, grant =
   }
 
   // An answer to a question settles the question: it is no longer open, and
-  // a restart does not end it with a note.
+  // a restart does not end it with a note. The open decisions of the
+  // question's request keep the answer (ledger.mjs).
   const enqueue = async (message, question = null) => {
     const textForController = question ? `(Answer to ${question.id}) ${message}` : message
-    const request = store.createRequest(textForController)
+    const request = store.createRequest(textForController, { answers: question?.id ?? null })
     if (question?.state === 'question') store.markAnswered(question, request.id)
     await channel.push(request)
     return request

@@ -117,6 +117,7 @@ before(async () => {
       VOICE_GW_DEFAULT_WAIT: '2',
       VOICE_GW_HINT_AFTER: '1',
       VOICE_GW_LOG_FILE: '',
+      VOICE_GW_SELF_CHECKOUT: '', // not this checkout, whatever state it is in
     },
     stderr: 'pipe',
   })
@@ -161,6 +162,8 @@ test('declares the channel and permission capabilities and the reply tool', asyn
     'dispatch',
     'worker_status',
     'stop_worker',
+    'open_items',
+    'resolve_decision',
     'restart_controller',
     'raise_alarm',
   ])

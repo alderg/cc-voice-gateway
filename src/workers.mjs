@@ -12,7 +12,9 @@
 //
 // A task for a repository whose worker is busy, or while every run slot is
 // taken, waits in a queue in .state/workers.json and starts by itself when
-// it is its turn (pump), so nobody has to remember to send it again.
+// it is its turn (pump), so nobody has to remember to send it again. While a
+// decision about a repository is open (ledger.mjs), its tasks wait too,
+// except the follow-up for the driver's answer to it.
 //
 // The gateway checks the checkout before a run (uncommitted files, a run
 // already going, the cap on parallel runs) in code, not in the worker's
@@ -172,17 +174,34 @@ export const queueList = (entries, { max = 5, repos = false } = {}) =>
 
 // What the controller hears when a queued task could not start and left the
 // queue: the controller's own task and the gateway's reason, nothing that a
-// repository wrote.
-export function parkedText(entry, why, status) {
+// repository wrote. decision: the open decision it became.
+export function parkedText(entry, why, status, decision = null) {
   const hint =
     status === 'dirty'
       ? 'If the driver says to go ahead anyway, dispatch it again with allow_dirty and their words.'
       : 'If the driver still wants it, dispatch it again with their words.'
   return (
     `The queued task ${entry.id} for ${entry.worker} did not start: ${why}. It has left the queue. ` +
-    `Task: "${preview(entry.task, 200)}". Tell the driver and ask what to do. ${hint}`
+    `Task: "${preview(entry.task, 200)}". Tell the driver and ask what to do. ${hint}` +
+    (decision
+      ? ` It is open decision ${decision.id} now, and other tasks for ${entry.worker} wait until it is closed: ` +
+        'the follow-up for the answer closes it, or resolve_decision.'
+      : '')
   )
 }
+
+// The push decision after a run, in the gateway's words.
+function pushText(task, commits, files) {
+  const left = [commits && plural(commits, 'commit') + ' on no remote', files && plural(files, 'new uncommitted file')]
+  const what = left.filter(Boolean).join(' and ')
+  const ask = task.access === 'read-only' ? 'Commit them in the container' : commits ? 'Push them' : 'Commit and push them'
+  return `${task.repo}: task ${task.id} left ${what}. ${ask}, or leave them as they are?`
+}
+
+// A queued task that could not start, as an open decision.
+const parkedDecision = (entry, why) =>
+  `The queued task ${entry.id} for ${entry.worker} did not start: ${why}. Task: "${preview(entry.task, 120)}". ` +
+  'Dispatch it again, or let it go?'
 
 function duration(ms) {
   const seconds = Math.round(ms / 1000)
@@ -298,6 +317,7 @@ export class Workers extends EventEmitter {
     runner = new HostRunner(root),
     access = null,
     killswitch = null,
+    ledger = null,
     stateDir,
     claudeBin = 'claude',
     ghBin = 'gh',
@@ -310,6 +330,7 @@ export class Workers extends EventEmitter {
     this.runner = runner
     this.access = access // GitHubAccess in the container, null on this computer
     this.killswitch = killswitch // while it is locked, nothing starts
+    this.ledger = ledger // open decisions: they hold a repository's queue
     this.stateDir = stateDir
     this.stateFile = join(stateDir, 'workers.json')
     this.tasksDir = join(stateDir, 'tasks')
@@ -488,21 +509,39 @@ export class Workers extends EventEmitter {
 
   // A task on the driver's words, which the caller has checked (channel.mjs).
   // It starts at once, or waits in the queue: behind a run in the same
-  // repository, behind tasks queued there before it, or for a free run slot.
-  // request: the id of the voice request with the words.
-  async dispatch({ worker, task, words, fresh = false, allowDirty = false, direct = false, request = null }) {
+  // repository, behind an open decision about it, behind tasks queued there
+  // before it, or for a free run slot. request: the id of the voice request
+  // with the words; answers: the request whose question those words answer.
+  // The follow-up for an answer is not held by that question's decisions,
+  // and goes before the tasks they hold.
+  async dispatch({ worker, task, words, fresh = false, allowDirty = false, direct = false, request = null, answers = null }) {
     if (this.killswitch?.locked) return { status: 'locked', state: this.killswitch.state }
     const names = await this.repos()
     if (!names.includes(worker)) return { status: 'unknown', names }
-    const job = { worker, task, words, fresh, allowDirty, direct, request }
-    const why = this.waiting(worker) ?? (this.slotsFull() ? 'full' : this.queued(worker).length ? 'queue' : null)
-    if (why) return this.enqueue(job, why)
+    const job = { worker, task, words, fresh, allowDirty, direct, request, answers }
+    const first = this.follows(worker, answers).length > 0
+    const ahead = this.queued(worker).length && !first
+    const why = this.waiting(worker, answers) ?? (this.slotsFull() ? 'full' : ahead ? 'queue' : null)
+    if (why) return this.enqueue(job, why, { first })
     return this.launch(job)
+  }
+
+  // The decisions that the driver's answer on request `answers` is about, of
+  // this repository or of none: the follow-up's start closes them.
+  follows(repo, answers) {
+    if (!answers || !this.ledger) return []
+    return this.ledger.forRequest(answers, { closed: true }).filter(d => d.repo === repo || d.repo === null)
+  }
+
+  // The open decisions that hold a repository's tasks: all of them, except
+  // those that a follow-up answers.
+  holds(repo, answers = null) {
+    return this.ledger?.forRepo(repo).filter(d => !answers || !d.requests.includes(answers)) ?? []
   }
 
   // The checks before a run, and the start: for a dispatch, and for a queued
   // task when it is its turn (entry).
-  async launch({ worker, task, words, fresh = false, allowDirty = false, direct = false }, entry = null) {
+  async launch({ worker, task, words, fresh = false, allowDirty = false, direct = false, answers = null }, entry = null) {
     this.starting.add(worker)
     try {
       const facts = await this.inspect(worker)
@@ -515,7 +554,7 @@ export class Workers extends EventEmitter {
       if (direct && !facts.pushDirect && facts.access?.level !== 'full') return { status: 'refused', facts }
       if (facts.dirty.length && !allowDirty) return { status: 'dirty', files: facts.dirty }
       facts.unpushed = await this.baseline(facts.dir)
-      return this.start(facts, { task, words, fresh, direct }, entry)
+      return this.start(facts, { task, words, fresh, direct, answers }, entry)
     } finally {
       this.starting.delete(worker)
     }
@@ -532,7 +571,7 @@ export class Workers extends EventEmitter {
     return state ? state.unpushed.map(commit => commit.hash) : null
   }
 
-  start(facts, { task, words, fresh, direct = false }, entry = null) {
+  start(facts, { task, words, fresh, direct = false, answers = null }, entry = null) {
     if (this.killswitch?.locked) return { status: 'locked', state: this.killswitch.state }
     if (entry && !this.state.queue.some(waiting => waiting.id === entry.id)) return { status: 'dropped' }
     const previous = fresh ? null : this.state.repos[facts.name]?.sessionId
@@ -595,6 +634,14 @@ export class Workers extends EventEmitter {
       reported: false,
     }
     if (entry) record.queued = entry.id // it waited in the queue as this
+    // The follow-up for the driver's answer: the decisions it answers close
+    // now, and what they were about counts again in this run's audit.
+    const follows = this.follows(facts.name, answers)
+    const closed = follows.filter(d => this.ledger.close(d, { outcome: `the follow-up task ${id} started`, by: 'dispatch' }))
+    if (follows.length) {
+      record.follows = follows.map(d => d.id)
+      record.carried = { commits: follows.flatMap(d => d.details?.commits ?? []), files: follows.flatMap(d => d.details?.files ?? []) }
+    }
     child.on('error', error => this.finish(record, 'failed', `could not start ${error.path || this.claudeBin}: ${error.message}`))
     child.stdin.on('error', () => {}) // the run may end before it read everything
     child.stdin.end(prompt({ task, words, facts, direct }))
@@ -606,7 +653,7 @@ export class Workers extends EventEmitter {
     const queued = entry ? [`queued as ${entry.id}`] : []
     log('worker start', facts.name, id, previous ? 'resumed session' : 'new session', ...queued, preview(task, 60))
     this.emit('started', record)
-    return { status: 'started', task: record, facts }
+    return { status: 'started', task: record, facts, closed: closed.map(d => d.id) }
   }
 
   // Stopped by the controller, which knows and needs no event; or by the time
@@ -660,31 +707,37 @@ export class Workers extends EventEmitter {
   }
 
   // 'busy' while a repository cannot take a run: one is going or starting,
-  // or the last one is still being checked or reported. Otherwise null.
-  waiting(repo) {
+  // or the last one is still being checked or reported. 'decision' while an
+  // open decision holds it (except those that `answers` answers). Otherwise
+  // null.
+  waiting(repo, answers = null) {
     const last = this.lastTask(repo)
     if (last?.state === 'running' || this.starting.has(repo) || this.auditing.has(repo)) return 'busy'
     if (last && !last.reported) return 'busy'
+    if (this.holds(repo, answers).length) return 'decision'
     return null
   }
 
-  enqueue(job, reason) {
+  // first: before the other tasks of its repository, for a follow-up.
+  enqueue(job, reason, { first = false } = {}) {
     const entry = { id: this.newTaskId('q'), ...job, queuedAt: Date.now() }
-    this.state.queue.push(entry)
+    const at = first ? this.state.queue.findIndex(waiting => waiting.worker === job.worker) : -1
+    this.state.queue.splice(at >= 0 ? at : this.state.queue.length, 0, entry)
     try {
       this.save()
     } catch (error) {
-      this.state.queue.pop() // not kept, so not queued
+      this.state.queue = this.state.queue.filter(waiting => waiting !== entry) // not kept, so not queued
       throw error
     }
     log('worker queued', job.worker, entry.id, reason, preview(job.task, 60))
     return {
       status: 'queued',
       entry,
-      reason, // busy, queue (others before it), full (no run slot)
+      reason, // busy, decision, queue (others before it), full (no run slot)
       position: this.queued(job.worker).indexOf(entry) + 1,
       task: this.running().find(t => t.repo === job.worker) ?? null,
       running: this.running(),
+      holds: this.holds(job.worker, job.answers),
     }
   }
 
@@ -700,7 +753,7 @@ export class Workers extends EventEmitter {
         if (seen.has(entry.worker)) continue
         seen.add(entry.worker)
         if (this.slotsFull()) return
-        if (this.waiting(entry.worker)) continue
+        if (this.waiting(entry.worker, entry.answers)) continue
         await this.startQueued(entry)
         return
       }
@@ -721,7 +774,7 @@ export class Workers extends EventEmitter {
       return
     }
     // Meanwhile a dispatch may have taken the slot, or the controller dropped it.
-    if (!this.queued(entry.worker).includes(entry) || this.slotsFull() || this.waiting(entry.worker)) return
+    if (!this.queued(entry.worker).includes(entry) || this.slotsFull() || this.waiting(entry.worker, entry.answers)) return
     if (!names.includes(entry.worker)) return this.park(entry, 'the repository is gone')
     let result
     try {
@@ -740,7 +793,8 @@ export class Workers extends EventEmitter {
     this.park(entry, why ?? `it could not start (${result.status})`, result.status)
   }
 
-  // Takes a queued task out of the queue because it cannot start.
+  // Takes a queued task out of the queue because it cannot start; it becomes
+  // an open decision, which holds the repository's other tasks.
   park(entry, why, status = 'gone') {
     this.state.queue = this.state.queue.filter(waiting => waiting.id !== entry.id)
     try {
@@ -749,11 +803,13 @@ export class Workers extends EventEmitter {
       log('worker state not saved:', error.message)
     }
     log('queued task left the queue', entry.worker, entry.id, why)
-    this.emit('parked', entry, why, status)
+    const decision = this.ledger?.add({ kind: 'other', repo: entry.worker, text: parkedDecision(entry, why), details: { queued: entry } }) ?? null
+    this.emit('parked', entry, why, status, decision)
   }
 
   // The kill switch empties the queue: nothing starts while it is locked,
-  // nor by itself after the unlock. Returns the tasks that were queued.
+  // nor by itself after the unlock. Each task becomes an open decision.
+  // Returns the tasks that were queued.
   parkAll() {
     const parked = this.state.queue
     if (!parked.length) return []
@@ -762,6 +818,9 @@ export class Workers extends EventEmitter {
       this.save()
     } catch (error) {
       log('worker state not saved:', error.message)
+    }
+    for (const entry of parked) {
+      this.ledger?.add({ kind: 'other', repo: entry.worker, text: parkedDecision(entry, 'the kill switch locked'), details: { queued: entry } })
     }
     return parked
   }
@@ -897,8 +956,10 @@ export class Workers extends EventEmitter {
   // Looks at the run's checkout once it has ended, whatever the worker wrote:
   // commits on no remote that were not there at its start, uncommitted files
   // that were not there at its start, and whether it is back on its starting
-  // branch. Kept with the task, so that the result says the same after a
-  // gateway restart; { ok: false } when git does not answer.
+  // branch. What the decisions it follows up were about counts again: a
+  // follow-up that was to push and did not is caught too. Kept with the
+  // task, so that the result says the same after a gateway restart;
+  // { ok: false } when git does not answer. Then the decision (decide).
   async audit(task) {
     if (task.audit) return task.audit
     // Until it is done, the next queued task there waits.
@@ -909,25 +970,49 @@ export class Workers extends EventEmitter {
     if (!now) {
       task.audit = { ok: false, at: Date.now() }
     } else {
+      const carried = new Set([...(task.carried?.commits ?? []), ...(task.carried?.files ?? [])])
       const before = new Set(task.unpushedBefore ?? [])
       const dirtyBefore = new Set(task.startDirty ?? [])
+      const counts = (seen, item) => !seen.has(item) || carried.has(item)
       task.audit = {
         ok: true,
         at: Date.now(),
         branch: now.branch,
         startBranch: task.startBranch ?? null,
         remote: now.remote,
-        unpushed: now.unpushed.filter(commit => !before.has(commit.hash)),
-        dirty: now.dirty.filter(file => !dirtyBefore.has(file)),
+        unpushed: now.unpushed.filter(commit => counts(before, commit.hash)),
+        dirty: now.dirty.filter(file => counts(dirtyBefore, file)),
       }
     }
     log('worker audit', task.repo, task.id, auditSummary(task.audit))
+    this.decide(task)
     try {
       this.save()
     } catch (error) {
       log('worker state not saved:', error.message) // the audit holds in this gateway
     }
     return task.audit
+  }
+
+  // What the audit found becomes a push decision for the driver: commits on
+  // no remote (not at read-only, where commits stay in the container by
+  // design) and new uncommitted files. It replaces an open one of an earlier
+  // audit there. Its text names no branch or file: those come from the run.
+  decide(task) {
+    if (!this.ledger || task.decision !== undefined) return
+    const commits = task.audit.ok && task.access !== 'read-only' ? task.audit.unpushed : []
+    const files = task.audit.ok ? task.audit.dirty : []
+    task.decision = null
+    if (!commits.length && !files.length) return
+    const earlier = this.ledger.forRepo(task.repo).filter(d => d.kind === 'push' && d.details?.task)
+    const decision = this.ledger.add({
+      kind: 'push',
+      repo: task.repo,
+      text: pushText(task, commits.length, files.length),
+      details: { task: task.id, commits: commits.map(commit => commit.hash), files },
+    })
+    for (const d of earlier) this.ledger.close(d, { outcome: `replaced by ${decision.id}, after task ${task.id}`, by: 'gateway' })
+    task.decision = decision.id
   }
 
   // --- texts for the controller -------------------------------------------
@@ -962,7 +1047,8 @@ export class Workers extends EventEmitter {
   stateText(repo) {
     const task = this.lastTask(repo)
     const queued = this.queued(repo)
-    const queue = queued.length ? `; queued: ${queueList(queued)}` : ''
+    const open = this.holds(repo).map(d => `${d.id} (${d.kind}, ${d.state})`)
+    const queue = (queued.length ? `; queued: ${queueList(queued)}` : '') + (open.length ? `; open decisions: ${open.join(', ')}` : '')
     if (!task) return `idle${queue}`
     if (task.state === 'running') {
       return `running ${task.id} for ${duration(Date.now() - task.startedAt)} ("${preview(task.task, 50)}")${queue}`
@@ -1007,6 +1093,12 @@ export class Workers extends EventEmitter {
       `Task: ${preview(task.task, 200)}`,
     ]
     if (task.audit) lines.push(auditText(task.audit))
+    if (task.decision) {
+      lines.push(
+        `The gateway made it open decision ${task.decision}: ask the driver whether to push (state "question"); ` +
+          '"done" is refused until you asked.',
+      )
+    }
     if (task.result) lines.push(`Result: ${task.result}`)
     if (task.state !== 'done' && task.lastText && task.lastText !== preview(task.result ?? '', 300)) {
       lines.push(`Last message: ${task.lastText}`)

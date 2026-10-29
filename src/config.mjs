@@ -109,6 +109,9 @@ export const config = {
   // The checkout the gateway looks at with git when the controller answers a
   // request: its own. Empty: no look. Tests use a stand-in.
   selfCheckout: env.VOICE_GW_SELF_CHECKOUT ?? ROOT,
+  // Minutes after which a decision the driver was asked about and has not
+  // answered gets a reminder, at most three times (ledger.mjs).
+  remindMinutes: num(env.VOICE_GW_REMIND_MINUTES, 30),
 
   // Pull requests that workers open (pulls.mjs): how often the gateway looks
   // at their checks and reviews, in seconds, and for how many hours at most.
@@ -161,6 +164,8 @@ export const config = {
 config.oauthStateFile = join(config.secretsDir, 'oauth.json')
 // Voice requests, so that they survive a restart of the controller session.
 config.requestsFile = join(config.stateDir, 'requests.json')
+// Open decisions (ledger.mjs), for the same reason.
+config.jobsFile = join(config.stateDir, 'jobs.json')
 config.adminSocket = join(config.secretsDir, 'admin.sock')
 config.pullsStateFile = join(config.stateDir, 'pulls.json')
 config.telegramTokenFile = join(config.secretsDir, 'telegram_token')

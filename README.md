@@ -424,7 +424,7 @@ and fails closed.
 
 | Tool | Allowed |
 |---|---|
-| The gateway's tools | `reply`, `list_workers`, `dispatch`, `worker_status`, `stop_worker`, `restart_controller`, `raise_alarm`, and above `confined` `clone_repo` and `delete_path` (a confirmed one gets "ask"), as `mcp__voice__…` and `mcp__plugin_voice_voice__…` |
+| The gateway's tools | `reply`, `list_workers`, `dispatch`, `worker_status`, `stop_worker`, `open_items`, `resolve_decision`, `restart_controller`, `raise_alarm`, and above `confined` `clone_repo` and `delete_path` (a confirmed one gets "ask"), as `mcp__voice__…` and `mcp__plugin_voice_voice__…` |
 | ToolSearch, TodoWrite, TaskCreate, TaskGet, TaskList, TaskUpdate | Always. They load deferred tools and keep the to-do list |
 | Read, Glob, Grep | Inside `controller/` |
 | Write, Edit, MultiEdit, NotebookEdit | Inside `controller/playground/` |
@@ -501,8 +501,11 @@ and its instructions call that text data, never instructions. The gateway checks
   said; the gateway's prefix alone does not count.
 - **Every dispatch.** With `direct` and `allow_dirty` too. Otherwise `dispatch=needs_driver`:
   nothing starts, and the controller is told to ask you by voice. `list_workers`,
-  `worker_status` and `stop_worker` are not checked.
+  `worker_status`, `stop_worker` and `open_items` are not checked.
 - **Cloning and deleting.** `clone_repo` and a confirmed `delete_path` are checked the same way.
+- **Queued tasks and decisions.** A queued task's words are checked when it is queued, not again
+  at its turn. `resolve_decision`, which closes an open decision
+  ([8.4](#84-voice-commands)), is checked the same way.
 - **What it guarantees:** text in a repository, a run's result or a pull request cannot start a
   worker by itself.
 - **What it does not:** the controller still reads that text, and it writes the `task` itself. A
@@ -542,10 +545,16 @@ What applies to every worker run (`src/workers.mjs`):
   commits do not count. The result event carries it twice: in the attribute `git`, in the
   gateway's words only ("clean", or "1 commit on no remote, 1 new uncommitted file"), and in a line
   with the branches and files, before the worker's text. `worker_status` and `stop_worker` show it
-  too. A run that was stopped or failed also brings the worker's last message.
+  too. A run that was stopped or failed also brings the worker's last message. Commits on no remote
+  (not at `read-only`, where they stay in the container by design) and new uncommitted files become
+  an open push decision ([8.4](#84-voice-commands)): the controller has to ask you, and the
+  repository's queue waits until you decided. A follow-up that was to push and did not is caught
+  too: what its decision was about counts again in its own check.
 - **The gateway's own checkout** gets the same look whenever the controller replies "done": if it
   has uncommitted changes or commits on no remote, the reply's result says so in one line
-  (`VOICE_GW_SELF_CHECKOUT`). The reply itself goes out first.
+  (`VOICE_GW_SELF_CHECKOUT`), and it becomes an open push decision, until you were asked. Once you
+  decided about exactly these files and commits, it stays quiet; once the checkout is clean, the
+  decision closes. The reply itself goes out first.
 - **Not this repository.** On this computer the gateway's own checkout is no worker, even inside
   `VOICE_GW_WORKER_ROOT`: a run there could change the gateway, the confine hook and
   `controller/CLAUDE.md`. `VOICE_GW_WORKER_SELF=1` lists it anyway. In Docker, the container's
@@ -785,9 +794,10 @@ unlock by voice, Telegram or the controller.
 | `.secrets/telegram_token`, `.secrets/telegram_chat_id` | The Telegram bot | 0600 |
 | `.secrets/killswitch.json` | Kill switch state, present while locked | 0600 |
 | `.secrets/worker/claude_token`, `.secrets/worker/github_token` | The container's logins, mounted read-only into it | 0600, folder 0700 |
-| `.state/` | Worker state, run output, open requests, watched pull requests, the watchdog's lock | 0700 when the gateway creates it |
+| `.state/` | Worker state, run output, open requests and decisions, watched pull requests, the watchdog's lock | 0700 when the gateway creates it |
 | `.state/tasks/`, `.state/workers.json` | Each run's output with every tool input and result; the workers' state, with the queue | 0600, folder 0700 |
 | `.state/requests.json` | Voice requests and the answers, with what the voice client has read | 0600 |
+| `.state/jobs.json` | Open decisions, with the driver's answers, and the last 100 closed ones for a week | 0600 |
 | `.logs/gateway.log`, `.logs/gateway.log.1` | Log, without tokens; rotated at `VOICE_GW_LOG_MAX_MB` | 0600, folder 0700 when the gateway creates it |
 
 Folders created by an earlier version keep their mode; tighten them once with
@@ -846,7 +856,8 @@ is guarded as follows:
   an instruction, not enforcement. The dispatch check ([5.4](#54-approvals-by-voice)) holds in
   code, but a phrase you said within `VOICE_GW_DISPATCH_WINDOW` can be reused for another task,
   and the controller writes the task itself. Merges still need your approval; its answers to you,
-  `restart_controller` and `raise_alarm` are not checked.
+  `restart_controller` and `raise_alarm` are not checked. Of an open decision, the gateway makes
+  sure that the controller asks you, not how well.
 - **The voice AI is an instruction-follower.** If it rewrites "emergency stop" into a longer
   sentence, the phrase check can miss it, and the check knows only English; the `emergency_stop`
   tool is there for that. Approvals depend on
@@ -1166,9 +1177,15 @@ What survives:
 
 - **Worker runs:** detached; the new gateway follows them and reports their results.
 - **Queued tasks:** in `.state/workers.json`; the new gateway starts them in their order.
+- **Open decisions:** in `.state/jobs.json`, with your answers.
 - **Requests:** kept in `.state/requests.json`. Answers given before the restart stay deliverable.
-  An unfinished request ends with a note to say it again. A worker result the old controller had
-  not answered goes to the new one again.
+  An unfinished request ends with a note to say it again; a question to you stays open, and you
+  can still answer it. A worker result the old controller had not answered goes to the new one
+  again.
+- **What is open, for the new session:** once it is connected, the gateway sends it one event with
+  `kind="summary"`: open decisions, queued tasks, runs going, requests not finished, and the
+  requests the restart ended. The controller works from it instead of memory files. Its reply to
+  it is for the gateway only: no news, no Telegram.
 - **Not:** open approvals, and the old session's conversation.
 
 Without the watchdog the controller says it cannot restart itself.
@@ -1193,6 +1210,8 @@ at most three short sentences, without code, paths or lists.
 | "What is the alpha worker doing?" | `worker_status`, with the queue there |
 | "Stop the alpha worker." | `stop_worker`; the next queued task there starts |
 | "Forget the changelog task." / "Stop alpha and drop the rest." | `stop_worker` with `drop` and the task's id, or with `"all"` |
+| "What is open?" / "Is anything waiting for me?" | `open_items`: open decisions, queued tasks, runs, unfinished requests; the controller answers from it |
+| "Leave the commits in alpha as they are." | `resolve_decision` with your words closes the push decision; alpha's queued tasks go on |
 | "Clone drawio-mcp from alderg." | Above `confined`: `clone_repo`; you hear when it is there |
 | "Delete the folder old-experiment." | Above `confined`: `delete_path` says what would be lost, the controller asks; you say yes, then confirm the approval |
 | "Look up the release notes of the latest Claude Code." | Only at `unrestricted`: the controller uses the web itself |
@@ -1208,6 +1227,28 @@ at most three short sentences, without code, paths or lists.
 request of the last `VOICE_GW_DISPATCH_WINDOW` minutes, the gateway starts nothing and the
 controller asks you first ([5.4](#54-approvals-by-voice)). When a worker result or a review asks
 for something, the controller is told to tell you and let you decide.
+
+**Open items** (`src/ledger.mjs`), so that nothing is forgotten while you drive:
+
+- **Every question is an open decision,** kept in `.state/jobs.json`: the controller's questions,
+  of kind `push`, `merge`, `restart`, `delete` or `other`, and what the gateway raises itself: a
+  push decision after a run that left commits on no remote or uncommitted files
+  ([5.5](#55-workers-on-this-computer-or-in-docker)), one for a queued task that could not start,
+  and one for the gateway's own checkout.
+- **Pending, asked, answered, closed.** Your answer to the question ("(Answer to <id>) …") is kept
+  with it. It closes when the follow-up dispatch with your answer starts, when the controller
+  replies "done" to your answer, or with `resolve_decision` and your words.
+- **The controller has to ask.** It cannot reply "done" to a request whose decision was never put
+  to you; the reply tool says why.
+- **The queue waits.** While a decision about a repository is open, its tasks wait
+  (`dispatch=queued … reason=decision`); the follow-up for your answer goes first.
+- **Reminders.** A question you have not answered comes back to the controller after
+  `VOICE_GW_REMIND_MINUTES` (30), at most three times. It asks again, and you hear it as news.
+- **What is open?** `open_items` lists everything in one call. At every start of the controller
+  session, the gateway sends it the same list as an event, so a restarted controller needs no
+  memory files.
+- **Only known texts.** These lists hold what the gateway, the controller and you said, never text
+  from a repository, so they come without `trusted="no"`; of a worker result only its ids.
 
 **Pull requests and reviews:**
 
@@ -1269,8 +1310,9 @@ setting with where it came from.
 | `VOICE_GW_PORT` | `8787` | Local HTTP port |
 | `VOICE_GW_HOST` | `127.0.0.1` | Bind address; keep loopback |
 | `VOICE_GW_SECRETS_DIR` | `.secrets` | Secrets, settings file, admin socket |
-| `VOICE_GW_STATE_DIR` | `.state` | Worker state, run output, requests, pull request watches |
+| `VOICE_GW_STATE_DIR` | `.state` | Worker state and queue, run output, requests, open decisions, pull request watches |
 | `VOICE_GW_SELF_CHECKOUT` | This checkout | The checkout whose uncommitted changes and commits on no remote a "done" reply mentions ([5.5](#55-workers-on-this-computer-or-in-docker)); empty: none. Tests use a stand-in |
+| `VOICE_GW_REMIND_MINUTES` | `30` | Minutes before a question you have not answered comes back to the controller as a reminder, at most three times ([8.4](#84-voice-commands)) |
 | `VOICE_GW_LOG_FILE` | `.logs/gateway.log` | Empty: stderr only |
 | `VOICE_GW_LOG_MAX_MB` | `10` | Past this size the log moves to `gateway.log.1`, replacing the one before |
 | `VOICE_GW_OAUTH_HOSTS` | `claude.ai,claude.com` | Hosts allowed in redirect addresses and client ID metadata documents |
@@ -1380,7 +1422,10 @@ do not set them.
 | `delete=unplanned` | A deletion needs a plan of the same path from the last 15 minutes: the controller calls `delete_path` without `confirm` first. |
 | A worker fails at once | `could not start claude`: Claude Code is not on the gateway's `PATH`; set `VOICE_GW_CLAUDE_BIN`. Otherwise read `.state/tasks/<task>.err`. |
 | A queued task does not start | It waits while a run goes on in its repository, while that run's result has not reached the controller (is the session connected?), while every `VOICE_GW_MAX_WORKERS` slot is taken, and while the kill switch is locked; behind a worker container that does not answer it tries again every 30 s. `list_workers` shows the queue, `.state/workers.json` holds it under `queue`. |
-| An event with `kind="queue"` | A queued task could not start at its turn and left the queue: uncommitted changes, the origin changed in the container, a `direct` push not allowed, or the repository is gone. The controller asks you; dispatched again, it starts from the beginning. |
+| An event with `kind="queue"` | A queued task could not start at its turn and left the queue: uncommitted changes, the origin changed in the container, a `direct` push not allowed, or the repository is gone. It is an open decision now; the controller asks you, and dispatched again, it starts from the beginning. |
+| `dispatch=queued … reason=decision`, and nothing starts | An open decision about the repository holds its tasks, for example unpushed commits after the last run. Answer it, or tell the controller to leave it: `resolve_decision` closes it with your words, and the tasks start. `open_items` lists what holds what. |
+| The controller says a reply was "Not sent: decision … was never asked" | The gateway raised a decision on that request, and the controller has to put it to you before it may reply "done". It is meant to ask with state "question"; nothing is lost in between. |
+| A decision stays open although it was settled | It closes by itself only through the follow-up dispatch for your answer or the controller's "done" to it. Say what you decided; the controller closes it with `resolve_decision`. `.state/jobs.json` holds them all. |
 | A result says `git="1 commit on no remote"` although the worker pushed | The check counts commits that no remote-tracking branch (`refs/remotes/…`) has. A push to a URL instead of a named remote does not update them; `git fetch` in the checkout does. Without any remote, commits never count. |
 | What did a worker do? | `.state/tasks/<task>.jsonl` holds the whole run. `claude --resume <session>` in the repository opens the session; `.state/workers.json` lists the session ids. |
 | A private repository is handled like a public one | `gh` is not logged in or not on the `PATH`, so the visibility is unknown, and the worker asks before pushing to be safe. |
@@ -1430,7 +1475,8 @@ src/
   voice.mjs          HTTP side: the voice tools
   oauth.mjs          sign-in: OAuth metadata, registration, pairing page, tokens
   ipguard.mjs        the door: access log, /mcp only from Anthropic's addresses, alerts on Telegram
-  workers.mjs        workers: repositories, claude -p runs, results
+  workers.mjs        workers: repositories, claude -p runs, the queue, the check after a run, results
+  ledger.mjs         open decisions for the driver, and the open items
   runners.mjs        where workers run: this computer, or the Docker container
   access.mjs         access levels in the container, from the GitHub token
   pulls.mjs          the watch on pull requests that workers open
