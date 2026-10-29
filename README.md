@@ -1480,8 +1480,10 @@ either case.
     server. The confine hook blocks their tools.
   - **development** otherwise: `--dangerously-load-development-channels server:voice`, with
     `--strict-mcp-config --mcp-config controller/.mcp.json`. So the gateway is the only MCP server.
-    Claude Code asks at every start; answer at the terminal. `VOICE_GW_CHANNEL=plugin|development`
-    overrides the choice; `node scripts/channel-mode.mjs` shows it.
+    Claude Code asks at every start; answer at the terminal. With a personal account this is the only
+    way, and no start runs unattended ([known issues](#810-known-issues)).
+    `VOICE_GW_CHANNEL=plugin|development` overrides the choice; `node scripts/channel-mode.mjs` shows
+    it.
 
 Claude Code starts the gateway itself, from `controller/.mcp.json` or as the plugin's server, so
 the gateway lives and ends with the session. Do not drop the user settings with
@@ -1627,7 +1629,8 @@ the watchdog systemd starts next for the third. The LaunchAgent on macOS has no 
 `--stop`, then `kickstart`, is a stop and a start.
 
 With the development flag, a restarted session waits for the channel warning to be answered at the
-terminal (`tmux attach -t voice`, Enter); with the plugin it does not. Claude in Chrome's notice for
+terminal (`tmux attach -t voice`, Enter); with the plugin it does not. With a personal account there
+is no plugin, so every restart waits for it ([known issues](#810-known-issues)). Claude in Chrome's notice for
 the first start would wait there too, at a start by the watchdog or the autostart alike; the start
 script marks it as seen beforehand ([8.1](#81-starting-and-stopping)). The message when a restart
 begins names what it may wait for: "Confirm the development channel at the terminal (tmux attach -t
@@ -2082,6 +2085,25 @@ gateway; do not set them.
 | A start script fails at once with `mapfile: command not found` or another bash error on macOS | A checkout from before macOS support: pull. Since then the scripts run with bash 3.2; `scripts/check-macos.sh` runs `bash -n` on each with `/bin/bash`. |
 
 Claude Code's debug log is at `~/.claude/debug/<session-id>.txt`.
+
+### 8.10 Known issues
+
+**With a personal account, every start of the controller waits for a confirmation at the
+terminal.** A personal claude.ai account, Pro or Max for example, has no organisation and so no
+channel allowlist for the plugin ([7.4](#74-admin-steps-for-team-and-enterprise)). The controller
+then runs with the development channel flag, and Claude Code shows a confirmation prompt at every
+start of it. So the gateway cannot start or restart fully by itself: not after a crash, not by the
+watchdog, not by the autostart and not by `scripts/restart-everything.sh`. After every start,
+someone has to confirm the dialog in the Claude process through tmux, over SSH if need be:
+
+```bash
+tmux attach -t voice   # then Enter; leave tmux again with Ctrl+B, then D
+```
+
+Until then voice requests do not arrive. The Telegram message that a restart begins says when the
+start waits for it ([8.2](#82-the-watchdog)). Fully automatic, unattended operation is currently
+only possible with a Team or Enterprise account whose Owner has put the plugin on the channel
+allowlist ([8.1](#81-starting-and-stopping), plugin mode).
 
 ## 9. Repository layout
 

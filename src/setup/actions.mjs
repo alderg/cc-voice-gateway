@@ -859,6 +859,12 @@ export function createSetup({
     return ok
   }
 
+  // The development channel's confirmation at every start (README, "Known issues").
+  const DEVELOPMENT_NOTE =
+    'the channel: the plugin is not on an allowlist, so every start of the controller, also after a crash, by the ' +
+    'watchdog and by scripts/restart-everything.sh, waits for the development channel\'s confirmation at the terminal ' +
+    '(tmux attach -t voice, then Enter); personal accounts (Pro, Max) have no allowlist, see "Known issues" in the README'
+
   // What Claude in Chrome needs while the gateway runs, and its risk.
   const CHROME_DESKTOP =
     'Claude in Chrome: it works only while someone is signed in at the desktop, or in a remote desktop session that ' +
@@ -891,6 +897,8 @@ export function createSetup({
         line(chromeNote())
         line(CHROME_DESKTOP)
       }
+      // Without the plugin on the allowlist, no start runs unattended.
+      if (channelMode({ env, root }).mode === 'development') line(DEVELOPMENT_NOTE)
       if (body.plugin?.register && channelMode({ env, root }).mode === 'plugin-register') {
         const code = await runCommand(bin.claude, ['plugin', 'marketplace', 'add', root], { env, onLine: line, timeoutMs: 60000 })
         line(code === 0 ? `registered this repository as the marketplace ${MARKETPLACE}` : 'registering the marketplace failed; the start script tries again')

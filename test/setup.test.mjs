@@ -910,7 +910,7 @@ test('Claude in Chrome: the page learns whether its notice for the first start i
 
 // The page's script against a stand-in for the browser: every element a plain
 // object, /api/state answered with these settings and what the server saw.
-async function page(settings, chrome) {
+async function page(settings, chrome, plugin = { mode: 'plugin', reason: '', allowlist: {} }) {
   const elements = new Map()
   const element = () => ({
     value: '', hidden: false, textContent: '', className: '', checked: false, disabled: false, dataset: {}, attributes: {}, listeners: {},
@@ -927,7 +927,7 @@ async function page(settings, chrome) {
   const state = {
     host: 'test', root: ROOT, remaining: { overallMs: 600000, idleMs: 600000 }, checks: [], overridden: [], settings,
     models: [], efforts: [], secrets: {}, git: { name: '', email: '' }, repos: { host: [], docker: [] },
-    watchdog: { platform: 'linux', unit: 'cc-voice-gateway.service' }, plugin: { mode: 'plugin', reason: '', allowlist: {} }, chrome,
+    watchdog: { platform: 'linux', unit: 'cc-voice-gateway.service' }, plugin, chrome,
   }
   const context = vm.createContext({
     document: { querySelector: $, querySelectorAll: selector => (selector === '[data-setting]' ? [select] : []) },
@@ -939,7 +939,7 @@ async function page(settings, chrome) {
   })
   vm.runInContext(readFileSync(join(ROOT, 'src', 'setup', 'ui', 'app.js'), 'utf8'), context)
   await sleep(50) // its start reads /api/state
-  return { notice: $('#chrome-notice'), guide: $('#chrome-guide'), security: $('#chrome-security'), select }
+  return { notice: $('#chrome-notice'), guide: $('#chrome-guide'), security: $('#chrome-security'), pluginWarning: $('#plugin-warning'), select }
 }
 
 test('Claude in Chrome on the page: a warning with what to do at the terminal, unless its notice is confirmed already', async () => {
@@ -1007,6 +1007,34 @@ test('finishing with Claude in Chrome on: a line with what to do at the terminal
   assert.match(seen, /Claude in Chrome: its notice for the first start is confirmed already for this user; restarts do not wait for it/)
   assert.match(seen, /Claude in Chrome: it works only while someone is signed in at the desktop, or in a remote desktop session that stays when disconnected, with Chrome open in a window of its own and the Claude extension signed in to the same claude\.ai account; the controller can use every login of that Chrome profile, so give Claude a profile of its own \(README, "Claude in Chrome"\)/)
   assert.doesNotMatch(await finish('off', '0'), /Claude in Chrome/)
+})
+
+test('the plugin step: without the allowlist, a warning that every start waits for a confirmation at the terminal; in the finish log too', async () => {
+  const html = readFileSync(join(ROOT, 'src', 'setup', 'ui', 'index.html'), 'utf8')
+  const warning = /<p id="plugin-warning" class="notice" role="alert" hidden>([^<]*)<\/p>/.exec(html)?.[1].replace(/\s+/g, ' ')
+  assert.match(warning, /^Warning: without the plugin on the allowlist, every start of the controller waits for the development channel's confirmation at the terminal, also after a crash, by the watchdog and by scripts\/restart-everything\.sh: someone has to confirm it each time \(tmux attach -t voice, then Enter\)\./)
+  assert.match(warning, /Personal accounts, Pro or Max for example, have no allowlist; see "Known issues" in the README\.$/)
+  const development = await page({}, { noticeSeen: true }, { mode: 'development', reason: 'not on the allowlist', allowlist: {} })
+  assert.equal(development.pluginWarning.hidden, false)
+  for (const mode of ['plugin', 'plugin-register']) {
+    assert.equal((await page({}, { noticeSeen: true }, { mode, reason: '', allowlist: {} })).pluginWarning.hidden, true, mode)
+  }
+
+  const finish = async (name, env = {}) => {
+    const setup = createSetup({ root: ROOT, secretsDir: join(TMP, `secrets-channel-${name}`), env: { ...setupEnv(), ...env }, home: HOME, platform: 'linux', say })
+    const { job } = await setup.api['POST /api/finish']({
+      body: { settings: { VOICE_GW_PORT: '8787', VOICE_GW_DOCKER: '' }, telegram: { enabled: false }, docker: { enabled: false }, watchdog: {} },
+    })
+    let done
+    for (let i = 0; i < 250 && (done = setup.api['GET /api/jobs/:id']({ id: job })).state === 'running'; i++) await sleep(20)
+    assert.equal(done.state, 'done', done.lines.join('\n'))
+    return done.lines.join('\n')
+  }
+  assert.match(
+    await finish('development'),
+    /the channel: the plugin is not on an allowlist, so every start of the controller, also after a crash, by the watchdog and by scripts\/restart-everything\.sh, waits for the development channel's confirmation at the terminal \(tmux attach -t voice, then Enter\); personal accounts \(Pro, Max\) have no allowlist, see "Known issues" in the README/,
+  )
+  assert.doesNotMatch(await finish('plugin', { VOICE_GW_CHANNEL: 'plugin' }), /the channel: /)
 })
 
 test('the settings file: one line per setting, read without running anything', () => {

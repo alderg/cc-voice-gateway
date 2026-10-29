@@ -268,6 +268,7 @@ function fillPlugin() {
         : `The controller starts with the development flag: ${reason}.`
   $('#plugin-register-box').hidden = mode !== 'plugin-register'
   $('#plugin-admin').hidden = mode !== 'development'
+  $('#plugin-warning').hidden = mode !== 'development'
   $('#plugin-json').textContent = JSON.stringify({ channelsEnabled: true, allowedChannelPlugins: [allowlist] }, null, 2)
 }
 

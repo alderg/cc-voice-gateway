@@ -289,6 +289,10 @@
 <section id="s-plugin">
   <h2>8. The channel as a plugin</h2>
   <p id="plugin-status"></p>
+  <p id="plugin-warning" class="notice" role="alert" hidden>Warning: without the plugin on the allowlist, every start of the
+    controller waits for the development channel's confirmation at the terminal, also after a crash, by the watchdog
+    and by scripts/restart-everything.sh: someone has to confirm it each time (tmux attach -t voice, then Enter).
+    Personal accounts, Pro or Max for example, have no allowlist; see "Known issues" in the README.</p>
   <div id="plugin-register-box" hidden>
     <label><input type="checkbox" id="plugin-register" checked> Register this repository as the marketplace now</label>
   </div>
