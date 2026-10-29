@@ -163,12 +163,31 @@ function showLevelWarning() {
   $('#level-warning').hidden = !text
 }
 
+// Shown for a kill switch that does less than lock by itself.
+const KILLSWITCH_WARNINGS = {
+  manual:
+    'Warning: the rules then only write to the gateway log what they would have done. A worker that pushes to ' +
+    'the default branch, writes outside its repository or changes unusually much goes on until you say ' +
+    '"emergency stop", send /stop on Telegram, or the controller raises the alarm.',
+  off:
+    'Warning: nothing then locks the gateway, not even "emergency stop" by voice or /stop on Telegram; the ' +
+    'gateway only logs them. Workers can be stopped one by one with stop_worker. A lock from before stays ' +
+    'until it is unlocked at the computer.',
+}
+
+function showKillSwitchWarning() {
+  const text = KILLSWITCH_WARNINGS[$('#killswitch-mode').value]
+  $('#killswitch-warning').textContent = text ?? ''
+  $('#killswitch-warning').hidden = !text
+}
+
 function fillSettings() {
   for (const element of $$('[data-setting]')) {
     const value = state.settings[element.dataset.setting]
     if (value !== undefined) element.value = value
   }
   showLevelWarning()
+  showKillSwitchWarning()
   // The Funnel's idle time: 0 means never; ticking the box suggests 90.
   const idle = $('#funnel-idle')
   $('#funnel-idle-on').checked = idle.value !== '' && idle.value !== '0'
@@ -318,6 +337,7 @@ action('#docker-build', '#build-state', async () => {
 
 $('#docker-on').addEventListener('change', () => ($('#docker').hidden = !$('#docker-on').checked))
 $('#controller-level').addEventListener('change', showLevelWarning)
+$('#killswitch-mode').addEventListener('change', showKillSwitchWarning)
 $('#funnel-idle-on').addEventListener('change', () => ($('#funnel-idle').disabled = !$('#funnel-idle-on').checked))
 
 function collect() {

@@ -399,6 +399,7 @@ test('the start: checks, current settings, repositories and the plugin, without 
   assert.equal(check('Docker').detail, 'server 29.0.0')
   assert.equal(check('Tailscale').ok, false)
   assert.equal(data.settings.VOICE_GW_PORT, '8787')
+  assert.equal(data.settings.VOICE_GW_KILLSWITCH, 'auto', 'the kill switch locks by itself, by default')
   assert.deepEqual(data.secrets, { telegramToken: null, telegramChatId: null, githubToken: null, claudeToken: null })
   assert.deepEqual(data.git, { name: 'Test Driver', email: 'driver@example.com' })
   assert.equal(data.plugin.mode, 'development')
@@ -470,10 +471,13 @@ test('Docker: the image is built with progress on the page, and nothing secret i
 
 test('finishing: invalid input is refused before anything is written', async () => {
   const { call } = flow.page
-  const refused = await call('/api/finish', { settings: { VOICE_GW_PORT: '80', VOICE_GW_WORKER_MODEL: 'x; rm -rf /', NOPE: '1' } })
+  const refused = await call('/api/finish', {
+    settings: { VOICE_GW_PORT: '80', VOICE_GW_WORKER_MODEL: 'x; rm -rf /', VOICE_GW_KILLSWITCH: 'sometimes', NOPE: '1' },
+  })
   assert.equal(refused.status, 400)
   assert.match(refused.data.error, /VOICE_GW_PORT: not a valid value/)
   assert.match(refused.data.error, /VOICE_GW_WORKER_MODEL: not a valid value/)
+  assert.match(refused.data.error, /VOICE_GW_KILLSWITCH: not a valid value/)
   assert.match(refused.data.error, /unknown setting NOPE/)
   assert.ok(!existsSync(SECRETS), 'nothing written')
 })
@@ -493,6 +497,7 @@ test('finishing: the files in .secrets with mode 0600 in folders of 0700, the co
       VOICE_GW_CONTROLLER_EFFORT: 'low',
       VOICE_GW_WORKER_MODEL: 'opus',
       VOICE_GW_WORKER_EFFORT: 'high',
+      VOICE_GW_KILLSWITCH: 'manual',
     },
     telegram: { enabled: true },
     docker: { enabled: true, repos: ['acme/guarded', 'acme/open'], gitName: 'Test Driver', gitEmail: 'driver@example.com' },
@@ -526,6 +531,7 @@ test('finishing: the files in .secrets with mode 0600 in folders of 0700, the co
     VOICE_GW_CONTROLLER_EFFORT: 'low',
     VOICE_GW_WORKER_MODEL: 'opus',
     VOICE_GW_WORKER_EFFORT: 'high',
+    VOICE_GW_KILLSWITCH: 'manual',
   })
   for (const value of SECRET_VALUES) assert.ok(!readFileSync(join(SECRETS, 'gateway.env'), 'utf8').includes(value))
 

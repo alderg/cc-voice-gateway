@@ -22,6 +22,12 @@ export const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max']
 // confinement (controller/.claude/hooks/confine.mjs).
 export const CONTROLLER_LEVELS = ['confined', 'clone-delete', 'unrestricted']
 
+// What locks the kill switch (VOICE_GW_KILLSWITCH, killswitch.mjs): off,
+// nothing; manual, only the driver's emergency stop, Telegram's /stop and the
+// controller's raise_alarm, while the rules only log; auto, the default, also
+// the rules.
+export const KILLSWITCH_MODES = ['off', 'manual', 'auto']
+
 // Where Claude voice mode calls from: Anthropic's published outbound range.
 export const ANTHROPIC_RANGES = ['160.79.104.0/21']
 
@@ -143,6 +149,10 @@ export const config = {
   access: env.VOICE_GW_ACCESS || '',
   githubApi: env.VOICE_GW_GITHUB_API || 'https://api.github.com',
 
+  // What locks the kill switch: off, manual or auto (KILLSWITCH_MODES). An
+  // unknown value counts as auto; the gateway says so in its log.
+  killSwitchMode: KILLSWITCH_MODES.includes(env.VOICE_GW_KILLSWITCH) ? env.VOICE_GW_KILLSWITCH : 'auto',
+  killSwitchSetting: env.VOICE_GW_KILLSWITCH ?? '',
   // The kill switch's rules on a worker run (guard.mjs): at most this many file
   // edits, and at the end at most this many files and lines changed.
   killMaxEdits: num(env.VOICE_GW_KILL_MAX_EDITS, 500),

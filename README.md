@@ -759,6 +759,20 @@ controller following instructions.
 
 ![Kill switch](docs/killswitch.drawio.svg)
 
+**What locks it** is a setting, `VOICE_GW_KILLSWITCH`, also in the setup assistant:
+
+| Setting | Locks it | The rules |
+|---|---|---|
+| `auto`, the default | Every trigger below | Lock it |
+| `manual` | Voice, Telegram and the controller | Only write to the gateway log what they would have done (`kill switch not locked, VOICE_GW_KILLSWITCH=manual; rule would have locked it: …`) |
+| `off` | Nothing; each trigger is only logged | Only log, as at `manual` |
+
+At `off`, "emergency stop" by voice answers that the kill switch is off and hands nothing over,
+`/stop` on Telegram gets the same answer there, and `raise_alarm` tells the controller to tell you;
+workers can still be stopped one by one with `stop_worker`. The setting decides only what locks it
+from now on: a lock from before stays until you unlock it, and the gateway's log names the setting
+at every start.
+
 **Triggers:**
 
 | Trigger | How | Checked |
@@ -997,7 +1011,7 @@ the `localhost` link).
 | Step | What the assistant does | What you give it |
 |---|---|---|
 | This computer | Checks Node.js, `npm install`, Claude Code (2.1.80+), git, the `gh` login, Docker, tmux, Tailscale | Fixes for what is marked as needed |
-| Gateway | Port, repositories folder, runs at a time, time limit, approvals by voice, what the controller may do (with a warning above `confined`), the Funnel off when idle and after how many minutes | Choices |
+| Gateway | Port, repositories folder, runs at a time, time limit, approvals by voice, what the controller may do (with a warning above `confined`), what locks the kill switch (with a warning below `auto`), the Funnel off when idle and after how many minutes | Choices |
 | Models | Model and effort for the controller (`--model`, `--effort` from `start-controller.sh`) and for every worker run, on the host and in Docker | Choices, or Claude Code's defaults |
 | Telegram | Checks the token (`getMe`), finds your private chat with `getUpdates` once you wrote to the bot, sends a test message | A token from [@BotFather](https://t.me/BotFather), one message to the bot |
 | Workers in Docker | Checks the GitHub token and shows the level per repository with the gateway's detection. Builds the image with its progress shown. Starts the container, sets git's name and email in it, and clones the chosen repositories inside it | A token from `claude setup-token`, optionally a GitHub token ([5.6](#56-access-levels-and-their-detection)), the repositories |
@@ -1429,6 +1443,7 @@ setting with where it came from.
 | `VOICE_GW_DOCKER_BIN` | `docker` | Docker CLI |
 | `VOICE_GW_ACCESS` | empty | `read-only`, `pr` or `full` for every repository; empty: detected |
 | `VOICE_GW_GITHUB_API` | `https://api.github.com` | GitHub API for the level check |
+| `VOICE_GW_KILLSWITCH` | `auto` | What locks the kill switch ([5.9](#59-the-kill-switch)): `auto`, the rules and the manual triggers; `manual`, only "emergency stop" by voice, `/stop` on Telegram and the controller's `raise_alarm`, while the rules only log what they would have done; `off`, nothing, every trigger is only logged. Another value counts as `auto` |
 | `VOICE_GW_KILL_MAX_EDITS` | `500` | Kill switch: file edits in one run |
 | `VOICE_GW_KILL_MAX_FILES` | `300` | Kill switch: files changed in one run |
 | `VOICE_GW_KILL_MAX_LINES` | `30000` | Kill switch: lines changed in one run |

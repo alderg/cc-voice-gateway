@@ -17,7 +17,7 @@
 // And what is open, so that nothing is forgotten: decisions for the driver
 // (ledger.mjs), the queue (workers.mjs), the requests (store.mjs).
 
-import { CONTROLLER_LEVELS, EFFORTS, ROOT, VERSION, config } from './config.mjs'
+import { CONTROLLER_LEVELS, EFFORTS, KILLSWITCH_MODES, ROOT, VERSION, config } from './config.mjs'
 import { log } from './log.mjs'
 import { execFileSync } from 'node:child_process'
 import { Store } from './store.mjs'
@@ -29,7 +29,7 @@ import { Workers, auditSummary, gitState, hostGit, parkedText, queueList } from 
 import { Restarter } from './restart.mjs'
 import { PullWatcher } from './pulls.mjs'
 import { TelegramCommands, TelegramFallback, loadTelegram } from './telegram.mjs'
-import { KillSwitch, alarmText } from './killswitch.mjs'
+import { KillSwitch, alarmText, offText } from './killswitch.mjs'
 import { RunGuard } from './guard.mjs'
 import { hostname } from 'node:os'
 import { DockerRunner, HostRunner } from './runners.mjs'
@@ -64,9 +64,21 @@ store.on('answer', request => {
     log('answer not kept with its decisions:', error.message)
   }
 })
-const killswitch = new KillSwitch({ file: config.killSwitchFile })
+const killswitch = new KillSwitch({ file: config.killSwitchFile, mode: config.killSwitchMode })
+if (config.killSwitchSetting && !KILLSWITCH_MODES.includes(config.killSwitchSetting)) {
+  log(`VOICE_GW_KILLSWITCH=${config.killSwitchSetting} is not one of ${KILLSWITCH_MODES.join(', ')}; auto instead`)
+}
+log(
+  `kill switch ${killswitch.mode}: ` +
+    {
+      auto: 'the rules and the manual triggers lock it',
+      manual: 'only the manual triggers lock it (voice, Telegram, raise_alarm); the rules only log',
+      off: 'nothing locks it; every trigger is only logged',
+    }[killswitch.mode],
+)
 if (killswitch.locked) {
   log(`kill switch is locked since ${killswitch.state.at} by ${killswitch.state.trigger}: ${killswitch.state.reason}`)
+  if (killswitch.mode !== 'auto') log('kill switch: the setting does not unlock it; only scripts/unlock.mjs does')
 }
 const auth = new Auth({ stateFile: config.oauthStateFile, allowedHosts: config.oauthHosts })
 if (config.access && !ACCESS_LEVELS.includes(config.access)) {
@@ -313,7 +325,10 @@ if (telegram) {
   log(`telegram fallback ready: questions and approvals after ${config.telegramAfterSeconds} s without a voice call`)
   // Inbound, only the kill switch and the Funnel, only from the configured chat.
   telegramCommands = new TelegramCommands(telegram, { pollSeconds: config.telegramPollSeconds }).start()
-  telegramCommands.on('stop', ({ text }) => killswitch.trip({ trigger: 'telegram', reason: `"${text}" on Telegram` }))
+  telegramCommands.on('stop', ({ text }) => {
+    const state = killswitch.trip({ trigger: 'telegram', reason: `"${text}" on Telegram` })
+    if (!state && !killswitch.locked) say(`cc-voice-gateway on ${hostname()}: "${text}" locked nothing. ${offText()}`)
+  })
   telegramCommands.on('funnel', ({ action }) => funnel.command(action))
   telegramCommands.on('stale', stale => say(staleText(stale)))
 } else {

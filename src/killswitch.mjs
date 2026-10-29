@@ -13,11 +13,18 @@
 // only. It survives restarts; a file that cannot be read counts as locked.
 // Unlocking only with scripts/unlock.mjs on the server, through the admin
 // socket; there is no way to unlock by voice, Telegram or the controller.
+//
+// What locks it is a setting (VOICE_GW_KILLSWITCH, MODES): auto, the
+// default, every trigger; manual, only those of people (voice, Telegram, the
+// controller), while the rules only log what they would have done; off,
+// none, and each trigger is logged. A lock from before stays until it is
+// unlocked, whatever the setting.
 
 import { randomBytes } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
+import { KILLSWITCH_MODES as MODES } from './config.mjs'
 import { log as defaultLog, preview } from './log.mjs'
 
 export const TRIGGERS = ['voice', 'telegram', 'rule', 'controller']
@@ -49,15 +56,21 @@ export function emergencyPhrase(text) {
 }
 
 export class KillSwitch extends EventEmitter {
-  constructor({ file, log = defaultLog }) {
+  constructor({ file, mode = 'auto', log = defaultLog }) {
     super()
     this.file = file
+    this.mode = MODES.includes(mode) ? mode : 'auto' // anything else: as safe as it gets
     this.log = log
     this.state = this.load()
   }
 
   get locked() {
     return this.state !== null
+  }
+
+  // Whether a trigger locks it at this setting.
+  locks(trigger) {
+    return this.mode === 'auto' || (this.mode === 'manual' && trigger !== 'rule')
   }
 
   load() {
@@ -95,9 +108,15 @@ export class KillSwitch extends EventEmitter {
     }
   }
 
-  // Locks, or adds another trigger to the lock. Returns the state.
+  // Locks, or adds another trigger to the lock. Returns the state; null when
+  // the setting keeps this trigger from locking, which is only logged.
   trip({ trigger, reason }) {
     const event = { trigger, reason: preview(String(reason || 'no reason given'), 300), at: new Date().toISOString() }
+    if (!this.locks(trigger)) {
+      this.log(`kill switch not locked, VOICE_GW_KILLSWITCH=${this.mode}; ${trigger} would have locked it: ${event.reason}`)
+      this.emit('ignored', event)
+      return null
+    }
     const first = !this.state
     if (first) this.state = { id: randomBytes(4).toString('hex'), ...event, events: [] }
     this.state.events = [...this.state.events, event].slice(-50)
@@ -127,6 +146,11 @@ const clock = iso => {
   const date = new Date(iso)
   return Number.isNaN(date.getTime()) ? iso : date.toISOString().replace('T', ' ').slice(0, 16) + ' UTC'
 }
+
+// For a trigger of a person that did not lock it: the switch is off.
+export const offText = () =>
+  'The kill switch is turned off in the settings (VOICE_GW_KILLSWITCH=off), so nothing was locked and the workers ' +
+  'go on; it can be turned on again only at the computer.'
 
 // One sentence or two for whoever hears or reads it.
 export function alarmText(state, { short = false } = {}) {

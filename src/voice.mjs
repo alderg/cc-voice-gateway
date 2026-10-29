@@ -15,7 +15,7 @@ import { z } from 'zod'
 import { VERSION } from './config.mjs'
 import { readBody } from './http.mjs'
 import { log, preview } from './log.mjs'
-import { alarmText, emergencyPhrase } from './killswitch.mjs'
+import { alarmText, emergencyPhrase, offText } from './killswitch.mjs'
 import { IpGuard, accessLine } from './ipguard.mjs'
 
 const VOICE_INSTRUCTIONS = `
@@ -151,6 +151,7 @@ function statusText(store, settings, killswitch) {
   const lines = [
     `[gateway=ok controller=${confirmed ? 'confirmed' : 'unconfirmed'} open=${open.length} ` +
       `approvals=${permissions.length} relay=${settings.permissionRelay ? 'on' : 'off'} uptime=${uptime}m` +
+      `${killswitch && killswitch.mode !== 'auto' ? ` killswitch=${killswitch.mode}` : ''}` +
       `${killswitch ? ` locked=${killswitch.locked ? 'yes' : 'no'}` : ''}]`,
     confirmed
       ? `Gateway reachable. Claude Code last answered ${ago(store.controllerLastReplyAt)}.`
@@ -197,14 +198,20 @@ function buildVoiceServer(store, channel, settings, { killswitch = null, grant =
     return { ...result, content: [{ type: 'text', text: [head, alarm, ...rest].join('\n') }, ...result.content.slice(1)] }
   }
 
+  // The emergency stop: locked, or, with the kill switch turned off in the
+  // settings, an answer that says so.
+  const emergency = reason => {
+    const state = killswitch.trip({ trigger: 'voice', reason }) ?? killswitch.state
+    if (!state) return text(`[state=off] Emergency stop: ${offText()} Tell the user.`)
+    heard(state)
+    return text(`[state=locked] Emergency stop. ${alarmText(state)} Tell the user it is done.`)
+  }
+
   // An emergency phrase locks the gateway before anything reaches Claude Code;
-  // while it is locked, nothing new is handed over.
+  // while it is locked, nothing new is handed over. With the switch off, the
+  // phrase does not reach Claude Code either.
   const refuse = message => {
-    if (killswitch && emergencyPhrase(message)) {
-      const state = killswitch.trip({ trigger: 'voice', reason: `"${preview(message, 80)}" by voice` })
-      heard(state)
-      return text(`[state=locked] Emergency stop. ${alarmText(state)} Tell the user it is done.`)
-    }
+    if (killswitch && emergencyPhrase(message)) return emergency(`"${preview(message, 80)}" by voice`)
     if (killswitch?.locked) {
       heard(killswitch.state)
       return text(`[state=locked] ${alarmText(killswitch.state)} Nothing was handed over. Tell the user.`)
@@ -249,11 +256,7 @@ function buildVoiceServer(store, channel, settings, { killswitch = null, grant =
         },
         annotations: { destructiveHint: true },
       },
-      async ({ words }) => {
-        const state = killswitch.trip({ trigger: 'voice', reason: words ? `"${preview(words, 80)}" by voice` : 'emergency_stop by voice' })
-        heard(state)
-        return text(`[state=locked] Emergency stop. ${alarmText(state)} Tell the user it is done.`)
-      },
+      async ({ words }) => emergency(words ? `"${preview(words, 80)}" by voice` : 'emergency_stop by voice'),
     )
   }
 

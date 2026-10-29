@@ -26,7 +26,7 @@ import { z } from 'zod'
 import { VERSION, config } from './config.mjs'
 import { CONTROLLER_STATES } from './store.mjs'
 import { log, preview } from './log.mjs'
-import { alarmText } from './killswitch.mjs'
+import { alarmText, offText } from './killswitch.mjs'
 import { size } from './folders.mjs'
 import { auditText, queueList } from './workers.mjs'
 import { DECISION_KINDS, decisionLine, openItems } from './ledger.mjs'
@@ -850,7 +850,13 @@ export async function startChannel(
   mcp.setRequestHandler(CallToolRequestSchema, async request => {
     if (killswitch && request.params.name === ALARM_TOOL.name) {
       const reason = String(request.params.arguments?.reason ?? '').trim() || 'no reason given'
-      const state = killswitch.trip({ trigger: 'controller', reason })
+      const state = killswitch.trip({ trigger: 'controller', reason }) ?? killswitch.state
+      if (!state) {
+        return toolText(
+          `[killswitch=off] ${offText()} Tell the driver in one sentence what looks wrong, and stop a worker with ` +
+            'stop_worker if they say so.',
+        )
+      }
       return toolText(`[killswitch=locked] ${alarmText(state)}`)
     }
     if (workers && WORKER_TOOLS.some(tool => tool.name === request.params.name)) {

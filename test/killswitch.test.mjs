@@ -195,6 +195,49 @@ test('the state: locked, saved for this user only, survives a new instance, fail
   assert.match(damaged.state.reason, /unreadable/)
 })
 
+test('the setting VOICE_GW_KILLSWITCH: auto locks on everything, manual not on the rules, off on nothing', () => {
+  const file = join(TMP, 'modes', 'killswitch.json')
+  const logged = []
+  const log = line => logged.push(line)
+  const make = mode => new KillSwitch({ file, mode, log })
+
+  const manual = make('manual')
+  const ignored = []
+  manual.on('ignored', event => ignored.push(event.trigger))
+  assert.equal(manual.trip({ trigger: 'rule', reason: 'write outside the allowed folders: x' }), null)
+  assert.equal(manual.locked, false)
+  assert.equal(existsSync(file), false, 'nothing saved')
+  assert.deepEqual(ignored, ['rule'])
+  assert.match(logged.at(-1), /^kill switch not locked, VOICE_GW_KILLSWITCH=manual; rule would have locked it: write outside the allowed folders: x$/)
+  for (const trigger of ['voice', 'telegram', 'controller']) {
+    const locking = make('manual')
+    assert.equal(locking.trip({ trigger, reason: 'stop' }).trigger, trigger, `${trigger} locks at manual`)
+    locking.unlock({ by: 'test' })
+  }
+
+  const off = make('off')
+  for (const trigger of ['voice', 'telegram', 'controller', 'rule']) {
+    assert.equal(off.trip({ trigger, reason: 'stop' }), null, `${trigger} does not lock when off`)
+  }
+  assert.equal(off.locked, false)
+  assert.equal(logged.filter(line => line.startsWith('kill switch not locked, VOICE_GW_KILLSWITCH=off;')).length, 4)
+
+  // A lock from before stays, whatever the setting; the setting only keeps it from locking again.
+  make('auto').trip({ trigger: 'voice', reason: 'emergency stop' })
+  const stays = make('off')
+  assert.equal(stays.locked, true)
+  assert.equal(stays.trip({ trigger: 'rule', reason: 'again' }), null)
+  assert.deepEqual(stays.state.events.map(e => e.trigger), ['voice'])
+  stays.unlock({ by: 'test' })
+
+  // Anything else is as safe as it gets.
+  assert.equal(make('sometimes').mode, 'auto')
+  assert.equal(make(undefined).mode, 'auto')
+  const auto = make('auto')
+  assert.equal(auto.trip({ trigger: 'rule', reason: 'x' }).trigger, 'rule')
+  auto.unlock({ by: 'test' })
+})
+
 // --- the rules ---------------------------------------------------------------------------
 
 function guarded({ git = {}, limits, direct = false, pushDirect = false } = {}) {
@@ -503,8 +546,8 @@ async function freePort() {
   return port
 }
 
-function repo(name) {
-  const dir = join(ROOT, name)
+function repo(name, root = ROOT) {
+  const dir = join(root, name)
   mkdirSync(dir, { recursive: true })
   const git = (...args) => execFileSync('git', args, { cwd: dir, stdio: 'ignore' })
   git('init', '-q', '-b', 'main')
@@ -516,7 +559,8 @@ function repo(name) {
 
 let gw
 
-async function startGateway() {
+// secrets, state, root: for a gateway of its own, with its own lock and repositories.
+async function startGateway({ secrets = SECRETS, state = join(TMP, 'state'), root = ROOT, env = {} } = {}) {
   const port = await freePort()
   const g = { events: [], verdicts: [], log: '' }
   g.claudeCode = new Client({ name: 'fake-claude-code', version: '0.0.0' })
@@ -540,9 +584,9 @@ async function startGateway() {
     env: {
       ...process.env,
       VOICE_GW_PORT: String(port),
-      VOICE_GW_SECRETS_DIR: SECRETS,
-      VOICE_GW_STATE_DIR: join(TMP, 'state'),
-      VOICE_GW_WORKER_ROOT: ROOT,
+      VOICE_GW_SECRETS_DIR: secrets,
+      VOICE_GW_STATE_DIR: state,
+      VOICE_GW_WORKER_ROOT: root,
       VOICE_GW_CLAUDE_BIN: join(BIN, 'claude'),
       VOICE_GW_GH_BIN: join(BIN, 'gh'),
       VOICE_GW_TELEGRAM_API: telegram.url,
@@ -552,6 +596,7 @@ async function startGateway() {
       VOICE_GW_LOG_FILE: '',
       FAKE_CLAUDE_LOG: join(TMP, 'claude-calls.jsonl'),
       FAKE_GH_STATE: GH_STATE,
+      ...env,
     },
     stderr: 'pipe',
   })
@@ -566,7 +611,7 @@ async function startGateway() {
   }
   g.voice = {}
   for (const name of ['car', 'phone']) {
-    const { access_token } = await adminRequest(join(SECRETS, 'admin.sock'), 'POST', '/token', { name })
+    const { access_token } = await adminRequest(join(secrets, 'admin.sock'), 'POST', '/token', { name })
     const client = new Client({ name, version: '0.0.0' })
     await client.connect(
       new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp`), {
@@ -780,5 +825,60 @@ test('locked at startup with a worker state that cannot be saved: logged, and th
   } finally {
     await client.close()
     chmodSync(state, 0o700)
+  }
+})
+
+// --- the setting VOICE_GW_KILLSWITCH ------------------------------------------------------
+
+// A gateway at a setting, with its own lock, state and repository alpha.
+async function gatewayAt(mode) {
+  const root = join(TMP, 'modes-dev')
+  if (!existsSync(join(root, 'alpha'))) repo('alpha', root)
+  const secrets = join(TMP, `mode-${mode}`, 'secrets')
+  mkdirSync(secrets, { recursive: true, mode: 0o700 })
+  const g = await startGateway({ secrets, state: join(TMP, `mode-${mode}`, 'state'), root, env: { VOICE_GW_KILLSWITCH: mode } })
+  g.lock = async () => adminRequest(join(secrets, 'admin.sock'), 'GET', '/killswitch')
+  // A run that pushes to main: the rule's verdict is in the log, and the run ends as usual.
+  g.pushToMain = async () => {
+    const id = /task=(t[a-z0-9]{3})/.exec((await g.dispatch('alpha', 'PUSHMAIN: push it.')).text)[1]
+    await waitUntil(() => g.events.find(e => e.meta?.task === id))
+  }
+  return g
+}
+
+test('VOICE_GW_KILLSWITCH=manual: a rule only logs; "emergency stop" by voice still locks', async () => {
+  const g = await gatewayAt('manual')
+  try {
+    assert.match(g.log, /kill switch manual: only the manual triggers lock it \(voice, Telegram, raise_alarm\); the rules only log/)
+    await g.pushToMain()
+    assert.match(g.log, /kill switch not locked, VOICE_GW_KILLSWITCH=manual; rule would have locked it: push to the default branch: the command "git push origin main"/)
+    assert.equal((await g.lock()).locked, false)
+    assert.match(await g.voice.car('status'), /^\[gateway=ok .* killswitch=manual locked=no\]/)
+    assert.match(await g.voice.car('send', { message: 'Emergency stop!' }), /^\[state=locked\] Emergency stop\./)
+    assert.equal((await g.lock()).state.trigger, 'voice')
+  } finally {
+    await g.close()
+  }
+})
+
+test('VOICE_GW_KILLSWITCH=off: nothing locks; voice, emergency_stop and raise_alarm say so, and the rules log', async () => {
+  const g = await gatewayAt('off')
+  try {
+    assert.match(g.log, /kill switch off: nothing locks it; every trigger is only logged/)
+    const said = await g.voice.car('send', { message: 'Emergency stop!' })
+    assert.match(said, /^\[state=off\] Emergency stop: The kill switch is turned off in the settings \(VOICE_GW_KILLSWITCH=off\), so nothing was locked and the workers go on/)
+    assert.ok(!g.events.some(e => e.content.includes('Emergency stop!')), 'the phrase did not reach the controller')
+    const tool = await g.voice.carClient.callTool({ name: 'emergency_stop', arguments: { words: 'Notstopp!' } })
+    assert.match(tool.content[0].text, /^\[state=off\] Emergency stop: The kill switch is turned off/)
+    const alarm = await g.controller('raise_alarm', { reason: 'The worker writes to files nobody asked for.' })
+    assert.match(alarm.text, /^\[killswitch=off\] The kill switch is turned off .* Tell the driver in one sentence what looks wrong/)
+    await g.pushToMain()
+    for (const trigger of ['voice', 'controller', 'rule']) {
+      assert.match(g.log, new RegExp(`kill switch not locked, VOICE_GW_KILLSWITCH=off; ${trigger} would have locked it`), trigger)
+    }
+    assert.equal((await g.lock()).locked, false)
+    assert.match(await g.voice.car('status'), /^\[gateway=ok .* killswitch=off locked=no\]/)
+  } finally {
+    await g.close()
   }
 })

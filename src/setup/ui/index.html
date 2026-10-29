@@ -55,6 +55,17 @@
     <p class="guide">Confined: it answers, hands work to the workers and reads pull request status; nothing else.
       The other two levels widen what a voice request can do on this computer.</p>
     <p id="level-warning" class="notice wide" role="alert" hidden></p>
+    <label>Kill switch
+      <select id="killswitch-mode" data-setting="VOICE_GW_KILLSWITCH">
+        <option value="auto">automatic and manual (default)</option>
+        <option value="manual">manual only: the rules only log</option>
+        <option value="off">off: nothing locks it</option>
+      </select>
+    </label>
+    <p class="guide">What locks the gateway and stops every worker. Manual: "emergency stop" by voice,
+      <code>/stop</code> on Telegram and the controller's alarm. Automatic: also fixed rules on the workers' runs,
+      such as a push to the default branch, a write outside the repository or unusually many changes.</p>
+    <p id="killswitch-warning" class="notice wide" role="alert" hidden></p>
     <label><input type="checkbox" id="funnel-idle-on"> Turn Tailscale Funnel off when idle</label>
     <p class="guide">The public endpoint is then only up while you use it. The gateway says on Telegram when it
       turned the Funnel off; <code>/funnel on</code> or "keep alive" there turns it on again, within about two

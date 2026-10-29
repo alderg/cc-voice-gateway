@@ -1,5 +1,6 @@
 // Fixed rules on the workers' runs, checked by the gateway while it follows
-// them, whatever the instructions say. A violation trips the kill switch.
+// them, whatever the instructions say. A violation trips the kill switch,
+// which locks at VOICE_GW_KILLSWITCH=auto and only logs it otherwise.
 //
 //   default branch  a push to the repository's default branch, or a merge,
 //                   that was not an explicit direct dispatch at level full,

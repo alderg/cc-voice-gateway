@@ -15,7 +15,7 @@ import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync
 import { homedir, hostname, platform as osPlatform } from 'node:os'
 import { dirname, isAbsolute, join } from 'node:path'
 import { ACCESS_LEVELS, GitHubAccess } from '../access.mjs'
-import { CONTROLLER_LEVELS, EFFORTS } from '../config.mjs'
+import { CONTROLLER_LEVELS, EFFORTS, KILLSWITCH_MODES } from '../config.mjs'
 import { LAUNCH_AGENT, MAC_TAILSCALE, SERVICE, findCommand, servicePath } from '../platform.mjs'
 import { HostRunner } from '../runners.mjs'
 import { SETTINGS_FILE_NAME, formatSettings, readSettings } from '../settings.mjs'
@@ -45,6 +45,7 @@ export function fields(root) {
     VOICE_GW_WORKER_TIMEOUT: { default: '60', valid: INT(5, 1440) },
     VOICE_GW_PERMISSION_RELAY: { default: '1', valid: ONE_OF('1', '0') },
     VOICE_GW_CONTROLLER_LEVEL: { default: 'confined', valid: ONE_OF(...CONTROLLER_LEVELS) },
+    VOICE_GW_KILLSWITCH: { default: 'auto', valid: ONE_OF(...KILLSWITCH_MODES) },
     VOICE_GW_TELEGRAM_AFTER: { default: '600', valid: INT(10, 3600) },
     VOICE_GW_FUNNEL_IDLE: { default: '0', valid: INT(0, 1440) },
     VOICE_GW_DOCKER: { default: '', valid: NAME },
