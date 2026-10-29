@@ -317,7 +317,7 @@ to a lost phone or a leaked token.
 
 | Actor | Can | Cannot |
 |---|---|---|
-| Anyone on the internet | Reach the sign-in page | Call a tool without a token; get a token without a pairing code from your computer |
+| Anyone on the internet | Reach the sign-in page; get a line in the log, and for anything suspicious a message on Telegram | Reach `/mcp` from outside Anthropic's addresses; call a tool without a token; get a token without a pairing code from your computer |
 | A signed-in voice client | Send requests, read answers, answer approvals, lock the kill switch | Unlock the kill switch; reach the controller's tools directly |
 | The controller, level `confined` (default) | Read `controller/`, write `controller/playground/`, read pull request and CI status, merge after an approval, dispatch workers with your words from a recent voice request, raise the alarm | Start a worker on words that only a worker result or a pull request brought in (see 5.4); anything else (see 5.3) |
 | The controller at `clone-delete` | As at `confined`; also clone GitHub repositories into the worker root and delete files and folders there, each deletion after its plan, your words and an approval | Delete outside the worker root, the gateway's own checkout, or in a repository while its worker runs |
@@ -331,7 +331,27 @@ to a lost phone or a leaked token.
 
 - **Binding and exposure.** The gateway listens on `127.0.0.1` only (`VOICE_GW_HOST`). A tunnel or
   reverse proxy publishes it at HTTPS on port 443. A certificate from a public authority, Tailscale
-  Funnel's included, puts the host name into the certificate transparency logs.
+  Funnel's included, puts the host name into the certificate transparency logs, and scanners find it
+  within hours.
+- **`/mcp` only from Anthropic's addresses** (`src/ipguard.mjs`). Claude voice mode calls the
+  connector from Anthropic's servers, which use the published range `160.79.104.0/21`. A request to
+  `/mcp` that came through the tunnel from anywhere else gets a 403 before its token is looked at.
+  The address is the last `X-Forwarded-For` entry, the one the tunnel set; Tailscale Funnel also
+  marks its requests with `Tailscale-Funnel-Request`. Programs on this computer that call without
+  `X-Forwarded-For`, such as `scripts/fake-voice.mjs`, pass. Other ranges, or none:
+  `VOICE_GW_MCP_ALLOW` ([8.7](#87-configuration)). The sign-in pages stay open to every address:
+  you sign in from your own browser.
+- **Every request in the log**: one line with the caller's address, `funnel`, `proxy` or `local`,
+  the method, the path without its query, and the status. Only the watchdog's local `/healthz`
+  checks are left out.
+- **Alerts on Telegram**, if it is set up: a request to `/mcp` from outside the range; one from
+  Anthropic's addresses without a valid token (you connecting the connector, or someone else's
+  Claude account that found the address); a sign-in without a valid pairing code, a wrong code, too
+  many wrong codes, a burnt code; and every successful sign-in, with the client's name. Each names
+  the address. An expired token of a known connection, the hourly refresh, is only logged.
+  Throttled: one message per kind and address in 15 minutes, six an hour in all; what is held back
+  is counted in the next message, or in a summary once messages may go out again. A successful
+  sign-in always goes out.
 - **The gateway is its own OAuth server.** OAuth metadata, dynamic client registration, client ID
   metadata documents, and the authorisation code flow with PKCE (S256).
 - **Redirect addresses** must be HTTPS on `claude.ai` or `claude.com` (`VOICE_GW_OAUTH_HOSTS`), or
@@ -637,7 +657,8 @@ folder, `.git` included.
 - **When:** after `VOICE_GW_TELEGRAM_AFTER` seconds (60) without a voice tool call, voice mode
   counts as ended. Results, questions and approval requests then also go to the chat, each once;
   interim `working` updates do not. The kill switch alarm goes at once, whether voice mode is on
-  or not, and so does a note when the gateway ends because another process holds its port.
+  or not, and so do a note when the gateway ends because another process holds its port and the
+  alerts about suspicious requests and sign-ins ([5.2](#52-the-voice-endpoint-and-oauth)).
 - **Inbound:** only the kill switch (`/stop`, `/killswitch`, `/emergencystop` or an emergency
   phrase) and the Funnel (`/funnel on`, `/funnel off`, `/funnel`, "keep alive";
   [7.3](#73-publishing-the-endpoint)), only from the configured private chat. Everything else is
@@ -786,8 +807,9 @@ is guarded as follows:
   sentence, the phrase check can miss it, and the check knows only English; the `emergency_stop`
   tool is there for that. Approvals depend on
   it asking you.
-- **The endpoint is public.** The pairing code protects the sign-in; nothing limits the request
-  rate, and nothing protects the availability.
+- **The endpoint is public.** The pairing code protects the sign-in, and `/mcp` answers through the
+  tunnel only Anthropic's addresses; but every Claude account calls from those too, and the sign-in
+  pages answer everyone. Nothing limits the request rate, and nothing protects the availability.
 - **Above `confined`, more rests on the sign-in.** At `clone-delete`, a deletion needs words and
   an approval that whoever can call the connector can give. At `unrestricted`, nothing in this
   design limits the controller, and the kill switch's rules do not watch it.
@@ -950,6 +972,9 @@ Claude's servers call the connector from Anthropic's cloud. Any tunnel or revers
   `/.well-known/…` and `/oauth/…`. Do not open port 8787 itself;
 - passes the **public host name** in `Host` or `X-Forwarded-Host`, and sends
   `X-Forwarded-Proto: https`: the sign-in metadata is built from them;
+- adds the **caller's address** as the last `X-Forwarded-For` entry: only Anthropic's addresses
+  may call `/mcp` ([5.2](#52-the-voice-endpoint-and-oauth)). A tunnel that cannot do that needs
+  `VOICE_GW_MCP_ALLOW=any`;
 - allows **responses of up to a minute**, since `get_reply` waits up to 40 seconds.
 
 **Tailscale Funnel** (tested). On Linux run `sudo tailscale set --operator=$USER` once.
@@ -983,7 +1008,8 @@ voice.example.com {
 }
 ```
 
-With nginx add `proxy_set_header Host $host;` and `proxy_set_header X-Forwarded-Proto https;`.
+With nginx add `proxy_set_header Host $host;`, `proxy_set_header X-Forwarded-Proto https;` and
+`proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`.
 
 ### 7.4 Admin steps for Team and Enterprise
 
@@ -1167,7 +1193,9 @@ npm test                             # both ends without Claude Code or a phone
 
 `pair.mjs` and `fake-voice.mjs` talk to the running gateway, so the controller must run. A
 connector unused for more than 30 days must sign in again. `.logs/gateway.log` has one line per
-connector call and sign-in step; it shows whether and how far the voice AI got.
+connector call and sign-in step, and one per HTTP request with the caller's address
+(`http 160.79.106.3 funnel POST /mcp 200`); it shows whether and how far the voice AI got, and who
+else knocked.
 
 ### 8.6 Getting changes out of the container
 
@@ -1191,6 +1219,7 @@ gateway reads them at its start: restart the controller after a change.
 | `VOICE_GW_LOG_FILE` | `.logs/gateway.log` | Empty: stderr only |
 | `VOICE_GW_LOG_MAX_MB` | `10` | Past this size the log moves to `gateway.log.1`, replacing the one before |
 | `VOICE_GW_OAUTH_HOSTS` | `claude.ai,claude.com` | Hosts allowed in redirect addresses and client ID metadata documents |
+| `VOICE_GW_MCP_ALLOW` | `160.79.104.0/21`, Anthropic's | Ranges (CIDR) or addresses that may call `/mcp` through the tunnel, comma-separated; `any`: no limit, for a tunnel without `X-Forwarded-For` ([5.2](#52-the-voice-endpoint-and-oauth)) |
 | `VOICE_GW_PERMISSION_RELAY` | on | `0`: approvals only at the terminal |
 | `VOICE_GW_PERMISSION_TTL` | `900` | Seconds before an open approval leaves the voice view |
 | `VOICE_GW_DEFAULT_WAIT` | `25` | Seconds `get_reply` waits by default |
@@ -1287,7 +1316,9 @@ do not set them.
 | `status` reports `controller=unconfirmed`, `get_reply` shows a hint | The session runs without the channel (neither the plugin nor `--dangerously-load-development-channels server:voice`), or the organisation blocks channels. Start it with `scripts/start-controller.sh` and check `/mcp`; otherwise Claude Code drops events silently. |
 | `voice port … is in use by another process` in the log, and the same on Telegram | Another process holds `VOICE_GW_PORT`: a second controller session, or a gateway left over from an earlier session, which also answers the watchdog's `/healthz`. The new gateway ends with an error. `lsof -nP -iTCP:8787 -sTCP:LISTEN` shows the process; end it, start only one controller, then restart it. |
 | Voice assistant answers itself instead of asking | Say "Ask Claude Code …" explicitly. |
-| Voice assistant says the connector does not work | Look at `.logs/gateway.log`. No `voice initialize`: the request never arrived (URL, tunnel or proxy, DNS). `voice 401`: the client has to sign in again. `initialize` and `tools/list` but no `tools/call`: the assistant chose not to call a tool. |
+| Voice assistant says the connector does not work | Look at `.logs/gateway.log`. No `voice initialize`: the request never arrived (URL, tunnel or proxy, DNS). `voice 401`: the client has to sign in again. `voice 403`: the caller's address is not allowed, see the next row. `initialize` and `tools/list` but no `tools/call`: the assistant chose not to call a tool. |
+| `voice 403 … not an allowed address` for Claude's own calls | Anthropic calls from a range missing in `VOICE_GW_MCP_ALLOW`, or the tunnel does not put the caller's address last in `X-Forwarded-For` (then every call shows the same address). Add the range, or set `VOICE_GW_MCP_ALLOW=any`, and restart the controller. |
+| A Telegram alert about a request without a token, or a sign-in | It names the address. A request without a token from Anthropic's addresses comes with every new sign-in of the connector; if you did not connect it, nothing got in, and the pairing code keeps it so. A successful sign-in you did not make: `node scripts/pair.mjs list`, then `revoke`. |
 | A repository is missing from `list_workers` | Only folders directly in the worker root with a `.git` count. Check `VOICE_GW_WORKER_ROOT`. |
 | The controller says it cannot clone or delete | The level is `confined`, or workers run in Docker; the log line `controller level …` says which. A new level counts from the next start of the start script: `--stop`, then start it again. |
 | `delete=unplanned` | A deletion needs a plan of the same path from the last 15 minutes: the controller calls `delete_path` without `confirm` first. |
@@ -1339,6 +1370,7 @@ src/
   channel.mjs        stdio side: channel, reply and worker tools, permission relay
   voice.mjs          HTTP side: the voice tools
   oauth.mjs          sign-in: OAuth metadata, registration, pairing page, tokens
+  ipguard.mjs        the door: access log, /mcp only from Anthropic's addresses, alerts on Telegram
   workers.mjs        workers: repositories, claude -p runs, results
   runners.mjs        where workers run: this computer, or the Docker container
   access.mjs         access levels in the container, from the GitHub token

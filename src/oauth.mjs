@@ -19,8 +19,12 @@
 // Tokens and client secrets are stored as SHA-256 hashes in .secrets/oauth.json,
 // which only this process writes. Comparing hashes of random tokens is safe
 // against timing attacks, so plain === is enough.
+//
+// Every step of a sign-in with a pairing code is also an event, 'pairing', for
+// the alerts on Telegram (ipguard.mjs).
 
 import { createHash, randomBytes, randomInt } from 'node:crypto'
+import { EventEmitter } from 'node:events'
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { readBody, sendJson } from './http.mjs'
@@ -106,8 +110,9 @@ async function readParams(req) {
   return new URLSearchParams(body)
 }
 
-export class Auth {
+export class Auth extends EventEmitter {
   constructor({ stateFile, allowedHosts }) {
+    super()
     this.stateFile = stateFile
     // Hosts allowed in redirect URIs and client ID metadata documents.
     this.allowedHosts = allowedHosts
@@ -157,11 +162,13 @@ export class Auth {
   // PAIRING_ATTEMPTS_TOTAL wrong ones from anywhere the code is burnt. A client
   // ID metadata document is public, anyone can name it, so such a client
   // counts by address only: nobody can lock out Claude's published identity.
-  checkPairingCode(input, { clientId = null, address = '?' } = {}) {
+  checkPairingCode(input, { clientId = null, clientName = null, address = '?' } = {}) {
     const pairing = this.pairing
+    const event = { address, client: clientName }
     if (!pairing || pairing.expiresAt < now()) {
       this.pairing = null
-      log('oauth sign-in without a valid pairing code')
+      log(`oauth sign-in without a valid pairing code from ${address}`)
+      this.report({ outcome: 'none', ...event })
       return false
     }
     const { wrong } = pairing
@@ -169,6 +176,7 @@ export class Auth {
     const count = (map, key) => (key === null ? 0 : (map.get(key) ?? 0))
     if (count(wrong.clients, client) >= PAIRING_ATTEMPTS || count(wrong.addresses, address) >= PAIRING_ATTEMPTS) {
       log(`oauth pairing code refused for ${address}: too many wrong attempts from this client or address`)
+      this.report({ outcome: 'refused', ...event })
       return false
     }
     if (sha256(String(input ?? '').replace(/[\s-]/g, '')) === pairing.hash) {
@@ -181,11 +189,22 @@ export class Auth {
     if (wrong.total >= PAIRING_ATTEMPTS_TOTAL) {
       this.pairing = null
       log(`oauth wrong pairing code from ${address}; ${wrong.total} wrong attempts in all, the code is burnt`)
+      this.report({ outcome: 'burnt', total: wrong.total, ...event })
       return false
     }
     const left = PAIRING_ATTEMPTS - Math.max(count(wrong.clients, client), count(wrong.addresses, address))
     log(`oauth wrong pairing code from ${address}, ${left} attempts left there`)
+    this.report({ outcome: 'wrong', left, ...event })
     return false
+  }
+
+  // A listener's error must not fail the sign-in.
+  report(event) {
+    try {
+      this.emit('pairing', event)
+    } catch (error) {
+      log('oauth sign-in event not handled:', error.message)
+    }
   }
 
   // --- grants (admin socket) ----------------------------------------------
@@ -223,6 +242,9 @@ export class Auth {
 
   issue(grant, { refresh = true, ttl = ACCESS_TTL_S } = {}) {
     const access = random()
+    // The token it replaces, so that a late request with it counts as the
+    // refresh it is, not as a stranger's token (verify).
+    if (grant.accessHash) grant.previousAccessHash = grant.accessHash
     grant.accessHash = sha256(access)
     grant.accessExpiresAt = now() + ttl * 1000
     const tokens = { access_token: access, token_type: 'Bearer', expires_in: ttl, scope: SCOPE }
@@ -237,12 +259,19 @@ export class Auth {
 
   // --- the protected resource ---------------------------------------------
 
+  // { grant }, or { error, reason }. error is what the client hears (missing or
+  // invalid_token); reason tells the log and the alerts more: missing, unknown,
+  // or expired, an expired or replaced token of a connection known here, as
+  // with every hourly refresh.
   verify(req) {
     const match = /^Bearer\s+(\S+)$/i.exec(req.headers.authorization ?? '')
-    if (!match) return { error: 'missing' }
+    if (!match) return { error: 'missing', reason: 'missing' }
     const hash = sha256(match[1])
     const grant = this.state.grants.find(g => g.accessHash === hash)
-    if (!grant || grant.accessExpiresAt < now()) return { error: 'invalid_token' }
+    if (!grant || grant.accessExpiresAt < now()) {
+      const known = grant ?? this.state.grants.find(g => g.previousAccessHash === hash)
+      return { error: 'invalid_token', reason: known ? 'expired' : 'unknown' }
+    }
     grant.lastUsedAt = now()
     return { grant }
   }
@@ -439,7 +468,8 @@ export class Auth {
       redirect(res, withParams(redirectUri, { error: 'access_denied', state, iss: origin }))
       return
     }
-    if (!this.checkPairingCode(params.get('pairing_code'), { clientId: client.clientId, address: clientAddress(req) })) {
+    const address = clientAddress(req)
+    if (!this.checkPairingCode(params.get('pairing_code'), { clientId: client.clientId, clientName: client.name, address })) {
       sendPage(res, 200, signInPage(params, client, origin, 'Wrong or expired code. Run node scripts/pair.mjs again.'))
       return
     }
@@ -452,7 +482,8 @@ export class Auth {
       codeChallenge: checked.codeChallenge,
       expiresAt: now() + CODE_TTL_MS,
     })
-    log('oauth sign-in accepted for', JSON.stringify(client.name))
+    log('oauth sign-in accepted for', JSON.stringify(client.name), `from ${address}`)
+    this.report({ outcome: 'accepted', address, client: client.name })
     redirect(res, withParams(redirectUri, { code, state, iss: origin }))
   }
 

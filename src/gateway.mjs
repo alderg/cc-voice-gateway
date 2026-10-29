@@ -5,7 +5,8 @@
 // One process, two faces:
 //   stdio  -> Claude Code controller session (a channel: push events, reply tool, permission relay)
 //   HTTP   -> voice assistant in the car (MCP tools: status, send, ask, get_reply, approve),
-//             behind an OAuth sign-in
+//             behind an OAuth sign-in, and through the tunnel only from Anthropic's
+//             addresses (ipguard.mjs)
 // plus a Unix socket for scripts/pair.mjs (pairing codes, connections), the
 // workers: headless Claude Code runs in the repositories next to this one, or
 // in a Docker container with its own clones, a watch on the pull requests they
@@ -32,6 +33,7 @@ import { DockerRunner, HostRunner } from './runners.mjs'
 import { ACCESS_LEVELS, GitHubAccess } from './access.mjs'
 import { FolderTools, clonedText } from './folders.mjs'
 import { FunnelSwitch, staleText } from './funnel.mjs'
+import { Alerts, IpGuard } from './ipguard.mjs'
 
 const store = new Store({ permissionTtlSeconds: config.permissionTtlSeconds, file: config.requestsFile })
 const killswitch = new KillSwitch({ file: config.killSwitchFile })
@@ -222,6 +224,16 @@ if (telegram) {
   log('telegram fallback off: telegram_token and telegram_chat_id not both set')
 }
 
+// The door of the voice endpoint (ipguard.mjs): /mcp through the tunnel only
+// from the allowed addresses, and suspicious requests and every sign-in step
+// on Telegram, throttled. Without Telegram, the log has them.
+const ipGuard = new IpGuard({
+  allow: config.mcpAllow,
+  alerts: new Alerts({ send: telegram ? text => telegram.send(text) : null }),
+})
+auth.on('pairing', event => ipGuard.pairing(event))
+log(`${ipGuard.describe()}; suspicious requests ${telegram ? 'reported on Telegram' : 'only in the log'}`)
+
 // --- the kill switch's effects, in code ---------------------------------------
 
 // No new tasks (Workers.dispatch and the voice tools check the switch), every
@@ -305,7 +317,7 @@ async function portBusy() {
 }
 
 admin = await startAdmin(auth, config.adminSocket, { killswitch })
-http = startVoiceHttp(store, channel, auth, config, { killswitch, onPortBusy: portBusy })
+http = startVoiceHttp(store, channel, auth, config, { killswitch, onPortBusy: portBusy, guard: ipGuard })
 
 // Once the session is connected: worker results the previous session never
 // answered go to this one, and after a restart by the watchdog the driver

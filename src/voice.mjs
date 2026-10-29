@@ -1,6 +1,7 @@
 // Voice side: a Streamable HTTP MCP endpoint for the voice assistant
 // (Claude voice mode), reached through a tunnel and protected by the OAuth
-// sign-in in oauth.mjs.
+// sign-in in oauth.mjs. Through the tunnel, only Anthropic's servers may call
+// it (ipguard.mjs), and every request gets a line in the log.
 //
 // Stateless by design: every POST gets its own short-lived MCP server, all
 // state lives in the shared Store. Long tasks are followed with short polls
@@ -15,6 +16,7 @@ import { VERSION } from './config.mjs'
 import { readBody } from './http.mjs'
 import { log, preview } from './log.mjs'
 import { alarmText, emergencyPhrase } from './killswitch.mjs'
+import { IpGuard, accessLine } from './ipguard.mjs'
 
 const VOICE_INSTRUCTIONS = `
 This connector reaches Claude Code sessions running on the user's own computer. The user is usually
@@ -391,7 +393,7 @@ const MAX_BODY_BYTES = 1024 * 1024
 // One log line per JSON-RPC message, so the log shows whether the
 // voice assistant called the connector at all, and which tool. Message texts are
 // logged by the channel side (push) only when a request reaches the controller.
-function logCall(req, body, grant) {
+function logCall(req, body, grant, caller) {
   for (const message of Array.isArray(body) ? body : [body]) {
     const method = message?.method
     if (!method || method.startsWith('notifications/')) continue
@@ -402,7 +404,7 @@ function logCall(req, body, grant) {
         `client=${client.name ?? '?'}/${client.version ?? '?'}`,
         `protocol=${message.params?.protocolVersion ?? '?'}`,
         `ua=${JSON.stringify(preview(req.headers['user-agent'] ?? '', 60))}`,
-        `from=${req.headers['x-forwarded-for'] ?? req.socket.remoteAddress}`,
+        `from=${caller.address}`,
         `grant=${grant.id}`,
       )
     } else if (method === 'tools/call') {
@@ -413,11 +415,37 @@ function logCall(req, body, grant) {
   }
 }
 
+// A request target that is no URL at all, such as "http://[", is answered
+// with a 400 instead of failing the handler.
+function parseUrl(target) {
+  try {
+    return new URL(target || '/', 'http://localhost')
+  } catch {
+    return null
+  }
+}
+
 // onPortBusy: called when another process holds the port (gateway.mjs ends
-// the gateway then); without it, that is only logged.
-export function startVoiceHttp(store, channel, auth, settings, { killswitch = null, onPortBusy = null } = {}) {
+// the gateway then); without it, that is only logged. guard: who may call
+// /mcp, and the alerts (ipguard.mjs).
+export function startVoiceHttp(
+  store,
+  channel,
+  auth,
+  settings,
+  { killswitch = null, onPortBusy = null, guard = new IpGuard() } = {},
+) {
   const server = createServer(async (req, res) => {
-    const url = new URL(req.url || '/', 'http://localhost')
+    const caller = guard.caller(req)
+    const url = parseUrl(req.url)
+    // The watchdog checks /healthz every 30 s; those lines would drown the rest.
+    if (url?.pathname !== '/healthz' || caller.via !== 'local') {
+      res.on('close', () => log(accessLine(req, res, url, caller)))
+    }
+    if (!url) {
+      res.writeHead(400).end()
+      return
+    }
 
     if (url.pathname === '/healthz') {
       res.writeHead(200, { 'content-type': 'text/plain' }).end('ok')
@@ -431,14 +459,19 @@ export function startVoiceHttp(store, channel, auth, settings, { killswitch = nu
       return
     }
     if (url.pathname !== '/mcp') {
-      // Old connector URLs had the secret in the path; keep it out of the log.
-      log('rejected', req.method, url.pathname.startsWith('/mcp/') ? '/mcp/…' : preview(url.pathname, 60))
-      res.writeHead(404).end()
+      res.writeHead(404).end() // the access log has it, with the caller's address
       return
     }
-    const { grant, error } = auth.verify(req)
+    // Claude voice mode calls only from Anthropic's servers: through the
+    // tunnel, anyone else is turned away before the token is looked at.
+    if (!guard.allows(caller)) {
+      guard.blocked(req, caller)
+      res.writeHead(403).end()
+      return
+    }
+    const { grant, error, reason } = auth.verify(req)
     if (!grant) {
-      log('voice 401', error === 'missing' ? 'no token: the client has to sign in' : 'unknown or expired token')
+      guard.refused(caller, reason)
       auth.challenge(res, req, error)
       return
     }
@@ -459,7 +492,7 @@ export function startVoiceHttp(store, channel, auth, settings, { killswitch = nu
       res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32700, message: 'Parse error' }, id: null }))
       return
     }
-    logCall(req, body, grant)
+    logCall(req, body, grant, caller)
 
     // Tool calls show that the voice mode is still on (Telegram fallback).
     if ((Array.isArray(body) ? body : [body]).some(message => message?.method === 'tools/call')) {

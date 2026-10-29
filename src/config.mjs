@@ -22,6 +22,9 @@ export const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max']
 // confinement (controller/.claude/hooks/confine.mjs).
 export const CONTROLLER_LEVELS = ['confined', 'clone-delete', 'unrestricted']
 
+// Where Claude voice mode calls from: Anthropic's published outbound range.
+export const ANTHROPIC_RANGES = ['160.79.104.0/21']
+
 const secretsDir = process.env.VOICE_GW_SECRETS_DIR || join(ROOT, '.secrets')
 const settingsFile = join(secretsDir, SETTINGS_FILE_NAME)
 const env = { ...readSettings(settingsFile), ...process.env }
@@ -68,6 +71,16 @@ export const config = {
   oauthHosts: (env.VOICE_GW_OAUTH_HOSTS || 'claude.ai,claude.com')
     .split(',')
     .map(host => host.trim())
+    .filter(Boolean),
+
+  // Addresses that may call /mcp through the Funnel or another proxy
+  // (ipguard.mjs): comma-separated ranges (CIDR) or addresses, by default
+  // Anthropic's. "any" lifts the limit, for a tunnel that does not pass the
+  // caller's address in X-Forwarded-For. Programs on this computer that call
+  // without X-Forwarded-For always pass.
+  mcpAllow: (env.VOICE_GW_MCP_ALLOW || ANTHROPIC_RANGES.join(','))
+    .split(',')
+    .map(range => range.trim())
     .filter(Boolean),
 
   // Workers: every git repository in this folder, by default the one this
