@@ -1081,7 +1081,8 @@ VOICE_GW_WATCHDOG=0 scripts/start-controller.sh # without the watchdog
 
 - **Folder and mode:** starts `claude` in `controller/` with `--permission-mode manual`.
 - **Model and effort:** `--model`/`--effort` from `VOICE_GW_CONTROLLER_MODEL` and
-  `VOICE_GW_CONTROLLER_EFFORT`; options given to the script come last and win.
+  `VOICE_GW_CONTROLLER_EFFORT`, and `--chrome` with `VOICE_GW_CONTROLLER_CHROME=1`; options given
+  to the script come last and win.
 - **The channel,** chosen by `scripts/channel-mode.mjs` before every start:
   - **plugin**, when the organisation's managed settings (`~/.claude/remote-settings.json`, or the
     managed settings file on this computer) name `voice@cc-voice-gateway` in
@@ -1287,6 +1288,7 @@ setting with where it came from.
 |---|---|---|
 | `VOICE_GW_CONTROLLER_MODEL` | Claude Code's default | `--model` for the controller |
 | `VOICE_GW_CONTROLLER_EFFORT` | Claude Code's default | `--effort` for the controller |
+| `VOICE_GW_CONTROLLER_CHROME` | `0` | `1`: `--chrome` for the controller, so it can use Claude in Chrome: a Chrome with the Claude extension, signed in, open on a desktop of the same user (a remote desktop session that stays when you disconnect works) |
 | `VOICE_GW_WATCHDOG` | `1` | `0`: start without the watchdog |
 | `VOICE_GW_WATCHDOG_INTERVAL` | `30` | Seconds between health checks |
 | `VOICE_GW_WATCHDOG_HEALTH_FAILS` | `3` | Failed checks before a restart |

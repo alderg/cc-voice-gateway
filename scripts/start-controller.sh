@@ -20,7 +20,8 @@
 # Both read the gateway's settings from controller/.mcp.json and from
 # .secrets/gateway.env, which the setup assistant writes (scripts/setup.mjs).
 # From the latter this script also takes the session's model and effort:
-# VOICE_GW_CONTROLLER_MODEL and VOICE_GW_CONTROLLER_EFFORT.
+# VOICE_GW_CONTROLLER_MODEL and VOICE_GW_CONTROLLER_EFFORT, and with
+# VOICE_GW_CONTROLLER_CHROME=1 Claude in Chrome (--chrome).
 #
 # The session runs in manual mode, whatever defaultMode the user settings set.
 # controller/.claude/settings.json lets Bash, Write and Edit run without asking,
@@ -243,10 +244,11 @@ choose_channel() {
     unrestricted)
       log "controller level unrestricted: the confinement is off. By voice, the controller can run any command as $(id -un), read and change any file, .secrets/ included, and use the web" ;;
   esac
-  # The session's model and effort from the settings; options given to this
-  # script come later and win.
+  # The session's model, effort and Claude in Chrome from the settings;
+  # options given to this script come later and win.
   if [ -n "${VOICE_GW_CONTROLLER_MODEL:-}" ]; then claude_args+=(--model "$VOICE_GW_CONTROLLER_MODEL"); fi
   if [ -n "${VOICE_GW_CONTROLLER_EFFORT:-}" ]; then claude_args+=(--effort "$VOICE_GW_CONTROLLER_EFFORT"); fi
+  if [ "${VOICE_GW_CONTROLLER_CHROME:-0}" = 1 ]; then claude_args+=(--chrome); fi
   export VOICE_GW_CHANNEL_MODE=$channel_mode # for the gateway (restart.mjs)
 }
 

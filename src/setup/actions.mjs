@@ -53,6 +53,7 @@ export function fields(root) {
     VOICE_GW_ACCESS: { default: '', valid: ONE_OF(...ACCESS_LEVELS) },
     VOICE_GW_CONTROLLER_MODEL: { default: '', valid: MODEL },
     VOICE_GW_CONTROLLER_EFFORT: { default: '', valid: ONE_OF(...EFFORTS) },
+    VOICE_GW_CONTROLLER_CHROME: { default: '0', valid: ONE_OF('1', '0') },
     VOICE_GW_WORKER_MODEL: { default: '', valid: MODEL },
     VOICE_GW_WORKER_EFFORT: { default: '', valid: ONE_OF(...EFFORTS) },
   }
