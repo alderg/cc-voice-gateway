@@ -269,9 +269,12 @@ everything blue is Claude Code.
 
 ![Flow of a request](docs/request-flow.drawio.svg)
 
-The voice AI calls `send` and then `get_reply` until the state is `done`. Every result starts with
-a machine-readable line, for example `[state=working id=k7f3 elapsed=34s]`. Requests and approvals
-have these states:
+The voice AI calls `send` and then `get_reply` until the state is `done`. Before `send` or `ask`
+it says one short line in your language that fits the request, in its own words each time: a task
+is on its way, a question gets its answer in a moment. The tool descriptions ask for no fixed phrase,
+since you may speak any language, and never for a "let me check": the voice AI only passes the
+request on. Every result starts with a machine-readable line, for example
+`[state=working id=k7f3 elapsed=34s]`. Requests and approvals have these states:
 
 ![States](docs/states.drawio.svg)
 
