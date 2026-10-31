@@ -17,6 +17,17 @@
 // A worktree is removed once a run there has ended with nothing uncommitted
 // and nothing unpushed (Workers.tidy); git worktree remove needs --force for
 // one with submodules, so the gateway checks first.
+//
+// The checkout's installed dependencies, its node_modules folders, top level
+// and nested (test/*/node_modules), are linked into a new worktree at the
+// same places (linkNodeModules), so that a run there needs neither an install
+// nor a link of its own, which could point outside its worktree and lock the
+// kill switch (guard.mjs). Only where the place is free and git ignores the
+// folder in the checkout. A link is a file to git, which a pattern such as
+// node_modules/ (folders only) does not cover: then one anchored line in the
+// repository's info/exclude, which its worktrees share, ignores it, so that
+// the check after a run finds nothing new. Before a worktree is removed, the
+// links go as links, never into what they point to.
 
 import { posix } from 'node:path'
 import { preview } from './log.mjs'
@@ -26,6 +37,30 @@ export const WORKTREES = '.voice-worktrees'
 const FETCH_MS = 5 * 60 * 1000 // fetching the start branch
 const LOCAL_MS = 5 * 60 * 1000 // a submodule from the checkout's own module
 const NETWORK_MS = 20 * 60 * 1000 // a submodule from its URL, shallow
+const MODULES_DEPTH = 8 // how deep in the checkout node_modules folders are looked for
+const MODULES_MAX = 200 // linked into one worktree at most
+export const EXCLUDE_MARK = '# cc-voice-gateway: node_modules of the checkout, linked into its worktrees (src/worktrees.mjs)'
+
+// The node_modules folders of a checkout ($1), relative to it, to a depth
+// ($2): real folders, not links, none inside another node_modules, nothing
+// in .git.
+const FIND_MODULES = 'cd "$1" || exit 1; find . -maxdepth "$2" -name .git -prune -o -type d -name node_modules -prune -print'
+
+// Whether a place ($1) is free for a link: nothing there, not even a broken
+// link, and its folder there.
+const FREE = 'if [ -e "$1" ] || [ -L "$1" ]; then exit 1; fi; [ -d "$(dirname "$1")" ]'
+
+// Lines ($2…) in an exclude file ($1), each once, on lines of their own.
+const EXCLUDE =
+  'f=$1; shift; mkdir -p "$(dirname "$f")" && touch "$f" || exit 1; [ -z "$(tail -c 1 "$f")" ] || echo >> "$f"; ' +
+  'for line in "$@"; do grep -qxF -- "$line" "$f" || printf "%s\\n" "$line" >> "$f" || exit 1; done'
+
+// The node_modules links in a worktree ($1), to a depth ($2), removed as
+// links: rm on the link's own path, which never reaches what it points to.
+// find follows no links, and skips the folders a run installed there.
+const UNLINK_MODULES =
+  'cd "$1" || exit 0; find . -maxdepth "$2" \\( -name .git -o -type d -name node_modules \\) -prune -o ' +
+  '-type l -name node_modules -print | while IFS= read -r link; do rm -f -- "$link"; done'
 
 // Where the worktree of a run is, as the runner reaches it.
 export const worktreeDir = (runner, repo, id) => runner.dir(posix.join(WORKTREES, repo, id))
@@ -151,13 +186,58 @@ export async function makeWorktree(runner, { main, dir, branch = null, again = n
   const list = []
   const subs = (await gitIn(runner, dir, ['ls-files', '--', '.gitmodules'])).stdout?.trim() ? await submodules(runner, dir) : []
   for (const sub of subs) list.push(await submodule(runner, { main, dir, sub, env }))
+  const links = await linkNodeModules(runner, { main, dir })
   const head = await gitIn(runner, dir, ['branch', '--show-current'])
-  return { ok: true, created: true, base, fetched, branch: head.ok ? head.stdout.trim() || null : null, submodules: list }
+  return { ok: true, created: true, base, fetched, branch: head.ok ? head.stdout.trim() || null : null, submodules: list, links }
 }
 
-// Removes a worktree and what git keeps of it. --force: one with submodules
-// cannot go otherwise; the caller has checked that nothing is left in it.
+// The checkout's node_modules folders into a new worktree, as links at the
+// same places (see the top): where the place is free and git ignores the
+// folder in the checkout, and the link is ignored too, by the repository's
+// patterns or by an anchored line in its info/exclude. Returns the places
+// linked, relative to the worktree.
+export async function linkNodeModules(runner, { main, dir }) {
+  const found = await runner.sh(FIND_MODULES, [main, String(MODULES_DEPTH)])
+  if (!found.ok) return []
+  const places = found.stdout
+    .split('\n')
+    .map(line => line.trim().replace(/^\.\//, ''))
+    .filter(Boolean)
+    .slice(0, MODULES_MAX)
+  const wanted = []
+  for (const rel of places) {
+    if (!(await runner.sh(FREE, [posix.join(dir, rel)])).ok) continue
+    if (!(await gitIn(runner, main, ['check-ignore', '-q', '--', rel])).ok) continue
+    // Asked while nothing is there, git answers for a file, as a link is one.
+    const ignored = (await gitIn(runner, dir, ['check-ignore', '-q', '--', rel])).ok
+    wanted.push({ rel, exclude: !ignored })
+  }
+  // Anchored, and the path as it is, not a pattern.
+  const excludes = wanted.filter(place => place.exclude).map(place => `/${place.rel.replace(/[*?[\\]/g, '\\$&')}`)
+  const excluded = excludes.length ? await addExcludes(runner, main, excludes) : true
+  const linked = []
+  for (const { rel, exclude } of wanted) {
+    if (exclude && !excluded) continue // it would count as a new file in the worktree
+    if ((await runner.sh('ln -s -- "$1" "$2"', [posix.join(main, rel), posix.join(dir, rel)])).ok) linked.push(rel)
+  }
+  return linked
+}
+
+// Lines in the repository's info/exclude, which its worktrees share, with
+// the mark once; each line once.
+async function addExcludes(runner, main, lines) {
+  const common = await gitIn(runner, main, ['rev-parse', '--git-common-dir'])
+  if (!common.ok) return false
+  const gitDir = common.stdout.trim()
+  const file = posix.join(posix.isAbsolute(gitDir) ? gitDir : posix.join(main, gitDir), 'info', 'exclude')
+  return (await runner.sh(EXCLUDE, [file, EXCLUDE_MARK, ...lines])).ok
+}
+
+// Removes a worktree and what git keeps of it: first its node_modules links,
+// as links. --force: one with submodules cannot go otherwise; the caller has
+// checked that nothing is left in it.
 export async function removeWorktree(runner, { main, dir }) {
+  await runner.sh(UNLINK_MODULES, [dir, String(MODULES_DEPTH)])
   const removed = await gitIn(runner, main, ['worktree', 'remove', '--force', dir], { timeout: 120000 })
   await gitIn(runner, main, ['worktree', 'prune'])
   return removed.ok || !(await isTop(runner, dir))
@@ -172,8 +252,9 @@ export async function orphans(runner, dir) {
 
 // What the worker reads about its worktree, as lines of its prompt; only for
 // runs in a worktree. facts: what inspect found; wt: { dir, base, target,
-// created, again, fetched, submodules, resumed, resumedSession }, target
-// being the branch it started from, where its pull request goes.
+// created, again, fetched, submodules, links, resumed, resumedSession },
+// target being the branch it started from, where its pull request goes,
+// links the node_modules linked in when it was made.
 export function worktreeLines(facts, wt, { direct = false } = {}) {
   const lines = []
   const target = (facts.pushDirect || direct ? facts.defaultBranch || wt.target : wt.target || facts.defaultBranch) || 'the default branch'
@@ -225,6 +306,15 @@ export function worktreeLines(facts, wt, { direct = false } = {}) {
       )
     }
   }
+  const links = wt.links ?? []
+  const shown = links.slice(0, 5).join(', ') + (links.length > 5 ? ` and ${links.length - 5} more` : '')
+  lines.push(
+    '- Dependencies: the installed node_modules of the repository\'s checkout are linked into this worktree already' +
+      (links.length ? ` (${shown})` : ', where it has any') +
+      '. Never create links or files outside this worktree. The links lead into the checkout, so never install into ' +
+      'them; where a test folder lacks its dependencies or needs others, remove its link (rm on the link, no ' +
+      'trailing slash) and install them inside the worktree.',
+  )
   lines.push('- The gateway removes this worktree after the run once nothing is left uncommitted or unpushed in it.')
   return lines
 }

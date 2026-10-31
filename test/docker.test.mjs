@@ -639,8 +639,12 @@ test('Docker: a further run of a repository works in a worktree in the container
   assert.ok(add.includes(`VOICE_GW_TASK=${second.id}`))
   assert.ok(add.includes(CONTAINER))
   assert.deepEqual(dockerCalls().find(c => c.includes('voice-run') && c.includes(second.id)).slice(0, 4), ['exec', '-i', '-w', wt])
+  // The checkout's node_modules are looked for, and the links removed, in the container too.
+  const shells = dockerCalls().filter(c => c[0] === 'exec' && c.includes(CONTAINER) && c.includes('sh') && c.some(a => a.includes('node_modules')))
+  assert.ok(shells.some(c => c.includes(join(REPOS, 'local'))), 'looked for in the clone')
   await waitUntil(() => !existsSync(wt))
   assert.ok(dockerCalls().some(c => c.includes('worktree') && c.includes('remove')), 'removed in the container')
+  assert.ok(dockerCalls().some(c => c.includes('sh') && c.includes(wt) && c.some(a => a.includes('-type l'))), 'the links removed as links first')
   await controller('stop_worker', { worker: 'local', drop: 'all' })
 })
 

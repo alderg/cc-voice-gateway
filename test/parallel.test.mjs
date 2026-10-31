@@ -12,7 +12,20 @@
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  chmodSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readlinkSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs'
 import { EventEmitter } from 'node:events'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -34,6 +47,8 @@ const { answeredTask } = await import('../src/channel.mjs')
 const { RunGuard } = await import('../src/guard.mjs')
 const { SettingsWatcher } = await import('../src/live.mjs')
 const { environmentWins } = await import('../src/settings.mjs')
+const { HostRunner } = await import('../src/runners.mjs')
+const { EXCLUDE_MARK, linkNodeModules, makeWorktree, removeWorktree } = await import('../src/worktrees.mjs')
 
 // The stand-in for claude. Words in the task:
 //   HOLD:<name>  waits until the file holds/<name> is there
@@ -430,6 +445,126 @@ test("a worktree where the checkout's submodule is not initialised: a shallow cl
     assert.deepEqual(two.task.submodules.map(s => [s.path, s.how, s.ok]), [['lib', 'shallow from its URL', true]])
     assert.ok(!existsSync(join(root, 'alpha', 'lib', 'lib.txt')), 'the checkout as it was')
     assert.throws(() => git(dir, 'config', '--get', 'submodule.lib.url'), 'and its config: the URL came with -c')
+    release(a)
+    await ended(one.task)
+  } finally {
+    workers.close()
+  }
+})
+
+// --- the checkout's node_modules in a worktree ---------------------------------------------------
+
+// A checkout with installed node_modules: at the top (ignored by "/node_modules",
+// which covers a link), with a package that has its own; in test/a (ignored by
+// "node_modules/", folders only, not a link); in test/b (by "node_modules"); in
+// test/c (not ignored); in build, which only the checkout has.
+function modulesCheckout() {
+  const main = join(TMP, `modules${++count}`, 'alpha')
+  mkdirSync(main, { recursive: true })
+  git(main, 'init', '-q', '-b', 'main')
+  const file = (path, text = '') => {
+    mkdirSync(join(main, path, '..'), { recursive: true })
+    writeFileSync(join(main, path), text)
+  }
+  file('.gitignore', '/node_modules\nbuild/\n')
+  file('test/a/.gitignore', 'node_modules/\n')
+  file('test/a/a.test.js')
+  file('test/b/.gitignore', 'node_modules\n')
+  file('test/b/b.test.js')
+  file('test/c/c.test.js')
+  git(main, 'add', '.')
+  git(main, 'commit', '-q', '-m', 'init')
+  for (const path of ['node_modules/pkg', 'node_modules/pkg/node_modules/dep', 'test/a/node_modules/m', 'test/b/node_modules/m', 'test/c/node_modules/m', 'build/node_modules/m']) {
+    file(`${path}/index.js`, 'installed\n')
+  }
+  return { main, runner: new HostRunner(join(main, '..')) }
+}
+
+const excludeOf = main => readFileSync(join(main, '.git', 'info', 'exclude'), 'utf8')
+
+test("a new worktree gets the checkout's node_modules as links, nested too, where git ignores them, and nothing new to commit", async () => {
+  const { main, runner } = modulesCheckout()
+  const wt = join(main, '..', '.voice-worktrees', 'alpha', 't1')
+  const checkout = git(main, 'status', '--porcelain')
+  const made = await makeWorktree(runner, { main, dir: wt, remote: false })
+  assert.equal(made.ok, true)
+  assert.deepEqual([...made.links].sort(), ['node_modules', 'test/a/node_modules', 'test/b/node_modules'])
+  for (const rel of made.links) {
+    assert.ok(lstatSync(join(wt, rel)).isSymbolicLink(), rel)
+    assert.equal(readlinkSync(join(wt, rel)), join(main, rel), `${rel}: the checkout's own, by its absolute path`)
+  }
+  assert.equal(readFileSync(join(wt, 'test', 'a', 'node_modules', 'm', 'index.js'), 'utf8'), 'installed\n')
+  assert.ok(!existsSync(join(wt, 'test', 'c', 'node_modules')), 'not ignored in the checkout: not linked')
+  assert.ok(!existsSync(join(wt, 'build')), 'no folder for it in the worktree: not linked, and none made')
+  // A link is a file to git: "node_modules/" does not cover it, the anchored line does.
+  assert.equal(git(wt, 'status', '--porcelain'), '', 'nothing new in the worktree')
+  assert.equal(git(main, 'status', '--porcelain'), checkout, 'nor in the checkout')
+  const lines = excludeOf(main).split('\n')
+  assert.ok(lines.includes(EXCLUDE_MARK))
+  assert.ok(lines.includes('/test/a/node_modules'))
+  assert.ok(!lines.includes('/test/b/node_modules') && !lines.includes('/node_modules'), 'only where the patterns do not cover a link')
+  // A second worktree: each line once.
+  const again = await makeWorktree(runner, { main, dir: join(main, '..', '.voice-worktrees', 'alpha', 't2'), remote: false })
+  assert.equal(again.links.length, 3)
+  const counted = excludeOf(main).split('\n')
+  assert.equal(counted.filter(line => line === EXCLUDE_MARK).length, 1)
+  assert.equal(counted.filter(line => line === '/test/a/node_modules').length, 1)
+})
+
+test('node_modules: a place in the worktree that is taken stays as it is, a broken link too', async () => {
+  const { main, runner } = modulesCheckout()
+  const wt = join(main, '..', 'wt')
+  git(main, 'worktree', 'add', '-q', '--detach', wt, 'HEAD')
+  mkdirSync(join(wt, 'test', 'a', 'node_modules'))
+  symlinkSync(join(main, 'nowhere'), join(wt, 'test', 'b', 'node_modules'))
+  assert.deepEqual(await linkNodeModules(runner, { main, dir: wt }), ['node_modules'])
+  assert.ok(lstatSync(join(wt, 'test', 'a', 'node_modules')).isDirectory(), 'its own folder, not replaced')
+  assert.equal(readlinkSync(join(wt, 'test', 'b', 'node_modules')), join(main, 'nowhere'), 'the broken link, not replaced')
+})
+
+test("removing a worktree removes its node_modules links as links: the checkout's packages stay", async () => {
+  const { main, runner } = modulesCheckout()
+  const wt = join(main, '..', '.voice-worktrees', 'alpha', 't1')
+  await makeWorktree(runner, { main, dir: wt, remote: false })
+  // One the run installed itself goes with the worktree.
+  mkdirSync(join(wt, 'test', 'c', 'node_modules', 'own'), { recursive: true })
+  writeFileSync(join(wt, 'test', 'c', 'node_modules', 'own', 'index.js'), 'x')
+  assert.equal(await removeWorktree(runner, { main, dir: wt }), true)
+  assert.ok(!existsSync(wt))
+  assert.ok(!git(main, 'worktree', 'list').includes(wt))
+  for (const path of ['node_modules/pkg', 'node_modules/pkg/node_modules/dep', 'test/a/node_modules/m', 'test/b/node_modules/m']) {
+    assert.equal(readFileSync(join(main, path, 'index.js'), 'utf8'), 'installed\n', path)
+  }
+})
+
+test('a run in a worktree: the prompt names the linked node_modules, and the worktree goes after a clean run, the packages stay', async () => {
+  const { root, dir, workers, dispatch } = setup({ maxPerRepo: 2 })
+  try {
+    mkdirSync(join(dir, 'test', 'a'), { recursive: true })
+    writeFileSync(join(dir, 'test', 'a', '.gitignore'), 'node_modules/\n')
+    git(dir, 'add', '.')
+    git(dir, 'commit', '-q', '-m', 'tests')
+    git(dir, 'push', '-q', 'origin', 'main')
+    mkdirSync(join(dir, 'test', 'a', 'node_modules', 'm'), { recursive: true })
+    writeFileSync(join(dir, 'test', 'a', 'node_modules', 'm', 'index.js'), 'installed\n')
+
+    const a = hold()
+    const one = await dispatch(`HOLD:${a} one`)
+    const b = hold()
+    const two = await dispatch(`HOLD:${b} two`, { parallel: true })
+    const wt = join(worktreesOf(root), two.task.id)
+    const call = await until(() => callOf(two.task.id))
+    assert.equal(readlinkSync(join(wt, 'test', 'a', 'node_modules')), join(dir, 'test', 'a', 'node_modules'))
+    assert.match(
+      call.input,
+      /^- Dependencies: the installed node_modules of the repository's checkout are linked into this worktree already \(test\/a\/node_modules\)\. Never create links or files outside this worktree\. The links lead into the checkout, so never install into them; where a test folder lacks its dependencies or needs others, remove its link \(rm on the link, no trailing slash\) and install them inside the worktree\.$/m,
+    )
+    release(b)
+    await ended(two.task)
+    assert.deepEqual(workers.runMeta(two.task), { worktree: two.task.id }, 'clean: the link counts as nothing new')
+    assert.equal(two.task.worktreeRemoved, true)
+    assert.ok(!existsSync(wt))
+    assert.equal(readFileSync(join(dir, 'test', 'a', 'node_modules', 'm', 'index.js'), 'utf8'), 'installed\n')
     release(a)
     await ended(one.task)
   } finally {
@@ -955,4 +1090,18 @@ test('the prompt of a run in a worktree where pull requests are off: a detached 
   const kept = prompt({ task: 'Go on.', words: 'go on', facts: { ...facts, dirty: ['left.txt'] } })
   assert.match(kept, /^- Uncommitted files in your worktree: left\.txt \(left by an earlier run of this task\)$/m)
   assert.doesNotMatch(kept, /not yours, leave them alone/)
+})
+
+test('the prompt of a run in a worktree: the linked node_modules, at most five by name, and never anything outside it', () => {
+  const worktree = { dir: '/w/.voice-worktrees/delta/t1ab', target: 'main', base: 'origin/main', created: true, submodules: [] }
+  const facts = { origin: 'acme/delta', visibility: 'private', branch: 'main', dirty: [], defaultBranch: 'main' }
+  const links = ['node_modules', ...[1, 2, 3, 4, 5, 6].map(n => `test/t${n}/node_modules`)]
+  const many = prompt({ task: 'Fix it.', words: 'fix it', facts: { ...facts, worktree: { ...worktree, links } } })
+  assert.match(
+    many,
+    /^- Dependencies: the installed node_modules of the repository's checkout are linked into this worktree already \(node_modules, test\/t1\/node_modules, test\/t2\/node_modules, test\/t3\/node_modules, test\/t4\/node_modules and 2 more\)\. Never create links or files outside this worktree\. The links lead into the checkout, so never install into them;/m,
+  )
+  // Found again, or a checkout with none: the rule all the same.
+  const none = prompt({ task: 'Go on.', words: 'go on', facts: { ...facts, worktree: { ...worktree, created: false, links: null } } })
+  assert.match(none, /^- Dependencies: the installed node_modules of the repository's checkout are linked into this worktree already, where it has any\. Never create links or files outside this worktree\./m)
 })

@@ -1335,6 +1335,7 @@ export class Workers extends EventEmitter {
         again: made.created && Boolean(wt?.branch && made.base === wt.branch),
         fetched: made.fetched,
         submodules: made.submodules,
+        links: made.links ?? null,
         resumed: entry?.requeued?.why ?? null,
         resumedSession: record.resumed,
       }
@@ -1344,7 +1345,8 @@ export class Workers extends EventEmitter {
       record.preparing = false
       this.spawnRun(record, promptFacts, job)
       const subs = made.submodules?.length ? `, submodules ${made.submodules.map(s => `${s.path} ${s.ok ? s.how : 'failed'}`).join(', ')}` : ''
-      log('worker worktree', record.repo, record.id, made.created ? `made from ${made.base}` : 'found again', record.dir + subs)
+      const links = made.links?.length ? `, node_modules linked: ${made.links.length}` : ''
+      log('worker worktree', record.repo, record.id, made.created ? `made from ${made.base}` : 'found again', record.dir + subs + links)
       this.save()
       this.emit('started', record)
     } catch (error) {

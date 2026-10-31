@@ -280,6 +280,13 @@ export class HostRunner {
     return { ok, stdout: stdout ?? '', stderr: stderr ?? '' }
   }
 
+  // A shell script with its arguments: { ok, stdout, stderr }. For the
+  // links of a worktree (worktrees.mjs).
+  async sh(script, args = [], { timeout = 60000 } = {}) {
+    const { ok, stdout, stderr } = await run('sh', ['-c', script, 'sh', ...args], timeout)
+    return { ok, stdout: stdout ?? '', stderr: stderr ?? '' }
+  }
+
   // Detached: its own process group, so stopping it reaches the commands it
   // started, and a controller restart does not end it. env carries the
   // run's marks (MARK).
@@ -409,6 +416,12 @@ export class DockerRunner {
   async git(dir, ...args) {
     const { ok, stdout } = await this.exec(['git', '-C', dir, ...args])
     return ok ? stdout : null
+  }
+
+  // As HostRunner.sh, in the container.
+  async sh(script, args = [], { timeout = 60000 } = {}) {
+    const { ok, stdout, stderr } = await this.exec(['sh', '-c', script, 'sh', ...args], timeout)
+    return { ok, stdout: stdout ?? '', stderr: stderr ?? '' }
   }
 
   // As HostRunner.gitRun, in the container; the environment goes with

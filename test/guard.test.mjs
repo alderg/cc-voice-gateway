@@ -192,6 +192,9 @@ EOF`,
   `sort -u words.txt -o /tmp/words.txt`,
   `tar -czf /tmp/backup.tgz src`,
   `ln -sf ../shared/config.json config.json`,
+  // A link's target is read, not written: only the link's own path counts.
+  `ln -sf /home/someone/other/test/node_modules test/node_modules`,
+  `ln -s -t test /opt/elsewhere/node_modules`,
   `cp -r fixtures /tmp/fixtures && cp /tmp/fixtures/a.json test/`,
   `install -m 644 dist/app.js build/app.js`,
   `dd if=/dev/zero of=/tmp/blob bs=1k count=1 2>/dev/null`,
@@ -232,6 +235,8 @@ const OUTSIDE = [
   ['cp -t /etc a b', '/etc'],
   ['install -d /opt/thing', '/opt/thing'],
   ['ln -s x /usr/local/bin/x', '/usr/local/bin/x'],
+  // A link one level above the repository, wherever it points.
+  ['ln -sf /work/alpha/test/implicit-globals/node_modules ../implicit-globals/node_modules', '/work/implicit-globals/node_modules'],
   ['rsync -a dist/ /var/www/', '/var/www'],
   ['rm -rf ~/.ssh', '~/.ssh'],
   ['mkdir -p ~/.config/x', '~/.config/x'],
