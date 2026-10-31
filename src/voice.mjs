@@ -106,6 +106,13 @@ function describeNews(news) {
   return lines
 }
 
+// Approvals the voice client heard that were answered at the computer since,
+// each once.
+const answeredElsewhereLines = store =>
+  store
+    .takeAnsweredElsewhere()
+    .map(permission => `Approval ${permission.code} was answered at the computer and no longer waits; do not ask the user about it.`)
+
 function describePermission(permission) {
   const details = preview(permission.inputPreview || '', 200)
   // Claude Code's descriptions often end with a full stop already.
@@ -131,6 +138,7 @@ function report(store, request, settings) {
   const lines = [`[${head.join(' ')}]`]
   for (const update of fresh) lines.push(`Claude Code: ${update.text}`)
   for (const permission of permissions) lines.push(describePermission(permission))
+  lines.push(...answeredElsewhereLines(store))
   // After this, further answers to the request count as news.
   if (request.state === 'done') store.markClosed(request)
   const news = store.takeNews(request)
@@ -208,6 +216,7 @@ function statusText(store, settings, killswitch) {
   if (permissions.length) {
     lines.push('Pending approvals: ' + permissions.map(p => `${p.code} (${p.toolName})`).join('; '))
   }
+  lines.push(...answeredElsewhereLines(store))
   const news = store.takeNews()
   if (news.length) lines.push(...describeNews(news))
   return lines.join('\n')
@@ -453,6 +462,15 @@ function buildVoiceServer(store, channel, settings, { killswitch = null, grant =
         annotations: { destructiveHint: true },
       },
       withLine(withAlarm(async ({ code, decision }) => {
+        // Answered in the terminal or through Remote Control: a verdict now
+        // would apply to nothing.
+        const known = store.getPermission(code)
+        if (known?.status === 'elsewhere') {
+          return text(
+            `[approval=elsewhere code=${known.code}] Already answered at the computer; nothing to do. Tell the user ` +
+              'in a few words.',
+          )
+        }
         if (killswitch?.locked && decision === 'allow') {
           return text(`[approval=locked code=${code}] The kill switch is locked: nothing can be allowed now.`)
         }

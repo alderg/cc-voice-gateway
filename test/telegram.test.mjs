@@ -294,6 +294,33 @@ test('approvals the voice client has heard are not sent', async () => {
   telegram.close()
 })
 
+test('an approval sent here and answered at the computer since: said once, also while the voice mode is on; one never sent here, not at all', async () => {
+  const { store, sent, telegram } = fallback()
+  store.addPermission({ request_id: 'bdozq', tool_name: 'Monitor', description: 'Watch the build log', input_preview: '' })
+  await waitFor(() => sent.length === 1)
+  assert.match(sent[0], /^Approval request bdozq \(controller session\)/)
+
+  store.voiceCallStarted()
+  assert.deepEqual(store.closePermissionsElsewhere().map(p => p.code), ['bdozq'])
+  await waitFor(() => sent.length === 2)
+  assert.equal(sent[1], 'Approval request bdozq was answered at the computer; nothing to do.')
+  assert.deepEqual(store.closePermissionsElsewhere(), [], 'closed already')
+  assert.equal(store.getPermission('BDOZQ').status, 'elsewhere')
+  assert.equal(store.resolvePermission('bdozq', 'allow'), null, 'no verdict for it any more')
+
+  // Heard by voice only: closed without a word here.
+  store.addPermission({ request_id: 'fghjk', tool_name: 'Bash', description: 'Run ls', input_preview: '' })
+  for (const permission of store.openPermissions()) permission.announced = true // what get_reply does
+  store.voiceCallEnded()
+  store.closePermissionsElsewhere()
+  await sleep(AFTER * 1000 + 100)
+  store.changed()
+  assert.equal(sent.length, 2)
+  assert.deepEqual(store.takeAnsweredElsewhere().map(p => p.code), ['fghjk'], 'the voice client hears it, once')
+  assert.deepEqual(store.takeAnsweredElsewhere(), [])
+  telegram.close()
+})
+
 test('a failing Telegram call is logged and changes nothing for the voice path', async () => {
   const { store, sent, logged, telegram, voiceCall } = fallback({ fail: true })
   const request = voiceCall(() => store.createRequest('Anything new?'))

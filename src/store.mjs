@@ -237,7 +237,7 @@ export class Store extends EventEmitter {
       description,
       inputPreview: input_preview,
       createdAt: Date.now(),
-      status: 'open', // open | allow | deny
+      status: 'open', // open | allow | deny | elsewhere (answered at the computer)
       announced: false, // reported to the voice client at least once
     })
     this.emit('permission', this.permissions.get(code)) // for the statistics
@@ -272,6 +272,35 @@ export class Store extends EventEmitter {
     this.emit('permission', permission)
     this.changed()
     return permission
+  }
+
+  // An approval by its code, open or answered, while it is kept; else null.
+  getPermission(code) {
+    this.prunePermissions()
+    return this.permissions.get(String(code).toLowerCase()) ?? null
+  }
+
+  // The open approvals were answered at the computer, in the terminal or
+  // through Remote Control: the session that asked showed a sign of life
+  // since (channel.mjs). Off the voice client's list; a late answer to one
+  // hears so. Returns them.
+  closePermissionsElsewhere() {
+    const closed = this.openPermissions()
+    for (const permission of closed) {
+      permission.status = 'elsewhere'
+      permission.resolvedAt = Date.now()
+      this.emit('permission', permission) // Telegram says so where it sent it
+    }
+    if (closed.length) this.changed()
+    return closed
+  }
+
+  // Approvals the voice client heard that were answered at the computer
+  // since: each once, so that it stops asking the driver about them.
+  takeAnsweredElsewhere() {
+    const told = [...this.permissions.values()].filter(p => p.status === 'elsewhere' && p.announced && !p.toldElsewhere)
+    for (const permission of told) permission.toldElsewhere = true
+    return told
   }
 
   // --- whether the voice client is still there ----------------------------

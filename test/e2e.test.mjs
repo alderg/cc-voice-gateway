@@ -378,6 +378,41 @@ test('permission relay: prompt -> get_reply -> approve -> verdict to Claude Code
   assert.equal(verdicts.filter(v => v.request_id === 'abcde').length, 1)
 })
 
+test('an approval answered at the computer: the next tool call of the session closes it, a late approve sends no verdict', async () => {
+  const id = idOf(await voiceCall('send', { message: 'Watch the build.' }))
+  await waitUntil(() => channelEvents.find(e => e.meta?.request_id === id))
+  const ask = request_id =>
+    claudeCode.notification({
+      method: 'notifications/claude/channel/permission_request',
+      params: { request_id, tool_name: 'Monitor', description: 'Watch the build log', input_preview: '{}' },
+    })
+  await ask('bdozq')
+  assert.match(await voiceCall('get_reply', { id, wait_seconds: 3 }), /approval=bdozq/)
+
+  // Answered in the terminal, which Claude Code does not tell the channel; the
+  // session goes on and calls a tool of the gateway.
+  const workers = await claudeCode.callTool({ name: 'list_workers', arguments: {} })
+  assert.equal(workers.isError, false)
+  await waitUntil(() => gatewayLog.includes('permission answered at the computer code=bdozq tool=Monitor (then list_workers called)'))
+  const out = await voiceCall('get_reply', { id, wait_seconds: 1 })
+  assert.doesNotMatch(out, /approval=bdozq|Approval needed/)
+  assert.match(out, /^Approval bdozq was answered at the computer and no longer waits; do not ask the user about it\.$/m)
+  assert.doesNotMatch(await voiceCall('get_reply', { id, wait_seconds: 1 }), /bdozq/, 'said once')
+  assert.doesNotMatch(await voiceCall('status'), /Pending approvals/)
+
+  const late = await voiceCall('approve', { code: 'bdozq', decision: 'allow' })
+  assert.match(late, /^\[approval=elsewhere code=bdozq\] Already answered at the computer; nothing to do\./)
+  await new Promise(r => setTimeout(r, 200))
+  assert.ok(!verdicts.some(v => v.request_id === 'bdozq'), 'no verdict that would apply to nothing')
+
+  // A prompt after the tool call waits as before, until a reply from the session.
+  await ask('cdpqr')
+  assert.match(await voiceCall('status'), /Pending approvals: cdpqr \(Monitor\)/)
+  await controllerReply(id, 'done', 'The build is green.')
+  assert.doesNotMatch(await voiceCall('status'), /Pending approvals/)
+  assert.match(await voiceCall('approve', { code: 'cdpqr', decision: 'deny' }), /^\[approval=elsewhere code=cdpqr\]/)
+})
+
 test('approve rejects malformed codes', async () => {
   const result = await voice.callTool({ name: 'approve', arguments: { code: 'll111', decision: 'allow' } })
   assert.equal(result.isError, true)

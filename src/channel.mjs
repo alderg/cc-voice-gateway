@@ -1194,7 +1194,23 @@ export async function startChannel(
   ]
   mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools }))
 
+  // Claude Code does not tell the channel when a permission dialog it relayed
+  // is answered in the terminal or through Remote Control: it stops waiting
+  // for a verdict and drops a late one as stale. But the session waits on the
+  // dialog, and runs a tool of this server never next to another (they carry
+  // no readOnlyHint), so a tool call from it means that every dialog relayed
+  // before was answered. A new permission request does not: tools it runs in
+  // parallel ask at the same time. (A subagent's dialog, at the level that
+  // lets the controller start subagents, could still be waiting: then it is
+  // answered at the computer.)
+  const answeredElsewhere = sign => {
+    for (const permission of store.closePermissionsElsewhere()) {
+      log('permission answered at the computer', `code=${permission.code}`, `tool=${permission.toolName}`, `(then ${sign})`)
+    }
+  }
+
   mcp.setRequestHandler(CallToolRequestSchema, async request => {
+    if (permissionRelay) answeredElsewhere(`${request.params.name} called`)
     if (killswitch && request.params.name === ALARM_TOOL.name) {
       const reason = String(request.params.arguments?.reason ?? '').trim() || 'no reason given'
       const state = killswitch.trip({ trigger: 'controller', reason }) ?? killswitch.state

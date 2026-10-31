@@ -270,8 +270,10 @@ export class TelegramFallback {
     this.timer = null
     this.queue = Promise.resolve() // keeps messages in order
     this.check = this.check.bind(this)
+    this.answered = this.answered.bind(this)
     store.on('change', this.check)
     store.on('voice', this.check)
+    store.on('permission', this.answered)
     this.check()
   }
 
@@ -279,6 +281,20 @@ export class TelegramFallback {
     clearTimeout(this.timer)
     this.store.off('change', this.check)
     this.store.off('voice', this.check)
+    this.store.off('permission', this.answered)
+  }
+
+  // An approval request sent here that was answered at the computer since
+  // (store.closePermissionsElsewhere): said once, whether the voice mode is
+  // on or not, so that nobody answers it again by voice.
+  answered(permission) {
+    try {
+      if (permission.status !== 'elsewhere' || !permission.telegram || permission.telegramClosed || this.paused()) return
+      permission.telegramClosed = true
+      this.deliver(`Approval request ${permission.code} was answered at the computer; nothing to do.`)
+    } catch (error) {
+      this.log('telegram fallback failed:', error.message)
+    }
   }
 
   // Runs on every change in the store and when the voice mode may have ended.
