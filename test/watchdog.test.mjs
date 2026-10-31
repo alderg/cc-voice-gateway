@@ -46,7 +46,6 @@ const fromFile = process.env.VOICE_GW_SETTINGS_FROM_FILE ?? null
 const note = event => appendFileSync(process.env.FAKE_CLAUDE_LOG, JSON.stringify({
   pid: process.pid, event, step, lock: lock ?? null, mode: process.env.VOICE_GW_CHANNEL_MODE ?? null, restarted, settings, fromFile,
 }) + '\\n')
-note('start')
 // the gateway's statistics: saved as it starts, and with the end as it ends
 const startedAt = Date.now()
 const saveStats = ended => {
@@ -57,11 +56,13 @@ const saveStats = ended => {
   if (ended) data.current.endedAt = Date.now()
   writeFileSync(process.env.VOICE_GW_STATE_DIR + '/stats.json', JSON.stringify(data))
 }
+// before its start shows: a stop from then on reaches the handler
+let gateway = null
+process.on('SIGTERM', () => { note('SIGTERM'); saveStats(true); gateway?.kill(); process.exit(143) })
+note('start')
 saveStats(false)
 // what the setup assistant does meanwhile: new settings, for the next start
 if ('settings' in step) writeFileSync(process.env.VOICE_GW_SECRETS_DIR + '/gateway.env', step.settings)
-let gateway = null
-process.on('SIGTERM', () => { note('SIGTERM'); saveStats(true); gateway?.kill(); process.exit(143) })
 if (step.restart) {
   // what the gateway does for restart_controller: a note for the watchdog, then SIGTERM
   writeFileSync(lock + '/restart', JSON.stringify({ by: 'voice', at: new Date().toISOString() }))
@@ -200,6 +201,11 @@ function waitUntil(predicate, ms = 10000) {
 }
 
 const exited = child => new Promise(resolve => child.on('exit', code => resolve(code)))
+
+// Until the session's gateway has saved its statistics, as it does at its
+// start: a stop before that has none to send. (claude.pid alone is there
+// before claude runs, and a slow start of node lost the race.)
+const statsSaved = dir => waitUntil(() => existsSync(join(dir, 'state', 'stats.json')))
 
 // --- crashes and intentional stops ---------------------------------------------
 
@@ -413,6 +419,7 @@ test('restart-everything under tmux: says what it stops, ends what is left of th
   const forever = 'setInterval(() => {}, 1000)'
   const before = telegram.messages.length
   await running(e)
+  await statsSaved(c.dir)
   // Worker runs on this computer keep running under tmux.
   writeFileSync(join(c.dir, 'state', 'workers.json'), JSON.stringify({
     tasks: [{ id: 't1aa', repo: 'alpha', kind: 'repo', state: 'running', startedAt: Date.now() - 5 * 60000, container: null }],
@@ -460,6 +467,7 @@ test('restart-everything with the systemd service: worker runs end with its stop
   const { c } = e
   const before = telegram.messages.length
   await running(e)
+  await statsSaved(c.dir)
   writeFileSync(join(c.dir, 'state', 'workers.json'), JSON.stringify({
     tasks: [
       { id: 't1aa', repo: 'alpha', kind: 'repo', state: 'running', startedAt: Date.now(), container: null },
@@ -809,7 +817,7 @@ test('a restart of the service: --stop says it was requested, the stopping watch
   let before = telegram.messages.length
   const first = spawn(SCRIPT, [], { env: c.env, stdio: 'ignore' })
   const done = exited(first)
-  await waitUntil(() => existsSync(join(c.dir, 'state', 'controller.lock', 'claude.pid')))
+  await statsSaved(c.dir)
   assert.equal((await runCommand(SCRIPT, ['--stop'], systemd(c, 'restart'))).status, 0)
   assert.equal(await done, 0)
   let sent = texts(before, c)
@@ -828,7 +836,7 @@ test('a restart of the service: --stop says it was requested, the stopping watch
   before = telegram.messages.length
   const again = spawn(SCRIPT, [], { env: stop.env, stdio: 'ignore' })
   const ended = exited(again)
-  await waitUntil(() => existsSync(join(stop.dir, 'state', 'controller.lock', 'claude.pid')))
+  await statsSaved(stop.dir)
   assert.equal((await runCommand(SCRIPT, ['--stop'], systemd(stop, 'stop'))).status, 0)
   assert.equal(await ended, 0)
   sent = texts(before, stop)
@@ -842,7 +850,7 @@ test('a stop at the computer: the statistics, without who stopped it; a crash ke
   let before = telegram.messages.length
   const first = spawn(SCRIPT, [], { env: c.env, stdio: 'ignore' })
   const done = exited(first)
-  await waitUntil(() => existsSync(join(c.dir, 'state', 'controller.lock', 'claude.pid')))
+  await statsSaved(c.dir)
   assert.equal((await run(c, ['--stop'])).status, 0)
   assert.equal(await done, 0)
   let sent = texts(before, c)
