@@ -37,6 +37,39 @@ const MAX_LINES = 400
 export const PAIRING_MINUTES = 10 // a code from the page; scripts/pair.mjs makes one for five
 export const STAY_MS = 20 * 60 * 1000 // after writing, at least this long for connecting the Claude app
 const FUNNEL_CACHE_MS = 10000 // the page polls; tailscale is asked at most this often
+const LISTEN_CACHE_MS = 60000 // and netstat or ss, for port 443, at most this often
+
+// The ports Tailscale Funnel publishes on (VOICE_GW_FUNNEL_PORT, scripts/funnel.sh).
+export const FUNNEL_PORTS = ['443', '8443', '10000']
+// Tailscale's own addresses: 100.64.0.0/10 and fd7a:115c:a1e0::/48.
+const TAILNET = /^(100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.|fd7a:115c:a1e0:)/i
+
+// Another web server that listens on TCP port 443 on this computer, from
+// netstat -anv -p tcp on macOS, which lists other users' listeners without
+// sudo (with the process's name on recent versions), or ss -ltnp on Linux
+// (with it only for one's own processes): { name }, name null when not
+// shown, or null when there is none. Tailscale's own listeners, by their
+// name or a tailnet address, do not count.
+export function webServerOn443(text, platform) {
+  for (const line of String(text).split('\n')) {
+    const columns = line.trim().split(/\s+/)
+    let local, name
+    if (platform === 'darwin') {
+      if (!/^tcp/.test(columns[0]) || columns[5] !== 'LISTEN') continue
+      local = columns[3].slice(0, columns[3].lastIndexOf('.'))
+      if (columns[3].slice(local.length + 1) !== '443') continue
+      name = columns.slice(6).map(column => /^([^:]+):\d+$/.exec(column)?.[1]).find(Boolean)
+    } else {
+      if (columns[0] !== 'LISTEN' || !columns[3]) continue
+      local = columns[3].slice(0, columns[3].lastIndexOf(':')).replace(/^\[|\]$|%.*$/g, '')
+      if (columns[3].slice(columns[3].lastIndexOf(':') + 1) !== '443') continue
+      name = /users:\(\("([^"]+)"/.exec(line)?.[1]
+    }
+    if (/tailscale|ipnextension/i.test(name ?? '') || TAILNET.test(local)) continue
+    return { name: /^[\w.@+-]{1,40}$/.test(name ?? '') ? name : null }
+  }
+  return null
+}
 
 // The settings the page sets, with their defaults (as in config.mjs and the
 // start scripts) and what a valid value looks like. A value equal to its
@@ -66,6 +99,7 @@ export function fields(root) {
     VOICE_GW_KILLSWITCH: { default: 'auto', valid: ONE_OF(...KILLSWITCH_MODES) },
     VOICE_GW_TELEGRAM_AFTER: { default: '600', valid: INT(10, 3600) },
     VOICE_GW_FUNNEL_IDLE: { default: '0', valid: INT(0, 1440) },
+    VOICE_GW_FUNNEL_PORT: { default: '443', valid: ONE_OF(...FUNNEL_PORTS) },
     VOICE_GW_DOCKER: { default: '', valid: NAME },
     VOICE_GW_DOCKER_FOLDER: { default: join(homedir(), 'docker-developer'), valid: PATH },
     VOICE_GW_DOCKER_IMAGE: { default: 'cc-voice-worker', valid: IMAGE },
@@ -176,6 +210,8 @@ export function createSetup({
     loginctl: env.VOICE_SETUP_LOGINCTL_BIN || 'loginctl',
     launchctl: env.VOICE_SETUP_LAUNCHCTL_BIN || 'launchctl',
     plutil: env.VOICE_SETUP_PLUTIL_BIN || 'plutil',
+    netstat: env.VOICE_SETUP_NETSTAT_BIN || 'netstat',
+    ss: env.VOICE_SETUP_SS_BIN || 'ss',
     tailscale:
       env.VOICE_SETUP_TAILSCALE_BIN ||
       (platform === 'darwin' && !findCommand('tailscale', env.PATH) && existsSync(MAC_TAILSCALE) ? MAC_TAILSCALE : 'tailscale'),
@@ -325,6 +361,10 @@ export function createSetup({
   async function state({ server }) {
     const current = readSettings(settingsFile)
     const settings = Object.fromEntries(Object.entries(FIELDS).map(([name, field]) => [name, current[name] ?? field.default]))
+    // Without a Funnel port in the file, 8443 while another web server has
+    // 443 here: written with the setup, unless changed on the page.
+    const web443 = await webServer443()
+    if (!current.VOICE_GW_FUNNEL_PORT && web443) settings.VOICE_GW_FUNNEL_PORT = '8443'
     const [list, git, watchdog, linger, loaded] = await Promise.all([
       checks(),
       Promise.all([output(bin.git, ['config', '--global', 'user.name']), output(bin.git, ['config', '--global', 'user.email'])]),
@@ -366,6 +406,9 @@ export function createSetup({
       // Claude Code's config: true, false, or null when it cannot tell. Read
       // only; the page warns unless it is true.
       chrome: { noticeSeen: chromeNoticeSeen({ env, home }) },
+      // Another web server on port 443 here: { name }, name null when not
+      // known, or null. Only its process name.
+      web443,
     }
   }
 
@@ -874,6 +917,16 @@ export function createSetup({
     'watchdog and by scripts/restart-everything.sh, waits for the development channel\'s confirmation at the terminal ' +
     '(tmux attach -t voice, then Enter); personal accounts (Pro, Max) have no allowlist, see "Known issues" in the README'
 
+  // The Funnel's port while another web server has 443 on this computer.
+  const funnelPortNote = (port, web443) => {
+    const server = `another web server on this computer${web443.name ? ` (${web443.name})` : ''} uses port 443`
+    return port === '443'
+      ? `the Funnel: ${server}, so a browser on this computer, the Claude app's sign-in too, reaches it instead of ` +
+          'the Funnel; choose port 8443 for the Funnel in section 2'
+      : `the Funnel: ${server}, so the Funnel uses port ${port}, and the connector URL ends in :${port}/mcp; that ` +
+          'server stays as it is'
+  }
+
   // What Claude in Chrome needs while the gateway runs, and its risk.
   const CHROME_DESKTOP =
     'Claude in Chrome: it works only while someone is signed in at the desktop, or in a remote desktop session that ' +
@@ -903,29 +956,52 @@ export function createSetup({
 
   const admin = (method, path, body) => adminRequest(join(secretsDir, 'admin.sock'), method, path, body, { timeoutMs: 5000 })
   const funnelScript = join(root, 'scripts', 'funnel.sh')
-  const funnelEnv = () => ({
+  const funnelEnv = port => ({
     ...env,
     VOICE_GW_SECRETS_DIR: secretsDir,
     VOICE_GW_TAILSCALE_BIN: env.VOICE_SETUP_TAILSCALE_BIN || env.VOICE_GW_TAILSCALE_BIN || bin.tailscale,
+    VOICE_GW_FUNNEL_PORT: port,
   })
   let pairing = null // the page's last code: { id, askedAt, expiresAt }
   let funnelSeen = null // { at, value }
   let funnelJob = null
+  let listenSeen = null // { at, value }
 
-  // { state: 'on' | 'off' | null, url }: null when Tailscale is missing or
-  // does not answer; the URL only while the Funnel publishes the endpoint.
+  // Another web server on port 443 here (webServerOn443): { name } or null,
+  // also when netstat or ss is missing or fails. Best effort: it never stops
+  // the setup.
+  async function webServer443() {
+    if (listenSeen && Date.now() - listenSeen.at < LISTEN_CACHE_MS) return listenSeen.value
+    const listed = platform === 'darwin' ? await output(bin.netstat, ['-anv', '-p', 'tcp']) : await output(bin.ss, ['-ltnp'])
+    listenSeen = { at: Date.now(), value: listed.code === 0 ? webServerOn443(listed.text, platform) : null }
+    return listenSeen.value
+  }
+
+  // The Funnel's port, as funnel.sh takes it: FUNNEL_PORT or
+  // VOICE_GW_FUNNEL_PORT from outside, else the settings file's; without
+  // one, 8443 while another web server has 443 here, as the page suggests.
+  async function funnelPort() {
+    const chosen = env.FUNNEL_PORT || env.VOICE_GW_FUNNEL_PORT || readSettings(settingsFile).VOICE_GW_FUNNEL_PORT
+    return chosen || ((await webServer443()) ? '8443' : FIELDS.VOICE_GW_FUNNEL_PORT.default)
+  }
+
+  // { state: 'on' | 'off' | null, url, port, web443 }: null when Tailscale is
+  // missing or does not answer; the URL only while the Funnel publishes the
+  // endpoint; web443, another web server on 443 here, for the page to say
+  // why the port is not 443.
   async function funnel() {
     const starting = jobs.get(funnelJob)?.state === 'running'
     if (funnelSeen && !starting && Date.now() - funnelSeen.at < FUNNEL_CACHE_MS) return funnelSeen.value
-    const said = await output('bash', [funnelScript, 'state'], { env: funnelEnv() })
+    const port = await funnelPort()
+    const said = await output('bash', [funnelScript, 'state'], { env: funnelEnv(port) })
     const words = said.text.split('\n').map(word => word.trim())
     const state = said.code !== 0 ? null : words.includes('on') ? 'on' : words.includes('off') ? 'off' : null
     let url = null
     if (state === 'on') {
-      const printed = (await output('bash', [funnelScript, 'url'], { env: funnelEnv() })).text.trim()
+      const printed = (await output('bash', [funnelScript, 'url'], { env: funnelEnv(port) })).text.trim()
       url = /^https:\/\/[A-Za-z0-9.-]+(:\d{1,5})?\/mcp$/.test(printed) ? printed : null
     }
-    funnelSeen = { at: Date.now(), value: { state, url } }
+    funnelSeen = { at: Date.now(), value: { state, url, port, web443: await webServer443() } }
     return funnelSeen.value
   }
 
@@ -997,8 +1073,9 @@ export function createSetup({
 
   async function funnelStart() {
     if (jobs.get(funnelJob)?.state === 'running') throw fail('The Funnel is being started already.', 409)
-    funnelJob = startJob('starting the Funnel', async line => {
-      const code = await runCommand('bash', [funnelScript, 'start'], { env: funnelEnv(), onLine: line, timeoutMs: 5 * 60 * 1000 })
+    const port = await funnelPort()
+    funnelJob = startJob(`starting the Funnel on port ${port}`, async line => {
+      const code = await runCommand('bash', [funnelScript, 'start'], { env: funnelEnv(port), onLine: line, timeoutMs: 5 * 60 * 1000 })
       funnelSeen = null
       return code === 0
     }).job
@@ -1012,7 +1089,11 @@ export function createSetup({
     stay = Boolean(body.stay)
     finishing = startJob('writing the setup', async line => {
       const settings = writeFiles({ values, docker, scratchDocker, telegramOn }, line)
+      funnelSeen = null // section 10 asks again, with the port as written
       await liveNote(settings, line)
+      const web443 = await webServer443()
+      const port = settings.after.VOICE_GW_FUNNEL_PORT ?? FIELDS.VOICE_GW_FUNNEL_PORT.default
+      if (web443) line(funnelPortNote(port, web443))
       let ok = true
       if (docker) ok = (await setUpDocker(values, docker, line)) && ok
       if (scratchDocker) ok = (await setUpScratchDocker(values, line)) && ok

@@ -22,7 +22,7 @@ const ROOT = fileURLToPath(new URL('..', import.meta.url)).replace(/\/$/, '')
 const TMP = mkdtempSync(join(tmpdir(), 'voice-gw-setup-'))
 // Whatever the modules here log goes to a file of this test, never the real log.
 process.env.VOICE_GW_LOG_FILE = join(TMP, 'gateway.log')
-const { createSetup } = await import('../src/setup/actions.mjs')
+const { createSetup, webServerOn443 } = await import('../src/setup/actions.mjs')
 const { COOKIE, newToken, sameSecret, startSetupServer } = await import('../src/setup/server.mjs')
 const { formatSettings, readSettings } = await import('../src/settings.mjs')
 
@@ -36,6 +36,7 @@ const ECHO = join(TMP, 'echo') // a line the fake docker build prints, to test r
 const LINGER = join(TMP, 'linger') // the fake loginctl's lingering: yes, no (without the file), or denied
 const LOADED = join(TMP, 'launch-agent-loaded') // the fake launchctl: the LaunchAgent is loaded
 const SESSION = join(TMP, 'tmux-session') // the fake tmux: the session "voice" runs
+const LISTENERS = join(TMP, 'listeners') // what the fake ss and netstat list
 
 const TELEGRAM_TOKEN = '987654321:TEST-telegram-token-never-shown-xyz12'
 const GITHUB_TOKEN = 'github_pat_TEST_setup_token_never_shown_0123456789'
@@ -117,6 +118,10 @@ switch (${JSON.stringify(name)}) {
   case 'plutil':
     out(argv[1] + ': OK')
     break
+  case 'ss':
+  case 'netstat':
+    if (existsSync(${JSON.stringify(LISTENERS)})) out(readFileSync(${JSON.stringify(LISTENERS)}, 'utf8'))
+    break
   case 'loginctl': {
     const linger = existsSync(${JSON.stringify(LINGER)}) ? readFileSync(${JSON.stringify(LINGER)}, 'utf8') : 'no'
     if (argv[0] === 'show-user') out('Linger=' + (linger === 'yes' ? 'yes' : 'no'))
@@ -166,6 +171,8 @@ const setupEnv = () => ({
   VOICE_SETUP_LOGINCTL_BIN: join(BIN, 'loginctl'),
   VOICE_SETUP_LAUNCHCTL_BIN: join(BIN, 'launchctl'),
   VOICE_SETUP_PLUTIL_BIN: join(BIN, 'plutil'),
+  VOICE_SETUP_SS_BIN: join(BIN, 'ss'),
+  VOICE_SETUP_NETSTAT_BIN: join(BIN, 'netstat'),
   VOICE_SETUP_TAILSCALE_BIN: join(BIN, 'no-tailscale'),
   VOICE_GW_TELEGRAM_API: api.url,
   VOICE_GW_GITHUB_API: api.url,
@@ -211,7 +218,7 @@ const say = line => terminal.push(line)
 
 before(async () => {
   mkdirSync(BIN, { recursive: true })
-  for (const name of ['claude', 'gh', 'tmux', 'systemctl', 'loginctl', 'launchctl', 'plutil', 'docker']) {
+  for (const name of ['claude', 'gh', 'tmux', 'systemctl', 'loginctl', 'launchctl', 'plutil', 'docker', 'ss', 'netstat']) {
     writeFileSync(join(BIN, name), FAKE(name))
     chmodSync(join(BIN, name), 0o755)
   }
@@ -912,7 +919,7 @@ test('Claude in Chrome: the page learns whether its notice for the first start i
 
 // The page's script against a stand-in for the browser: every element a plain
 // object, /api/state answered with these settings and what the server saw.
-async function page(settings, chrome, plugin = { mode: 'plugin', reason: '', allowlist: {} }, checks = []) {
+async function page(settings, chrome, plugin = { mode: 'plugin', reason: '', allowlist: {} }, checks = [], more = {}) {
   const elements = new Map()
   const element = () => ({
     value: '', hidden: false, textContent: '', className: '', checked: false, disabled: false, dataset: {}, attributes: {}, listeners: {},
@@ -926,13 +933,14 @@ async function page(settings, chrome, plugin = { mode: 'plugin', reason: '', all
   const $ = selector => elements.get(selector) ?? elements.set(selector, element()).get(selector)
   const select = $('#controller-chrome')
   select.dataset.setting = 'VOICE_GW_CONTROLLER_CHROME'
+  $('#funnel-port').dataset.setting = 'VOICE_GW_FUNNEL_PORT'
   const state = {
     host: 'test', root: ROOT, remaining: { overallMs: 600000, idleMs: 600000 }, checks, overridden: [], settings,
     models: [], efforts: [], secrets: {}, git: { name: '', email: '' }, repos: { host: [], docker: [] },
-    watchdog: { platform: 'linux', unit: 'cc-voice-gateway.service' }, plugin, chrome,
+    watchdog: { platform: 'linux', unit: 'cc-voice-gateway.service' }, plugin, chrome, ...more,
   }
   const context = vm.createContext({
-    document: { querySelector: $, querySelectorAll: selector => (selector === '[data-setting]' ? [select] : []) },
+    document: { querySelector: $, querySelectorAll: selector => (selector === '[data-setting]' ? [select, $('#funnel-port')] : []) },
     fetch: async () => ({ ok: true, status: 200, json: async () => state }),
     setInterval: () => 0,
     clearInterval: () => {},
@@ -943,6 +951,115 @@ async function page(settings, chrome, plugin = { mode: 'plugin', reason: '', all
   await sleep(50) // its start reads /api/state
   return { $, notice: $('#chrome-notice'), guide: $('#chrome-guide'), security: $('#chrome-security'), pluginWarning: $('#plugin-warning'), select }
 }
+
+// --- the Funnel's port, with another web server on 443 ------------------------------
+
+// macOS's netstat -anv -p tcp, with the process column of recent versions:
+// Tailscale's network extension on the tailnet address, Apache on every one.
+const MAC_LISTENERS = [
+  'Active Internet connections (including servers)',
+  'Proto Recv-Q Send-Q  Local Address          Foreign Address        (state)      rxbytes      txbytes  rhiwat  shiwat    process:pid   state  options',
+  'tcp4       0      0  100.101.102.103.443    *.*                    LISTEN             0            0  131072  131072  io.tailscale.ipn.macsys.network-extension:612  00000 00000006',
+  'tcp4       0      0  127.0.0.1.8787         *.*                    LISTEN             0            0  131072  131072  node:4242  00000 00000006',
+  'tcp46      0      0  *.443                  *.*                    LISTEN             0            0  131072  131072  httpd:301  00100 00000006',
+  'tcp4       0      0  192.168.1.5.443        17.57.144.20.52000     ESTABLISHED        0            0  131072  131072  Safari:777  00102 00000000',
+].join('\n')
+// Linux's ss -ltnp: tailscaled's listener on the tailnet address, and Apache
+// with its name only when it runs as this user.
+const LINUX_LISTENERS = [
+  'State  Recv-Q Send-Q   Local Address:Port    Peer Address:PortProcess',
+  'LISTEN 0      4096   100.101.102.103:443          0.0.0.0:*',
+  'LISTEN 0      4096         127.0.0.1:8787         0.0.0.0:*    users:(("node",pid=4242,fd=20))',
+  'LISTEN 0      511                  *:443                *:*    users:(("apache2",pid=812,fd=4))',
+].join('\n')
+
+test('port 443: another web server on this computer, from netstat on macOS and ss on Linux; Tailscale\'s own listeners do not count', () => {
+  assert.deepEqual(webServerOn443(MAC_LISTENERS, 'darwin'), { name: 'httpd' })
+  assert.equal(webServerOn443(MAC_LISTENERS.split('\n').filter(line => !line.includes('httpd')).join('\n'), 'darwin'), null, 'Tailscale and a connection')
+  assert.deepEqual(webServerOn443('tcp4  0  0  *.443  *.*  LISTEN  0  0  131072  131072  0  0', 'darwin'), { name: null }, 'an older netstat, without the process')
+  assert.deepEqual(webServerOn443(LINUX_LISTENERS, 'linux'), { name: 'apache2' })
+  assert.deepEqual(webServerOn443('LISTEN 0 511 0.0.0.0:443 0.0.0.0:*', 'linux'), { name: null }, 'another user\'s: no name')
+  assert.deepEqual(webServerOn443('LISTEN 0 511 [::]:443 [::]:*', 'linux'), { name: null })
+  assert.equal(webServerOn443('LISTEN 0 511 0.0.0.0:4430 0.0.0.0:*', 'linux'), null)
+  assert.equal(webServerOn443('LISTEN 0 511 [fd7a:115c:a1e0::1]:443 [::]:*', 'linux'), null, 'a tailnet address')
+  assert.equal(webServerOn443('LISTEN 0 511 0.0.0.0:443 0.0.0.0:* users:(("tailscaled",pid=9,fd=3))', 'linux'), null)
+  assert.equal(webServerOn443('', 'linux'), null)
+})
+
+test('the Funnel port: 8443 by default while another web server has 443 here, written with the setup and said why; 443 otherwise', async () => {
+  const funnelSetup = (name, platform = 'linux') =>
+    createSetup({ root: ROOT, secretsDir: join(TMP, `secrets-funnel-${name}`), env: setupEnv(), home: HOME, platform, say })
+  const finish = async (setup, port) => {
+    const { job } = await setup.api['POST /api/finish']({
+      body: { settings: { VOICE_GW_PORT: '8787', VOICE_GW_DOCKER: '', VOICE_GW_FUNNEL_PORT: port }, telegram: { enabled: false }, docker: { enabled: false }, watchdog: {} },
+    })
+    let done
+    for (let i = 0; i < 250 && (done = setup.api['GET /api/jobs/:id']({ id: job })).state === 'running'; i++) await sleep(20)
+    assert.equal(done.state, 'done', done.lines.join('\n'))
+    return done.lines.join('\n')
+  }
+  try {
+    rmSync(LISTENERS, { force: true })
+    const free = funnelSetup('free')
+    let state = await free.api['GET /api/state']({})
+    assert.deepEqual([state.settings.VOICE_GW_FUNNEL_PORT, state.defaults.VOICE_GW_FUNNEL_PORT, state.web443], ['443', '443', null])
+    assert.ok(calls().some(c => c.command === 'ss' && c.argv.join(' ') === '-ltnp'))
+    assert.doesNotMatch(await finish(free, '443'), /the Funnel: /)
+    assert.equal(readSettings(join(TMP, 'secrets-funnel-free', 'gateway.env')).VOICE_GW_FUNNEL_PORT, undefined, 'the default: left out')
+
+    writeFileSync(LISTENERS, LINUX_LISTENERS)
+    const taken = funnelSetup('taken')
+    state = await taken.api['GET /api/state']({})
+    assert.equal(state.settings.VOICE_GW_FUNNEL_PORT, '8443')
+    assert.deepEqual(state.web443, { name: 'apache2' })
+    assert.equal(state.defaults.VOICE_GW_FUNNEL_PORT, '443', 'funnel.sh\'s default: 8443 has to be written')
+    assert.match(await finish(taken, '8443'), /the Funnel: another web server on this computer \(apache2\) uses port 443, so the Funnel uses port 8443, and the connector URL ends in :8443\/mcp; that server stays as it is/)
+    assert.equal(readSettings(join(TMP, 'secrets-funnel-taken', 'gateway.env')).VOICE_GW_FUNNEL_PORT, '8443')
+    // Written, the file's value counts, also 443 chosen against the suggestion.
+    assert.equal((await taken.api['GET /api/state']({})).settings.VOICE_GW_FUNNEL_PORT, '8443')
+    assert.match(await finish(funnelSetup('taken'), '443'), /the Funnel: another web server on this computer \(apache2\) uses port 443, so a browser on this computer, the Claude app's sign-in too, reaches it instead of the Funnel; choose port 8443 for the Funnel in section 2/)
+    writeFileSync(join(TMP, 'secrets-funnel-taken', 'gateway.env'), 'VOICE_GW_FUNNEL_PORT=10000\n')
+    assert.equal((await taken.api['GET /api/state']({})).settings.VOICE_GW_FUNNEL_PORT, '10000')
+
+    writeFileSync(LISTENERS, MAC_LISTENERS)
+    state = await funnelSetup('mac', 'darwin').api['GET /api/state']({})
+    assert.deepEqual([state.settings.VOICE_GW_FUNNEL_PORT, state.web443], ['8443', { name: 'httpd' }])
+    assert.ok(calls().some(c => c.command === 'netstat' && c.argv.join(' ') === '-anv -p tcp'))
+
+    // Without ss or netstat, or when they fail: nothing known, 443, and the setup goes on.
+    const blind = createSetup({ root: ROOT, secretsDir: join(TMP, 'secrets-funnel-blind'), env: { ...setupEnv(), VOICE_SETUP_SS_BIN: join(BIN, 'no-ss') }, home: HOME, platform: 'linux', say })
+    state = await blind.api['GET /api/state']({})
+    assert.deepEqual([state.settings.VOICE_GW_FUNNEL_PORT, state.web443], ['443', null])
+
+    const refused = await funnelSetup('refused').api['POST /api/finish']({ body: { settings: { VOICE_GW_FUNNEL_PORT: '8080' } } }).catch(error => error)
+    assert.match(refused.message, /VOICE_GW_FUNNEL_PORT: not a valid value/)
+  } finally {
+    rmSync(LISTENERS, { force: true })
+  }
+
+  // The page, in section 2: why the port is 8443, or that 443 does not work from here.
+  const html = readFileSync(join(ROOT, 'src', 'setup', 'ui', 'index.html'), 'utf8')
+  assert.match(html, /<select id="funnel-port" data-setting="VOICE_GW_FUNNEL_PORT"><option value="443">443 \(default\)<\/option><option value="8443">8443<\/option><option value="10000">10000<\/option><\/select>/)
+  assert.match(html, /<p id="funnel-port-note" class="notice wide" hidden><\/p>/)
+  const plugin = { mode: 'plugin', reason: '', allowlist: {} }
+  const { $ } = await page({ VOICE_GW_FUNNEL_PORT: '8443' }, { noticeSeen: true }, plugin, [], { web443: { name: 'httpd' } })
+  assert.equal($('#funnel-port').value, '8443')
+  assert.equal($('#funnel-port-note').hidden, false)
+  assert.equal(
+    $('#funnel-port-note').textContent,
+    'Another web server on this computer (httpd) already uses port 443, so the Funnel uses port 8443, and the connector URL ends in :8443/mcp. That server stays as it is.',
+  )
+  $('#funnel-port').value = '443'
+  for (const listener of $('#funnel-port').listeners.change) listener()
+  assert.equal(
+    $('#funnel-port-note').textContent,
+    "Another web server on this computer (httpd) already uses port 443: a browser on this computer, the Claude app's sign-in too, reaches it instead of the Funnel. Choose port 8443 for the Funnel in section 2, and write the setup.",
+  )
+  const unnamed = (await page({ VOICE_GW_FUNNEL_PORT: '8443' }, { noticeSeen: true }, plugin, [], { web443: { name: null } })).$
+  assert.match(unnamed('#funnel-port-note').textContent, /^Another web server on this computer already uses port 443, so/)
+  const none = (await page({ VOICE_GW_FUNNEL_PORT: '443' }, { noticeSeen: true }, plugin, [], { web443: null })).$
+  assert.equal(none('#funnel-port-note').hidden, true)
+})
 
 test('Docker not available: section 1 says so, and the two container checkboxes cannot be ticked, with a line why; one on from before stays', async () => {
   const missing = createSetup({ root: ROOT, secretsDir: join(TMP, 'secrets-no-docker'), env: { ...setupEnv(), VOICE_GW_DOCKER_BIN: join(BIN, 'no-docker') }, home: HOME, platform: 'linux', say })

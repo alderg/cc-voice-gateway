@@ -216,6 +216,24 @@ function showChromeNotice() {
   box.textContent = confirmed ? CHROME_CONFIRMED : CHROME_WARNING
 }
 
+// Another web server on port 443 of this computer (state.web443, and the
+// poll's funnel.web443: { name } or null) and the Funnel's port: why it is
+// not 443, or that 443 does not work from this computer.
+function funnelPortNote(port, web443) {
+  if (!web443) return ''
+  const server = `Another web server on this computer${web443.name ? ` (${web443.name})` : ''} already uses port 443`
+  return port === '443'
+    ? `${server}: a browser on this computer, the Claude app's sign-in too, reaches it instead of the Funnel. Choose ` +
+        'port 8443 for the Funnel in section 2, and write the setup.'
+    : `${server}, so the Funnel uses port ${port}, and the connector URL ends in :${port}/mcp. That server stays as it is.`
+}
+
+function showFunnelPortNote() {
+  const text = funnelPortNote($('#funnel-port').value, state.web443)
+  $('#funnel-port-note').textContent = text
+  $('#funnel-port-note').hidden = !text
+}
+
 // The work folders in a container of their own, when they are on.
 const scratchDocker = () => $('#scratch-on').checked && $('#scratch-docker-on').checked
 
@@ -263,6 +281,7 @@ function fillSettings() {
   showLevelWarning()
   showKillSwitchWarning()
   showChromeNotice()
+  showFunnelPortNote()
   // The Funnel's idle time: 0 means never; ticking the box suggests 90.
   const idle = $('#funnel-idle')
   $('#funnel-idle-on').checked = idle.value !== '' && idle.value !== '0'
@@ -419,6 +438,7 @@ for (const id of ['#docker-on', '#scratch-on', '#scratch-docker-on']) $(id).addE
 $('#controller-level').addEventListener('change', showLevelWarning)
 $('#killswitch-mode').addEventListener('change', showKillSwitchWarning)
 $('#controller-chrome').addEventListener('change', showChromeNotice)
+$('#funnel-port').addEventListener('change', showFunnelPortNote)
 $('#funnel-idle-on').addEventListener('change', () => ($('#funnel-idle').disabled = !$('#funnel-idle-on').checked))
 
 function collect() {
@@ -579,6 +599,9 @@ async function connect() {
             : 'not available here (Tailscale missing or not logged in); publish the endpoint another way, README 7.3',
         funnel.state === 'on' ? 'ok' : '',
       )
+      const portNote = funnelPortNote(funnel.port ?? '443', funnel.web443)
+      $('#connect-port-note').textContent = portNote
+      $('#connect-port-note').hidden = !portNote
       $('#connect-url').textContent = funnel.url ?? ''
       $('#connect-url-row').hidden = !funnel.url
       $('#funnel-row').hidden = funnel.state !== 'off'

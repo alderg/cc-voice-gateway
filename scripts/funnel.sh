@@ -2,14 +2,18 @@
 # Publishes the local voice endpoint through Tailscale Funnel and prints the
 # connector URL. The URL holds no secret: the connector signs in with OAuth.
 #
-#   scripts/funnel.sh start    expose http://127.0.0.1:$VOICE_GW_PORT on https://<host>
+#   scripts/funnel.sh start    expose http://127.0.0.1:$VOICE_GW_PORT on https://<host>[:port]
 #   scripts/funnel.sh stop     remove that funnel again
 #   scripts/funnel.sh status   show Tailscale's serve/funnel config
 #   scripts/funnel.sh state    "on" while Funnel publishes the endpoint, else "off"
 #   scripts/funnel.sh url      print the connector URL only
 #
-# Funnel accepts the HTTPS ports 443, 8443 and 10000, but Claude's servers only
-# reached 443 in our tests, so that is the default.
+# The public port: FUNNEL_PORT, else VOICE_GW_FUNNEL_PORT (the settings file),
+# else 443. Funnel accepts only the HTTPS ports 443, 8443 and 10000. 443 is the
+# default; 8443 is for a computer where another web server, such as macOS's own
+# Apache, listens on 443 itself: a connection from this computer to its own
+# tailnet address on 443 reaches that server instead of the Funnel, so the
+# sign-in in a browser here would fail. The setup assistant then chooses 8443.
 #
 # The tailscale command: VOICE_GW_TAILSCALE_BIN, else tailscale on the PATH
 # (Linux, Homebrew, or the macOS app's "Install CLI"), else the macOS app's
@@ -20,7 +24,14 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 . "$ROOT/scripts/settings.sh"
 PORT="${VOICE_GW_PORT:-8787}"
-FUNNEL_PORT="${FUNNEL_PORT:-443}"
+FUNNEL_PORT="${FUNNEL_PORT:-${VOICE_GW_FUNNEL_PORT:-443}}"
+case $FUNNEL_PORT in
+  443 | 8443 | 10000) ;;
+  *)
+    echo "Tailscale Funnel takes only the ports 443, 8443 and 10000, not $FUNNEL_PORT (FUNNEL_PORT or VOICE_GW_FUNNEL_PORT)" >&2
+    exit 2
+    ;;
+esac
 MAC_APP=/Applications/Tailscale.app/Contents/MacOS/Tailscale
 if [ -n "${VOICE_GW_TAILSCALE_BIN:-}" ]; then
   TAILSCALE=$VOICE_GW_TAILSCALE_BIN

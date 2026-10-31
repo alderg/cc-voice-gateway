@@ -29,7 +29,8 @@ const SECRETS = join(TMP, 'secrets') // the gateway's, and the setup's
 const BIN = join(TMP, 'bin')
 const SESSION = join(TMP, 'tmux-session') // the fake tmux: the session "voice" runs
 const PANE = join(TMP, 'tmux-pane') // the fake tmux: what its pane shows
-const FUNNEL_ON = join(TMP, 'funnel-on') // the fake tailscale: the Funnel publishes the endpoint
+const FUNNEL_ON = join(TMP, 'funnel-on') // the fake tailscale: the Funnel publishes the endpoint, on the port in it (443 if empty)
+const LISTENERS = join(TMP, 'listeners') // the fake ss: what listens on this computer
 const CALLBACK = 'https://claude.ai/api/mcp/auth_callback'
 const FORWARDED = { 'x-forwarded-proto': 'https', 'x-forwarded-host': 'voice-test.example.ts.net' }
 
@@ -69,9 +70,9 @@ const CHANNEL_PANE = [
 // start that is refused as on Linux without the operator setting, so that no
 // check of the public relays runs.
 const FAKE_TAILSCALE = `#!/usr/bin/env node
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 const argv = process.argv.slice(2).join(' ')
-const key = 'voice-test.example.ts.net:443'
+const key = 'voice-test.example.ts.net:' + ((existsSync(${JSON.stringify(FUNNEL_ON)}) && readFileSync(${JSON.stringify(FUNNEL_ON)}, 'utf8').trim()) || '443')
 if (argv === 'status --json') console.log(JSON.stringify({ Self: { DNSName: 'voice-test.example.ts.net.' } }))
 else if (argv === 'funnel status --json') {
   const proxy = 'http://127.0.0.1:' + process.env.VOICE_GW_PORT
@@ -80,6 +81,10 @@ else if (argv === 'funnel status --json') {
   console.error('Access denied: serve config denied')
   process.exit(1)
 } else process.exit(2)
+`
+const FAKE_SS = `#!/usr/bin/env node
+import { existsSync, readFileSync } from 'node:fs'
+if (existsSync(${JSON.stringify(LISTENERS)})) process.stdout.write(readFileSync(${JSON.stringify(LISTENERS)}, 'utf8'))
 `
 
 let port
@@ -134,6 +139,7 @@ const setupEnv = () => ({
   ...process.env,
   VOICE_SETUP_TMUX_BIN: join(BIN, 'tmux'),
   VOICE_SETUP_TAILSCALE_BIN: join(BIN, 'tailscale'),
+  VOICE_SETUP_SS_BIN: join(BIN, 'ss'),
   VOICE_GW_PORT: String(port), // funnel.sh compares the Funnel's target with it
   VOICE_GW_STATE_DIR: join(TMP, 'state'),
   CLAUDE_CONFIG_DIR: join(TMP, 'claude-config'),
@@ -218,7 +224,7 @@ const codes = [] // every code the page got, to look for them where they must no
 
 before(async () => {
   mkdirSync(BIN, { recursive: true })
-  for (const [name, text] of [['tmux', FAKE_TMUX], ['tailscale', FAKE_TAILSCALE]]) {
+  for (const [name, text] of [['tmux', FAKE_TMUX], ['tailscale', FAKE_TAILSCALE], ['ss', FAKE_SS]]) {
     writeFileSync(join(BIN, name), text)
     chmodSync(join(BIN, name), 0o755)
   }
@@ -299,7 +305,7 @@ test('a code from the running gateway: valid ten minutes, and only in the answer
   const { call } = flow.page
   let { data } = await call('/api/connect')
   assert.equal(data.gateway, true)
-  assert.deepEqual(data.funnel, { state: 'off', url: null })
+  assert.deepEqual(data.funnel, { state: 'off', url: null, port: '443', web443: null })
   assert.equal(data.pairing, null)
 
   const made = await call('/api/pairing', {})
@@ -361,11 +367,38 @@ test('the Funnel: off with a start from the page, which shows its output; on wit
   assert.equal(started.status, 200)
   const job = await follow(flow.page, started.data.job)
   assert.equal(job.state, 'failed')
+  assert.equal(job.title, 'starting the Funnel on port 443')
   assert.match(job.lines.join('\n'), /Run 'sudo tailscale set --operator=\$USER' once/)
 
   writeFileSync(FUNNEL_ON, '')
   const { data } = await call('/api/connect') // the start emptied the cache
-  assert.deepEqual(data.funnel, { state: 'on', url: 'https://voice-test.example.ts.net/mcp' })
+  assert.deepEqual(data.funnel, { state: 'on', url: 'https://voice-test.example.ts.net/mcp', port: '443', web443: null })
+})
+
+test('the Funnel with another web server on 443 here: on 8443, its URL with :8443, and why; the file\'s port counts once written', async () => {
+  const secrets = join(TMP, 'secrets-8443')
+  mkdirSync(secrets, { recursive: true })
+  const connect = async () => (await createSetup({ root: ROOT, secretsDir: secrets, env: setupEnv(), platform: 'linux', say }).api['GET /api/connect']({})).funnel
+  // A connect answer needs a gateway on these secrets: its admin socket.
+  const gatewaySocket = createServer(socket => socket.end())
+  await new Promise(resolve => gatewaySocket.listen(join(secrets, 'admin.sock'), resolve))
+  try {
+    writeFileSync(LISTENERS, 'State Recv-Q Send-Q Local Address:Port Peer Address:Port Process\nLISTEN 0 511 *:443 *:* users:(("apache2",pid=812,fd=4))\n')
+    writeFileSync(FUNNEL_ON, '443') // an older Funnel on 443 does not count
+    assert.deepEqual(await connect(), { state: 'off', url: null, port: '8443', web443: { name: 'apache2' } })
+    writeFileSync(FUNNEL_ON, '8443')
+    assert.deepEqual(await connect(), { state: 'on', url: 'https://voice-test.example.ts.net:8443/mcp', port: '8443', web443: { name: 'apache2' } })
+
+    writeFileSync(join(secrets, 'gateway.env'), 'VOICE_GW_FUNNEL_PORT=443\n')
+    assert.deepEqual(await connect(), { state: 'off', url: null, port: '443', web443: { name: 'apache2' } }, 'chosen against the suggestion')
+    rmSync(LISTENERS)
+    writeFileSync(join(secrets, 'gateway.env'), 'VOICE_GW_FUNNEL_PORT=8443\n')
+    assert.deepEqual(await connect(), { state: 'on', url: 'https://voice-test.example.ts.net:8443/mcp', port: '8443', web443: null })
+  } finally {
+    gatewaySocket.close()
+    rmSync(LISTENERS, { force: true })
+    writeFileSync(FUNNEL_ON, '')
+  }
 })
 
 test('expiry: a code from the page signs in until its ten minutes are up, not after; one from pair.mjs lasts five', () => {
@@ -559,6 +592,18 @@ test('the page: what to do while the gateway is down, then a code with its time,
   assert.equal($('#connect-url').textContent, 'https://voice-test.example.ts.net/mcp')
   assert.equal($('#connect-url-row').hidden, false)
   assert.equal($('#funnel-row').hidden, true, 'no start while it is on')
+  assert.equal($('#connect-port-note').hidden, true, 'on 443, with nothing else there')
+
+  // Another web server has 443 here: the Funnel on 8443, and why, in a sentence or two.
+  connect = { gateway: true, funnel: { state: 'on', url: 'https://voice-test.example.ts.net:8443/mcp', port: '8443', web443: { name: 'httpd' } }, pairing: null, remaining }
+  await ui.poll()
+  assert.equal($('#connect-url').textContent, 'https://voice-test.example.ts.net:8443/mcp')
+  assert.equal($('#connect-port-note').hidden, false)
+  assert.equal(
+    $('#connect-port-note').textContent,
+    'Another web server on this computer (httpd) already uses port 443, so the Funnel uses port 8443, and the connector URL ends in :8443/mcp. That server stays as it is.',
+  )
+  assert.match(html, /<p>Tailscale Funnel: <span id="connect-funnel" class="state"><\/span><\/p>\s*<p id="connect-port-note" class="notice" hidden><\/p>/)
 
   await ui.click('#pairing-new')
   assert.ok(ui.asked.includes('POST /api/pairing'))

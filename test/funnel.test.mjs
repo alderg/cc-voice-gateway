@@ -286,6 +286,46 @@ test('scripts/funnel.sh: state and url from tailscale\'s JSON, with the tailscal
   assert.equal(funnel('nonsense').status, 2)
 })
 
+test('scripts/funnel.sh: the port from VOICE_GW_FUNNEL_PORT in the settings file, FUNNEL_PORT over it, and only the three Funnel allows', () => {
+  const dir = join(TMP, 'tailscale-port')
+  const secrets = join(dir, 'secrets')
+  mkdirSync(secrets, { recursive: true })
+  const fake = join(dir, 'tailscale')
+  writeFileSync(fake, `#!/bin/sh\necho "$*" >> "${dir}/calls"\ncase "$1" in status) cat "${dir}/status.json" ;; funnel) [ "$2" = status ] && cat "${dir}/funnel.json" ;; esac\nexit 0\n`)
+  chmodSync(fake, 0o755)
+  writeFileSync(join(dir, 'status.json'), JSON.stringify({ Self: { DNSName: 'sky.tail1234.ts.net.' } }))
+  // On 8443, next to an older Funnel on 443 that proxies to the gateway too.
+  const key = port => `sky.tail1234.ts.net:${port}`
+  const proxy = { Handlers: { '/': { Proxy: 'http://127.0.0.1:8787' } } }
+  writeFileSync(join(dir, 'funnel.json'), JSON.stringify({ AllowFunnel: { [key(8443)]: true }, Web: { [key(8443)]: proxy } }))
+  const base = Object.fromEntries(Object.entries(process.env).filter(([name]) => !['FUNNEL_PORT', 'VOICE_GW_FUNNEL_PORT'].includes(name)))
+  const funnel = (command, env = {}) =>
+    spawnSync('bash', [fileURLToPath(new URL('../scripts/funnel.sh', import.meta.url)), command], {
+      encoding: 'utf8',
+      env: { ...base, VOICE_GW_TAILSCALE_BIN: fake, VOICE_GW_SECRETS_DIR: secrets, VOICE_GW_PORT: '8787', ...env },
+    })
+  assert.equal(funnel('state').stdout, 'off\n', 'without a setting: 443')
+  assert.equal(funnel('url').stdout, 'https://sky.tail1234.ts.net/mcp\n')
+
+  writeFileSync(join(secrets, 'gateway.env'), 'VOICE_GW_FUNNEL_PORT=8443\n')
+  assert.equal(funnel('state').stdout, 'on\n')
+  assert.equal(funnel('url').stdout, 'https://sky.tail1234.ts.net:8443/mcp\n')
+  writeFileSync(join(dir, 'calls'), '')
+  assert.equal(funnel('stop').status, 0)
+  assert.equal(readFileSync(join(dir, 'calls'), 'utf8'), 'funnel --https=8443 off\n', 'the setting\'s Funnel, not the one on 443')
+
+  assert.equal(funnel('url', { FUNNEL_PORT: '10000' }).stdout, 'https://sky.tail1234.ts.net:10000/mcp\n', 'FUNNEL_PORT wins')
+  assert.equal(funnel('url', { FUNNEL_PORT: '443' }).stdout, 'https://sky.tail1234.ts.net/mcp\n')
+  for (const env of [{ FUNNEL_PORT: '8080' }, { VOICE_GW_FUNNEL_PORT: '80' }]) {
+    const refused = funnel('start', env)
+    assert.equal(refused.status, 2, JSON.stringify(env))
+    assert.match(refused.stderr, /^Tailscale Funnel takes only the ports 443, 8443 and 10000, not (8080|80) /)
+  }
+  writeFileSync(join(dir, 'calls'), '')
+  funnel('start', { FUNNEL_PORT: '8080' })
+  assert.equal(readFileSync(join(dir, 'calls'), 'utf8'), '', 'tailscale is not asked')
+})
+
 // --- through the gateway ------------------------------------------------------------
 
 async function freePort() {

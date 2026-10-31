@@ -92,6 +92,12 @@
       minutes. Without Telegram only at the computer: <code>scripts/funnel.sh start</code>.</p>
     <label>Minutes after the last voice call <input id="funnel-idle" data-setting="VOICE_GW_FUNNEL_IDLE" inputmode="numeric"></label>
     <p class="guide">90 covers a break in a long drive.</p>
+    <label>Tailscale Funnel port
+      <select id="funnel-port" data-setting="VOICE_GW_FUNNEL_PORT"><option value="443">443 (default)</option><option value="8443">8443</option><option value="10000">10000</option></select>
+    </label>
+    <p class="guide">The public HTTPS port; Funnel allows only these three. 443, unless another web server on this
+      computer already uses it: then 8443, chosen by itself, and the connector URL ends in <code>:8443/mcp</code>.</p>
+    <p id="funnel-port-note" class="notice wide" hidden></p>
   </div>
 </section>
 
@@ -352,6 +358,7 @@
   <div id="connect-ready" hidden>
     <h3>The endpoint</h3>
     <p>Tailscale Funnel: <span id="connect-funnel" class="state"></span></p>
+    <p id="connect-port-note" class="notice" hidden></p>
     <p id="connect-url-row" hidden>Connector URL: <code id="connect-url"></code></p>
     <div id="funnel-row" class="row" hidden>
       <button id="funnel-start">Start the Funnel</button>
