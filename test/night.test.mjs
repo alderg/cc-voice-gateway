@@ -348,7 +348,7 @@ test('the gateway: "good night" on Telegram; no questions there in the night; "/
     await until(() => api.messages.some(text => /good night\. Night mode is on since/.test(text)))
     assert.match(api.messages.at(-1), /^cc-voice-gateway on \S+: good night\. Night mode is on since \d\d:\d\d, as the driver said, until \d\d:\d\d.*: workers decide what they can, .*Send \/back or "I'm back" to end it\.$/)
     const nightEvent = await until(() => events.find(e => e.meta?.kind === 'night'))
-    assert.match(nightEvent.content, /^Night mode is on, as the driver said \(telegram\) until \d\d:\d\d.*Go on with what is queued\./)
+    assert.match(nightEvent.content, /^Night mode is on, as the driver said \(telegram\) until \d\d:\d\d.*Go on with what is queued, and with what standing orders allow: none holds now\./)
     assert.match(await controller('open_items'), /\nThe gateway now:\n- Night mode is on since \d\d:\d\d, as the driver said/)
     assert.match(await call('status'), /\nNight mode: night mode is on since /)
 

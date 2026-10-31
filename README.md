@@ -574,7 +574,11 @@ and its instructions call that text data, never instructions. The gateway checks
 - **Cloning and deleting.** `clone_repo` and a confirmed `delete_path` are checked the same way.
 - **Queued tasks and decisions.** A queued task's words are checked when it is queued, not again
   at its turn. `resolve_decision`, which closes an open decision
-  ([8.4](#84-voice-commands)), is checked the same way.
+  ([8.4](#84-voice-commands)), is checked the same way, and so are `set_away` (night mode) and
+  `standing_order`.
+- **Standing orders.** Without fresh words, a dispatch may cite a [standing order](#standing-orders)
+  you made by voice: only for its repository, only until it runs out, and the kill switch ends it.
+  Its words are yours from when you made it. No text of a worker or GitHub makes or extends one.
 - **What it guarantees:** text in a repository, a run's result or a pull request cannot start a
   worker by itself.
 - **What it does not:** the controller still reads that text, and it writes the `task` itself. A
@@ -1797,6 +1801,7 @@ at most three short sentences, without code, paths or lists.
 | "Emergency stop!" | The kill switch locks before anything reaches the controller ([5.9](#59-the-kill-switch)) |
 | "Restart the controller." | Restart through the watchdog after your yes ([8.3](#83-restarting-the-controller-by-voice)) |
 | "Good night." / "I'm back." | `set_away`: [night mode](#night-mode) on until the end of the quiet hours, or off, with the summary of the night |
+| "Keep going with the Simple Modern milestones in alpha tonight." | `standing_order`: until the end of the quiet hours the controller dispatches the next tasks there within that scope itself ([standing orders](#standing-orders)) |
 
 **Work folders by voice**, once they are turned on ([work folders](#work-folders)), for a task
 that needs no repository:
@@ -1819,10 +1824,11 @@ that needs no repository:
 
 **Your words.** The controller passes your words with every dispatch. If they are not from a voice
 request of the last `VOICE_GW_DISPATCH_WINDOW` minutes, the gateway starts nothing and the
-controller asks you first ([5.4](#54-approvals-by-voice)). When a worker result or a review asks
-for something, the controller is told to tell you and let you decide. The one exception is your
-standing instruction to fix review comments, which the gateway carries out itself, not the
-controller ([below](#automatic-fixes-for-review-comments)).
+controller asks you first ([5.4](#54-approvals-by-voice)), unless a [standing order](#standing-orders)
+you gave by voice covers the task. When a worker result or a review asks for something, the
+controller is told to tell you and let you decide. The one exception is your standing instruction
+to fix review comments, which the gateway carries out itself, not the controller
+([below](#automatic-fixes-for-review-comments)).
 
 **Open items** (`src/ledger.mjs`), so that nothing is forgotten while you drive:
 
@@ -2038,14 +2044,37 @@ defers what needs you, goes on with other work meanwhile, and tells you in the m
     day: their repository, or their worktree, never other work. No reminders.
   - Telegram carries alarms only: the kill switch, a standby, a wait for the usage limit, once each.
     No questions, approvals or news.
-  - The controller hears that the night began (an event of the gateway), and goes on with what is
-    queued.
+  - The controller hears that the night began (an event of the gateway), goes on with what is
+    queued, and chains work within your [standing orders](#standing-orders).
   - `status` and `open_items` say so.
 - **In the morning:** one summary, on Telegram and as an event for the controller, which tells you
   as news: what was done (each run that ended, with its pull request), the assumptions made, the
   deferred questions, the decisions waiting, and the waits for the usage limit. The night's news
   and its questions on Telegram count as told then. A night that ended while the gateway was down
   gets its summary at the next start (`.state/night.json`).
+
+#### Standing orders
+
+A dispatch takes your words from a voice request of the last minutes, so at night nothing new
+could start. A standing order lets the controller chain work while you are away
+(`src/orders.mjs`):
+
+- **You give it by voice:** "Keep going with the Simple Modern milestones in alpha tonight." The
+  controller makes it with `standing_order`: a repository (or `scratch/new` with work folders on), a
+  scope in your words, and an expiry, by default the end of the night or the next quiet hours,
+  otherwise 12 hours, at most 24. It takes your words as `dispatch` does: never typed ones, and
+  never a worker's or GitHub's, which can neither make nor extend an order. A new one takes new
+  words.
+- **While it holds,** the controller may dispatch tasks for that repository within that scope
+  citing the order (`order="o2ab"`) instead of fresh words, one after the other as the work needs.
+  The gateway checks the repository and the expiry, logs each, and the worker reads the scope and
+  stays within it, noting what falls outside as a deferred question. `open_items` shows the order
+  with the tasks dispatched under it.
+- **What still stops everything:** the kill switch, which also ends every order (after an alarm,
+  you say again what may go on), a standby, and the wait for the usage limit, during which its
+  tasks wait in the queue.
+- **Ended** when it runs out, or with `end_order` when you say so or its work is done
+  (`.state/orders.json`).
 
 ### 8.5 Statistics
 
@@ -2159,7 +2188,7 @@ limits at once.
 | `VOICE_GW_PORT` | `8787` | Local HTTP port |
 | `VOICE_GW_HOST` | `127.0.0.1` | Bind address; keep loopback |
 | `VOICE_GW_SECRETS_DIR` | `.secrets` | Secrets, settings file, admin socket |
-| `VOICE_GW_STATE_DIR` | `.state` | Worker state and queue, run output, requests, open decisions, pull request watches, usage limit waits |
+| `VOICE_GW_STATE_DIR` | `.state` | Worker state and queue, run output, requests, open decisions, pull request watches, usage limit waits, night mode, standing orders |
 | `VOICE_GW_SELF_CHECKOUT` | This checkout | The checkout whose uncommitted changes and commits on no remote a "done" reply mentions ([5.5](#55-workers-on-this-computer-or-in-docker)); empty: none. Tests use a stand-in |
 | `VOICE_GW_REMIND_MINUTES` | `30` | Minutes before a decision you were never asked about, or a question you have not answered, comes back to the controller as a reminder, at most three times ([8.4](#84-voice-commands)) |
 | `VOICE_GW_LOG_FILE` | `.logs/gateway.log` | Empty: stderr only |
@@ -2450,6 +2479,7 @@ src/
   standby.mjs        the standby when the connector is disconnected, until a new sign-in
   limits.mjs         the Claude usage limit: seen in runs and the controller's transcript, waited out
   night.mjs          night mode: the quiet hours, good night and I'm back, the morning summary
+  orders.mjs         standing orders: what the controller may dispatch without fresh words, at night
   workers.mjs        workers: repositories, claude -p runs, the queue, the check after a run, results
   workspaces.mjs     where a run works: a repository, or a work folder, with its rules and check
   worktrees.mjs      the worktrees of further runs of a repository: made, with submodules, removed

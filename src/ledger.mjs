@@ -375,7 +375,11 @@ export function openItems({ ledger, workers = null, store, interrupted = [], not
         const holds = held(entry).map(d => d.id)
         // A fix the gateway queued for review comments, and how it waits,
         // when not behind the others (workers.mjs, queueMarks).
-        const review = entry.review ? `, from the review of pull request ${entry.review.number}` : ''
+        const review = entry.review
+          ? `, from the review of pull request ${entry.review.number}`
+          : entry.order
+            ? `, under standing order ${entry.order.id}`
+            : ''
         const marks = entry.requeued
           ? `, resumes ${entry.continues}${entry.worktree ? ' in its worktree' : ''}${entry.requeued.limit ? ' after the usage limit' : ''}`
           : entry.after?.length

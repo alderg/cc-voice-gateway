@@ -66,6 +66,7 @@ import { dirname, join, posix, relative } from 'node:path'
 import { Limits, limitOf, waitText, worse } from './limits.mjs'
 import { log, preview } from './log.mjs'
 import { NIGHT_RULE } from './night.mjs'
+import { orderRule } from './orders.mjs'
 import { SUBAGENT_TOOLS, addResult } from './stats.mjs'
 import { DockerRunner, HostRunner, MARK, MAX_FILES, alive, startOf } from './runners.mjs'
 import {
@@ -284,9 +285,14 @@ export const resumeWhere = entry =>
 
 // How a queued task waits, in a few words, or '': next to the others, after
 // named ones, or as an interrupted run that resumes (resumeWhere); and
-// whether the gateway queued it for review comments (reviewFix).
+// whether the gateway queued it for review comments (reviewFix), or the
+// controller under a standing order (orders.mjs).
 export function queueMarks(entry) {
-  const review = entry.review ? `from the review of pull request ${entry.review.number}` : ''
+  const review = entry.review
+    ? `from the review of pull request ${entry.review.number}`
+    : entry.order
+      ? `under standing order ${entry.order.id}`
+      : ''
   const how = entry.requeued
     ? `resumes ${entry.continues}${resumeWhere(entry)}`
     : entry.after?.length
@@ -938,12 +944,14 @@ export class Workers extends EventEmitter {
     after = null,
     continues = null,
     answered = null,
+    order = null,
   }) {
     if (this.killswitch?.locked) return { status: 'locked', state: this.killswitch.state }
     if (this.standby?.active) return { status: 'standby', why: this.standby.state.reason }
     const names = await this.known(worker)
     if (!names.includes(worker)) return { status: 'unknown', names }
     const job = { worker, task, words, fresh, allowDirty, direct, draft, request, answers }
+    if (order) job.order = { id: order.id, worker: order.worker, scope: order.scope } // a standing order it comes under (orders.mjs)
     if (this.workspace(worker)?.kind !== 'scratch') {
       const order = this.checkOrder(worker, { after, continues })
       if (order.problems.length) return { status: 'order', problems: order.problems }
@@ -1043,8 +1051,8 @@ export class Workers extends EventEmitter {
   // checkout's uncommitted files are a question only for a run there; a
   // worktree is the task's own.
   async launch(job, entry = null) {
-    const { worker, task, words, fresh = false, allowDirty = false, direct = false, draft = false, answers = null } = job
-    if (this.workspace(worker)?.kind === 'scratch') return this.launchScratch({ worker, task, words, fresh, answers }, entry)
+    const { worker, task, words, fresh = false, allowDirty = false, direct = false, draft = false, answers = null, order = null } = job
+    if (this.workspace(worker)?.kind === 'scratch') return this.launchScratch({ worker, task, words, fresh, answers, order }, entry)
     this.starting.add(worker)
     try {
       const facts = await this.inspect(worker)
@@ -1067,7 +1075,7 @@ export class Workers extends EventEmitter {
         facts.decided = [...decided]
         const dir = place.worktree ? this.worktreeOf(place.worktree, worker) : null
         if (dir && this.stopStrays({ dir, why: 'found before a new run there' }).length) return { status: 'busy', strays: true }
-        return this.start(facts, { task, words, fresh, direct, draft, answers }, entry, place)
+        return this.start(facts, { task, words, fresh, direct, draft, answers, order }, entry, place)
       }
       facts.followed = facts.dirty.filter(file => decided.has(file))
       const foreign = facts.dirty.filter(file => !decided.has(file))
@@ -1076,7 +1084,7 @@ export class Workers extends EventEmitter {
       // Never a second run in a checkout where a worker process still runs:
       // one of a run nobody follows is ended, and the task waits for it.
       if (this.stopStrays({ dir: facts.dir, why: 'found before a new run there' }).length) return { status: 'busy', strays: true }
-      return this.start(facts, { task, words, fresh, direct, draft, answers }, entry)
+      return this.start(facts, { task, words, fresh, direct, draft, answers, order }, entry)
     } finally {
       this.starting.delete(worker)
     }
@@ -1112,7 +1120,7 @@ export class Workers extends EventEmitter {
   // are kept, so that the look after the run tells what it made. Any number
   // of new ones may start at once, within the run slots: each is a starting
   // of its own. A new folder whose run did not start goes again.
-  async launchScratch({ worker, task, words, fresh = false, answers = null }, entry = null) {
+  async launchScratch({ worker, task, words, fresh = false, answers = null, order = null }, entry = null) {
     const isNew = worker === SCRATCH_NEW
     const key = isNew ? Symbol(worker) : worker
     this.starting.add(key)
@@ -1130,7 +1138,7 @@ export class Workers extends EventEmitter {
       if (!files) return { status: 'gone', why: 'its folder cannot be read; it may have been removed at the desk' }
       if (this.stopStrays({ dir, why: 'found before a new run there' }).length) return { status: 'busy', strays: true }
       const facts = { kind: 'scratch', name, dir, hostDir: this.scratch.hostDir(name), files, made: Boolean(made), where: this.scratch.where() }
-      const result = this.start(facts, { task, words, fresh, answers }, entry)
+      const result = this.start(facts, { task, words, fresh, answers, order }, entry)
       if (result.status === 'started') made = null
       return result
     } finally {
@@ -1169,7 +1177,7 @@ export class Workers extends EventEmitter {
   // worktree starts at once as a record, and its worktree is made (or found
   // again) before claude starts in it (prepare); until then it is
   // "preparing", and counts as running.
-  start(facts, { task, words, fresh, direct = false, draft = false, answers = null }, entry = null, place = 'main') {
+  start(facts, { task, words, fresh, direct = false, draft = false, answers = null, order = null }, entry = null, place = 'main') {
     if (this.killswitch?.locked) return { status: 'locked', state: this.killswitch.state }
     if (this.standby?.active) return { status: 'standby', why: this.standby.state.reason }
     if (entry && !this.state.queue.some(waiting => waiting.id === entry.id)) return { status: 'dropped' }
@@ -1222,6 +1230,7 @@ export class Workers extends EventEmitter {
       reported: false,
     }
     if (this.night?.active()) record.night = true // started in night mode: its rule (runLines)
+    if (order) record.order = order // dispatched under a standing order: its scope (runLines)
     if (wid) {
       record.worktree = wid // the worktree it runs in, by the task that made it
       record.checkout = facts.dir // the repository's checkout, whose git the worktree shares
@@ -2767,6 +2776,7 @@ export function runLines(record) {
         'a repository, the files in a work folder), then finish it.',
     )
   }
+  if (record.order) lines.push(orderRule(record.order))
   if (record.night) lines.push(NIGHT_RULE)
   return lines.length ? lines.join('\n') + '\n' : ''
 }

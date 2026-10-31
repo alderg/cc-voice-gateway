@@ -53,6 +53,7 @@ import { Standby } from './standby.mjs'
 import { Presence } from './presence.mjs'
 import { Limits, TranscriptWatch, accountName, clock } from './limits.mjs'
 import { Night, morningText } from './night.mjs'
+import { Orders } from './orders.mjs'
 
 // How long a shutdown waits at most for its message on Telegram.
 const FAREWELL_MS = 3000
@@ -120,6 +121,9 @@ const presence = new Presence({ name: config.gatewayName, standbySetting: config
 const night = new Night({ hours: config.quietHours, file: config.nightFile, pollMs: config.nightPollSeconds * 1000 })
 if (config.quietHours && !night.hours) log(`VOICE_GW_QUIET_HOURS=${config.quietHours} is no range such as 23:00-07:30; night mode only when the driver says good night`)
 else log(night.hours ? `night mode in the quiet hours ${config.quietHours}, and when the driver says good night` : 'night mode when the driver says good night (no quiet hours set)')
+// Standing orders (orders.mjs): what the controller may dispatch without
+// fresh words of the driver, at night say; the kill switch ends them.
+const orders = new Orders({ file: config.ordersFile })
 log(
   `gateway ${presence.label}${config.standby ? ', on standby by its settings (VOICE_GW_STANDBY=1): the connector hands nothing over' : ''}; ` +
     `standby when the connector is disconnected: ${config.disconnectStandby ? 'on' : 'off (VOICE_GW_DISCONNECT_STANDBY=0)'}`,
@@ -374,15 +378,16 @@ const channel = await startChannel(store, {
   alive: () => limits.end('controller', 'it answered again'),
   notes: () => openNotes(),
   night,
+  orders,
 })
 
 const capital = text => `${text[0].toUpperCase()}${text.slice(1)}`
 
 // What the gateway waits for or how it works now, for open_items and the
-// start-up summary: night mode, the usage limit waits.
+// start-up summary: night mode, the standing orders, the usage limit waits.
 function openNotes() {
   const notes = night.text() ? [`${capital(night.text())}.`] : []
-  return [...notes, ...limits.list().map(item => `${capital(item.text)}.`)]
+  return [...notes, ...orders.lines(), ...limits.list().map(item => `${capital(item.text)}.`)]
 }
 
 // When a run ends, the gateway looks at its checkout (Workers.audit), and the
@@ -575,6 +580,8 @@ async function lockdown(why) {
     log('kill switch: worker runs stopped, but their state was not saved:', error.message)
   }
   folders?.stopAll()
+  // After an alarm the driver says again what may go on without them.
+  orders.endAll(`the kill switch locked (${why})`)
   for (const permission of store.openPermissions()) {
     store.resolvePermission(permission.code, 'deny')
     channel.sendVerdict(permission.code, 'deny').catch(() => {})
@@ -901,7 +908,9 @@ night.on('night', async ({ until, by }) => {
       `Night mode is on${by === 'quiet hours' ? ', for the quiet hours' : `, as the driver said (${by})`}` +
         `${until ? ` until ${clock(until)}` : ', until the driver says they are back'}. Workers decide what they can, ` +
         'conservatively, note their assumptions and defer what needs the driver; questions and decisions wait for the ' +
-        'morning, and Telegram carries alarms only. Go on with what is queued. Reply "done"; the driver does not hear it.',
+        'morning, and Telegram carries alarms only. Go on with what is queued, and with what standing orders allow' +
+        `${orders.active().length ? ` (${orders.active().map(order => `${order.id} for ${order.worker}`).join(', ')})` : ': none holds now'}. ` +
+        'Reply "done"; the driver does not hear it.',
       { origin: 'gateway' },
     )
     await channel.push(request, { kind: 'night', state: 'on' })

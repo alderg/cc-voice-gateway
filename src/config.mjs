@@ -284,6 +284,8 @@ config.standbyFile = join(config.stateDir, 'standby.json')
 config.limitsFile = join(config.stateDir, 'limits.json')
 // Night mode and what its night noted (night.mjs).
 config.nightFile = join(config.stateDir, 'night.json')
+// The driver's standing orders (orders.mjs).
+config.ordersFile = join(config.stateDir, 'orders.json')
 // The statistics of this running time and of all time (stats.mjs).
 config.statsFile = join(config.stateDir, 'stats.json')
 config.telegramTokenFile = join(config.secretsDir, 'telegram_token')

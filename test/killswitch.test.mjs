@@ -662,6 +662,11 @@ after(async () => {
 })
 
 test('voice: "emergency stop" locks before anything reaches the controller; every voice chat hears the alarm once', async () => {
+  // A standing order that holds when the switch trips ends (orders.mjs).
+  await gw.voice.car('send', { message: 'Keep going on alpha tonight, finish the milestones.' })
+  const order = await gw.controller('standing_order', { worker: 'alpha', scope: 'finish the milestones', words: 'Keep going on alpha tonight' })
+  assert.match(order.text, /^\[order=o[a-z0-9]{3} worker=alpha /)
+  assert.match((await gw.controller('open_items')).text, /Standing order o[a-z0-9]{3} for alpha/)
   // An approval that is open when the switch trips gets denied.
   await gw.claudeCode.notification({
     method: 'notifications/claude/channel/permission_request',
@@ -695,6 +700,10 @@ test('voice: "emergency stop" locks before anything reaches the controller; ever
   const dispatch = await gw.controller('dispatch', { worker: 'alpha', task: 'Fix it.', words: 'Fix it.' })
   assert.equal(dispatch.isError, true)
   assert.match(dispatch.text, /^\[dispatch=locked worker=alpha\] Kill switch locked since .*, by voice/)
+  // The order ended with the lock, and no new one is made while locked.
+  assert.doesNotMatch((await gw.controller('open_items')).text, /Standing order/)
+  assert.match(gw.log, /standing orders ended \(the kill switch locked \(voice\)\): o[a-z0-9]{3}/)
+  assert.match((await gw.controller('standing_order', { worker: 'alpha', scope: 'the rest', words: 'keep going on alpha' })).text, /^\[order=locked\] Kill switch locked since/)
   const refused = await gw.voice.car('send', { message: 'Fix the typo.' })
   assert.match(refused, /^\[state=locked\] .* Nothing was handed over\./)
   assert.doesNotMatch(refused, /another connector/)
