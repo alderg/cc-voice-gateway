@@ -33,11 +33,14 @@ npm install
 scripts/check-macos.sh --quick
 ```
 
-`check-macos.sh` prints PASS, WARN or FAIL per check: tools and versions, `bash -n` of every script
-with `/bin/bash`, the settings, the LaunchAgent, what runs. Without `--quick` it also runs the test
-suite, the same files as `npm test`: an INFO line says it starts, about 340 tests in about two
-minutes, then it prints a dot per test, X for a failure, and its PASS or FAIL. WARN is fine for
-what is optional or not set up yet.
+`check-macos.sh` prints PASS, WARN or FAIL per check, and INFO for what needs no verdict: tools and
+versions, `bash -n` of every script with `/bin/bash`, the settings, the LaunchAgent, what runs.
+Here, before the setup, there is no `.secrets/gateway.env` yet: an INFO line says so, and the
+settings, the LaunchAgent and the gateway are INFO too, as only the setup brings them. Once the file
+is there, they are WARN when missing; `--before-setup` or `--after-setup` decides instead of the
+file. Without `--quick` it also runs the test suite, the same files as `npm test`: an INFO line
+says it starts, about 340 tests in about two minutes, then it prints a dot per test, X for a
+failure, and its PASS or FAIL. WARN is fine for what is optional.
 
 ## 3. The setup assistant
 

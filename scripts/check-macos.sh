@@ -4,8 +4,16 @@
 # FAIL. Step 1 of the install and test guide, docs/macos.md. It starts, stops
 # and changes nothing; the test suite writes only to temporary folders.
 #
-#   scripts/check-macos.sh           all checks, with the test suite (about two minutes)
-#   scripts/check-macos.sh --quick   without the test suite
+#   scripts/check-macos.sh                  all checks, with the test suite (about two minutes)
+#   scripts/check-macos.sh --quick          without the test suite
+#   scripts/check-macos.sh --before-setup   as before the setup, whatever is there
+#   scripts/check-macos.sh --after-setup    as after the setup, whatever is there
+#
+# Before the setup (node scripts/setup.mjs) there is no .secrets/gateway.env
+# yet. Then an INFO line says so, and what only the setup brings is INFO, not
+# WARN: the settings file, the LaunchAgent, the gateway answering. After the
+# setup they are WARN when missing. --before-setup and --after-setup decide
+# instead of the file; --quick goes with either.
 #
 # On purpose /bin/bash: on macOS that is bash 3.2, which every script here has
 # to run with. It runs on Linux as well, without the macOS checks.
@@ -14,7 +22,18 @@ set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd -P)
 cd "$ROOT" || exit 1
 quick=0
-[ "${1:-}" = --quick ] && quick=1
+setup= # before or after; empty: before if there is no .secrets/gateway.env
+for arg; do
+  case $arg in
+    --quick) quick=1 ;;
+    --before-setup) setup=before ;;
+    --after-setup) setup=after ;;
+    *)
+      echo "usage: scripts/check-macos.sh [--quick] [--before-setup | --after-setup]" >&2
+      exit 2
+      ;;
+  esac
+done
 failed=0
 
 pass() { printf 'PASS  %s\n' "$*"; }
@@ -35,6 +54,14 @@ if [ "$system" = Darwin ]; then
   PATH="$PATH:$HOME/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:$HOME/.docker/bin:/Applications/Docker.app/Contents/Resources/bin"
 else
   warn "not macOS but $system: the macOS checks are left out"
+fi
+secrets=${VOICE_GW_SECRETS_DIR:-$ROOT/.secrets}
+brings='the settings, the LaunchAgent and the gateway are INFO, not WARN'
+if [ "$setup" = before ]; then
+  info "before the setup, as --before-setup says: $brings"
+elif [ -z "$setup" ] && [ ! -e "$secrets/gateway.env" ]; then
+  setup=before
+  info "before the setup: no $secrets/gateway.env yet, so $brings"
 fi
 
 # Version $2 at least $1, both as 1.2.3.
@@ -112,8 +139,13 @@ fi
 
 # --- settings and files -------------------------------------------------------
 
-secrets=${VOICE_GW_SECRETS_DIR:-$ROOT/.secrets}
-if [ -r "$secrets/gateway.env" ]; then pass "settings: $secrets/gateway.env"; else warn "no $secrets/gateway.env yet: node scripts/setup.mjs"; fi
+if [ -r "$secrets/gateway.env" ]; then
+  pass "settings: $secrets/gateway.env"
+elif [ "$setup" = before ]; then
+  info "no settings yet: the setup writes $secrets/gateway.env"
+else
+  warn "no $secrets/gateway.env yet: node scripts/setup.mjs"
+fi
 socket=$secrets/admin.sock
 if [ ${#socket} -le 103 ]; then
   pass "the admin socket's path has ${#socket} characters (at most 103 on macOS)"
@@ -149,6 +181,8 @@ if [ "$mac" = 1 ] && [ -e "$plist" ]; then
   else
     warn "the LaunchAgent is not loaded yet: launchctl bootstrap gui/$(id -u) $plist, or log in again"
   fi
+elif [ "$mac" = 1 ] && [ "$setup" = before ]; then
+  info "no LaunchAgent yet: the setup writes it when its autostart is chosen ($plist)"
 elif [ "$mac" = 1 ]; then
   warn "no LaunchAgent: the setup's autostart was not chosen ($plist)"
 fi
@@ -164,6 +198,8 @@ if curl -fsS -m 5 "http://127.0.0.1:$port/healthz" >/dev/null 2>&1; then
     if pmset -g assertions 2>/dev/null | grep -q caffeinate; then pass "caffeinate keeps the Mac awake"; else warn "no caffeinate assertion (VOICE_GW_CAFFEINATE=0, or started without the watchdog)"; fi
   fi
   if tmux has-session -t voice 2>/dev/null; then pass "the tmux session voice runs"; else warn "no tmux session voice: the controller runs outside tmux"; fi
+elif [ "$setup" = before ]; then
+  info "the gateway does not answer on 127.0.0.1:$port: it runs once the setup has started the controller"
 else
   warn "the gateway does not answer on 127.0.0.1:$port: the controller is not running, or waits at the terminal (tmux attach -t voice)"
 fi
