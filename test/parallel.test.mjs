@@ -893,7 +893,8 @@ test("only values set from outside win over the file: not those the start script
   const configUrl = new URL('../src/config.mjs', import.meta.url).href
   const maxWorkers = extra => {
     const env = { ...process.env, VOICE_GW_SECRETS_DIR: secrets, VOICE_GW_MCP_JSON: mcp, VOICE_GW_MAX_WORKERS: '5', ...extra }
-    const script = `const { config } = await import(${JSON.stringify(configUrl)}); console.log(config.maxWorkers)`
+    // As a string, not coloured where FORCE_COLOR is set (controller.test.mjs).
+    const script = `const { config } = await import(${JSON.stringify(configUrl)}); console.log(String(config.maxWorkers))`
     return execFileSync(process.execPath, ['--input-type=module', '-e', script], { env, encoding: 'utf8' }).trim()
   }
   assert.equal(maxWorkers({ VOICE_GW_SETTINGS_FROM_FILE: 'VOICE_GW_MAX_WORKERS VOICE_GW_PORT' }), '3', 'exported from the file: the file is newer')

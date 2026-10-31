@@ -131,7 +131,9 @@ test('VOICE_GW_REMOTE_CONTROL in the config: 1 is on, from the environment or th
     const env = { ...process.env, VOICE_GW_SECRETS_DIR: secrets }
     delete env.VOICE_GW_REMOTE_CONTROL
     if (value !== null) env.VOICE_GW_REMOTE_CONTROL = value
-    const script = `const { config } = await import(${JSON.stringify(configUrl)}); console.log(config.remoteControl)`
+    // As a string: console.log colours a boolean where FORCE_COLOR is set, as
+    // node --test sets it for the tests when its reporter writes to a terminal.
+    const script = `const { config } = await import(${JSON.stringify(configUrl)}); console.log(String(config.remoteControl))`
     return execFileSync(process.execPath, ['--input-type=module', '-e', script], { env, encoding: 'utf8' }).trim()
   }
   try {
