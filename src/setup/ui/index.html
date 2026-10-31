@@ -159,6 +159,7 @@
   <h2>5. Workers in Docker <span class="opt">optional</span></h2>
   <p class="guide">The workers run in a container that sees only one folder of clones, with the access the GitHub token gives them.</p>
   <label><input type="checkbox" id="docker-on"> Run the workers in a Docker container</label>
+  <p id="docker-unavailable" class="notice" hidden></p>
   <div id="docker" hidden>
     <div class="grid">
       <label>Container <input data-setting="VOICE_GW_DOCKER" id="docker-name"></label>
@@ -254,6 +255,7 @@
       <p class="guide">A work folder is removed this long after its last run, up to 365 days. 0: kept for good.</p>
     </div>
     <label><input type="checkbox" id="scratch-docker-on"> Run them in a container of their own</label>
+    <p id="scratch-docker-unavailable" class="notice" hidden></p>
     <p class="guide">A protected environment: a container from the worker image that sees only the work folders, with
       Claude Code's token (section 5) and no GitHub token; not your files, SSH keys or logins. Without it they run on
       this computer as you, and only the kill switch's rules watch where they write.</p>

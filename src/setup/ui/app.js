@@ -219,6 +219,31 @@ function showChromeNotice() {
 // The work folders in a container of their own, when they are on.
 const scratchDocker = () => $('#scratch-on').checked && $('#scratch-docker-on').checked
 
+// Docker as section 1 found it: without an answer from its server neither
+// container can run, so ticking one is blocked, with a line why. One that is
+// on from before stays as it is, and the line says it cannot run until
+// Docker answers; unticked, the setting goes when the setup is written.
+const DOCKER_MISSING = what =>
+  `Docker is not available on this computer (section 1), so ${what} cannot run in a container. It takes Docker ` +
+  'Desktop, or the Docker engine on Linux, installed and running; then reload this page.'
+const DOCKER_MISSING_KEPT = (what, name) =>
+  `Docker does not answer on this computer (section 1). The setup has ${what} in the container ${name} from before ` +
+  'and keeps it, but until Docker answers, that container cannot run and writing the setup cannot start it. Start ' +
+  `Docker, then reload this page; or untick it to run ${what} on this computer.`
+
+function showDockerAvailability() {
+  const ready = state.checks.find(check => check.name === 'Docker')?.ok === true
+  for (const [box, note, setting, what] of [
+    ['#docker-on', '#docker-unavailable', 'VOICE_GW_DOCKER', 'the workers'],
+    ['#scratch-docker-on', '#scratch-docker-unavailable', 'VOICE_GW_SCRATCH_DOCKER', 'the work folders'],
+  ]) {
+    const before = state.settings[setting]
+    $(box).disabled = !ready && !before
+    $(note).hidden = ready
+    $(note).textContent = ready ? '' : before ? DOCKER_MISSING_KEPT(what, before) : DOCKER_MISSING(what)
+  }
+}
+
 // What the two containers need on the page: the workers' everything, Claude
 // Code's token for either.
 function showContainers() {
@@ -248,6 +273,7 @@ function fillSettings() {
   $('#scratch-on').checked = state.settings.VOICE_GW_SCRATCH === '1'
   $('#scratch-docker-on').checked = Boolean(state.settings.VOICE_GW_SCRATCH_DOCKER)
   if (!$('#scratch-docker-name').value) $('#scratch-docker-name').value = 'voice-scratch'
+  showDockerAvailability()
   showContainers()
   $('#telegram-on').checked = Boolean(state.secrets.telegramToken && state.secrets.telegramChatId)
   $('#git-name').value = state.git.name

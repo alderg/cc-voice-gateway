@@ -912,7 +912,7 @@ test('Claude in Chrome: the page learns whether its notice for the first start i
 
 // The page's script against a stand-in for the browser: every element a plain
 // object, /api/state answered with these settings and what the server saw.
-async function page(settings, chrome, plugin = { mode: 'plugin', reason: '', allowlist: {} }) {
+async function page(settings, chrome, plugin = { mode: 'plugin', reason: '', allowlist: {} }, checks = []) {
   const elements = new Map()
   const element = () => ({
     value: '', hidden: false, textContent: '', className: '', checked: false, disabled: false, dataset: {}, attributes: {}, listeners: {},
@@ -927,7 +927,7 @@ async function page(settings, chrome, plugin = { mode: 'plugin', reason: '', all
   const select = $('#controller-chrome')
   select.dataset.setting = 'VOICE_GW_CONTROLLER_CHROME'
   const state = {
-    host: 'test', root: ROOT, remaining: { overallMs: 600000, idleMs: 600000 }, checks: [], overridden: [], settings,
+    host: 'test', root: ROOT, remaining: { overallMs: 600000, idleMs: 600000 }, checks, overridden: [], settings,
     models: [], efforts: [], secrets: {}, git: { name: '', email: '' }, repos: { host: [], docker: [] },
     watchdog: { platform: 'linux', unit: 'cc-voice-gateway.service' }, plugin, chrome,
   }
@@ -941,8 +941,45 @@ async function page(settings, chrome, plugin = { mode: 'plugin', reason: '', all
   })
   vm.runInContext(readFileSync(join(ROOT, 'src', 'setup', 'ui', 'app.js'), 'utf8'), context)
   await sleep(50) // its start reads /api/state
-  return { notice: $('#chrome-notice'), guide: $('#chrome-guide'), security: $('#chrome-security'), pluginWarning: $('#plugin-warning'), select }
+  return { $, notice: $('#chrome-notice'), guide: $('#chrome-guide'), security: $('#chrome-security'), pluginWarning: $('#plugin-warning'), select }
 }
+
+test('Docker not available: section 1 says so, and the two container checkboxes cannot be ticked, with a line why; one on from before stays', async () => {
+  const missing = createSetup({ root: ROOT, secretsDir: join(TMP, 'secrets-no-docker'), env: { ...setupEnv(), VOICE_GW_DOCKER_BIN: join(BIN, 'no-docker') }, home: HOME, platform: 'linux', say })
+  const docker = (await missing.api['GET /api/state']({})).checks.find(check => check.name === 'Docker')
+  assert.deepEqual([docker.ok, docker.optional, docker.detail], [false, true, 'not available'])
+
+  const html = readFileSync(join(ROOT, 'src', 'setup', 'ui', 'index.html'), 'utf8')
+  assert.match(html, /<input type="checkbox" id="docker-on"> Run the workers in a Docker container<\/label>\s*<p id="docker-unavailable" class="notice" hidden><\/p>/)
+  assert.match(html, /<input type="checkbox" id="scratch-docker-on"> Run them in a container of their own<\/label>\s*<p id="scratch-docker-unavailable" class="notice" hidden><\/p>/)
+
+  const plugin = { mode: 'plugin', reason: '', allowlist: {} }
+  const off = (await page({}, { noticeSeen: true }, plugin, [docker])).$
+  assert.equal(off('#docker-on').disabled, true)
+  assert.equal(off('#docker-on').checked, false)
+  assert.equal(off('#docker-unavailable').hidden, false)
+  assert.equal(
+    off('#docker-unavailable').textContent,
+    'Docker is not available on this computer (section 1), so the workers cannot run in a container. It takes Docker Desktop, or the Docker engine on Linux, installed and running; then reload this page.',
+  )
+  assert.equal(off('#scratch-docker-on').disabled, true, 'the work folders\' container the same')
+  assert.match(off('#scratch-docker-unavailable').textContent, /^Docker is not available on this computer \(section 1\), so the work folders cannot run in a container\./)
+
+  // On from before: kept as it is, and said why it cannot run.
+  const kept = (await page({ VOICE_GW_DOCKER: 'voice-workers', VOICE_GW_SCRATCH: '1', VOICE_GW_SCRATCH_DOCKER: 'voice-scratch' }, { noticeSeen: true }, plugin, [docker])).$
+  assert.deepEqual([kept('#docker-on').checked, kept('#docker-on').disabled], [true, false])
+  assert.equal(
+    kept('#docker-unavailable').textContent,
+    'Docker does not answer on this computer (section 1). The setup has the workers in the container voice-workers from before and keeps it, but until Docker answers, that container cannot run and writing the setup cannot start it. Start Docker, then reload this page; or untick it to run the workers on this computer.',
+  )
+  assert.deepEqual([kept('#scratch-docker-on').checked, kept('#scratch-docker-on').disabled], [true, false])
+  assert.match(kept('#scratch-docker-unavailable').textContent, /the work folders in the container voice-scratch from before and keeps it/)
+
+  // Docker answers: as before.
+  const ready = (await page({}, { noticeSeen: true }, plugin, [{ ...docker, ok: true, detail: 'server 29.0.0' }])).$
+  for (const id of ['#docker-on', '#scratch-docker-on']) assert.equal(ready(id).disabled, false, id)
+  for (const id of ['#docker-unavailable', '#scratch-docker-unavailable']) assert.equal(ready(id).hidden, true, id)
+})
 
 test('Claude in Chrome on the page: a warning with what to do at the terminal, unless its notice is confirmed already', async () => {
   const html = readFileSync(join(ROOT, 'src', 'setup', 'ui', 'index.html'), 'utf8')
