@@ -21,6 +21,9 @@ import { IpGuard, accessLine } from './ipguard.mjs'
 const VOICE_INSTRUCTIONS = `
 This connector reaches Claude Code sessions running on the user's own computer. The user is usually
 driving, so keep everything you say short.
+Never leave the user in silence: they cannot look at the screen, and silence sounds as if they were not
+heard. Whenever they have said something, say something back at once, at least a short okay in their
+language, and before every tool call. If you did not understand, ask back instead of staying quiet.
 Workflow: send (or ask) -> get_reply, repeated while state is "sent" or "working" (each call waits up
 to about 40 seconds) -> read the answer. Before send or ask, acknowledge in one short line in the
 user's language that fits the request: a task is on its way, a question gets its answer in a moment.
@@ -39,9 +42,10 @@ const RELAY_RULE =
   'own knowledge or searching the web.'
 
 // What the voice AI says before it hands a request over. No fixed phrases:
-// the user may speak any language.
+// the user may speak any language. Never skipped: in a car, silence sounds
+// as if the request was not heard.
 const ACK_RULE =
-  ' Before the call, say one short line to the user in their language that fits this request: for a task, ' +
+  ' Before the call, always, say one short line to the user in their language that fits this request: for a task, ' +
   'that it is on its way (in the sense of "will do"); for a plain question, that the answer comes in a moment. ' +
   'Word it freshly each time, in your own words, not as a fixed phrase. Never say or imply that you will look ' +
   'it up or check it yourself ("let me check", "I\'ll have a look" or the like in any language): you only pass ' +
@@ -308,7 +312,8 @@ function buildVoiceServer(store, channel, settings, { killswitch = null, grant =
       const request = await enqueue(message, question)
       return text(
         `[state=sent id=${request.id}] Handed over${question ? ` as the answer to ${question.id}` : ''}. ` +
-          `Now call get_reply with id=${request.id}.`,
+          'If you have not told the user yet, say a short okay in their language now. ' +
+          `Then call get_reply with id=${request.id}.`,
       )
     }),
   )
