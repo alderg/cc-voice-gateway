@@ -357,13 +357,15 @@ test('the command shows its link only on a terminal, never in a pipe', () => {
 })
 
 // A terminal for a command: script(1) of util-linux on Linux, of BSD on macOS.
+// Its input from /dev/null: BSD script gives up when its input is a socket, as
+// Node's pipes are ("tcgetattr/ioctl: Operation not supported on socket").
 const onTerminal = command =>
   process.platform === 'darwin' ? ['-q', '/dev/null', ...command] : ['-qec', command.join(' '), '/dev/null']
 const noScript = process.platform === 'darwin' ? false : process.platform !== 'linux' || spawnSync('script', ['--version']).status !== 0
 
 test('the command on a terminal: one link per address, and it ends by itself', { skip: noScript }, async () => {
   const command = [process.execPath, join(ROOT, 'scripts', 'setup.mjs'), '--host', '127.0.0.1', '--port', '0', '--idle', '0.02']
-  const child = spawn('script', onTerminal(command), { env: { ...process.env, VOICE_GW_SECRETS_DIR: SECRETS } })
+  const child = spawn('script', onTerminal(command), { env: { ...process.env, VOICE_GW_SECRETS_DIR: SECRETS }, stdio: ['ignore', 'pipe', 'pipe'] })
   let out = ''
   child.stdout.on('data', chunk => (out += chunk))
   child.stderr.on('data', chunk => (out += chunk))
