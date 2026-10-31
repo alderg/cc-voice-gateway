@@ -900,11 +900,15 @@ test('macOS: no idle sleep while the watchdog runs (caffeinate), unless VOICE_GW
 test('macOS: started by the LaunchAgent\'s tmux, the log says so; a stop never comes from it', async () => {
   const user = process.env.USER ?? process.env.LOGNAME
   const agent = { XPC_SERVICE_NAME: 'com.drawio.cc-voice-gateway' } // launchd names its job so
-  // launchd's tmux runs the script: here a bash called tmux, which stays its parent.
+  // launchd's tmux runs the script: here a bash called tmux, which stays its
+  // parent. Like tmux, which sets the environment of what it starts itself, it
+  // hands the script launchd's name with env: on macOS what a shell forks
+  // finds XPC_SERVICE_NAME set to 0.
   const tmux = join(TMP, 'tmux-bin', 'tmux')
   mkdirSync(dirname(tmux), { recursive: true })
   symlinkSync(['/bin/bash', '/usr/bin/bash', '/usr/local/bin/bash'].find(existsSync), tmux)
-  const viaTmux = (c, args = '') => spawn(tmux, ['-c', `"$0"${args}; exit $?`, SCRIPT], { env: c.env, stdio: 'ignore' })
+  const viaTmux = (c, args = '') =>
+    spawn(tmux, ['-c', `env XPC_SERVICE_NAME="$XPC_SERVICE_NAME" "$0"${args}; exit $?`, SCRIPT], { env: c.env, stdio: 'ignore' })
 
   const c = setup([{ run: true }, { exit: 0 }], { env: agent })
   const done = exited(viaTmux(c))
