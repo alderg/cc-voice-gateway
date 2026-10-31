@@ -3,9 +3,9 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>cc-voice-gateway · Claude Code, hands-free</title>
+<title>cc-voice-gateway · Claude Code, by voice</title>
 <meta name="description" content="Talk to Claude in the car, on a walk or at your desk, and a team of Claude Code agents on your own computer does the work: in parallel, as pull requests, and it tells you how it went. An open-source prototype, provided as-is.">
-<meta property="og:title" content="cc-voice-gateway · Claude Code, hands-free">
+<meta property="og:title" content="cc-voice-gateway · Claude Code, by voice">
 <meta property="og:description" content="Claude's voice mode, connected to Claude Code on your own computer: three layers of AI, parallel workers, results as spoken news, safe by design. An open-source prototype, provided as-is.">
 <meta property="og:type" content="website">
 <meta property="og:image" content="https://alderg.github.io/cc-voice-gateway/assets/video-poster.jpg">
@@ -367,7 +367,7 @@
   <div class="wrap">
     <a class="brand" href="#top"><i></i>cc-voice-gateway</a>
     <div class="navlinks">
-      <a class="opt" href="#hands-free">Hands-free</a>
+      <a class="opt" href="#voice">Voice control</a>
       <a class="opt" href="#orchestration">Orchestration</a>
       <a class="opt" href="#parallel">Parallel</a>
       <a class="opt" href="#feedback">Feedback</a>
@@ -382,8 +382,8 @@
   <div class="wrap">
     <div class="eq" aria-hidden="true" id="eq"></div>
     <span class="pill"><b>OSS</b>An open-source prototype · Claude voice mode × Claude Code</span>
-    <h1>Claude Code,<br><span class="grad">hands-free.</span></h1>
-    <p class="lead">Talk to Claude in the car, on a walk, or at your desk while your hands do something else.
+    <h1>Claude Code,<br><span class="grad">by voice.</span></h1>
+    <p class="lead">Talk to Claude in the car, on a walk, or at your desk while you keep using mouse and keyboard as usual.
       A team of Claude Code agents on your own computer does the work, in parallel and as pull requests,
       and tells you how it went.</p>
     <div class="actions">
@@ -414,7 +414,7 @@
       <h2>Your agents shouldn't stop when you leave the keyboard.</h2>
       <p class="lead">Claude's voice mode is a great partner to think out loud with, but it can't reach Claude Code,
         the agent that does the real work in your repositories. In the Claude app, Claude Code only has dictation.
-        cc-voice-gateway is the bridge: Claude's voice mode calls it as a custom connector, and it hands
+        cc-voice-gateway is the bridge: Claude's voice mode calls it as a custom connector, and it passes
         your request to Claude Code on your computer.</p>
     </div>
     <div class="bridge" aria-label="Claude voice mode connects through cc-voice-gateway to Claude Code">
@@ -429,7 +429,7 @@
 <section class="tight" style="padding-top:0">
   <div class="wrap">
     <nav class="five reveal" aria-label="What it does">
-      <a href="#hands-free"><b style="color:var(--orange)">01</b><span>Hands-free</span><small>Talk instead of type, wherever you are.</small></a>
+      <a href="#voice"><b style="color:var(--orange)">01</b><span>Voice control</span><small>Talk instead of type, wherever you are.</small></a>
       <a href="#orchestration"><b style="color:var(--purple)">02</b><span>Three layers of AI</span><small>One conversation, a whole team behind it.</small></a>
       <a href="#parallel"><b style="color:var(--blue)">03</b><span>Parallel workers</span><small>Several tasks at once, isolated where you want.</small></a>
       <a href="#feedback"><b style="color:var(--green)">04</b><span>It comes back to you</span><small>Spoken news, Telegram, reviews followed up.</small></a>
@@ -438,10 +438,10 @@
   </div>
 </section>
 
-<section id="hands-free">
+<section id="voice">
   <div class="wrap">
     <div class="head reveal">
-      <p class="kicker" style="color:var(--orange)"><b style="background:var(--orange)">01</b>Hands-free</p>
+      <p class="kicker" style="color:var(--orange)"><b style="background:var(--orange)">01</b>Voice control</p>
       <h2>Talk instead of type. <span class="grad">Wherever you are.</span></h2>
       <p class="lead">Claude's voice mode becomes the front end of your Claude Code sessions. It understands you in any
         language and keeps the context; the answers are written to be heard: short, the result first, no code,
@@ -467,8 +467,8 @@
           <div class="kb"></div><div class="mouse"></div>
         </div>
         <h3><span class="icon purple"><svg class="i"><use href="#i-monitor"/></svg></span>At your desk</h3>
-        <p>Keep a voice conversation running in the Claude app while your mouse and keyboard stay yours.
-          A second pair of hands for the chores next to your real work.</p>
+        <p>Keep a voice conversation running in the Claude app while you go on working with mouse and keyboard.
+          Delegate the chores without leaving what you are doing.</p>
         <div class="say">“Tell the alpha worker to update the changelog.”</div>
       </div>
       <div class="card case b-blue reveal">
@@ -505,7 +505,7 @@
         <div class="tag" style="color:var(--orange)">Layer 1</div>
         <h3>Voice AI</h3>
         <div class="where2">Claude voice mode, in the Claude app</div>
-        <ul><li>Listens and understands, in any language</li><li>Hands your request to the controller</li><li>Reads the answer aloud, and the news that came in</li></ul>
+        <ul><li>Listens and understands, in any language</li><li>Passes your request to the controller</li><li>Reads the answer aloud, and the news that came in</li></ul>
       </div>
       <div class="wire" aria-hidden="true">
         <small style="top:calc(50% - 44px)">request</small>

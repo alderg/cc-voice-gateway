@@ -6,7 +6,7 @@
       "hold": 0.6,
       "lines": [
         { "say": "This is C C voice gateway.", "caption": "This is cc-voice-gateway." },
-        { "say": "Claude Code, hands-free." }
+        { "say": "Claude Code, by voice." }
       ]
     },
     {
@@ -21,7 +21,7 @@
       "id": "anywhere",
       "lines": [
         { "say": "Talk to your Claude Code sessions in the car, with CarPlay or Android Auto." },
-        { "say": "At your desk, while your hands keep working with mouse and keyboard." },
+        { "say": "At your desk, while you keep working at your computer." },
         { "say": "Or on the go, right from your phone." }
       ]
     },
@@ -38,7 +38,7 @@
       "hold": 0.8,
       "lines": [
         { "say": "Behind the voice, three layers of AI work together." },
-        { "say": "Claude's voice mode listens, and hands off your request." },
+        { "say": "Claude's voice mode listens, and passes your request on." },
         { "say": "A controller on your computer keeps the context, steers the workers, and sums up their results." },
         { "say": "The workers do the real work, right in your repositories." }
       ]

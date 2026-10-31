@@ -1,6 +1,6 @@
 # cc-voice-gateway
 
-**Claude Code, hands-free.** Talk to Claude in the Claude app's voice mode, in the car, on a walk
+**Claude Code, by voice.** Talk to Claude in the Claude app's voice mode, in the car, on a walk
 or at your desk, and Claude Code sessions on your own computer do the work: answer questions about
 your repositories, change code, push branches, open, review and merge pull requests. Plain
 JavaScript (ESM, Node.js), no build step.
@@ -8,11 +8,11 @@ JavaScript (ESM, Node.js), no build step.
 This README is the technical documentation. What it is for, in a two-minute video, is on the
 [product page](https://alderg.github.io/cc-voice-gateway/).
 
-[![Video: cc-voice-gateway, Claude Code, hands-free](docs/assets/video-thumbnail.jpg)](https://alderg.github.io/cc-voice-gateway/#video)
+[![Video: cc-voice-gateway, Claude Code, by voice](docs/assets/video-thumbnail.jpg)](https://alderg.github.io/cc-voice-gateway/#video)
 
 | | What it does | Details |
 |---|---|---|
-| **Hands-free** | Claude's voice mode, through a custom MCP connector, as the front end of Claude Code: in the car with CarPlay or Android Auto, on the phone, or at the desk next to mouse and keyboard. Answers are written to be heard; approvals by voice | [Overview](#1-overview), [voice commands](#84-voice-commands) |
+| **Voice control** | Claude's voice mode, through a custom MCP connector, as the front end of Claude Code: in the car with CarPlay or Android Auto, on the phone, or at the desk next to mouse and keyboard. Answers are written to be heard; approvals by voice | [Overview](#1-overview), [voice commands](#84-voice-commands) |
 | **Three layers of AI** | The voice AI (Claude voice mode) hands each request to the controller, a Claude Code session on your computer reached through a channel. The controller keeps the context, dispatches workers (headless `claude -p` runs) and sums up their results. The gateway in between has no AI of its own | [Overview](#1-overview), [architecture](#41-architecture) |
 | **Parallel workers** | Several repositories at once, several runs per repository in git worktrees of their own, a queue that survives restarts, work folders for tasks without a repository; on this computer or in Docker | [Workers](#55-workers-on-this-computer-or-in-docker), [several runs](#several-runs-per-repository), [work folders](#work-folders) |
 | **It comes back to you** | Results as spoken news; questions and approvals on Telegram once the call has ended; pull requests watched, review comments fixed automatically; open items and reminders; the controller in the Claude app with Remote Control | [Telegram](#58-the-telegram-fallback), [open items](#84-voice-commands), [review fixes](#automatic-fixes-for-review-comments), [Remote Control](#remote-control-from-the-claude-app) |
