@@ -1902,20 +1902,28 @@ With several gateways, each a connector in claude.ai (this computer, a Raspberry
 all look alike to the voice assistant (`src/presence.mjs`):
 
 - **Every answer of the connector starts with one line** that names the gateway and says whether to
-  use it: `Gateway sky (Mac): active`, or `Gateway sky (Mac): inactive, no controller connected; use
-  another connector`. The name is `VOICE_GW_NAME`, by default the computer's, the one in the
-  gateway's Telegram messages, with the kind of computer (Mac, Raspberry Pi, Linux); a name with
-  its own brackets gets none added. `status` gives it first.
+  use it: `Gateway sky (Mac): active`. The name is `VOICE_GW_NAME`, by default the computer's, the
+  one in the gateway's Telegram messages, with the kind of computer (Mac, Raspberry Pi, Linux); a
+  name with its own brackets gets none added. `status` gives it first.
 - **Active** means: a controller session is connected to the gateway and the kill switch is not
-  locked. **Inactive:** on standby by its settings (`VOICE_GW_STANDBY=1`, a test install for
-  example), in standby after the connector was disconnected (below), the kill switch locked, or no
-  controller connected yet.
-- **While inactive, `send` and `ask` hand nothing over** and say so (`[state=inactive]`), so that no
-  request waits for a controller that is not there; `status` and `get_reply` answer as usual.
+  locked. **Inactive**, with what then:
+  - on standby by its settings (`VOICE_GW_STANDBY=1`, a test install for example), or in standby
+    after the connector was disconnected (below): `…; use another connector`, the only case that
+    sends the voice assistant elsewhere;
+  - the kill switch locked: `Gateway sky (Mac): inactive, kill switch locked; it can only be
+    unlocked at the computer`, never another connector, which would carry the work past an
+    emergency stop;
+  - no controller connected, mostly while it starts or restarts: `…; it is starting or not
+    running; try again in a minute`.
+- **While inactive, `send` and `ask` hand nothing over** and say so: with a locked kill switch as
+  before (`[state=locked]`), otherwise `[state=inactive]`, with the same advice as the line. So no
+  request waits for a controller that is not there; `status`, `get_reply` and `emergency_stop`
+  work in every state.
 - **The connector's instructions and every tool description** name the gateway, and a standby by the
-  settings, and tell the voice assistant to call `status` on its connectors first and to use only an
-  active one. They are fetched when the connector connects, so the live state is only in the
-  answers.
+  settings; the instructions and `status` tell the voice assistant to call `status` on its
+  connectors first, to use an active one, and to switch connectors only when an answer says so,
+  never because a kill switch is locked. They are fetched when the connector connects, so the live
+  state is only in the answers.
 
 **The standby after a disconnect** (`src/standby.mjs`, `VOICE_GW_DISCONNECT_STANDBY`, on by
 default). A connector removed in claude.ai goes on calling the address without a token when a

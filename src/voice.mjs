@@ -52,7 +52,9 @@ function voiceInstructions(presence) {
     VOICE_INSTRUCTIONS,
     `This connector is the gateway ${presence.label}. Every answer starts with a line that names the gateway and says ` +
       'whether it is active. If the user has several such connectors, one per computer, call status on them first and ' +
-      'use only the one whose answer says active; never hand a request to an inactive one.',
+      'use the one whose answer says active. Switch to another connector only when an answer says "use another ' +
+      'connector" (a gateway on standby); never because a kill switch is locked: tell the user it can only be ' +
+      'unlocked at the computer.',
   ]
   if (presence.standbySetting) {
     lines.push('This gateway is on standby by its settings: it hands nothing over. Use another connector.')
@@ -268,12 +270,15 @@ function buildVoiceServer(store, channel, settings, { killswitch = null, grant =
       heard(killswitch.state)
       return text(`[state=locked] ${alarmText(killswitch.state)} Nothing was handed over. Tell the user.`)
     }
-    // Inactive otherwise: nothing waits here for a controller that is not there.
-    const { active, why } = presence?.state() ?? { active: true }
+    // Inactive otherwise: nothing waits here for a controller that is not
+    // there. Only a standby sends the work to another connector.
+    const { active, why, standby } = presence?.state() ?? { active: true }
     if (!active) {
       return text(
-        `[state=inactive] Nothing was handed over: this gateway is inactive, ${why}. Tell the user in a few words, and ` +
-          'use another connector whose status says active.',
+        `[state=inactive] Nothing was handed over: this gateway is inactive, ${why}. ` +
+          (standby
+            ? 'Tell the user in a few words, and use another connector whose status says active.'
+            : 'Its controller is starting or not running: tell the user in a few words, and try again in a minute.'),
       )
     }
     return null
@@ -298,7 +303,8 @@ function buildVoiceServer(store, channel, settings, { killswitch = null, grant =
         'Check that the voice gateway is reachable and whether Claude Code is answering; lists open requests ' +
           'and pending approvals. Use when the user asks if the connection works or what is going on. Its first ' +
           'line says which gateway this is and whether it is active: when the user has several such connectors, ' +
-          'call status on them first and use only an active one.',
+          'call status on them first and use an active one. Switch connectors only when the line says "use another ' +
+          'connector", never because the kill switch is locked.',
       ),
       annotations: { readOnlyHint: true },
     },

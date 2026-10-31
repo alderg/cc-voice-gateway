@@ -6,7 +6,7 @@
 
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawn } from 'node:child_process'
 import { createHash, randomBytes } from 'node:crypto'
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
@@ -63,11 +63,15 @@ test("the gateway's line: its name and kind of computer; active only with a cont
   const standby = { active: false }
   const presence = new Presence({ host: 'sky.local', kind: 'Mac', killswitch, standby })
   assert.equal(presence.label, 'sky (Mac)')
-  assert.equal(presence.line(), 'Gateway sky (Mac): inactive, no controller connected; use another connector')
+  // Starting, or not running: it comes back by itself, so no other connector.
+  assert.equal(presence.line(), 'Gateway sky (Mac): inactive, no controller connected; it is starting or not running; try again in a minute')
   presence.connected = true
   assert.equal(presence.line(), 'Gateway sky (Mac): active')
+  // Locked: never another connector, which would carry the work past an emergency stop.
   killswitch.locked = true
-  assert.equal(presence.line(), 'Gateway sky (Mac): inactive, kill switch locked; use another connector')
+  assert.equal(presence.line(), 'Gateway sky (Mac): inactive, kill switch locked; it can only be unlocked at the computer')
+  assert.equal(presence.state().standby, undefined)
+  // Only a standby sends the voice assistant to another connector.
   standby.active = true
   assert.equal(presence.line(), 'Gateway sky (Mac): inactive, connector disconnected, in standby; use another connector')
   const test = new Presence({ host: 'sky', kind: 'Mac', standbySetting: true })
@@ -454,6 +458,48 @@ test('gateway: the connector revoked at the computer: one message, then standby;
     assert.equal(unknown.status, 200, 'an unknown token is answered alike')
   } finally {
     await g.close()
+  }
+})
+
+test('gateway: no controller connected yet, as during a start: inactive, try again in a minute; nothing handed over, and no other connector', async () => {
+  // The gateway as Claude Code starts it, before the session has taken up its channel.
+  const port = await freePort()
+  const secrets = join(TMP, 'starting', 'secrets')
+  mkdirSync(secrets, { recursive: true, mode: 0o700 })
+  const child = spawn(process.execPath, [GATEWAY], {
+    env: {
+      ...process.env,
+      VOICE_GW_PORT: String(port),
+      VOICE_GW_SECRETS_DIR: secrets,
+      VOICE_GW_STATE_DIR: join(TMP, 'starting', 'state'),
+      VOICE_GW_WORKER_ROOT: join(TMP, 'starting', 'no-repositories'),
+      VOICE_GW_LOG_FILE: '',
+      VOICE_GW_SELF_CHECKOUT: '',
+      VOICE_GW_NAME: 'Startbox (test)',
+    },
+    stdio: ['pipe', 'ignore', 'ignore'],
+  })
+  const voice = new Client({ name: 'car', version: '0.0.0' })
+  try {
+    await until(async () => (await fetch(`http://127.0.0.1:${port}/healthz`).catch(() => null))?.ok)
+    const { access_token } = await adminRequest(join(secrets, 'admin.sock'), 'POST', '/token', { name: 'car' })
+    await voice.connect(
+      new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp`), {
+        requestInit: { headers: { authorization: `Bearer ${access_token}` } },
+      }),
+    )
+    const call = async (tool, args = {}) => (await voice.callTool({ name: tool, arguments: args })).content[0].text
+    const line = 'Gateway Startbox (test): inactive, no controller connected; it is starting or not running; try again in a minute'
+    assert.match(await call('status'), new RegExp(`^${line.replace(/[()]/g, '\\$&')}\\n\\[gateway=ok `), 'status works in every state')
+    for (const tool of ['send', 'ask']) {
+      const said = await call(tool, { message: 'Is the build green?' })
+      assert.match(said, /\n\[state=inactive\] Nothing was handed over: this gateway is inactive, no controller connected\. Its controller is starting or not running: tell the user in a few words, and try again in a minute\.$/, tool)
+      assert.doesNotMatch(said, /another connector/, tool)
+    }
+  } finally {
+    await voice.close()
+    child.stdin.end()
+    await new Promise(resolve => child.on('exit', resolve))
   }
 })
 

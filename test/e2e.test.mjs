@@ -190,12 +190,16 @@ test('voice endpoint exposes the voice tools', async () => {
 test('the connector names its gateway, for a driver with several: in the instructions, in every tool description, first in every answer', async () => {
   assert.match(
     voice.getInstructions(),
-    /\nThis connector is the gateway Testbox \(e2e\)\. Every answer starts with a line that names the gateway and says whether it is active\. If the user has several such connectors, one per computer, call status on them first and use only the one whose answer says active; never hand a request to an inactive one\.$/,
+    /\nThis connector is the gateway Testbox \(e2e\)\. Every answer starts with a line that names the gateway and says whether it is active\. If the user has several such connectors, one per computer, call status on them first and use the one whose answer says active\. Switch to another connector only when an answer says "use another connector" \(a gateway on standby\); never because a kill switch is locked: tell the user it can only be unlocked at the computer\.$/,
   )
   assert.doesNotMatch(voice.getInstructions(), /on standby by its settings/)
   const { tools } = await voice.listTools()
   for (const tool of tools) assert.match(tool.description, /This is the gateway Testbox \(e2e\)\.$/, tool.name)
-  assert.match(tools.find(t => t.name === 'status').description, /when the user has several such connectors, call status on them first and use only an active one\./)
+  assert.match(
+    tools.find(t => t.name === 'status').description,
+    /when the user has several such connectors, call status on them first and use an active one\. Switch connectors only when the line says "use another connector", never because the kill switch is locked\./,
+  )
+  for (const tool of tools.filter(t => t.name !== 'status')) assert.doesNotMatch(tool.description, /another connector/, tool.name)
   // status gives it first, before the machine-readable line (voiceCall checks the line on every answer).
   const raw = resultText(await voice.callTool({ name: 'status', arguments: {} }))
   assert.match(raw, /^Gateway Testbox \(e2e\): active\n\[gateway=ok controller=/)
