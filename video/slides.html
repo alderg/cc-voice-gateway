@@ -1,340 +1,731 @@
 <!doctype html>
 <!--
-  The video's frames, 1920 x 1080. build.mjs opens this page once per spoken line,
-  with #s=<scene>&b=<build step>&c=<caption>&p=<progress 0..1>, and takes a screenshot.
-  Colors follow the diagrams: orange the Claude app, purple the gateway, blue Claude Code.
+  The video, animated, 1920 x 1080. build.mjs loads this page once, hands it the timeline with
+  setup({ total, fps, scenes: [{ id, start, end, lines: [{ start, voice, end, caption }] }], levels }),
+  then calls render(t) for every frame and takes a screenshot.
+  Elements with data-in="<line>" appear when that line of their scene starts, data-d adds a delay
+  (seconds, or "40%" of the line's spoken length), data-fx picks the motion (up, fade, pop, left,
+  right, type, wipe), data-out="<line>" hides or dims them again (data-outfx="dim").
+  Opened on its own, it plays with a guessed timeline: slides.html#t=12 shows second 12, #play plays.
+  Colors follow the diagrams: orange the voice AI, purple the gateway and controller, blue Claude Code.
 -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>cc-voice-gateway video frame</title>
+<title>cc-voice-gateway video</title>
 <style>
   :root {
-    --bg: #0a0f1f;
-    --bg2: #121a36;
+    --bg: #060a17;
     --ink: #f8fafc;
-    --muted: #94a3b8;
-    --line: #26314f;
-    --card: #131c38;
+    --text: #cbd5e1;
+    --muted: #8b9ab3;
+    --line: #243052;
+    --card: #0f1730;
+    --card2: #131d3b;
     --orange: #fb923c;
     --purple: #a78bfa;
     --blue: #60a5fa;
     --green: #4ade80;
     --red: #f87171;
     --amber: #fbbf24;
+    --tg: #38bdf8;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
   }
-  * { box-sizing: border-box; margin: 0; }
-  html, body { width: 1920px; height: 1080px; overflow: hidden; }
-  body {
-    background: radial-gradient(1400px 900px at 70% 20%, var(--bg2), var(--bg) 70%);
-    color: var(--ink);
-    font-family: system-ui, -apple-system, "Helvetica Neue", Helvetica, sans-serif;
-    -webkit-font-smoothing: antialiased;
-  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { width: 1920px; height: 1080px; overflow: hidden; background: var(--bg); }
+  body { color: var(--ink); font-family: system-ui, -apple-system, "Helvetica Neue", Helvetica, sans-serif; -webkit-font-smoothing: antialiased; }
+  svg.i { display: block; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+
+  /* background: slow blobs over a dotted grid */
+  #bg { position: absolute; inset: 0; overflow: hidden; }
+  .blob { position: absolute; width: 1400px; height: 1400px; border-radius: 50%; }
+  .b1 { background: radial-gradient(closest-side, rgba(167, 139, 250, .20), transparent); }
+  .b2 { background: radial-gradient(closest-side, rgba(96, 165, 250, .16), transparent); }
+  .b3 { background: radial-gradient(closest-side, rgba(251, 146, 60, .12), transparent); }
+  .dots { position: absolute; inset: -40px; background-image: radial-gradient(rgba(148, 163, 184, .16) 1.4px, transparent 1.6px); background-size: 36px 36px;
+    -webkit-mask-image: radial-gradient(ellipse 75% 70% at 50% 45%, #000 30%, transparent 85%); }
+
   section { position: absolute; inset: 0; display: none; }
-  section.on { display: block; }
-  [data-b] { transition: none; }
-  .hidden { opacity: 0; }
-  .dim { opacity: .35; }
-
-  .brand { position: absolute; left: 120px; top: 72px; font: 600 28px system-ui; color: var(--muted); letter-spacing: .01em; }
-  .brand i { display: inline-block; width: 14px; height: 14px; border-radius: 50%; background: var(--purple); margin-right: 12px; box-shadow: 0 0 18px var(--purple); }
-  .caption {
-    position: absolute; left: 50%; bottom: 84px; transform: translateX(-50%);
-    max-width: 1560px; padding: 18px 34px; border-radius: 16px;
-    background: rgba(2, 6, 23, .72); border: 1px solid rgba(148, 163, 184, .18);
-    font: 500 38px/1.3 system-ui; color: #e2e8f0; text-align: center; white-space: nowrap;
-  }
-  .progress { position: absolute; left: 0; bottom: 0; height: 6px; background: linear-gradient(90deg, var(--orange), var(--purple), var(--blue)); }
-
-  h1 { font: 750 84px/1.08 system-ui; letter-spacing: -.025em; }
-  h2 { font: 700 64px/1.1 system-ui; letter-spacing: -.02em; }
-  .sub { font: 450 42px/1.35 system-ui; color: #cbd5e1; }
+  .stage { position: absolute; inset: 0; transform-origin: 50% 46%; }
+  .abs { position: absolute; }
   .center { text-align: center; }
+  .grad { background: linear-gradient(90deg, var(--amber), var(--orange) 30%, var(--purple) 65%, var(--blue)); -webkit-background-clip: text; background-clip: text; color: transparent; }
 
-  /* scene: intro */
-  #intro .mark { position: absolute; top: 330px; width: 100%; font: 800 120px system-ui; letter-spacing: -.035em; }
-  #intro .mark i { display: inline-block; width: 40px; height: 40px; border-radius: 50%; background: var(--purple); margin-right: 34px; vertical-align: 14px; box-shadow: 0 0 50px var(--purple); }
-  #intro .proto { position: absolute; top: 500px; width: 100%; font: 500 44px system-ui; color: var(--muted); }
-  #intro .what { position: absolute; top: 610px; width: 100%; display: flex; justify-content: center; align-items: center; gap: 28px; font: 600 46px system-ui; color: #e2e8f0; }
-  #intro .what .chip { display: inline-flex; align-items: center; gap: 18px; padding: 16px 28px; border-radius: 18px; background: var(--card); border: 2px solid var(--line); }
-  #intro .what .chip.orange { border-color: rgba(251, 146, 60, .55); }
-  #intro .what .chip.blue { border-color: rgba(96, 165, 250, .55); }
+  .brand { position: absolute; left: 112px; top: 64px; font: 600 28px system-ui; color: var(--muted); display: flex; align-items: center; gap: 14px; }
+  .brand i { width: 14px; height: 14px; border-radius: 50%; background: var(--purple); box-shadow: 0 0 18px var(--purple); }
+  .chapter { position: absolute; right: 112px; top: 56px; display: flex; align-items: center; gap: 14px; padding: 10px 22px 10px 12px; border-radius: 999px;
+    background: rgba(15, 23, 48, .8); border: 1.5px solid var(--line); font: 600 26px system-ui; color: var(--text); }
+  .chapter b { display: grid; place-items: center; height: 38px; min-width: 38px; padding: 0 10px; border-radius: 999px; font: 700 21px var(--mono); color: #0b1020; }
 
-  /* scene: away */
-  #away .text { position: absolute; left: 120px; top: 320px; width: 820px; }
-  #away .text .sub { margin-top: 44px; }
-  #away svg { position: absolute; right: 80px; top: 150px; }
+  h2.title { position: absolute; left: 0; right: 0; top: 150px; text-align: center; font: 760 70px/1.1 system-ui; letter-spacing: -.025em; }
+  .sub { font: 450 34px/1.4 system-ui; color: var(--text); }
 
-  /* cards */
-  .card {
-    position: absolute; width: 560px; padding: 44px 46px; border-radius: 28px;
-    background: var(--card); border: 2px solid var(--line);
-  }
-  .card .icon { width: 84px; height: 84px; border-radius: 22px; display: grid; place-items: center; margin-bottom: 30px; }
-  .card .title { font: 700 46px/1.15 system-ui; }
-  .card .desc { font: 450 32px/1.35 system-ui; color: var(--muted); margin-top: 14px; }
+  .caption { position: absolute; left: 50%; bottom: 64px; transform: translateX(-50%); max-width: 1560px; padding: 16px 34px; border-radius: 18px;
+    background: rgba(3, 7, 18, .78); border: 1px solid rgba(148, 163, 184, .16); font: 500 36px/1.32 system-ui; color: #e2e8f0; text-align: center; text-wrap: balance; }
+  .progress { position: absolute; left: 0; right: 0; bottom: 0; height: 6px; background: rgba(148, 163, 184, .08); }
+  .progress i { display: block; height: 100%; width: 0; background: linear-gradient(90deg, var(--orange), var(--purple), var(--blue)); }
+
+  .card { position: absolute; border-radius: 30px; background: linear-gradient(180deg, var(--card2), var(--card)); border: 2px solid var(--line); }
   .card.orange { border-color: rgba(251, 146, 60, .55); }
-  .card.orange .icon { background: rgba(251, 146, 60, .14); }
   .card.blue { border-color: rgba(96, 165, 250, .55); }
-  .card.blue .icon { background: rgba(96, 165, 250, .14); }
-  .card.purple { border-color: rgba(167, 139, 250, .8); box-shadow: 0 0 80px rgba(167, 139, 250, .25); }
-  .card.purple .icon { background: rgba(167, 139, 250, .16); }
+  .card.purple { border-color: rgba(167, 139, 250, .8); box-shadow: 0 0 90px rgba(167, 139, 250, .22); }
+  .icon { display: grid; place-items: center; border-radius: 22px; }
+  .icon.orange { background: rgba(251, 146, 60, .14); color: var(--orange); }
+  .icon.purple { background: rgba(167, 139, 250, .16); color: var(--purple); }
+  .icon.blue { background: rgba(96, 165, 250, .14); color: var(--blue); }
+  .icon.green { background: rgba(74, 222, 128, .14); color: var(--green); }
+  .icon.red { background: rgba(248, 113, 113, .16); color: var(--red); }
+  .icon.amber { background: rgba(251, 191, 36, .14); color: var(--amber); }
+  .icon.tg { background: rgba(56, 189, 248, .16); color: var(--tg); }
 
-  /* scene: gap */
-  #gap h2 { position: absolute; top: 200px; width: 100%; }
-  #gap .left { left: 230px; top: 400px; }
-  #gap .right { right: 230px; top: 400px; }
-  #gap .broken { position: absolute; left: 790px; top: 560px; width: 340px; }
+  .wave { position: absolute; display: flex; align-items: center; justify-content: center; }
+  .wave i { display: block; border-radius: 99px; flex: none; }
 
-  /* scene: bridge */
-  #bridge h2 { position: absolute; top: 200px; width: 100%; }
-  #bridge .card { width: 480px; top: 420px; }
-  #bridge .left { left: 120px; }
-  #bridge .mid { left: 720px; }
-  #bridge .right { left: 1320px; }
-  #bridge .card { height: 330px; }
-  #bridge .card .title { font-size: 40px; white-space: nowrap; }
-  #bridge .link { position: absolute; top: 560px; height: 6px; width: 120px; border-radius: 3px; }
-  #bridge .l1 { left: 600px; background: linear-gradient(90deg, var(--orange), var(--purple)); }
-  #bridge .l2 { left: 1200px; background: linear-gradient(90deg, var(--purple), var(--blue)); }
+  /* intro and end */
+  .mark { position: absolute; left: 0; right: 0; text-align: center; font: 800 124px/1 system-ui; letter-spacing: -.04em; }
+  .mark i { display: inline-block; width: 40px; height: 40px; border-radius: 50%; background: var(--purple); margin-right: 34px; vertical-align: 14px; box-shadow: 0 0 50px var(--purple); }
+  .tagline { position: absolute; left: 0; right: 0; text-align: center; font: 700 76px/1.1 system-ui; letter-spacing: -.03em; }
+  #intro .mark { top: 470px; }
+  #intro .tagline { top: 640px; }
+  #end .mark { top: 330px; }
+  #end .tagline { top: 488px; font-size: 64px; }
+  #end .url { position: absolute; top: 630px; left: 50%; transform: translateX(-50%); padding: 20px 44px; border-radius: 999px; white-space: nowrap;
+    border: 2px solid rgba(167, 139, 250, .6); background: rgba(15, 23, 48, .7); font: 600 38px var(--mono); color: var(--ink); }
+  #end .notice { position: absolute; left: 0; right: 0; top: 790px; font: 450 30px/1.5 system-ui; color: var(--muted); }
 
-  /* scene: dialog */
-  #dialog .talk { position: absolute; left: 120px; top: 190px; width: 900px; }
+  /* gap */
+  .node { top: 380px; width: 520px; height: 320px; padding: 44px 46px; }
+  .node .icon { width: 88px; height: 88px; margin-bottom: 30px; }
+  .node .name { font: 720 46px/1.15 system-ui; }
+  .node .desc { font: 450 31px/1.35 system-ui; color: var(--muted); margin-top: 12px; }
+  #gap .left { left: 190px; }
+  #gap .right { left: 1210px; }
+  #gap .broken { left: 730px; top: 500px; }
+  #gap .bridge { left: 710px; top: 450px; width: 500px; height: 200px; }
+  .rail { position: absolute; height: 8px; border-radius: 4px; }
+  .pulses { position: absolute; height: 20px; }
+  .pulses i { position: absolute; top: 0; width: 20px; height: 20px; margin-left: -10px; border-radius: 50%; }
+  #gap .hub { position: absolute; left: 175px; top: 25px; width: 150px; height: 150px; border-radius: 50%; display: grid; place-items: center;
+    background: radial-gradient(circle at 50% 40%, #2a2050, #151032); border: 3px solid var(--purple); box-shadow: 0 0 90px rgba(167, 139, 250, .5); color: var(--purple); }
+  #gap .hublabel { position: absolute; left: -40px; right: -40px; top: 196px; text-align: center; font: 700 34px system-ui; color: var(--purple); }
+
+  /* anywhere */
+  .panel { top: 270px; width: 520px; height: 560px; padding: 30px; }
+  #anywhere .p1 { left: 140px; } #anywhere .p2 { left: 700px; } #anywhere .p3 { left: 1260px; }
+  .scene-art { position: relative; height: 300px; border-radius: 22px; background: #0a1128; border: 1.5px solid #1c2747; overflow: hidden; }
+  .panel .label { display: flex; align-items: center; gap: 16px; margin-top: 30px; font: 720 42px/1.1 system-ui; }
+  .panel .label .icon { width: 58px; height: 58px; border-radius: 16px; }
+  .panel .desc { font: 450 29px/1.38 system-ui; color: var(--muted); margin-top: 14px; }
+  .chips { display: flex; gap: 10px; }
+  .chip { padding: 6px 16px; border-radius: 999px; font: 600 21px system-ui; color: var(--text); background: rgba(148, 163, 184, .1); border: 1px solid rgba(148, 163, 184, .2); }
+  /* car display */
+  .dash { position: absolute; left: 24px; right: 24px; top: 26px; height: 196px; border-radius: 22px; background: #050914; border: 3px solid #26314f; display: flex; }
+  .dash .side { width: 70px; border-right: 1.5px solid #1c2747; display: grid; align-content: center; gap: 14px; justify-items: center; }
+  .dash .side i { width: 34px; height: 34px; border-radius: 10px; background: #1b2546; }
+  .dash .side i:nth-child(2) { background: rgba(251, 146, 60, .35); }
+  .dash .main { flex: 1; position: relative; }
+  .dash .orb { position: absolute; left: 34px; top: 50px; width: 92px; height: 92px; border-radius: 50%; background: radial-gradient(circle at 40% 35%, #fdba74, #ea580c 70%); box-shadow: 0 0 40px rgba(251, 146, 60, .55); }
+  .wheel { position: absolute; left: 50%; top: 236px; width: 380px; height: 380px; margin-left: -190px; border-radius: 50%; border: 18px solid #1c2747; }
+  /* desk */
+  .monitor { position: absolute; left: 34px; right: 34px; top: 22px; height: 200px; border-radius: 16px; background: #050914; border: 3px solid #26314f; overflow: hidden; }
+  .monitor .bar { height: 26px; background: #111a33; display: flex; gap: 8px; align-items: center; padding-left: 12px; }
+  .monitor .bar i { width: 10px; height: 10px; border-radius: 50%; background: #334155; }
+  .code { padding: 14px 18px; display: grid; gap: 10px; }
+  .code i { display: block; height: 10px; border-radius: 5px; }
+  .voicepill { position: absolute; right: 14px; bottom: 14px; display: flex; align-items: center; gap: 12px; padding: 10px 16px; border-radius: 999px;
+    background: rgba(251, 146, 60, .14); border: 1.5px solid rgba(251, 146, 60, .6); font: 600 18px system-ui; color: #fed7aa; }
+  .stand { position: absolute; left: 50%; top: 222px; width: 70px; height: 22px; margin-left: -35px; background: #1c2747; }
+  .keyboard { position: absolute; left: 70px; top: 248px; width: 270px; height: 40px; border-radius: 8px; background: #141d38; border: 1.5px solid #26314f;
+    background-image: radial-gradient(#334155 3px, transparent 3.5px); background-size: 18px 13px; background-position: 6px 6px; }
+  .mouse { position: absolute; left: 372px; top: 244px; width: 30px; height: 46px; border-radius: 15px; background: #141d38; border: 1.5px solid #3b4a6b; }
+  .cursor { position: absolute; width: 28px; height: 34px; }
+  /* phone */
+  .phone { position: absolute; left: 50%; top: 22px; width: 170px; height: 330px; margin-left: -85px; border-radius: 30px; background: #050914; border: 4px solid #2b3858; }
+  .phone .notch { position: absolute; left: 50%; top: 10px; width: 54px; height: 14px; margin-left: -27px; border-radius: 99px; background: #1b2546; }
+  .phone .orb { position: absolute; left: 50%; top: 62px; width: 74px; height: 74px; margin-left: -37px; border-radius: 50%; background: radial-gradient(circle at 40% 35%, #fdba74, #ea580c 70%); box-shadow: 0 0 36px rgba(251, 146, 60, .55); }
+  .bubble-sm { position: absolute; left: 14px; right: 14px; top: 196px; padding: 10px 12px; border-radius: 14px; background: rgba(251, 146, 60, .12); border: 1px solid rgba(251, 146, 60, .4); font: 500 15px/1.3 system-ui; color: #fed7aa; text-align: center; }
+  .trees { position: absolute; bottom: 0; left: 0; right: 0; height: 90px; }
+
+  /* dialog */
+  #dialog .talk { position: absolute; left: 112px; top: 200px; width: 900px; }
   .bubble { display: flex; gap: 22px; align-items: flex-start; margin-bottom: 30px; }
-  .bubble .who { flex: none; width: 92px; height: 76px; border-radius: 38px; display: grid; place-items: center; font: 700 22px system-ui; }
-  .bubble .says { padding: 22px 30px; border-radius: 24px; font: 500 36px/1.35 system-ui; background: #1b2546; }
-  .bubble.you .who { background: #334155; color: #e2e8f0; }
-  .bubble.claude .who { background: rgba(251, 146, 60, .18); color: var(--orange); border: 2px solid rgba(251, 146, 60, .6); }
-  .bubble.claude .says { background: rgba(251, 146, 60, .10); border: 1px solid rgba(251, 146, 60, .35); }
-  #dialog .worker {
-    position: absolute; right: 120px; top: 210px; width: 720px; padding: 34px 38px; border-radius: 24px;
-    background: #0b1228; border: 2px solid rgba(96, 165, 250, .55);
-    font: 500 29px/1.75 ui-monospace, "SF Mono", Menlo, monospace; color: #cbd5e1;
-  }
-  #dialog .worker .head { font: 700 30px system-ui; color: var(--blue); margin-bottom: 18px; }
+  .bubble .who { flex: none; width: 96px; height: 76px; border-radius: 38px; display: grid; place-items: center; font: 700 22px system-ui; }
+  .bubble .says { padding: 22px 30px; border-radius: 26px; font: 500 36px/1.35 system-ui; background: #18223f; border: 1px solid #26314f; }
+  .bubble.you .who { background: #2b3650; color: #e2e8f0; }
+  .bubble.claude .who { background: rgba(251, 146, 60, .16); color: var(--orange); border: 2px solid rgba(251, 146, 60, .6); }
+  .bubble.claude .says { background: rgba(251, 146, 60, .09); border-color: rgba(251, 146, 60, .38); }
+  #dialog .term { left: 1070px; top: 210px; width: 740px; height: 440px; padding: 0; border-color: rgba(96, 165, 250, .5); background: #070d1f; overflow: hidden; }
+  .term .head { display: flex; align-items: center; gap: 16px; padding: 22px 30px; border-bottom: 1.5px solid #1c2747; font: 700 28px system-ui; color: var(--blue); }
+  .term .head .state { margin-left: auto; font: 600 22px system-ui; padding: 6px 16px; border-radius: 999px; }
+  .term .body { padding: 26px 30px; font: 500 27px/1.85 var(--mono); color: #cbd5e1; }
+  .term .p { color: #64748b; }
   .ok { color: var(--green); }
   .hl { color: var(--ink); }
 
-  /* scene: review */
-  #review h2 { position: absolute; top: 140px; width: 100%; }
-  #review .pr {
-    position: absolute; left: 380px; top: 255px; width: 1160px; padding: 38px 52px; border-radius: 28px;
-    background: var(--card); border: 2px solid var(--line);
-  }
-  #review .pr .t { font: 700 46px/1.2 system-ui; }
-  #review .pr .t span { color: var(--muted); font-weight: 500; }
-  #review .pr .branch { margin-top: 16px; font: 500 28px ui-monospace, "SF Mono", Menlo, monospace; color: var(--purple); }
-  #review .row { display: flex; gap: 22px; align-items: center; font: 500 33px/1.3 system-ui; margin-top: 20px; }
-  #review .row .dot { flex: none; width: 46px; height: 46px; border-radius: 50%; display: grid; place-items: center; font: 800 26px system-ui; }
-  #review .commits { margin-top: 30px; padding-top: 6px; border-top: 1px solid var(--line); }
-  #review .commits .row { color: #cbd5e1; font-size: 31px; }
-  #review .commits .sha { font: 500 27px ui-monospace, "SF Mono", Menlo, monospace; color: var(--muted); width: 140px; }
-  #review .checks { margin-top: 26px; padding-top: 6px; border-top: 1px solid var(--line); }
+  /* layers */
+  .layer { top: 290px; width: 440px; height: 480px; padding: 38px 40px; }
+  #layers .c1 { left: 130px; } #layers .c2 { left: 740px; } #layers .c3 { left: 1350px; }
+  .layer .top { display: flex; align-items: center; gap: 20px; }
+  .layer .icon { width: 84px; height: 84px; }
+  .layer .kicker { font: 700 20px var(--mono); letter-spacing: .08em; text-transform: uppercase; }
+  .layer .name { font: 740 42px/1.1 system-ui; margin-top: 4px; }
+  .layer .where { font: 500 25px system-ui; color: var(--muted); margin-top: 22px; }
+  .layer ul { list-style: none; margin-top: 22px; display: grid; gap: 16px; }
+  .layer li { display: flex; gap: 14px; font: 500 28px/1.3 system-ui; color: var(--text); }
+  .layer li::before { content: ""; flex: none; width: 10px; height: 10px; border-radius: 50%; margin-top: 13px; background: currentColor; opacity: .9; }
+  .layer.orange li::before { background: var(--orange); }
+  .layer.purple li::before { background: var(--purple); }
+  .layer.blue li::before { background: var(--blue); }
+  .layer .workers { display: flex; gap: 10px; margin-top: 28px; }
+  .layer .workers span { padding: 6px 14px; border-radius: 10px; font: 600 20px var(--mono); color: #bfdbfe; background: rgba(96, 165, 250, .12); border: 1px solid rgba(96, 165, 250, .35); }
+  .link { position: absolute; top: 340px; width: 170px; height: 80px; }
+  .link .rail { left: 0; right: 0; height: 4px; opacity: .55; }
+  .link .lbl { position: absolute; left: 0; right: 0; text-align: center; font: 600 18px var(--mono); color: var(--muted); }
+  #layers .l1 { left: 570px; } #layers .l2 { left: 1180px; }
 
-  /* scene: road */
-  #road h2 { position: absolute; top: 200px; width: 100%; }
-  #road .tile { position: absolute; top: 380px; width: 500px; height: 380px; padding: 46px; border-radius: 28px; background: var(--card); border: 2px solid var(--line); }
-  #road .tile .icon { width: 96px; height: 96px; border-radius: 24px; display: grid; place-items: center; margin-bottom: 34px; }
-  #road .tile .title { font: 700 44px/1.15 system-ui; }
-  #road .tile .desc { font: 450 32px/1.35 system-ui; color: var(--muted); margin-top: 14px; }
-  #road .t1 { left: 140px; } #road .t2 { left: 710px; } #road .t3 { left: 1280px; }
-  #road .t3 { border-color: rgba(248, 113, 113, .6); box-shadow: 0 0 70px rgba(248, 113, 113, .18); }
-  #road .fine { position: absolute; top: 800px; width: 100%; font: 450 28px system-ui; color: var(--muted); }
+  /* parallel */
+  #parallel .board { left: 150px; top: 270px; width: 1620px; height: 560px; padding: 26px 40px; }
+  .board .bhead { display: flex; align-items: center; gap: 18px; padding-bottom: 18px; border-bottom: 1.5px solid #1c2747; font: 700 28px system-ui; color: var(--text); }
+  .board .bhead .stat { margin-left: auto; display: flex; gap: 14px; }
+  .board .bhead .stat span { padding: 6px 16px; border-radius: 999px; font: 600 22px system-ui; background: rgba(148, 163, 184, .1); }
+  .lane { display: grid; grid-template-columns: 70px 380px 400px 1fr 200px; align-items: center; gap: 22px; height: 92px; border-bottom: 1px solid #172142; }
+  .lane .icon { width: 60px; height: 60px; border-radius: 16px; }
+  .lane .who { font: 700 30px system-ui; }
+  .lane .who small { display: block; font: 500 21px system-ui; color: var(--muted); margin-top: 3px; }
+  .lane .task { font: 500 27px system-ui; color: var(--text); }
+  .lane .track { height: 14px; border-radius: 7px; background: #172142; overflow: hidden; }
+  .lane .fill { height: 100%; width: 0; border-radius: 7px; }
+  .lane .status { font: 600 23px system-ui; color: var(--muted); text-align: right; white-space: nowrap; }
+  .lane .status.done { color: var(--green); }
 
-  .play { position: absolute; left: 50%; top: 880px; width: 170px; height: 170px; margin: -85px 0 0 -85px; border-radius: 50%;
-    background: rgba(2, 6, 23, .55); border: 4px solid rgba(248, 250, 252, .85); display: none; place-items: center;
-    box-shadow: 0 0 120px rgba(167, 139, 250, .45); }
-  .play svg { margin-left: 14px; }
+  /* back */
+  #back .phonebig { left: 220px; top: 160px; width: 380px; height: 690px; border-radius: 56px; background: #050914; border: 6px solid #2b3858; box-shadow: 0 40px 120px rgba(0, 0, 0, .5); }
+  #back .phonebig .notch { position: absolute; left: 50%; top: 18px; width: 110px; height: 30px; margin-left: -55px; border-radius: 99px; background: #141d38; }
+  #back .phonebig .orb { position: absolute; left: 50%; top: 150px; width: 170px; height: 170px; margin-left: -85px; border-radius: 50%; background: radial-gradient(circle at 40% 35%, #fdba74, #ea580c 70%); box-shadow: 0 0 80px rgba(251, 146, 60, .5); }
+  #back .phonebig .said { position: absolute; left: 30px; right: 30px; top: 470px; font: 500 27px/1.4 system-ui; color: #fed7aa; text-align: center; }
+  #back .phonebig .mode { position: absolute; left: 0; right: 0; top: 80px; text-align: center; font: 600 20px system-ui; color: var(--muted); letter-spacing: .06em; text-transform: uppercase; }
+  #back h2.title { left: 700px; right: 120px; text-align: left; top: 175px; font-size: 64px; }
+  .note { position: absolute; left: 700px; width: 1100px; display: flex; gap: 26px; align-items: flex-start; padding: 26px 32px; border-radius: 26px;
+    background: linear-gradient(180deg, var(--card2), var(--card)); border: 2px solid var(--line); }
+  .note .icon { flex: none; width: 70px; height: 70px; border-radius: 18px; }
+  .note .src { font: 600 23px system-ui; color: var(--muted); }
+  .note .msg { font: 600 32px/1.3 system-ui; margin-top: 6px; }
+  .note.orange { border-color: rgba(251, 146, 60, .5); }
+  .note.tg { border-color: rgba(56, 189, 248, .5); }
+  .note.green { border-color: rgba(74, 222, 128, .45); }
+  .note.purple { border-color: rgba(167, 139, 250, .55); }
 
-  /* scene: end */
-  #end .mark { position: absolute; top: 300px; width: 100%; font: 800 120px system-ui; letter-spacing: -.035em; }
-  #end .mark i { display: inline-block; width: 40px; height: 40px; border-radius: 50%; background: var(--purple); margin-right: 34px; vertical-align: 14px; box-shadow: 0 0 50px var(--purple); }
-  #end .tag { position: absolute; top: 470px; width: 100%; font: 500 46px system-ui; color: #cbd5e1; }
-  #end .url { position: absolute; top: 600px; left: 50%; transform: translateX(-50%); padding: 20px 40px; border-radius: 999px;
-    border: 2px solid rgba(167, 139, 250, .6); font: 600 38px ui-monospace, "SF Mono", Menlo, monospace; color: var(--ink); white-space: nowrap; }
-  #end .notice { position: absolute; top: 790px; width: 100%; font: 450 30px/1.5 system-ui; color: var(--muted); }
+  /* safe */
+  #safe h2.title { left: 150px; right: auto; text-align: left; top: 160px; }
+  .rule { position: absolute; left: 150px; width: 960px; display: flex; gap: 26px; align-items: center; font: 600 34px/1.25 system-ui; }
+  .rule .icon { flex: none; width: 70px; height: 70px; border-radius: 18px; }
+  #safe .stop { left: 1210px; top: 250px; width: 560px; height: 560px; padding: 0; border-color: rgba(248, 113, 113, .55); box-shadow: 0 0 120px rgba(248, 113, 113, .16); }
+  .stop .btn { position: absolute; left: 50%; top: 70px; width: 250px; height: 250px; margin-left: -125px; border-radius: 50%; display: grid; place-items: center;
+    background: radial-gradient(circle at 45% 38%, #fca5a5, #dc2626 62%, #991b1b); border: 8px solid #3f1d2b; box-shadow: 0 18px 60px rgba(220, 38, 38, .45); font: 800 52px system-ui; letter-spacing: .04em; color: #fff; }
+  .stop .ring { position: absolute; left: 50%; top: 195px; width: 250px; height: 250px; margin: -125px 0 0 -125px; border-radius: 50%; border: 4px solid var(--red); }
+  .stop .t { position: absolute; left: 0; right: 0; top: 360px; text-align: center; font: 740 46px system-ui; }
+  .stop .d { position: absolute; left: 40px; right: 40px; top: 430px; text-align: center; font: 450 29px/1.4 system-ui; color: var(--muted); }
+
+  .play { position: absolute; left: 50%; top: 890px; width: 150px; height: 150px; margin: -75px 0 0 -75px; border-radius: 50%; display: none; place-items: center;
+    background: rgba(2, 6, 23, .6); border: 4px solid rgba(248, 250, 252, .85); box-shadow: 0 0 120px rgba(167, 139, 250, .45); }
+  .play svg { margin-left: 12px; }
 </style>
 </head>
 <body>
 
-<div class="brand" id="brand"><i></i>cc-voice-gateway</div>
+<div id="bg">
+  <div class="blob b1" id="b1"></div><div class="blob b2" id="b2"></div><div class="blob b3" id="b3"></div>
+  <div class="dots"></div>
+</div>
 
-<section id="intro">
-  <div class="mark center"><i></i>cc-voice-gateway</div>
-  <div class="proto center">A small prototype</div>
-  <div class="what" data-b="1">
-    <span class="chip blue"><svg width="40" height="30" viewBox="0 0 54 40"><path d="M4 6 L18 20 L4 34" fill="none" stroke="#60a5fa" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/><rect x="24" y="30" width="28" height="6" rx="3" fill="#60a5fa"/></svg>Claude Code</span>
-    <span>from</span>
-    <span class="chip orange"><svg width="40" height="36" viewBox="0 0 50 44"><g fill="#fb923c"><rect x="0" y="16" width="6" height="12" rx="3"/><rect x="11" y="8" width="6" height="28" rx="3"/><rect x="22" y="0" width="6" height="44" rx="3"/><rect x="33" y="10" width="6" height="24" rx="3"/><rect x="44" y="17" width="6" height="10" rx="3"/></g></svg>Claude's voice mode</span>
-  </div>
-</section>
+<section id="intro"><div class="stage">
+  <div class="wave" data-n="56" data-gap="10" data-bw="12" style="left:360px;top:200px;width:1200px;height:230px"></div>
+  <div class="mark" data-in="0" data-fx="up"><i></i>cc-voice-gateway</div>
+  <div class="tagline" data-in="1" data-fx="up">Claude Code, <span class="grad">hands-free.</span></div>
+</div></section>
 
-<section id="gap">
-  <h2 class="center" data-b="1">Voice mode can't reach Claude Code.</h2>
-  <div class="card orange left" data-b="0">
-    <div class="icon"><svg width="50" height="44" viewBox="0 0 50 44"><g fill="#fb923c"><rect x="0" y="16" width="6" height="12" rx="3"/><rect x="11" y="8" width="6" height="28" rx="3"/><rect x="22" y="0" width="6" height="44" rx="3"/><rect x="33" y="10" width="6" height="24" rx="3"/><rect x="44" y="17" width="6" height="10" rx="3"/></g></svg></div>
-    <div class="title">Claude voice mode</div>
-    <div class="desc">In the Claude app,<br>on your phone or in your car</div>
+<section id="gap"><div class="stage">
+  <div class="brand"><i></i>cc-voice-gateway</div>
+  <h2 class="title" data-in="0" data-out="2">Voice mode can talk. Claude Code can work.</h2>
+  <h2 class="title" data-in="2" data-d=".25">The gateway <span class="grad">connects the two.</span></h2>
+  <div class="card node orange left" data-in="0" data-fx="left">
+    <div class="icon orange" data-icon="wave" data-size="46"></div>
+    <div class="name">Claude voice mode</div>
+    <div class="desc">Talks with you, in any language, in the Claude app</div>
   </div>
-  <svg class="broken" data-b="1" width="340" height="80" viewBox="0 0 340 80">
-    <line x1="0" y1="40" x2="125" y2="40" stroke="#475569" stroke-width="5" stroke-dasharray="14 12" stroke-linecap="round"/>
-    <line x1="215" y1="40" x2="340" y2="40" stroke="#475569" stroke-width="5" stroke-dasharray="14 12" stroke-linecap="round"/>
-    <circle cx="170" cy="40" r="34" fill="rgba(248,113,113,.14)" stroke="#f87171" stroke-width="3"/>
-    <path d="M156 26 L184 54 M184 26 L156 54" stroke="#f87171" stroke-width="6" stroke-linecap="round"/>
+  <svg class="abs broken" data-in="1" data-d="40%" data-out="2" width="460" height="120" viewBox="0 0 460 120">
+    <line x1="10" y1="60" x2="175" y2="60" stroke="#475569" stroke-width="6" stroke-dasharray="16 14" stroke-linecap="round"/>
+    <line x1="285" y1="60" x2="450" y2="60" stroke="#475569" stroke-width="6" stroke-dasharray="16 14" stroke-linecap="round"/>
+    <circle cx="230" cy="60" r="44" fill="rgba(248,113,113,.14)" stroke="#f87171" stroke-width="4"/>
+    <path d="M212 42 L248 78 M248 42 L212 78" stroke="#f87171" stroke-width="8" stroke-linecap="round"/>
   </svg>
-  <div class="card blue right" data-b="1">
-    <div class="icon"><svg width="54" height="40" viewBox="0 0 54 40"><path d="M4 6 L18 20 L4 34" fill="none" stroke="#60a5fa" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/><rect x="24" y="30" width="28" height="6" rx="3" fill="#60a5fa"/></svg></div>
-    <div class="title">Claude Code</div>
-    <div class="desc">On your computer,<br>in your repositories</div>
+  <div class="bridge abs" data-in="2" data-fx="fade">
+    <div class="rail" data-in="2" data-fx="wipe" data-dur=".8" style="left:0;width:500px;top:96px;background:linear-gradient(90deg,var(--orange),var(--purple),var(--blue))"></div>
+    <div class="pulses" data-speed=".45" data-n="3" data-color="#fde68a" style="left:0;width:500px;top:90px"></div>
+    <div class="hub" data-in="2" data-d=".3" data-fx="pop"><span data-icon="gateway" data-size="70" data-stroke="2.4"></span></div>
+    <div class="hublabel" data-in="2" data-d=".6">cc-voice-gateway</div>
   </div>
-</section>
+  <div class="card node blue right" data-in="1" data-fx="right">
+    <div class="icon blue" data-icon="terminal" data-size="46"></div>
+    <div class="name">Claude Code</div>
+    <div class="desc">Works in your repositories, on your own computer</div>
+  </div>
+</div></section>
 
-<section id="bridge">
-  <h2 class="center" data-b="0">The gateway connects the two.</h2>
-  <div class="card orange left" data-b="1">
-    <div class="icon"><svg width="50" height="44" viewBox="0 0 50 44"><g fill="#fb923c"><rect x="0" y="16" width="6" height="12" rx="3"/><rect x="11" y="8" width="6" height="28" rx="3"/><rect x="22" y="0" width="6" height="44" rx="3"/><rect x="33" y="10" width="6" height="24" rx="3"/><rect x="44" y="17" width="6" height="10" rx="3"/></g></svg></div>
-    <div class="title">You talk</div>
-    <div class="desc">Claude voice mode,<br>in the car or on the phone</div>
+<section id="anywhere"><div class="stage">
+  <div class="brand"><i></i>cc-voice-gateway</div>
+  <div class="chapter"><b style="background:var(--orange)">01</b>Hands-free</div>
+  <h2 class="title" data-in="0" style="top:140px">Talk to Claude Code, <span class="grad">wherever you are.</span></h2>
+  <div class="card panel p1" data-in="0" data-d=".2">
+    <div class="scene-art">
+      <div class="wheel"></div>
+      <div class="dash"><div class="side"><i></i><i></i><i></i></div>
+        <div class="main"><div class="orb" data-orb="1"></div>
+          <div class="wave" data-n="14" data-gap="6" data-bw="8" data-color="#fb923c" style="left:146px;top:46px;width:190px;height:100px"></div></div></div>
+    </div>
+    <div class="label"><span class="icon orange" data-icon="car" data-size="32"></span>In the car</div>
+    <div class="desc">With CarPlay or Android Auto.<br>Your eyes stay on the road.</div>
   </div>
-  <div class="link l1" data-b="1"></div>
-  <div class="card purple mid" data-b="0">
-    <div class="icon"><svg width="52" height="52" viewBox="0 0 52 52"><circle cx="10" cy="26" r="7" fill="#a78bfa"/><circle cx="42" cy="26" r="7" fill="#a78bfa"/><path d="M17 26 H35" stroke="#a78bfa" stroke-width="5" stroke-linecap="round"/><path d="M26 6 V18 M26 34 V46" stroke="#a78bfa" stroke-width="5" stroke-linecap="round" opacity=".5"/></svg></div>
-    <div class="title">cc-voice-gateway</div>
-    <div class="desc">On your computer.<br>Relays, keeps state, guards</div>
+  <div class="card panel p2" data-in="1" data-d=".1">
+    <div class="scene-art">
+      <div class="monitor"><div class="bar"><i></i><i></i><i></i></div>
+        <div class="code">
+          <i style="width:62%;background:#3b4a6b"></i><i style="width:44%;margin-left:28px;background:#60a5fa;opacity:.55"></i>
+          <i style="width:70%;margin-left:28px;background:#3b4a6b"></i><i style="width:38%;margin-left:56px;background:#a78bfa;opacity:.55"></i>
+          <i style="width:52%;margin-left:28px;background:#3b4a6b"></i><i style="width:30%;background:#4ade80;opacity:.45"></i>
+        </div>
+        <div class="voicepill"><span data-icon="mic" data-size="20"></span>Voice
+          <div class="wave" data-n="9" data-gap="4" data-bw="5" data-color="#fb923c" style="position:relative;width:80px;height:28px"></div></div>
+      </div>
+      <div class="stand"></div><div class="keyboard"></div><div class="mouse"></div>
+      <svg class="cursor" id="cursor" viewBox="0 0 28 34"><path d="M3 2 L3 27 L9.5 21 L14 31 L18.5 29 L14 19.5 L23 19.5 Z" fill="#f8fafc" stroke="#0b1020" stroke-width="2" stroke-linejoin="round"/></svg>
+    </div>
+    <div class="label"><span class="icon purple" data-icon="monitor" data-size="32"></span>At your desk</div>
+    <div class="desc">Voice runs alongside.<br>Mouse and keyboard stay yours.</div>
   </div>
-  <div class="link l2" data-b="2"></div>
-  <div class="card blue right" data-b="2">
-    <div class="icon"><svg width="54" height="40" viewBox="0 0 54 40"><path d="M4 6 L18 20 L4 34" fill="none" stroke="#60a5fa" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/><rect x="24" y="30" width="28" height="6" rx="3" fill="#60a5fa"/></svg></div>
-    <div class="title">Claude Code works</div>
-    <div class="desc">In your repositories,<br>on your own computer</div>
+  <div class="card panel p3" data-in="2" data-d=".1">
+    <div class="scene-art">
+      <svg class="trees" viewBox="0 0 460 90" preserveAspectRatio="none"><path d="M0 70 Q 115 40 230 62 T 460 55 V90 H0Z" fill="#101a35"/><path d="M0 82 Q 140 62 260 78 T 460 74 V90 H0Z" fill="#141f3f"/></svg>
+      <div class="phone"><div class="notch"></div><div class="orb" data-orb="1"></div>
+        <div class="wave" data-n="12" data-gap="4" data-bw="6" data-color="#fb923c" style="left:20px;top:146px;width:122px;height:40px"></div>
+        <div class="bubble-sm">Pull request 12 is open.</div></div>
+    </div>
+    <div class="label"><span class="icon blue" data-icon="phone" data-size="32"></span>On the go</div>
+    <div class="desc">On a walk, at the gym,<br>between two meetings.</div>
   </div>
-</section>
+</div></section>
 
-<section id="dialog">
+<section id="dialog"><div class="stage">
+  <div class="brand"><i></i>cc-voice-gateway</div>
+  <div class="chapter"><b style="background:var(--orange)">01</b>Hands-free</div>
   <div class="talk">
-    <div class="bubble you" data-b="0"><div class="who">You</div><div class="says">Why did the build fail on main?</div></div>
-    <div class="bubble claude" data-b="1"><div class="who">Claude</div><div class="says">A date test assumes UTC.<br>Shall I fix it?</div></div>
-    <div class="bubble you" data-b="1"><div class="who">You</div><div class="says">Yes. Fix it and run the tests.</div></div>
-    <div class="bubble claude" data-b="3"><div class="who">Claude</div><div class="says">Pull request 12 is open.<br>All 128 tests pass.</div></div>
+    <div class="bubble you" data-in="0" data-fx="left"><div class="who">You</div><div class="says">Why did the build fail on main?</div></div>
+    <div class="bubble claude" data-in="0" data-d="62%" data-fx="left"><div class="who">Claude</div><div class="says">A date test assumes UTC.<br>Shall I fix it?</div></div>
+    <div class="bubble you" data-in="1" data-fx="left"><div class="who">You</div><div class="says">Yes. Fix it and run the tests.</div></div>
+    <div class="bubble claude" data-in="2" data-d="55%" data-fx="left"><div class="who">Claude</div><div class="says">Pull request 12 is open.<br>All 128 tests pass.</div></div>
   </div>
-  <div class="worker" data-b="2">
-    <div class="head">Worker · Claude Code in your repository</div>
-    <div>git switch -c <span class="hl">voice/fix-date-test</span></div>
-    <div>edit test/dates.test.mjs</div>
-    <div>npm test <span class="ok">✓ 128 passed</span></div>
-    <div>git commit <span class="hl">"Fix the date test"</span></div>
-    <div>pull request <span class="hl">#12</span> opened <span class="ok">✓</span></div>
-  </div>
-</section>
-
-<section id="review">
-  <h2 class="center" data-b="0">Changes stay reviewable.</h2>
-  <div class="pr" data-b="0">
-    <div class="t">Fix the date test for time zones <span>#12</span></div>
-    <div class="branch">voice/fix-date-test → main</div>
-    <div class="commits" data-b="1">
-      <div class="row"><span class="sha">3f2a9c1</span>Make the date test independent of the time zone</div>
-      <div class="row"><span class="sha">8b41e07</span>Run the tests in UTC and in Europe/Zurich</div>
-    </div>
-    <div class="checks" data-b="2">
-      <div class="row"><span class="dot" style="background:rgba(74,222,128,.16);color:#4ade80">✓</span>All checks passed</div>
-      <div class="row"><span class="dot" style="background:rgba(167,139,250,.18);color:#a78bfa">✓</span>Reviewed by Claude: no issues found</div>
-      <div class="row"><span class="dot" style="background:rgba(251,191,36,.16);color:#fbbf24">?</span>Merge waits for your spoken yes</div>
+  <div class="card term" data-in="1" data-d="20%" data-fx="right">
+    <div class="head"><span data-icon="terminal" data-size="30"></span>Worker · alpha
+      <span class="state" id="termstate" style="background:rgba(96,165,250,.14);color:#93c5fd">running</span></div>
+    <div class="body">
+      <div data-in="1" data-d="35%" data-fx="fade" data-dur=".15"><span class="p">$ </span><span data-in="1" data-d="35%" data-fx="type">git switch -c voice/fix-date-test</span></div>
+      <div data-in="1" data-d="58%" data-fx="fade"><span class="p">✎ </span>test/dates.test.mjs</div>
+      <div data-in="1" data-d="70%" data-fx="fade" data-dur=".15"><span class="p">$ </span><span data-in="1" data-d="70%" data-fx="type">npm test</span> <span class="ok" data-in="1" data-d="92%" data-fx="fade">✓ 128 passed</span></div>
+      <div data-in="2" data-d="0%" data-fx="fade" data-dur=".15"><span class="p">$ </span><span data-in="2" data-d="0%" data-fx="type">git commit -m "Fix the date test"</span></div>
+      <div data-in="2" data-d="22%" data-fx="fade" data-dur=".15"><span class="p">$ </span><span data-in="2" data-d="22%" data-fx="type">gh pr create</span> <span class="hl" data-in="2" data-d="45%" data-fx="fade">#12</span> <span class="ok" data-in="2" data-d="45%" data-fx="fade">✓</span></div>
     </div>
   </div>
-</section>
+</div></section>
 
-<section id="road">
-  <h2 class="center">Made for voice.</h2>
-  <div class="tile t1" data-b="0">
-    <div class="icon" style="background:rgba(251,146,60,.14)"><svg width="56" height="48" viewBox="0 0 56 48"><g fill="#fb923c"><rect x="0" y="18" width="7" height="12" rx="3.5"/><rect x="12" y="9" width="7" height="30" rx="3.5"/><rect x="24" y="0" width="7" height="48" rx="3.5"/><rect x="36" y="11" width="7" height="26" rx="3.5"/><rect x="48" y="18" width="7" height="12" rx="3.5"/></g></svg></div>
-    <div class="title">Voice only</div>
-    <div class="desc">Short answers.<br>Nothing to read.</div>
+<section id="layers"><div class="stage">
+  <div class="brand"><i></i>cc-voice-gateway</div>
+  <div class="chapter"><b style="background:var(--purple)">02</b>Orchestration</div>
+  <h2 class="title" data-in="0" style="top:140px">Three layers of AI. <span class="grad">One conversation.</span></h2>
+  <div class="card layer orange c1" data-in="1" data-fx="up">
+    <div class="top"><span class="icon orange" data-icon="wave" data-size="42"></span><div><div class="kicker" style="color:var(--orange)">Layer 1</div><div class="name">Voice AI</div></div></div>
+    <div class="where">Claude voice mode, in the Claude app</div>
+    <ul><li>Listens, in any language</li><li>Hands off your request</li><li>Reads the answer aloud</li></ul>
   </div>
-  <div class="tile t2" data-b="1">
-    <div class="icon" style="background:rgba(74,222,128,.14)"><svg width="52" height="40" viewBox="0 0 52 40"><path d="M4 21 L18 34 L48 5" fill="none" stroke="#4ade80" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
-    <div class="title">Approvals by voice</div>
-    <div class="desc">Claude Code asks.<br>You say yes or no.</div>
+  <div class="link l1" data-in="2" data-fx="fade">
+    <div class="lbl" style="top:-6px">request</div>
+    <div class="rail" style="top:30px;background:var(--orange)"></div>
+    <div class="pulses" data-speed=".55" data-n="2" data-color="#fdba74" style="left:0;width:170px;top:22px"></div>
+    <div class="rail" style="top:58px;background:var(--purple)"></div>
+    <div class="pulses" data-speed=".42" data-n="2" data-dir="-1" data-color="#c4b5fd" style="left:0;width:170px;top:50px"></div>
+    <div class="lbl" style="top:78px">answer</div>
   </div>
-  <div class="tile t3" data-b="2">
-    <div class="icon" style="background:rgba(248,113,113,.16)"><svg width="46" height="54" viewBox="0 0 46 54"><path d="M11 24 V15 a12 12 0 0 1 24 0 V24" fill="none" stroke="#f87171" stroke-width="6"/><rect x="3" y="24" width="40" height="28" rx="7" fill="#f87171"/></svg></div>
-    <div class="title">Emergency stop</div>
-    <div class="desc">One phrase locks<br>everything at once.</div>
+  <div class="card layer purple c2" data-in="2" data-fx="up">
+    <div class="top"><span class="icon purple" data-icon="cpu" data-size="42"></span><div><div class="kicker" style="color:var(--purple)">Layer 2</div><div class="name">Controller</div></div></div>
+    <div class="where">Claude Code, on your computer</div>
+    <ul><li>Keeps the context</li><li>Dispatches and steers the workers</li><li>Sums up their results</li></ul>
   </div>
-  <div class="fine center">Keep your eyes on the road. Use it only where it is safe and legal.</div>
-</section>
+  <div class="link l2" data-in="3" data-fx="fade">
+    <div class="lbl" style="top:-6px">task</div>
+    <div class="rail" style="top:30px;background:var(--purple)"></div>
+    <div class="pulses" data-speed=".55" data-n="2" data-color="#c4b5fd" style="left:0;width:170px;top:22px"></div>
+    <div class="rail" style="top:58px;background:var(--blue)"></div>
+    <div class="pulses" data-speed=".42" data-n="2" data-dir="-1" data-color="#93c5fd" style="left:0;width:170px;top:50px"></div>
+    <div class="lbl" style="top:78px">result</div>
+  </div>
+  <div class="card layer blue c3" data-in="3" data-fx="up">
+    <div class="top"><span class="icon blue" data-icon="terminal" data-size="42"></span><div><div class="kicker" style="color:var(--blue)">Layer 3</div><div class="name">Workers</div></div></div>
+    <div class="where">Claude Code runs, in your repositories</div>
+    <ul><li>Change code, run the tests</li><li>Commit and open pull requests</li><li>Report back when done</li></ul>
+    <div class="workers"><span>alpha</span><span>beta</span><span>work folder</span></div>
+  </div>
+</div></section>
 
-<section id="away">
-  <div class="text">
-    <h1>For time away<br>from your desk.</h1>
-    <p class="sub" data-b="1">Like a commute,<br>with your eyes on the road.</p>
+<section id="parallel"><div class="stage">
+  <div class="brand"><i></i>cc-voice-gateway</div>
+  <div class="chapter"><b style="background:var(--blue)">03</b>Parallel workers</div>
+  <h2 class="title" data-in="0" style="top:140px">Several workers. <span class="grad">At the same time.</span></h2>
+  <div class="card board" data-in="0" data-d=".3">
+    <div class="bhead"><span data-icon="terminal" data-size="30" style="color:var(--blue)"></span>Workers
+      <div class="stat"><span id="runs" style="color:#93c5fd">1 running</span><span id="queued" style="color:#fcd34d">0 queued</span></div></div>
+    <div class="lane" data-lane="0" data-in="0" data-d=".6" data-len="7.5">
+      <span class="icon blue" data-icon="branch" data-size="30"></span>
+      <div class="who">alpha<small>repository · this computer</small></div>
+      <div class="task">Fix the date test</div>
+      <div class="track"><div class="fill" style="background:var(--blue)"></div></div>
+      <div class="status" data-done="PR #12 ✓">running</div>
+    </div>
+    <div class="lane" data-lane="1" data-in="1" data-d="15%" data-len="8">
+      <span class="icon purple" data-icon="branch" data-size="30"></span>
+      <div class="who">alpha · 2<small>its own git worktree</small></div>
+      <div class="task">Update the changelog</div>
+      <div class="track"><div class="fill" style="background:var(--purple)"></div></div>
+      <div class="status" data-done="PR #13 ✓">running</div>
+    </div>
+    <div class="lane" data-lane="2" data-in="1" data-d="55%" data-len="9">
+      <span class="icon blue" data-icon="branch" data-size="30"></span>
+      <div class="who">beta<small>repository · this computer</small></div>
+      <div class="task">Add the API docs</div>
+      <div class="track"><div class="fill" style="background:var(--blue)"></div></div>
+      <div class="status" data-done="PR #4 ✓">running</div>
+    </div>
+    <div class="lane" data-lane="3" data-in="2" data-d="10%" data-len="6.5">
+      <span class="icon amber" data-icon="folder" data-size="30"></span>
+      <div class="who">work folder<small>no repository</small></div>
+      <div class="task">Compare three phone plans</div>
+      <div class="track"><div class="fill" style="background:var(--amber)"></div></div>
+      <div class="status" data-done="table ready ✓">running</div>
+    </div>
+    <div class="lane" data-lane="4" data-in="3" data-d="5%" data-len="20" style="border-bottom:0">
+      <span class="icon green" data-icon="box" data-size="30"></span>
+      <div class="who">gamma<small>Docker container · level pr</small></div>
+      <div class="task">Upgrade the dependencies</div>
+      <div class="track"><div class="fill" style="background:var(--green)"></div></div>
+      <div class="status" data-done="PR #31 ✓">running</div>
+    </div>
   </div>
-  <svg id="traffic" width="860" height="700" viewBox="0 0 860 700"></svg>
-</section>
+</div></section>
 
-<section id="end">
-  <div class="mark center"><i></i>cc-voice-gateway</div>
-  <div class="tag center">Claude Code from Claude's voice mode</div>
-  <div class="url">github.com/alderg/cc-voice-gateway</div>
-  <div class="notice center">A prototype, provided as-is. No support, no announcements.<br>Not an Anthropic product.</div>
-</section>
+<section id="back"><div class="stage">
+  <div class="brand"><i></i>cc-voice-gateway</div>
+  <div class="chapter"><b style="background:var(--green)">04</b>It comes back to you</div>
+  <div class="card phonebig" data-in="0" data-fx="left">
+    <div class="notch"></div><div class="mode">Voice mode</div>
+    <div class="orb" data-orb="1"></div>
+    <div class="wave" data-n="20" data-gap="6" data-bw="8" data-color="#fb923c" style="left:40px;top:350px;width:288px;height:80px"></div>
+    <div class="said" data-in="0" data-d="30%" data-fx="fade">“News from alpha: pull request 12 passed all checks.”</div>
+  </div>
+  <h2 class="title" data-in="0">Nothing gets lost <span class="grad">after you hang up.</span></h2>
+  <div class="note orange" style="top:320px" data-in="0" data-d="45%" data-fx="right">
+    <span class="icon orange" data-icon="speaker" data-size="36"></span>
+    <div><div class="src">Spoken news · in your next answer</div><div class="msg">alpha: pull request 12 is open. All checks passed.</div></div>
+  </div>
+  <div class="note tg" style="top:480px" data-in="1" data-d="25%" data-fx="right">
+    <span class="icon tg" data-icon="send" data-size="34"></span>
+    <div><div class="src">Telegram · after the call</div><div class="msg">beta asks: open the pull request as a draft?</div></div>
+  </div>
+  <div class="note green" style="top:640px;width:530px" data-in="2" data-d="10%" data-fx="right">
+    <span class="icon green" data-icon="check" data-size="36"></span>
+    <div><div class="src">Pull request #12</div><div class="msg">All checks passed</div></div>
+  </div>
+  <div class="note purple" style="top:640px;left:1270px;width:530px" data-in="2" data-d="45%" data-fx="right">
+    <span class="icon purple" data-icon="review" data-size="36"></span>
+    <div><div class="src">2 review comments</div><div class="msg">Fixed and pushed</div></div>
+  </div>
+</div></section>
 
-<div class="play" id="play"><svg width="60" height="70" viewBox="0 0 72 84"><path d="M4 6 L68 42 L4 78 Z" fill="#f8fafc" stroke="#f8fafc" stroke-width="6" stroke-linejoin="round"/></svg></div>
+<section id="safe"><div class="stage">
+  <div class="brand"><i></i>cc-voice-gateway</div>
+  <div class="chapter"><b style="background:var(--red)">05</b>Safe by design</div>
+  <h2 class="title" data-in="0">Safe <span class="grad">by design.</span></h2>
+  <div class="rule" style="top:300px" data-in="1" data-fx="left"><span class="icon purple" data-icon="pr" data-size="36"></span>Every change on a branch, as a pull request</div>
+  <div class="rule" style="top:400px" data-in="1" data-d="55%" data-fx="left"><span class="icon amber" data-icon="check" data-size="36"></span>A merge needs your yes, twice</div>
+  <div class="rule" style="top:500px" data-in="2" data-fx="left"><span class="icon orange" data-icon="mic" data-size="36"></span>Workers start only on your spoken words</div>
+  <div class="rule" style="top:600px" data-in="2" data-d="50%" data-fx="left"><span class="icon green" data-icon="box" data-size="36"></span>Docker containers with scoped GitHub tokens</div>
+  <div class="rule" style="top:700px" data-in="2" data-d="85%" data-fx="left"><span class="icon blue" data-icon="key" data-size="36"></span>Sign-in only with a code from your computer</div>
+  <div class="card stop" data-in="3" data-fx="pop">
+    <div class="ring" data-ring="0"></div><div class="ring" data-ring="1"></div>
+    <div class="btn">STOP</div>
+    <div class="t">“Emergency stop”</div>
+    <div class="d">Every worker stops at once.<br>Unlocked only at your computer.</div>
+  </div>
+</div></section>
+
+<section id="end"><div class="stage">
+  <div class="wave" data-n="40" data-gap="9" data-bw="10" style="left:560px;top:150px;width:800px;height:140px"></div>
+  <div class="mark" data-in="0" data-fx="up"><i></i>cc-voice-gateway</div>
+  <div class="tagline" data-in="0" data-d=".3" data-fx="up">Claude Code, <span class="grad">hands-free.</span></div>
+  <div class="url" data-in="0" data-d=".8" data-fx="fade">github.com/alderg/cc-voice-gateway</div>
+  <div class="notice center" data-in="0" data-d="1.4" data-fx="fade">Open source · Apache 2.0 · A prototype, provided as-is, without support.<br>Not an Anthropic product.</div>
+</div></section>
+
+<div class="play" id="play"><svg width="56" height="64" viewBox="0 0 72 84"><path d="M4 6 L68 42 L4 78 Z" fill="#f8fafc" stroke="#f8fafc" stroke-width="6" stroke-linejoin="round"/></svg></div>
 <div class="caption" id="caption"></div>
-<div class="progress" id="progress"></div>
+<div class="progress"><i id="progress"></i></div>
 
 <script>
-  // Traffic: rows of cars in three lanes, smaller towards the horizon.
-  const road = document.getElementById('traffic')
-  const ns = 'http://www.w3.org/2000/svg'
-  const add = (name, attrs) => {
-    const el = document.createElementNS(ns, name)
-    for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v)
-    road.appendChild(el)
-    return el
+  const ICONS = {
+    wave: '<g fill="currentColor" stroke="none"><rect x="2" y="9" width="2.6" height="6" rx="1.3"/><rect x="6.4" y="5.5" width="2.6" height="13" rx="1.3"/><rect x="10.7" y="2" width="2.6" height="20" rx="1.3"/><rect x="15" y="6" width="2.6" height="12" rx="1.3"/><rect x="19.4" y="9.5" width="2.6" height="5" rx="1.3"/></g>',
+    gateway: '<circle cx="5" cy="12" r="2.8"/><circle cx="19" cy="12" r="2.8"/><path d="M7.8 12h8.4"/><path d="M12 4v4M12 16v4" opacity=".5"/>',
+    terminal: '<path d="M4 6.5l5.5 5.5L4 17.5"/><path d="M12 18h8"/>',
+    check: '<path d="M4.5 12.5l5 5L19.5 7"/>',
+    key: '<circle cx="8" cy="15" r="4"/><path d="M11 12l8.5-8.5M16.5 6.5l3 3M14 9l2 2"/>',
+    branch: '<circle cx="6" cy="5.5" r="2.2"/><circle cx="6" cy="18.5" r="2.2"/><circle cx="18" cy="7.5" r="2.2"/><path d="M6 7.7v8.6"/><path d="M18 9.7v.8a4 4 0 0 1-4 4H9.5A3.5 3.5 0 0 0 6 18"/>',
+    pr: '<circle cx="6" cy="6" r="2.2"/><circle cx="6" cy="18" r="2.2"/><circle cx="18" cy="18" r="2.2"/><path d="M6 8.2v7.6"/><path d="M18 15.8V9.5A3.5 3.5 0 0 0 14.5 6H11"/><path d="M13.2 3.6L10.8 6l2.4 2.4"/>',
+    send: '<path d="M21 3L10.5 13.5"/><path d="M21 3l-6.5 18-4-7.5L3 9.5z"/>',
+    folder: '<path d="M3 7.5A2.5 2.5 0 0 1 5.5 5h3.7l2.3 2.3h7A2.5 2.5 0 0 1 21 9.8v7.7a2.5 2.5 0 0 1-2.5 2.5h-13A2.5 2.5 0 0 1 3 17.5z"/>',
+    box: '<path d="M12 2.8l8 4.4v9.6l-8 4.4-8-4.4V7.2z"/><path d="M4 7.2l8 4.4 8-4.4"/><path d="M12 11.6v9.6"/>',
+    car: '<path d="M3.5 13.5l1.8-5.2A2.5 2.5 0 0 1 7.7 6.6h8.6a2.5 2.5 0 0 1 2.4 1.7l1.8 5.2v4.5a1 1 0 0 1-1 1h-1.8a1 1 0 0 1-1-1V17H7.3v1a1 1 0 0 1-1 1H4.5a1 1 0 0 1-1-1z"/><path d="M3.5 13.5h17"/><circle cx="7.5" cy="15.2" r=".6"/><circle cx="16.5" cy="15.2" r=".6"/>',
+    monitor: '<rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8.5 20h7M12 16v4"/>',
+    phone: '<rect x="7" y="2.5" width="10" height="19" rx="2.5"/><path d="M11 18.5h2"/>',
+    speaker: '<path d="M4 9.5h3.5L13 5v14l-5.5-4.5H4z"/><path d="M16.5 9a4.5 4.5 0 0 1 0 6M19 6.5a8 8 0 0 1 0 11"/>',
+    mic: '<rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21"/>',
+    review: '<path d="M4 5h16v11H9.5L5 20z" /><path d="M8.5 10.5l2 2 4.5-4.5"/>',
+    cpu: '<rect x="6" y="6" width="12" height="12" rx="2.5"/><path d="M9.5 2.5V6M14.5 2.5V6M9.5 18v3.5M14.5 18v3.5M2.5 9.5H6M2.5 14.5H6M18 9.5h3.5M18 14.5h3.5"/><circle cx="12" cy="12" r="2" fill="currentColor" stroke="none"/>',
   }
-  const W = 860, H = 700, horizon = 120, vx = 430
-  add('polygon', { points: `${vx - 30},${horizon} ${vx + 30},${horizon} ${W},${H} 0,${H}`, fill: '#111a33' })
-  for (const f of [-1 / 3, 1 / 3]) {
-    for (let i = 0; i < 9; i++) {
-      const t0 = i / 9 + 0.02, t1 = t0 + 0.05
-      const y = t => horizon + (H - horizon) * t * t
-      const x = t => vx + f * (30 + (W / 2 - 30) * t * t) * 1
-      add('line', { x1: x(t0), y1: y(t0), x2: x(t1), y2: y(t1), stroke: '#334155', 'stroke-width': 2 + 6 * t1, 'stroke-linecap': 'round' })
-    }
+  for (const el of document.querySelectorAll('[data-icon]')) {
+    const s = el.dataset.size || 24
+    el.innerHTML = `<svg class="i" width="${s}" height="${s}" viewBox="0 0 24 24" style="stroke-width:${el.dataset.stroke || 2}">${ICONS[el.dataset.icon]}</svg>`
   }
-  const rows = [0.18, 0.3, 0.44, 0.6, 0.78, 0.98]
-  for (const r of rows) {
-    const y = horizon + (H - horizon) * r * r
-    const half = 30 + (W / 2 - 30) * r * r
-    for (const lane of [-2 / 3, 0, 2 / 3]) {
-      const cx = vx + lane * half
-      const w = 26 + 150 * r * r, h = w * 0.55
-      add('rect', { x: cx - w / 2, y: y - h, width: w, height: h, rx: w * 0.14, fill: '#1e293b', stroke: '#2b3a55', 'stroke-width': 1 })
-      for (const side of [-1, 1]) {
-        const lx = cx + side * w * 0.34, ly = y - h * 0.38, lr = Math.max(2, w * 0.06)
-        add('circle', { cx: lx, cy: ly, r: lr * 2.6, fill: 'rgba(239,68,68,.18)' })
-        add('circle', { cx: lx, cy: ly, r: lr, fill: '#ef4444' })
-      }
+
+  const clamp = x => Math.max(0, Math.min(1, x))
+  const easeOut = p => 1 - Math.pow(1 - clamp(p), 3)
+  const smooth = p => { p = clamp(p); return p * p * (3 - 2 * p) }
+  const hex = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16))
+  const mix = (a, b, p) => a.map((v, i) => Math.round(v + (b[i] - v) * p))
+  const STOPS = ['#fb923c', '#a78bfa', '#60a5fa'].map(hex)
+  const gradAt = p => (p < .5 ? mix(STOPS[0], STOPS[1], p * 2) : mix(STOPS[1], STOPS[2], p * 2 - 1))
+
+  const TL = { total: 0, fps: 30, scenes: [], levels: null }
+  const scenes = {}
+
+  function prepare() {
+    for (const section of document.querySelectorAll('section')) {
+      const anims = [...section.querySelectorAll('[data-in]')].map(el => {
+        if (el.dataset.fx === 'type') {
+          el.dataset.text = el.textContent
+          el.innerHTML = '<span></span><span style="opacity:0"></span>'
+        }
+        return el
+      })
+      const waves = [...section.querySelectorAll('.wave')].map(el => {
+        const n = Number(el.dataset.n), bw = Number(el.dataset.bw), gap = Number(el.dataset.gap)
+        el.style.gap = gap + 'px'
+        const bars = []
+        for (let i = 0; i < n; i++) {
+          const b = document.createElement('i')
+          b.style.width = bw + 'px'
+          b.style.background = el.dataset.color || `rgb(${gradAt(n === 1 ? 0 : i / (n - 1)).join(',')})`
+          el.appendChild(b)
+          bars.push(b)
+        }
+        return { el, bars, n, bw, h: el.offsetHeight || parseFloat(el.style.height) }
+      })
+      const pulses = [...section.querySelectorAll('.pulses')].map(el => {
+        const dots = []
+        for (let i = 0; i < Number(el.dataset.n || 3); i++) {
+          const d = document.createElement('i')
+          d.style.background = el.dataset.color || '#fff'
+          d.style.boxShadow = `0 0 18px ${el.dataset.color || '#fff'}`
+          el.appendChild(d)
+          dots.push(d)
+        }
+        return { el, dots, speed: Number(el.dataset.speed || .5), dir: Number(el.dataset.dir || 1) }
+      })
+      scenes[section.id] = { section, stage: section.querySelector('.stage'), anims, waves, pulses }
     }
   }
 
-  // Which scene, how far built, the caption and the progress.
-  const params = new URLSearchParams(location.hash.slice(1))
-  const scene = params.get('s') || 'intro'
-  const step = Number(params.get('b') || 0)
-  for (const section of document.querySelectorAll('section')) section.classList.toggle('on', section.id === scene)
-  for (const el of document.querySelectorAll(`#${scene} [data-b]`)) {
-    el.classList.toggle('hidden', Number(el.dataset.b) > step)
+  // The voice's loudness at time t, 0..1: from the voiceover when the build passes it, otherwise a guess.
+  function level(t) {
+    if (TL.levels && TL.levels.length) {
+      const f = t * TL.fps, i = Math.floor(f), a = TL.levels[i] || 0, b = TL.levels[i + 1] || 0
+      return a + (b - a) * (f - i)
+    }
+    return .45 + .35 * Math.sin(t * 2.1) * Math.sin(t * 0.7)
   }
-  const caption = params.get('c') || ''
-  const box = document.getElementById('caption')
-  box.textContent = caption
-  box.style.display = caption ? '' : 'none'
-  document.getElementById('progress').style.width = `${Number(params.get('p') || 0) * 100}%`
-  document.getElementById('brand').style.display = ['intro', 'end'].includes(scene) ? 'none' : ''
-  document.getElementById('play').style.display = params.get('play') ? 'grid' : 'none'
+
+  function lineTime(scene, idx, delay) {
+    const line = scene.lines[Math.min(idx, scene.lines.length - 1)]
+    if (!line) return scene.start
+    let d = 0
+    if (delay) d = delay.endsWith('%') ? (parseFloat(delay) / 100) * (line.end - line.voice) : parseFloat(delay)
+    return line.start + d
+  }
+
+  function animate(el, s, t) {
+    const at = lineTime(s, Number(el.dataset.in), el.dataset.d)
+    const fx = el.dataset.fx || 'up'
+    const dur = Number(el.dataset.dur || (fx === 'type' ? Math.max(.35, el.dataset.text.length * .035) : .6))
+    let p = (t - at) / dur
+    if (el.dataset.out !== undefined) {
+      const out = lineTime(s, Number(el.dataset.out), el.dataset.od)
+      const q = clamp((t - out) / .3)
+      if (q > 0) {
+        el.style.opacity = el.dataset.outfx === 'dim' ? 1 - .65 * q : 1 - q
+        return
+      }
+    }
+    if (fx === 'type') {
+      const n = Math.round(el.dataset.text.length * clamp(p))
+      el.firstChild.textContent = el.dataset.text.slice(0, n)
+      el.lastChild.textContent = el.dataset.text.slice(n)
+      el.style.opacity = p > 0 ? 1 : 0
+      return
+    }
+    const e = easeOut(p)
+    el.style.opacity = clamp(p * 1.6)
+    if (fx === 'up') el.style.transform = `translateY(${(1 - e) * 46}px)`
+    else if (fx === 'left') el.style.transform = `translateX(${-(1 - e) * 70}px)`
+    else if (fx === 'right') el.style.transform = `translateX(${(1 - e) * 70}px)`
+    else if (fx === 'pop') el.style.transform = `scale(${.82 + .18 * e})`
+    else if (fx === 'wipe') { el.style.opacity = p > 0 ? 1 : 0; el.style.clipPath = `inset(0 ${(1 - e) * 100}% 0 0)` }
+  }
+
+  function wave(w, t, lv, seed) {
+    const c = (w.n - 1) / 2
+    for (let i = 0; i < w.n; i++) {
+      const shape = Math.exp(-Math.pow((i - c) / (w.n * .34), 2))
+      const n1 = .55 + .45 * Math.sin(t * 9.1 + i * 1.37 + seed) * Math.sin(t * 5.3 + i * .71 + seed * 2)
+      const n2 = .5 + .5 * Math.sin(t * 13.7 + i * 2.3)
+      const amp = .16 + .84 * lv
+      const h = Math.max(w.bw, w.h * shape * amp * (.35 + .65 * Math.abs(n1)) * (.8 + .2 * n2))
+      w.bars[i].style.height = h.toFixed(1) + 'px'
+    }
+  }
+
+  const ticks = {
+    anywhere(lt, s, t) {
+      const c = document.getElementById('cursor')
+      c.style.left = (300 + 60 * Math.sin(t * .8) + 20 * Math.sin(t * 2.1)) + 'px'
+      c.style.top = (110 + 34 * Math.sin(t * 1.1 + 1)) + 'px'
+    },
+    dialog(lt, s, t) {
+      const done = t > lineTime(s, 2, '45%')
+      const st = document.getElementById('termstate')
+      st.textContent = done ? 'done' : 'running'
+      st.style.background = done ? 'rgba(74,222,128,.14)' : 'rgba(96,165,250,.14)'
+      st.style.color = done ? '#86efac' : '#93c5fd'
+    },
+    parallel(lt, s, t) {
+      let running = 0, queued = 0
+      for (const lane of s.el.querySelectorAll('.lane')) {
+        const start = lineTime(s, Number(lane.dataset.in), lane.dataset.d) + .3
+        const len = Number(lane.dataset.len)
+        const p = clamp((t - start) / len)
+        const fill = lane.querySelector('.fill'), status = lane.querySelector('.status')
+        fill.style.width = (p * 100).toFixed(2) + '%'
+        if (t >= start && p < 1) running++
+        if (Number(lane.dataset.lane) === 4 && t < start && t > lineTime(s, 2, '60%')) queued++
+        const done = p >= 1
+        status.textContent = done ? status.dataset.done : t >= start ? 'running' : ''
+        status.classList.toggle('done', done)
+      }
+      document.getElementById('runs').textContent = `${Math.max(running, 0)} running`
+      document.getElementById('queued').textContent = `${queued} queued`
+    },
+    safe(lt, s, t) {
+      const at = lineTime(s, 3, '10%')
+      for (const r of s.el.querySelectorAll('[data-ring]')) {
+        const ph = ((t - at) / 1.8 + Number(r.dataset.ring) * .5) % 1
+        r.style.opacity = t < at ? 0 : (1 - ph) * .7
+        r.style.transform = `scale(${1 + ph * .55})`
+      }
+    },
+  }
+
+  let opts = {}
+  function render(t, o = {}) {
+    opts = o
+    const F = .7
+    TL.scenes.forEach((s, si) => {
+      const sc = scenes[s.id]
+      const a = si === 0 ? 1 : smooth((t - (s.start - F / 2)) / F)
+      const b = si === TL.scenes.length - 1 ? 1 : 1 - smooth((t - (s.end - F / 2)) / F)
+      const op = Math.min(a, b)
+      sc.section.style.display = op > 0.001 ? 'block' : 'none'
+      if (op <= 0.001) return
+      sc.section.style.opacity = op
+      const lt = t - s.start, dur = s.end - s.start
+      sc.stage.style.transform = `scale(${1 + .028 * clamp(lt / dur)})`
+      s.el = sc.section
+      for (const el of sc.anims) animate(el, s, t)
+      const lv = level(t)
+      sc.waves.forEach((w, i) => wave(w, t, lv, i * 1.9))
+      for (const orb of sc.section.querySelectorAll('[data-orb]')) orb.style.transform = `scale(${1 + .1 * lv})`
+      for (const p of sc.pulses) {
+        const W = p.el.offsetWidth
+        p.dots.forEach((d, k) => {
+          const f = ((t * p.speed + k / p.dots.length) % 1 + 1) % 1
+          const x = p.dir > 0 ? f : 1 - f
+          d.style.left = (x * W).toFixed(1) + 'px'
+          d.style.opacity = Math.sin(Math.PI * f).toFixed(3)
+        })
+      }
+      if (ticks[s.id]) ticks[s.id](lt, s, t)
+    })
+    // the background drifts slowly
+    const bx = Math.sin(t * .05), by = Math.cos(t * .043)
+    Object.assign(document.getElementById('b1').style, { left: `${700 + 260 * bx}px`, top: `${-520 + 120 * by}px` })
+    Object.assign(document.getElementById('b2').style, { left: `${-420 + 200 * by}px`, top: `${80 + 140 * bx}px` })
+    Object.assign(document.getElementById('b3').style, { left: `${1100 - 180 * by}px`, top: `${300 - 160 * bx}px` })
+    // the caption of the line being spoken
+    const box = document.getElementById('caption')
+    let text = '', cop = 0
+    if (o.captions !== false) {
+      for (const s of TL.scenes) {
+        if (s.captions === false) continue
+        for (const line of s.lines) {
+          if (t >= line.voice - .15 && t < line.end) {
+            text = line.caption
+            cop = Math.min(clamp((t - (line.voice - .15)) / .2), clamp((line.end - t) / .2))
+          }
+        }
+      }
+    }
+    box.textContent = text
+    box.style.display = text ? '' : 'none'
+    box.style.opacity = cop
+    document.getElementById('progress').style.width = `${clamp(t / TL.total) * 100}%`
+    document.getElementById('play').style.display = o.play ? 'grid' : 'none'
+    document.querySelector('.progress').style.display = o.play || o.bare ? 'none' : ''
+  }
+
+  window.setup = timeline => { Object.assign(TL, timeline) }
+  window.render = render
+  prepare()
+
+  // Opened on its own: a guessed timeline, #t=<seconds> for a still, #play to play it.
+  const GUESS = [['intro', 2], ['gap', 3], ['anywhere', 3], ['dialog', 3], ['layers', 4], ['parallel', 4], ['back', 3], ['safe', 4], ['end', 1]]
+  if (!window.__BUILD__) {
+    let at = .5
+    const guessed = GUESS.map(([id, n]) => {
+      const start = at
+      const lines = []
+      for (let i = 0; i < n; i++) { const l = { start: at, voice: at + .2, caption: `${id}, line ${i + 1}` }; at += 3.6; l.end = at - .4; lines.push(l) }
+      at += .8
+      return { id, start, lines, captions: id !== 'end' }
+    })
+    guessed.forEach((s, i) => { s.end = i + 1 < guessed.length ? guessed[i + 1].start : at + 3 })
+    setup({ total: at + 3, scenes: guessed })
+    const h = new URLSearchParams(location.hash.slice(1))
+    if (h.has('play')) { const t0 = performance.now(); const loop = () => { render((performance.now() - t0) / 1000); requestAnimationFrame(loop) }; loop() }
+    else render(Number(h.get('t') || 1))
+  }
 </script>
 </body>
 </html>

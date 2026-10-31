@@ -3,73 +3,83 @@
   "scenes": [
     {
       "id": "intro",
+      "hold": 0.6,
       "lines": [
-        {
-          "say": "This is C C voice gateway, a small prototype.",
-          "caption": "This is cc-voice-gateway, a small prototype.",
-          "build": 0
-        },
-        { "say": "You talk to Claude, and Claude Code does the work.", "build": 1 }
+        { "say": "This is C C voice gateway.", "caption": "This is cc-voice-gateway." },
+        { "say": "Claude Code, hands-free." }
       ]
     },
     {
       "id": "gap",
       "lines": [
-        { "say": "In the Claude app, voice mode talks with you.", "build": 0 },
-        { "say": "But it can't reach Claude Code on your computer.", "build": 1 }
+        { "say": "Claude's voice mode is great to talk with." },
+        { "say": "But it can't reach Claude Code on your computer." },
+        { "say": "The gateway connects the two." }
       ]
     },
     {
-      "id": "bridge",
+      "id": "anywhere",
       "lines": [
-        { "say": "The gateway connects the two of them.", "build": 0 },
-        { "say": "Voice mode calls it as a custom connector.", "build": 1 },
-        {
-          "say": "It hands each request to a Claude Code session on your computer, and brings the answer back.",
-          "build": 2
-        }
+        { "say": "Talk to your Claude Code sessions in the car, with CarPlay or Android Auto." },
+        { "say": "At your desk, while your hands keep working with mouse and keyboard." },
+        { "say": "Or on the go, right from your phone." }
       ]
     },
     {
       "id": "dialog",
       "lines": [
-        { "say": "You can ask why a build failed.", "build": 0 },
-        { "say": "Ask for a fix, and a worker makes the change and runs the tests.", "build": 1 },
-        { "say": "It commits on a branch and opens a pull request.", "build": 2 },
-        { "say": "Then you hear the result in a sentence or two.", "build": 3 }
+        { "say": "Ask why the build failed, and hear the answer in a sentence." },
+        { "say": "Ask for a fix, and a worker changes the code and runs the tests." },
+        { "say": "It opens a pull request, and tells you how it went." }
       ]
     },
     {
-      "id": "review",
+      "id": "layers",
+      "hold": 0.8,
       "lines": [
-        { "say": "The changes stay in git, as pull requests to review at your desk.", "build": 1 },
-        { "say": "A merge needs your yes.", "build": 2 }
+        { "say": "Behind the voice, three layers of AI work together." },
+        { "say": "Claude's voice mode listens, and hands off your request." },
+        { "say": "A controller on your computer keeps the context, steers the workers, and sums up their results." },
+        { "say": "The workers do the real work, right in your repositories." }
       ]
     },
     {
-      "id": "road",
+      "id": "parallel",
+      "hold": 1.0,
       "lines": [
-        { "say": "Answers are short, and there is nothing to read.", "build": 0 },
-        { "say": "Approvals happen by voice.", "build": 1 },
-        { "say": "And if you say emergency stop, everything locks.", "build": 2 }
+        { "say": "Several workers run at the same time." },
+        { "say": "Across repositories, and side by side in worktrees of their own." },
+        { "say": "Tasks without code get a work folder: research, a calculation, a draft." },
+        { "say": "On your computer, or in a Docker container of their own." }
       ]
     },
     {
-      "id": "away",
+      "id": "back",
+      "hold": 0.6,
       "lines": [
-        {
-          "say": "It is meant for time away from the desk, like a commute, with your eyes on the road.",
-          "build": 1
-        }
+        { "say": "Results come back to you as short, spoken news." },
+        { "say": "If a worker needs you after you hung up, the question reaches you on Telegram." },
+        { "say": "Checks and reviews on your pull requests are followed up, and review comments get fixed." }
+      ]
+    },
+    {
+      "id": "safe",
+      "hold": 0.8,
+      "lines": [
+        { "say": "And it's safe by design." },
+        { "say": "Every change lands as a pull request, and a merge needs your yes, twice." },
+        { "say": "Workers start only on your spoken words." },
+        { "say": "And emergency stop locks everything, until you unlock it at your computer." }
       ]
     },
     {
       "id": "end",
       "captions": false,
+      "hold": 3.5,
       "lines": [
         {
-          "say": "C C voice gateway is a prototype, provided as is. The code is on GitHub.",
-          "build": 0
+          "say": "C C voice gateway. Open source on GitHub, as a prototype, provided as is.",
+          "caption": "cc-voice-gateway. Open source on GitHub, as a prototype, provided as-is."
         }
       ]
     }

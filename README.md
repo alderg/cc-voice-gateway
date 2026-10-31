@@ -1,13 +1,22 @@
 # cc-voice-gateway
 
-Talk to Claude in the Claude app's voice mode, on the phone or in the car, and have a Claude Code
-session on your own computer do the work: answer questions about your repositories, change code,
-push branches, open and merge pull requests. Plain JavaScript (ESM, Node.js), no build step.
+**Claude Code, hands-free.** Talk to Claude in the Claude app's voice mode, in the car, on a walk
+or at your desk, and Claude Code sessions on your own computer do the work: answer questions about
+your repositories, change code, push branches, open, review and merge pull requests. Plain
+JavaScript (ESM, Node.js), no build step.
 
-This README is the technical documentation. The idea in a short video is on the
+This README is the technical documentation. What it is for, in a two-minute video, is on the
 [product page](https://alderg.github.io/cc-voice-gateway/).
 
-[![Video: cc-voice-gateway, Claude Code from Claude's voice mode](docs/assets/video-thumbnail.png)](https://alderg.github.io/cc-voice-gateway/#video)
+[![Video: cc-voice-gateway, Claude Code, hands-free](docs/assets/video-thumbnail.jpg)](https://alderg.github.io/cc-voice-gateway/#video)
+
+| | What it does | Details |
+|---|---|---|
+| **Hands-free** | Claude's voice mode, through a custom MCP connector, as the front end of Claude Code: in the car with CarPlay or Android Auto, on the phone, or at the desk next to mouse and keyboard. Answers are written to be heard; approvals by voice | [Overview](#1-overview), [voice commands](#84-voice-commands) |
+| **Three layers of AI** | The voice AI (Claude voice mode) hands each request to the controller, a Claude Code session on your computer reached through a channel. The controller keeps the context, dispatches workers (headless `claude -p` runs) and sums up their results. The gateway in between has no AI of its own | [Overview](#1-overview), [architecture](#41-architecture) |
+| **Parallel workers** | Several repositories at once, several runs per repository in git worktrees of their own, a queue that survives restarts, work folders for tasks without a repository; on this computer or in Docker | [Workers](#55-workers-on-this-computer-or-in-docker), [several runs](#several-runs-per-repository), [work folders](#work-folders) |
+| **It comes back to you** | Results as spoken news; questions and approvals on Telegram once the call has ended; pull requests watched, review comments fixed automatically; open items and reminders; the controller in the Claude app with Remote Control | [Telegram](#58-the-telegram-fallback), [open items](#84-voice-commands), [review fixes](#automatic-fixes-for-review-comments), [Remote Control](#remote-control-from-the-claude-app) |
+| **Safe by design** | Pull requests on `voice/` branches; a merge after your yes and an approval; workers only on your spoken words; Docker access levels set by the GitHub token; a confined controller; a kill switch in code; sign-in with a pairing code, `/mcp` only from Anthropic's addresses | [Security design](#5-security-design) |
 
 > [!WARNING]
 > **Driving comes first.** When you use this in the car, keep your full attention on the traffic,
@@ -2419,7 +2428,8 @@ docs/
   index.html         the product page (GitHub Pages, from this folder)
   macos.md           install and test on a Mac, step by step
   assets/            the video, its poster, the README thumbnail, the dark architecture diagram
-video/               the video's sources: script.json (voiceover), slides.html (frames), build.mjs
+video/               the video's sources: storyboard.md (the messages), script.json (voiceover),
+                     slides.html (animated scenes), tts.py, build.mjs
 ```
 
 ## 10. Sources
