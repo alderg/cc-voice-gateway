@@ -114,4 +114,6 @@ terminal.close()
 process.on('SIGINT', () => server.stop('ended with Ctrl+C'))
 process.on('SIGTERM', () => server.stop('ended'))
 await server.done
+// The line for a sign-in on this computer goes out of /etc/hosts again.
+await setup.close()
 process.exit(0)

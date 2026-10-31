@@ -9,11 +9,9 @@
 #   scripts/funnel.sh url      print the connector URL only
 #
 # The public port: FUNNEL_PORT, else VOICE_GW_FUNNEL_PORT (the settings file),
-# else 443. Funnel accepts only the HTTPS ports 443, 8443 and 10000. 443 is the
-# default; 8443 is for a computer where another web server, such as macOS's own
-# Apache, listens on 443 itself: a connection from this computer to its own
-# tailnet address on 443 reaches that server instead of the Funnel, so the
-# sign-in in a browser here would fail. The setup assistant then chooses 8443.
+# else 443. Funnel accepts only the HTTPS ports 443, 8443 and 10000. Keep 443
+# for claude.ai's connector: Funnel serves 8443 publicly, but the connector did
+# not connect to it in our test.
 #
 # The tailscale command: VOICE_GW_TAILSCALE_BIN, else tailscale on the PATH
 # (Linux, Homebrew, or the macOS app's "Install CLI"), else the macOS app's

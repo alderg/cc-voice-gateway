@@ -34,7 +34,8 @@
 // Review comments, fixed without asking (VOICE_GW_AUTO_FIX_REVIEWS, on by
 // default; autoFix): new inline comments, reviews that request changes or
 // say something, and comments, of the repository's owner, members and
-// collaborators or of a review bot (bots, VOICE_GW_REVIEW_BOTS), get a fix
+// collaborators or of a review bot (bots, VOICE_GW_REVIEW_BOTS, a listed
+// login only where GitHub says it is a bot account), get a fix
 // that the watcher queues itself (Workers.reviewFix): a task in the
 // gateway's words, naming the pull request and its branch, never what the
 // reviews say, as a follow-up of the run that pushed the pull request.
@@ -82,6 +83,9 @@ const sameLogin = (a, b) => Boolean(a && b) && login(a).toLowerCase() === login(
 const collaborator = association => COLLABORATORS.includes(String(association ?? '').toUpperCase())
 // Created after a time (ms), or of no known time.
 const since = (at, time) => !at || !time || !(Date.parse(time) < at)
+// Whether an author says whether it is a bot: the REST API's type, gh's
+// is_bot, GraphQL's __typename.
+const typed = author => ['type', 'is_bot', '__typename'].some(key => author?.[key] !== undefined)
 
 // A check run (GitHub Actions, apps) or a commit status (other CI).
 const isStatus = check => check.__typename === 'StatusContext' || (!('status' in check) && 'state' in check)
@@ -364,7 +368,7 @@ export class PullWatcher extends EventEmitter {
       }
     }
     // Review comments fixed without asking: a fix queued, or why not.
-    const asking = this.autoFix ? this.asking(entry, newReviews, inline, newComments) : []
+    const asking = this.autoFix ? await this.asking(entry, newReviews, inline, newComments) : []
     const fix = asking.length ? await this.fix(entry, pr, asking) : null
     if (fix) lines.push(fix.line)
 
@@ -396,25 +400,48 @@ export class PullWatcher extends EventEmitter {
   // Who asks for a fix, of the new reviews and comments: inline comments,
   // reviews that request changes or say something, and comments with a
   // text, of a collaborator or a review bot, made since the run that started
-  // the watch began. Their logins, once each.
-  asking(entry, reviews, inline, comments) {
+  // the watch began. Their logins, once each. gh names the authors of
+  // reviews and comments without saying whether they are bots; for a login
+  // on the list, the REST API says it (authors).
+  async asking(entry, reviews, inline, comments) {
+    const untyped = item => !collaborator(item.authorAssociation) && this.listed(item.author) && !typed(item.author)
+    const rest = {
+      reviews: reviews.some(untyped) ? await this.authors(`repos/${entry.slug}/pulls/${entry.number}/reviews?per_page=100`) : new Map(),
+      comments: comments.some(untyped) ? await this.authors(`repos/${entry.slug}/issues/${entry.number}/comments?per_page=100`) : new Map(),
+    }
+    const author = (item, found) => (untyped(item) ? (found.get(item.id) ?? null) : item.author)
     const counts = (author, association, time) => (collaborator(association) || this.isBot(author)) && since(entry.since, time)
     const said = text => String(text ?? '').trim() !== ''
     const who = [
       ...reviews
-        .filter(r => (r.state === 'CHANGES_REQUESTED' || (r.state === 'COMMENTED' && said(r.body))) && counts(r.author, r.authorAssociation, r.submittedAt))
+        .filter(r => r.state === 'CHANGES_REQUESTED' || (r.state === 'COMMENTED' && said(r.body)))
+        .filter(r => counts(author(r, rest.reviews), r.authorAssociation, r.submittedAt))
         .map(r => r.author?.login),
       ...inline.filter(c => counts(c.user, c.author_association, c.created_at)).map(c => c.user?.login),
-      ...comments.filter(c => said(c.body) && counts(c.author, c.authorAssociation, c.createdAt)).map(c => c.author?.login),
+      ...comments.filter(c => said(c.body) && counts(author(c, rest.comments), c.authorAssociation, c.createdAt)).map(c => c.author?.login),
     ]
     return [...new Set(who.map(name => login(name) || 'someone'))]
   }
 
-  // A review bot: its login on the list, unless GitHub says it is a person
-  // (type in the REST API, is_bot from gh, __typename in GraphQL).
+  // A login on the list of review bots.
+  listed(author) {
+    return this.bots.some(name => sameLogin(name, author?.login))
+  }
+
+  // A review bot: its login on the list, and GitHub says it is a bot (type
+  // in the REST API, is_bot from gh, __typename in GraphQL). Without that it
+  // is not: a person may have an account of that name.
   isBot(author) {
-    if (!author || author.type === 'User' || author.is_bot === false || author.__typename === 'User') return false
-    return this.bots.some(name => sameLogin(name, author.login))
+    const bot = author?.type === 'Bot' || author?.is_bot === true || author?.__typename === 'Bot'
+    return bot && this.listed(author)
+  }
+
+  // The authors of a pull request's reviews, or of its comments, as the REST
+  // API gives them, with their type, by the node id that gh gives as the id:
+  // node id -> { login, type }. Empty when gh does not answer.
+  async authors(path) {
+    const all = await this.json(['api', path])
+    return new Map((Array.isArray(all) ? all : []).filter(item => item?.node_id && item.user).map(item => [item.node_id, item.user]))
   }
 
   // A fix for those who ask (autoFix.queue, Workers.reviewFix), or why there

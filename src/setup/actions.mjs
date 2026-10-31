@@ -4,7 +4,10 @@
 // into .secrets: the secrets as files of their own, the settings as
 // gateway.env (src/settings.mjs), the folders mode 0700, the files 0600.
 // Once the gateway runs, it also shows the connector URL and pairing codes
-// for the sign-in, so that connecting the Claude app needs no second terminal.
+// for the sign-in, so that connecting the Claude app needs no second terminal,
+// and where a browser on this computer does not reach the gateway under the
+// connector URL, it can prepare that sign-in with a marked line in
+// /etc/hosts, which it removes again by itself (hosts.mjs).
 //
 // Secrets entered on the page stay in memory until then. Nothing here sends a
 // secret back to the browser, prints it, or logs it: the page only learns
@@ -15,6 +18,7 @@
 
 import { spawn } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
+import { Resolver } from 'node:dns/promises'
 import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir, hostname, platform as osPlatform } from 'node:os'
 import { dirname, isAbsolute, join } from 'node:path'
@@ -28,6 +32,7 @@ import { SETTINGS_FILE_NAME, formatSettings, readSettings } from '../settings.mj
 import { Telegram } from '../telegram.mjs'
 import { githubSlug } from '../workers.mjs'
 import { scratchProblem } from '../workspaces.mjs'
+import { asAdmin, hostsCommand, hostsLine, markedLines, signInCheck } from './hosts.mjs'
 import { MARKETPLACE, PLUGIN, channelMode } from '../../scripts/channel-mode.mjs'
 import { chromeNoticeSeen } from '../../scripts/chrome-onboarding.mjs'
 
@@ -69,6 +74,14 @@ export function webServerOn443(text, platform) {
     return { name: /^[\w.@+-]{1,40}$/.test(name ?? '') ? name : null }
   }
   return null
+}
+
+// A name's public addresses, from public resolvers, not MagicDNS: for the
+// tailnet name, the Funnel's relays (hosts.mjs). [] when none answers.
+export async function publicAddresses(host) {
+  const resolver = new Resolver({ timeout: 3000, tries: 1 })
+  resolver.setServers(['1.1.1.1', '8.8.8.8'])
+  return resolver.resolve4(host).catch(() => [])
 }
 
 // The settings the page sets, with their defaults (as in config.mjs and the
@@ -187,7 +200,9 @@ async function capture(command, args, options = {}) {
 }
 
 // options: root, secretsDir, env (for the bins and APIs), home, platform,
-// uid, gid, say (a line for the terminal), setupToken (kept out of all output)
+// uid, gid, say (a line for the terminal), setupToken (kept out of all
+// output), lookup (a name's public addresses) and probe (whether the
+// gateway answers a sign-in from this computer); tests use stand-ins for both
 export function createSetup({
   root,
   secretsDir = join(root, '.secrets'),
@@ -198,6 +213,8 @@ export function createSetup({
   gid = process.getgid(),
   say = () => {},
   setupToken = '',
+  lookup = publicAddresses,
+  probe = signInCheck,
 }) {
   // On macOS the checks, the commands and the LaunchAgent also look where
   // Homebrew, Claude Code's installer and Docker Desktop put their commands.
@@ -214,6 +231,9 @@ export function createSetup({
     plutil: env.VOICE_SETUP_PLUTIL_BIN || 'plutil',
     netstat: env.VOICE_SETUP_NETSTAT_BIN || 'netstat',
     ss: env.VOICE_SETUP_SS_BIN || 'ss',
+    osascript: env.VOICE_SETUP_OSASCRIPT_BIN || 'osascript',
+    pkexec: env.VOICE_SETUP_PKEXEC_BIN || 'pkexec',
+    sudo: env.VOICE_SETUP_SUDO_BIN || 'sudo',
     tailscale:
       env.VOICE_SETUP_TAILSCALE_BIN ||
       (platform === 'darwin' && !findCommand('tailscale', env.PATH) && existsSync(MAC_TAILSCALE) ? MAC_TAILSCALE : 'tailscale'),
@@ -222,6 +242,7 @@ export function createSetup({
   const githubApi = env.VOICE_GW_GITHUB_API || 'https://api.github.com'
   const reposPath = env.VOICE_GW_DOCKER_REPOS || '/repos'
   const settingsFile = join(secretsDir, SETTINGS_FILE_NAME)
+  const hostsFile = env.VOICE_SETUP_HOSTS_FILE || '/etc/hosts'
   const workerSecrets = join(secretsDir, 'worker')
   const files = {
     telegramToken: join(secretsDir, 'telegram_token'),
@@ -363,10 +384,6 @@ export function createSetup({
   async function state({ server }) {
     const current = readSettings(settingsFile)
     const settings = Object.fromEntries(Object.entries(FIELDS).map(([name, field]) => [name, current[name] ?? field.default]))
-    // Without a Funnel port in the file, 8443 while another web server has
-    // 443 here: written with the setup, unless changed on the page.
-    const web443 = await webServer443()
-    if (!current.VOICE_GW_FUNNEL_PORT && web443) settings.VOICE_GW_FUNNEL_PORT = '8443'
     const [list, git, watchdog, linger, loaded] = await Promise.all([
       checks(),
       Promise.all([output(bin.git, ['config', '--global', 'user.name']), output(bin.git, ['config', '--global', 'user.email'])]),
@@ -408,9 +425,6 @@ export function createSetup({
       // Claude Code's config: true, false, or null when it cannot tell. Read
       // only; the page warns unless it is true.
       chrome: { noticeSeen: chromeNoticeSeen({ env, home }) },
-      // Another web server on port 443 here: { name }, name null when not
-      // known, or null. Only its process name.
-      web443,
     }
   }
 
@@ -919,15 +933,11 @@ export function createSetup({
     'watchdog and by scripts/restart-everything.sh, waits for the development channel\'s confirmation at the terminal ' +
     '(tmux attach -t voice, then Enter); personal accounts (Pro, Max) have no allowlist, see "Known issues" in the README'
 
-  // The Funnel's port while another web server has 443 on this computer.
-  const funnelPortNote = (port, web443) => {
-    const server = `another web server on this computer${web443.name ? ` (${web443.name})` : ''} uses port 443`
-    return port === '443'
-      ? `the Funnel: ${server}, so a browser on this computer, the Claude app's sign-in too, reaches it instead of ` +
-          'the Funnel; choose port 8443 for the Funnel in section 2'
-      : `the Funnel: ${server}, so the Funnel uses port ${port}, and the connector URL ends in :${port}/mcp; that ` +
-          'server stays as it is'
-  }
+  // The Funnel on another port than 443, which claude.ai's connector did not
+  // connect to in our test.
+  const portNote = port =>
+    `the Funnel on port ${port}: Funnel serves it publicly, but claude.ai's connector did not connect to it in our ` +
+    'test; keep 443 for the connector'
 
   // What Claude in Chrome needs while the gateway runs, and its risk.
   const CHROME_DESKTOP =
@@ -965,6 +975,8 @@ export function createSetup({
     VOICE_GW_FUNNEL_PORT: port,
   })
   let pairing = null // the page's last code: { id, askedAt, expiresAt }
+  let unpreparedFor = null // the code whose sign-in took the line in /etc/hosts away again
+  let hostsBusy = null // a change of /etc/hosts going, with its password dialog
   let funnelSeen = null // { at, value }
   let funnelJob = null
   let listenSeen = null // { at, value }
@@ -980,21 +992,23 @@ export function createSetup({
   }
 
   // The Funnel's port, as funnel.sh takes it: FUNNEL_PORT or
-  // VOICE_GW_FUNNEL_PORT from outside, else the settings file's; without
-  // one, 8443 while another web server has 443 here, as the page suggests.
-  async function funnelPort() {
+  // VOICE_GW_FUNNEL_PORT from outside, else the settings file's, else 443.
+  // Never chosen by itself: claude.ai's connector connects on 443.
+  function funnelPort() {
     const chosen = env.FUNNEL_PORT || env.VOICE_GW_FUNNEL_PORT || readSettings(settingsFile).VOICE_GW_FUNNEL_PORT
-    return chosen || ((await webServer443()) ? '8443' : FIELDS.VOICE_GW_FUNNEL_PORT.default)
+    return chosen || FIELDS.VOICE_GW_FUNNEL_PORT.default
   }
 
-  // { state: 'on' | 'off' | null, url, port, web443 }: null when Tailscale is
-  // missing or does not answer; the URL only while the Funnel publishes the
-  // endpoint; web443, another web server on 443 here, for the page to say
-  // why the port is not 443.
+  // { state: 'on' | 'off' | null, url, port, signIn, web443 }: null when
+  // Tailscale is missing or does not answer; the URL only while the Funnel
+  // publishes the endpoint; signIn, while it does, whether the gateway
+  // answers a sign-in from a browser on this computer under that URL ({ ok }
+  // or { ok: false, why }, hosts.mjs); web443, another web server on 443
+  // here, for the page to name it when it does not.
   async function funnel() {
     const starting = jobs.get(funnelJob)?.state === 'running'
     if (funnelSeen && !starting && Date.now() - funnelSeen.at < FUNNEL_CACHE_MS) return funnelSeen.value
-    const port = await funnelPort()
+    const port = funnelPort()
     const said = await output('bash', [funnelScript, 'state'], { env: funnelEnv(port) })
     const words = said.text.split('\n').map(word => word.trim())
     const state = said.code !== 0 ? null : words.includes('on') ? 'on' : words.includes('off') ? 'off' : null
@@ -1003,7 +1017,9 @@ export function createSetup({
       const printed = (await output('bash', [funnelScript, 'url'], { env: funnelEnv(port) })).text.trim()
       url = /^https:\/\/[A-Za-z0-9.-]+(:\d{1,5})?\/mcp$/.test(printed) ? printed : null
     }
-    funnelSeen = { at: Date.now(), value: { state, url, port, web443: await webServer443() } }
+    const signIn = url ? await probe(url).catch(() => ({ ok: false, why: 'unreachable' })) : null
+    const web443 = signIn && !signIn.ok ? await webServer443() : null
+    funnelSeen = { at: Date.now(), value: { state, url, port, signIn, web443 } }
     return funnelSeen.value
   }
 
@@ -1045,11 +1061,19 @@ export function createSetup({
     if (answer.gateway) {
       answer.funnel = await funnel()
       answer.pairing = await pairingState()
+      // Signed in with the page's code: the line for the sign-in goes again.
+      if (answer.pairing?.state === 'used' && unpreparedFor !== pairing.askedAt) {
+        unpreparedFor = pairing.askedAt
+        if (!hostsBusy && markedLines(hostsFile).length) changeHosts(() => unprepare('the pairing code was used')).catch(() => {})
+      }
     } else {
       answer.tmux = await tmuxSession()
       answer.waiting = answer.tmux ? await waitingFor() : null
       answer.pairing = pairing ? { state: pairing.expiresAt > Date.now() ? 'unknown' : 'expired' } : null
     }
+    // The setup's lines in /etc/hosts for a sign-in here, also those of an
+    // assistant before this one: the page offers to remove them.
+    answer.prepared = markedLines(hostsFile).map(({ address, host }) => ({ address, host }))
     answer.remaining = server?.remaining ?? null
     return answer
   }
@@ -1073,9 +1097,64 @@ export function createSetup({
     return { code: made.code, expiresIn }
   }
 
+  // --- the sign-in on this computer: a marked line in /etc/hosts (hosts.mjs) ---
+
+  const asRoot = command =>
+    asAdmin(command, {
+      platform,
+      bin,
+      path: env.PATH,
+      run: (tool, args) => runCommand(tool, args, { env, onLine: line => say(`setup: ${redact(line)}`), timeoutMs: 5 * 60 * 1000 }),
+    })
+
+  // One change of the file at a time: each may wait for a password.
+  function changeHosts(work) {
+    if (hostsBusy) throw fail('/etc/hosts is being changed already; answer the password dialog first.', 409)
+    hostsBusy = work().finally(() => {
+      hostsBusy = null
+      funnelSeen = null // the check under the tailnet name again
+    })
+    return hostsBusy
+  }
+
+  // "Prepare the sign-in on this computer": the tailnet name to one of the
+  // Funnel's public addresses, in place of any line of the setup's from
+  // before; then the check again. { prepared, address, host, works } or,
+  // without administrator rights here, { prepared: false, command }.
+  async function prepareSignIn() {
+    funnelSeen = null
+    const { url } = await funnel()
+    if (!url) throw fail('Start the Funnel first: the line points at its public address.', 409)
+    const host = /^https:\/\/([^/:]+)/.exec(url)[1]
+    const address = (await lookup(host).catch(() => [])).find(ip => /^(\d{1,3}\.){3}\d{1,3}$/.test(ip))
+    if (!address) throw fail(`No public address for ${host} yet (dig +short ${host} @1.1.1.1); the Funnel may still be starting.`, 409)
+    return changeHosts(async () => {
+      const line = hostsLine(address, host)
+      const command = hostsCommand(hostsFile, { remove: markedLines(hostsFile).map(m => m.line), add: line, platform })
+      const done = await asRoot(command)
+      if (!done.ok) return { prepared: false, command: done.command }
+      say(`setup: /etc/hosts sends ${host} to ${address} for the sign-in (${done.how})`)
+      const check = await probe(url).catch(() => ({ ok: false, why: 'unreachable' }))
+      return { prepared: true, address, host, works: check.ok, why: check.why ?? null }
+    })
+  }
+
+  // Takes the setup's lines out of /etc/hosts again. { removed } or, without
+  // administrator rights here, { removed: 0, command }.
+  async function unprepare(why) {
+    const lines = markedLines(hostsFile)
+    if (!lines.length) return { removed: 0 }
+    const done = await asRoot(hostsCommand(hostsFile, { remove: lines.map(m => m.line), platform }))
+    if (!done.ok) return { removed: 0, command: done.command }
+    say(`setup: the line for the sign-in is out of /etc/hosts again (${why})`)
+    return { removed: lines.length }
+  }
+
+  const removeSignIn = () => changeHosts(() => unprepare('"Remove it now"'))
+
   async function funnelStart() {
     if (jobs.get(funnelJob)?.state === 'running') throw fail('The Funnel is being started already.', 409)
-    const port = await funnelPort()
+    const port = funnelPort()
     funnelJob = startJob(`starting the Funnel on port ${port}`, async line => {
       const code = await runCommand('bash', [funnelScript, 'start'], { env: funnelEnv(port), onLine: line, timeoutMs: 5 * 60 * 1000 })
       funnelSeen = null
@@ -1093,9 +1172,8 @@ export function createSetup({
       const settings = writeFiles({ values, docker, scratchDocker, telegramOn }, line)
       funnelSeen = null // section 10 asks again, with the port as written
       await liveNote(settings, line)
-      const web443 = await webServer443()
       const port = settings.after.VOICE_GW_FUNNEL_PORT ?? FIELDS.VOICE_GW_FUNNEL_PORT.default
-      if (web443) line(funnelPortNote(port, web443))
+      if (port !== FIELDS.VOICE_GW_FUNNEL_PORT.default) line(portNote(port))
       let ok = true
       if (docker) ok = (await setUpDocker(values, docker, line)) && ok
       if (scratchDocker) ok = (await setUpScratchDocker(values, line)) && ok
@@ -1148,6 +1226,12 @@ export function createSetup({
 
   return {
     redact,
+    // When the assistant ends: the setup's lines in /etc/hosts go again,
+    // also those of an assistant before it.
+    async close() {
+      await hostsBusy?.catch(() => {})
+      if (markedLines(hostsFile).length) await unprepare('the assistant ended').catch(() => {})
+    },
     api: {
       'GET /api/state': state,
       'POST /api/telegram/token': telegramToken,
@@ -1163,6 +1247,8 @@ export function createSetup({
       'GET /api/connect': connectState,
       'POST /api/pairing': pairingCode,
       'POST /api/funnel/start': funnelStart,
+      'POST /api/signin/prepare': prepareSignIn,
+      'POST /api/signin/remove': removeSignIn,
     },
   }
 }

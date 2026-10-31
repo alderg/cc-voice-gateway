@@ -216,22 +216,50 @@ function showChromeNotice() {
   box.textContent = confirmed ? CHROME_CONFIRMED : CHROME_WARNING
 }
 
-// Another web server on port 443 of this computer (state.web443, and the
-// poll's funnel.web443: { name } or null) and the Funnel's port: why it is
-// not 443, or that 443 does not work from this computer.
-function funnelPortNote(port, web443) {
-  if (!web443) return ''
-  const server = `Another web server on this computer${web443.name ? ` (${web443.name})` : ''} already uses port 443`
-  return port === '443'
-    ? `${server}: a browser on this computer, the Claude app's sign-in too, reaches it instead of the Funnel. Choose ` +
-        'port 8443 for the Funnel in section 2, and write the setup.'
-    : `${server}, so the Funnel uses port ${port}, and the connector URL ends in :${port}/mcp. That server stays as it is.`
+// The Funnel on another port than 443: Funnel serves it, but claude.ai's
+// connector did not connect to it in our test.
+function funnelPortNote(port) {
+  return port && port !== '443'
+    ? `The Funnel is set to port ${port}: Funnel serves it publicly, but claude.ai's connector did not connect to it ` +
+        'in our test. Keep 443 for the connector.'
+    : ''
 }
 
 function showFunnelPortNote() {
-  const text = funnelPortNote($('#funnel-port').value, state.web443)
+  const text = funnelPortNote($('#funnel-port').value)
   $('#funnel-port-note').textContent = text
   $('#funnel-port-note').hidden = !text
+}
+
+// The sign-in from a browser on this computer, when the setup's check under
+// the tailnet name did not get the gateway (the poll's funnel.signIn): the
+// name leads to this computer itself, where another web server holds port
+// 443 (funnel.web443) or the Tailscale app cannot take it.
+function signInText(funnel) {
+  const web = funnel.web443
+  const where = web ? `another web server${web.name ? ` (${web.name})` : ''} holds port 443` : 'the Tailscale app cannot take port 443'
+  return (
+    'The Claude app reaches the gateway over the Funnel, but a browser on this computer cannot sign in: under the ' +
+    `tailnet name it reaches this computer itself, where ${where}. Sign in from another device, for example claude.ai ` +
+    'in a browser on your phone with a pairing code from this page, or prepare the sign-in on this computer: with your ' +
+    "administrator password, a marked line in /etc/hosts sends the name to the Funnel's public address until you have " +
+    'signed in.'
+  )
+}
+
+// The setup's lines in /etc/hosts (the poll's prepared: [{ address, host }]).
+function showPrepared(prepared = []) {
+  $('#signin-prepared').hidden = !prepared.length
+  $('#signin-prepared-text').textContent = prepared.length
+    ? `The sign-in on this computer is prepared: /etc/hosts sends ${prepared.map(p => `${p.host} to ${p.address}`).join(', ')}, ` +
+      "the Funnel's public address. Sign in now; the line goes again by itself once the code is used or this page ends."
+    : ''
+}
+
+// What to run in a terminal, where the setup has no administrator rights.
+function showCommand(command) {
+  $('#signin-command').hidden = !command
+  $('#signin-command').textContent = command ? `In a terminal on this computer:\n${command}` : ''
 }
 
 // The work folders in a container of their own, when they are on.
@@ -588,6 +616,7 @@ async function connect() {
     // Only when it changes: it is an alert, which a screen reader reads out.
     if ($('#connect-wait').textContent !== wait) $('#connect-wait').textContent = wait
     $('#connect-ready').hidden = !running
+    showPrepared(status.prepared)
     if (running) {
       const funnel = status.funnel ?? {}
       show(
@@ -599,9 +628,13 @@ async function connect() {
             : 'not available here (Tailscale missing or not logged in); publish the endpoint another way, README 7.3',
         funnel.state === 'on' ? 'ok' : '',
       )
-      const portNote = funnelPortNote(funnel.port ?? '443', funnel.web443)
+      const portNote = funnelPortNote(funnel.port)
       $('#connect-port-note').textContent = portNote
       $('#connect-port-note').hidden = !portNote
+      const blocked = Boolean(funnel.signIn && !funnel.signIn.ok)
+      $('#signin-box').hidden = !blocked
+      const note = blocked ? signInText(funnel) : ''
+      if ($('#signin-note').textContent !== note) $('#signin-note').textContent = note
       $('#connect-url').textContent = funnel.url ?? ''
       $('#connect-url-row').hidden = !funnel.url
       $('#funnel-row').hidden = funnel.state !== 'off'
@@ -618,6 +651,24 @@ action('#pairing-new', '#pairing-state', async () => {
   const made = await api('/api/pairing', {})
   showCode(made.code, made.expiresIn)
   return 'Enter it on the sign-in page. A new code replaces this one.'
+})
+
+action('#signin-prepare', '#signin-state', async () => {
+  const result = await api('/api/signin/prepare', {})
+  showCommand(result.prepared ? null : result.command)
+  if (!result.prepared) throw new Error('The setup has no administrator rights here: run the command below, then sign in.')
+  connect()
+  return result.works
+    ? `Prepared: ${result.host} now reaches the gateway from this computer too. Sign in.`
+    : `Prepared, but the check still does not reach the gateway (${result.why}); wait a moment, or sign in from another device.`
+})
+
+action('#signin-remove', '#signin-remove-state', async () => {
+  const result = await api('/api/signin/remove', {})
+  showCommand(result.command ?? null)
+  if (result.command) throw new Error('The setup has no administrator rights here: run the command below.')
+  connect()
+  return result.removed ? 'Removed from /etc/hosts.' : 'Nothing to remove.'
 })
 
 action('#funnel-start', '#funnel-start-state', async () => {

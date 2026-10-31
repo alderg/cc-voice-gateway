@@ -996,9 +996,8 @@ test('port 443: another web server on this computer, from netstat on macOS and s
   assert.equal(webServerOn443('', 'linux'), null)
 })
 
-test('the Funnel port: 8443 by default while another web server has 443 here, written with the setup and said why; 443 otherwise', async () => {
-  const funnelSetup = (name, platform = 'linux') =>
-    createSetup({ root: ROOT, secretsDir: join(TMP, `secrets-funnel-${name}`), env: setupEnv(), home: HOME, platform, say })
+test('the Funnel port: 443 by default and never changed by itself, also with another web server on 443; another one only by hand, with a line about the connector', async () => {
+  const funnelSetup = name => createSetup({ root: ROOT, secretsDir: join(TMP, `secrets-funnel-${name}`), env: setupEnv(), home: HOME, platform: 'linux', say })
   const finish = async (setup, port) => {
     const { job } = await setup.api['POST /api/finish']({
       body: { settings: { VOICE_GW_PORT: '8787', VOICE_GW_DOCKER: '', VOICE_GW_FUNNEL_PORT: port }, telegram: { enabled: false }, docker: { enabled: false }, watchdog: {} },
@@ -1009,37 +1008,19 @@ test('the Funnel port: 8443 by default while another web server has 443 here, wr
     return done.lines.join('\n')
   }
   try {
-    rmSync(LISTENERS, { force: true })
-    const free = funnelSetup('free')
-    let state = await free.api['GET /api/state']({})
-    assert.deepEqual([state.settings.VOICE_GW_FUNNEL_PORT, state.defaults.VOICE_GW_FUNNEL_PORT, state.web443], ['443', '443', null])
-    assert.ok(calls().some(c => c.command === 'ss' && c.argv.join(' ') === '-ltnp'))
-    assert.doesNotMatch(await finish(free, '443'), /the Funnel: /)
-    assert.equal(readSettings(join(TMP, 'secrets-funnel-free', 'gateway.env')).VOICE_GW_FUNNEL_PORT, undefined, 'the default: left out')
+    writeFileSync(LISTENERS, LINUX_LISTENERS) // another web server on 443 changes nothing here
+    const state = await funnelSetup('default').api['GET /api/state']({})
+    assert.deepEqual([state.settings.VOICE_GW_FUNNEL_PORT, state.defaults.VOICE_GW_FUNNEL_PORT], ['443', '443'])
+    assert.doesNotMatch(await finish(funnelSetup('default'), '443'), /the Funnel/)
+    assert.equal(readSettings(join(TMP, 'secrets-funnel-default', 'gateway.env')).VOICE_GW_FUNNEL_PORT, undefined, 'the default: left out')
 
-    writeFileSync(LISTENERS, LINUX_LISTENERS)
-    const taken = funnelSetup('taken')
-    state = await taken.api['GET /api/state']({})
-    assert.equal(state.settings.VOICE_GW_FUNNEL_PORT, '8443')
-    assert.deepEqual(state.web443, { name: 'apache2' })
-    assert.equal(state.defaults.VOICE_GW_FUNNEL_PORT, '443', 'funnel.sh\'s default: 8443 has to be written')
-    assert.match(await finish(taken, '8443'), /the Funnel: another web server on this computer \(apache2\) uses port 443, so the Funnel uses port 8443, and the connector URL ends in :8443\/mcp; that server stays as it is/)
-    assert.equal(readSettings(join(TMP, 'secrets-funnel-taken', 'gateway.env')).VOICE_GW_FUNNEL_PORT, '8443')
-    // Written, the file's value counts, also 443 chosen against the suggestion.
-    assert.equal((await taken.api['GET /api/state']({})).settings.VOICE_GW_FUNNEL_PORT, '8443')
-    assert.match(await finish(funnelSetup('taken'), '443'), /the Funnel: another web server on this computer \(apache2\) uses port 443, so a browser on this computer, the Claude app's sign-in too, reaches it instead of the Funnel; choose port 8443 for the Funnel in section 2/)
-    writeFileSync(join(TMP, 'secrets-funnel-taken', 'gateway.env'), 'VOICE_GW_FUNNEL_PORT=10000\n')
-    assert.equal((await taken.api['GET /api/state']({})).settings.VOICE_GW_FUNNEL_PORT, '10000')
-
-    writeFileSync(LISTENERS, MAC_LISTENERS)
-    state = await funnelSetup('mac', 'darwin').api['GET /api/state']({})
-    assert.deepEqual([state.settings.VOICE_GW_FUNNEL_PORT, state.web443], ['8443', { name: 'httpd' }])
-    assert.ok(calls().some(c => c.command === 'netstat' && c.argv.join(' ') === '-anv -p tcp'))
-
-    // Without ss or netstat, or when they fail: nothing known, 443, and the setup goes on.
-    const blind = createSetup({ root: ROOT, secretsDir: join(TMP, 'secrets-funnel-blind'), env: { ...setupEnv(), VOICE_SETUP_SS_BIN: join(BIN, 'no-ss') }, home: HOME, platform: 'linux', say })
-    state = await blind.api['GET /api/state']({})
-    assert.deepEqual([state.settings.VOICE_GW_FUNNEL_PORT, state.web443], ['443', null])
+    // Chosen by hand: written, and the log says that the connector did not connect there.
+    assert.match(
+      await finish(funnelSetup('hand'), '8443'),
+      /the Funnel on port 8443: Funnel serves it publicly, but claude\.ai's connector did not connect to it in our test; keep 443 for the connector/,
+    )
+    assert.equal(readSettings(join(TMP, 'secrets-funnel-hand', 'gateway.env')).VOICE_GW_FUNNEL_PORT, '8443')
+    assert.equal((await funnelSetup('hand').api['GET /api/state']({})).settings.VOICE_GW_FUNNEL_PORT, '8443')
 
     const refused = await funnelSetup('refused').api['POST /api/finish']({ body: { settings: { VOICE_GW_FUNNEL_PORT: '8080' } } }).catch(error => error)
     assert.match(refused.message, /VOICE_GW_FUNNEL_PORT: not a valid value/)
@@ -1047,28 +1028,21 @@ test('the Funnel port: 8443 by default while another web server has 443 here, wr
     rmSync(LISTENERS, { force: true })
   }
 
-  // The page, in section 2: why the port is 8443, or that 443 does not work from here.
+  // The page, in section 2: another port than 443 gets a line about the connector.
   const html = readFileSync(join(ROOT, 'src', 'setup', 'ui', 'index.html'), 'utf8')
   assert.match(html, /<select id="funnel-port" data-setting="VOICE_GW_FUNNEL_PORT"><option value="443">443 \(default\)<\/option><option value="8443">8443<\/option><option value="10000">10000<\/option><\/select>/)
   assert.match(html, /<p id="funnel-port-note" class="notice wide" hidden><\/p>/)
   const plugin = { mode: 'plugin', reason: '', allowlist: {} }
-  const { $ } = await page({ VOICE_GW_FUNNEL_PORT: '8443' }, { noticeSeen: true }, plugin, [], { web443: { name: 'httpd' } })
-  assert.equal($('#funnel-port').value, '8443')
+  const { $ } = await page({ VOICE_GW_FUNNEL_PORT: '443' }, { noticeSeen: true }, plugin)
+  assert.equal($('#funnel-port').value, '443')
+  assert.equal($('#funnel-port-note').hidden, true)
+  $('#funnel-port').value = '8443'
+  for (const listener of $('#funnel-port').listeners.change) listener()
   assert.equal($('#funnel-port-note').hidden, false)
   assert.equal(
     $('#funnel-port-note').textContent,
-    'Another web server on this computer (httpd) already uses port 443, so the Funnel uses port 8443, and the connector URL ends in :8443/mcp. That server stays as it is.',
+    "The Funnel is set to port 8443: Funnel serves it publicly, but claude.ai's connector did not connect to it in our test. Keep 443 for the connector.",
   )
-  $('#funnel-port').value = '443'
-  for (const listener of $('#funnel-port').listeners.change) listener()
-  assert.equal(
-    $('#funnel-port-note').textContent,
-    "Another web server on this computer (httpd) already uses port 443: a browser on this computer, the Claude app's sign-in too, reaches it instead of the Funnel. Choose port 8443 for the Funnel in section 2, and write the setup.",
-  )
-  const unnamed = (await page({ VOICE_GW_FUNNEL_PORT: '8443' }, { noticeSeen: true }, plugin, [], { web443: { name: null } })).$
-  assert.match(unnamed('#funnel-port-note').textContent, /^Another web server on this computer already uses port 443, so/)
-  const none = (await page({ VOICE_GW_FUNNEL_PORT: '443' }, { noticeSeen: true }, plugin, [], { web443: null })).$
-  assert.equal(none('#funnel-port-note').hidden, true)
 })
 
 test('Docker not available: section 1 says so, and the two container checkboxes cannot be ticked, with a line why; one on from before stays', async () => {

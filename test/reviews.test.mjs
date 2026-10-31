@@ -22,6 +22,7 @@ const TMP = realpathSync(mkdtempSync(join(tmpdir(), 'voice-gw-reviews-')))
 const BIN = join(TMP, 'bin')
 const GH = join(BIN, 'gh')
 const GH_STATE = join(TMP, 'github.json')
+const GH_LOG = join(TMP, 'gh-calls.jsonl')
 const INPUTS = join(TMP, 'inputs.txt') // what the stand-in for claude was asked, for Workers
 const GATEWAY = fileURLToPath(new URL('../src/gateway.mjs', import.meta.url))
 
@@ -33,17 +34,26 @@ const { REVIEW_WORDS, WORKER_RULES, Workers } = await import('../src/workers.mjs
 const { Ledger, openItems } = await import('../src/ledger.mjs')
 const { adminRequest } = await import('../src/admin.mjs')
 
+// gh as GitHub: pull requests as gh pr view gives them, whose reviews and
+// comments name their authors without a type, and by the REST API inline
+// comments, reviews and comments with the author's type. Every call is
+// logged.
 const FAKE_GH = `#!/usr/bin/env node
-import { readFileSync } from 'node:fs'
+import { appendFileSync, readFileSync } from 'node:fs'
 const args = process.argv.slice(2)
+appendFileSync(${JSON.stringify(GH_LOG)}, JSON.stringify(args) + '\\n')
 const state = JSON.parse(readFileSync(${JSON.stringify(GH_STATE)}, 'utf8'))
 const out = value => { process.stdout.write(JSON.stringify(value) + '\\n'); process.exit(0) }
 const fail = message => { process.stderr.write(message + '\\n'); process.exit(1) }
 const [a, b, c] = args
 if (a === 'auth' && b === 'status') process.exit(0)
 if (a === 'api' && b === 'user') out({ login: 'alderg' })
-const inline = a === 'api' && /^repos\\/(.+)\\/pulls\\/(\\d+)\\/comments/.exec(b)
-if (inline) out(state.inline?.[inline[1] + '#' + inline[2]] ?? [])
+const rest = a === 'api' && /^repos\\/(.+)\\/(pulls|issues)\\/(\\d+)\\/(comments|reviews)\\?/.exec(b)
+if (rest) {
+  const key = rest[1] + '#' + rest[3]
+  const what = rest[2] === 'issues' ? 'restComments' : rest[4] === 'reviews' ? 'restReviews' : 'inline'
+  out(state[what]?.[key] ?? [])
+}
 if (a === 'pr' && b === 'view') {
   const pr = state.prs?.[args[args.indexOf('--repo') + 1] + '#' + c]
   pr ? out(pr) : fail('no pull requests found')
@@ -52,7 +62,7 @@ if (a === 'repo' && b === 'view') { process.stdout.write('PRIVATE\\n'); process.
 fail('unknown command: ' + args.join(' '))
 `
 
-let github = { prs: {}, inline: {} }
+let github = { prs: {}, inline: {}, restReviews: {}, restComments: {} }
 function setGitHub(change) {
   const next = structuredClone(github)
   github = change(next) ?? next
@@ -90,8 +100,12 @@ before(() => {
   mkdirSync(BIN, { recursive: true })
   writeFileSync(GH, FAKE_GH)
   chmodSync(GH, 0o755)
-  setGitHub(() => ({ prs: {}, inline: {} }))
+  setGitHub(() => ({ prs: {}, inline: {}, restReviews: {}, restComments: {} }))
 })
+
+const ghCalls = () => (existsSync(GH_LOG) ? readFileSync(GH_LOG, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)) : [])
+// A review or comment as the REST API gives it: its node id, the id gh gives.
+const restItem = (id, login, type) => ({ id: 1000 + id.length, node_id: id, user: { login, type } })
 
 after(() => rmSync(TMP, { recursive: true, force: true }))
 
@@ -147,8 +161,9 @@ test('a fix is queued for new comments of a collaborator or a review bot, as the
     assert.equal(news[0].fix, null)
     assert.doesNotMatch(news[0].text, /Automatic fixing/)
 
-    // Copilot's review with a text: round 1, for the run that pushed it, on its branch.
+    // Copilot's review with a text, a bot by the REST API: round 1, for the run that pushed it, on its branch.
     setGitHub(g => {
+      g.restReviews['acme/alpha#31'] = [restItem('R1', 'stranger', 'User'), restItem('R2', 'copilot-pull-request-reviewer[bot]', 'Bot')]
       g.prs['acme/alpha#31'].reviews.push({
         id: 'R2',
         author: { login: 'copilot-pull-request-reviewer' },
@@ -182,8 +197,9 @@ test('a fix is queued for new comments of a collaborator or a review bot, as the
     await until(() => news.length === 4)
     assert.equal(asked.length, 2, 'an approval without a comment')
 
-    // The Claude app's comment, as gh shows the app: round 3.
+    // The Claude app's comment, as gh shows the app, a bot by the REST API: round 3.
     setGitHub(g => {
+      g.restComments['acme/alpha#31'] = [restItem('C3', 'claude[bot]', 'Bot')]
       g.prs['acme/alpha#31'].comments.push({ id: 'C3', author: { login: 'claude' }, authorAssociation: 'NONE', body: 'Code review: 1 issue.', createdAt: now() })
     })
     await until(() => news.length === 5)
@@ -215,6 +231,75 @@ test('what came before the run that started the watch starts nothing; a bot unde
     await until(() => news.length === 2)
     assert.equal(asked.length, 1)
     assert.match(news[1].text, /from Copilot ask for changes/)
+  } finally {
+    w.close()
+  }
+})
+
+test('a listed login counts only where GitHub says it is a bot: not with type User, not without a type, and gh\'s untyped reviews and comments by the REST API', async () => {
+  setGitHub(g => {
+    g.prs['acme/alpha#36'] = pr(36)
+    g.inline['acme/alpha#36'] = []
+  })
+  const { w, news, asked } = watcher('typed')
+  const restCalls = () => ghCalls().filter(call => call[0] === 'api' && /\/(reviews|issues\/36\/comments)\?/.test(call[1])).map(call => call[1])
+  const step = async change => {
+    const before = news.length
+    setGitHub(change)
+    await until(() => news.length === before + 1)
+    return news.at(-1)
+  }
+  try {
+    await w.fromRun(task([36]))
+    const calls = restCalls().length
+
+    // Inline comments come typed from the REST API: a person who took the name, and one with no type at all.
+    let item = await step(g => {
+      g.prs['acme/alpha#36'].reviews = [{ id: 'R1', author: { login: 'octo' }, authorAssociation: 'MEMBER', state: 'APPROVED', body: '' }]
+      g.inline['acme/alpha#36'] = [
+        { id: 1, user: { login: 'Copilot', type: 'User' }, author_association: 'NONE', path: 'a.js', line: 1, body: 'x' },
+        { id: 2, user: { login: 'copilot-pull-request-reviewer' }, author_association: 'NONE', path: 'a.js', line: 2, body: 'y' },
+      ]
+    })
+    assert.equal(item.fix, null)
+    assert.deepEqual(asked, [])
+    assert.equal(restCalls().length, calls, 'a collaborator\'s review needs no lookup')
+
+    // A review from a listed login, untyped in gh: the REST API says it is a person.
+    item = await step(g => {
+      g.restReviews['acme/alpha#36'] = [restItem('R2', 'claude', 'User')]
+      g.prs['acme/alpha#36'].reviews.push({ id: 'R2', author: { login: 'claude' }, authorAssociation: 'NONE', state: 'CHANGES_REQUESTED', body: 'z' })
+    })
+    assert.equal(item.fix, null)
+    assert.deepEqual(restCalls().slice(calls), ['repos/acme/alpha/pulls/36/reviews?per_page=100'])
+
+    // Untyped in gh, and not in the REST API's answer: no evidence, no fix.
+    item = await step(g => {
+      g.prs['acme/alpha#36'].reviews.push({ id: 'R3', author: { login: 'claude' }, authorAssociation: 'NONE', state: 'CHANGES_REQUESTED', body: 'z' })
+    })
+    assert.equal(item.fix, null)
+    assert.deepEqual(asked, [])
+
+    // The REST API says it is the Claude app: a fix.
+    item = await step(g => {
+      g.restReviews['acme/alpha#36'].push(restItem('R4', 'claude[bot]', 'Bot'))
+      g.prs['acme/alpha#36'].reviews.push({ id: 'R4', author: { login: 'claude' }, authorAssociation: 'NONE', state: 'COMMENTED', body: 'Two issues.' })
+    })
+    assert.equal(item.fix, 'q001')
+    assert.match(item.text, /from claude ask for changes: the gateway queued a fix/)
+
+    // A comment the same way, by the REST API's comments of the pull request.
+    item = await step(g => {
+      g.restComments['acme/alpha#36'] = [restItem('C1', 'claude', 'User'), restItem('C2', 'claude[bot]', 'Bot')]
+      g.prs['acme/alpha#36'].comments = [{ id: 'C1', author: { login: 'claude' }, authorAssociation: 'NONE', body: 'A person.' }]
+    })
+    assert.equal(item.fix, null)
+    item = await step(g => {
+      g.prs['acme/alpha#36'].comments.push({ id: 'C2', author: { login: 'claude' }, authorAssociation: 'NONE', body: 'The app.' })
+    })
+    assert.equal(item.fix, 'q002')
+    assert.ok(restCalls().includes('repos/acme/alpha/issues/36/comments?per_page=100'))
+    assert.equal(asked.length, 2)
   } finally {
     w.close()
   }
@@ -554,6 +639,7 @@ test('gateway: on by default, a bot\'s review queues the fix itself, the event s
     const session = claudeCalls()[0].args[claudeCalls()[0].args.indexOf('--session-id') + 1]
 
     setGitHub(g => {
+      g.restReviews['acme/alpha#7'] = [restItem('R1', 'copilot-pull-request-reviewer[bot]', 'Bot')]
       g.prs['acme/alpha#7'].reviews = [
         { id: 'R1', author: { login: 'copilot-pull-request-reviewer' }, authorAssociation: 'NONE', state: 'COMMENTED', body: 'One finding.', submittedAt: now() },
       ]

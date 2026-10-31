@@ -9,7 +9,7 @@
     "node": ">=20"
   },
   "scripts": {
-    "test": "node --test test/*.test.mjs",
+    "test": "node --require ./test/env.cjs --test test/*.test.mjs",
     "pair": "node scripts/pair.mjs",
     "fake-voice": "node scripts/fake-voice.mjs"
   },

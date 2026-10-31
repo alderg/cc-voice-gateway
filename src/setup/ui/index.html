@@ -104,8 +104,8 @@
     <label>Tailscale Funnel port
       <select id="funnel-port" data-setting="VOICE_GW_FUNNEL_PORT"><option value="443">443 (default)</option><option value="8443">8443</option><option value="10000">10000</option></select>
     </label>
-    <p class="guide">The public HTTPS port; Funnel allows only these three. 443, unless another web server on this
-      computer already uses it: then 8443, chosen by itself, and the connector URL ends in <code>:8443/mcp</code>.</p>
+    <p class="guide">The public HTTPS port; Funnel allows only these three. Keep 443 for claude.ai's connector: it did
+      not connect to 8443 in our test, although Funnel serves it publicly.</p>
     <p id="funnel-port-note" class="notice wide" hidden></p>
   </div>
 </section>
@@ -368,6 +368,13 @@
     <h3>The endpoint</h3>
     <p>Tailscale Funnel: <span id="connect-funnel" class="state"></span></p>
     <p id="connect-port-note" class="notice" hidden></p>
+    <div id="signin-box" hidden>
+      <p id="signin-note" class="notice" role="alert"></p>
+      <div class="row">
+        <button id="signin-prepare">Prepare the sign-in on this computer</button>
+        <span id="signin-state" class="state"></span>
+      </div>
+    </div>
     <p id="connect-url-row" hidden>Connector URL: <code id="connect-url"></code></p>
     <div id="funnel-row" class="row" hidden>
       <button id="funnel-start">Start the Funnel</button>
@@ -387,6 +394,12 @@
     <p class="guide">Then choose "Always allow" for the connector's tools, and try it in voice mode: "Ask Claude Code
       whether the gateway is up."</p>
   </div>
+  <div id="signin-prepared" class="row" hidden>
+    <span id="signin-prepared-text" class="state ok"></span>
+    <button id="signin-remove">Remove it now</button>
+    <span id="signin-remove-state" class="state"></span>
+  </div>
+  <pre id="signin-command" class="log" hidden></pre>
   <div id="end-row" class="row" hidden>
     <button id="end">End the assistant</button>
     <span id="end-note" class="sub"></span>

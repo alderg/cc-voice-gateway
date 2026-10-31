@@ -24,6 +24,7 @@ const { createSetup, PAIRING_MINUTES, STAY_MS } = await import('../src/setup/act
 const { startSetupServer } = await import('../src/setup/server.mjs')
 const { Auth } = await import('../src/oauth.mjs')
 const { adminRequest } = await import('../src/admin.mjs')
+const { HOSTS_MARK, hostsCommand, hostsLine, markedLines, signInCheck } = await import('../src/setup/hosts.mjs')
 
 const SECRETS = join(TMP, 'secrets') // the gateway's, and the setup's
 const BIN = join(TMP, 'bin')
@@ -31,10 +32,14 @@ const SESSION = join(TMP, 'tmux-session') // the fake tmux: the session "voice" 
 const PANE = join(TMP, 'tmux-pane') // the fake tmux: what its pane shows
 const FUNNEL_ON = join(TMP, 'funnel-on') // the fake tailscale: the Funnel publishes the endpoint, on the port in it (443 if empty)
 const LISTENERS = join(TMP, 'listeners') // the fake ss: what listens on this computer
+const HOSTS = join(TMP, 'hosts') // in place of /etc/hosts
+const OSASCRIPT_LOG = join(TMP, 'osascript.log') // what the fake osascript was asked to run
 const CALLBACK = 'https://claude.ai/api/mcp/auth_callback'
 const FORWARDED = { 'x-forwarded-proto': 'https', 'x-forwarded-host': 'voice-test.example.ts.net' }
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
+// The setup's check of a sign-in from this computer, in place of a request to the tailnet name: it gets the gateway.
+const reached = async () => ({ ok: true })
 
 const FAKE_TMUX = `#!/usr/bin/env node
 import { existsSync, readFileSync } from 'node:fs'
@@ -81,6 +86,18 @@ else if (argv === 'funnel status --json') {
   console.error('Access denied: serve config denied')
   process.exit(1)
 } else process.exit(2)
+`
+// Administrator rights: pkexec runs what it is given, as this user; osascript
+// runs the shell script of "do shell script … with administrator privileges".
+const FAKE_PKEXEC = '#!/bin/sh\nexec "$@"\n'
+const FAKE_OSASCRIPT = `#!/usr/bin/env node
+import { spawnSync } from 'node:child_process'
+import { appendFileSync } from 'node:fs'
+const script = process.argv[3]
+appendFileSync(${JSON.stringify(OSASCRIPT_LOG)}, process.argv[2] + ' ' + script + '\\n')
+const shell = /^do shell script "((?:[^"\\\\]|\\\\.)*)" with administrator privileges$/s.exec(script)
+if (!shell) process.exit(1)
+process.exit(spawnSync('sh', ['-c', shell[1].replace(/\\\\(.)/g, '$1')], { stdio: 'ignore' }).status ?? 1)
 `
 const FAKE_SS = `#!/usr/bin/env node
 import { existsSync, readFileSync } from 'node:fs'
@@ -140,6 +157,11 @@ const setupEnv = () => ({
   VOICE_SETUP_TMUX_BIN: join(BIN, 'tmux'),
   VOICE_SETUP_TAILSCALE_BIN: join(BIN, 'tailscale'),
   VOICE_SETUP_SS_BIN: join(BIN, 'ss'),
+  VOICE_SETUP_NETSTAT_BIN: join(BIN, 'ss'), // the same list, for a setup as on macOS
+  VOICE_SETUP_HOSTS_FILE: HOSTS,
+  VOICE_SETUP_PKEXEC_BIN: join(BIN, 'pkexec'),
+  VOICE_SETUP_SUDO_BIN: join(BIN, 'no-sudo'),
+  VOICE_SETUP_OSASCRIPT_BIN: join(BIN, 'osascript'),
   VOICE_GW_PORT: String(port), // funnel.sh compares the Funnel's target with it
   VOICE_GW_STATE_DIR: join(TMP, 'state'),
   CLAUDE_CONFIG_DIR: join(TMP, 'claude-config'),
@@ -224,12 +246,13 @@ const codes = [] // every code the page got, to look for them where they must no
 
 before(async () => {
   mkdirSync(BIN, { recursive: true })
-  for (const [name, text] of [['tmux', FAKE_TMUX], ['tailscale', FAKE_TAILSCALE], ['ss', FAKE_SS]]) {
+  writeFileSync(HOSTS, '127.0.0.1 localhost\n::1 localhost\n')
+  for (const [name, text] of [['tmux', FAKE_TMUX], ['tailscale', FAKE_TAILSCALE], ['ss', FAKE_SS], ['pkexec', FAKE_PKEXEC], ['osascript', FAKE_OSASCRIPT]]) {
     writeFileSync(join(BIN, name), text)
     chmodSync(join(BIN, name), 0o755)
   }
   port = await freePort()
-  flow.setup = createSetup({ root: ROOT, secretsDir: SECRETS, env: setupEnv(), platform: 'linux', say })
+  flow.setup = createSetup({ root: ROOT, secretsDir: SECRETS, env: setupEnv(), platform: 'linux', say, probe: reached })
   flow.server = await startSetupServer({ host: '127.0.0.1', port: 0, api: flow.setup.api, redact: flow.setup.redact, say })
   flow.page = await browser(flow.server)
 })
@@ -286,7 +309,7 @@ test('while the gateway is down: which question the tmux pane shows, as one word
 })
 
 test('polling the gateway is no activity: a page left alone still ends by itself', async () => {
-  const setup = createSetup({ root: ROOT, secretsDir: SECRETS, env: setupEnv(), platform: 'linux', say })
+  const setup = createSetup({ root: ROOT, secretsDir: SECRETS, env: setupEnv(), platform: 'linux', say, probe: reached })
   const server = await startSetupServer({ host: '127.0.0.1', port: 0, api: setup.api, say, idleMs: 600 })
   const page = await browser(server)
   const started = Date.now()
@@ -305,7 +328,7 @@ test('a code from the running gateway: valid ten minutes, and only in the answer
   const { call } = flow.page
   let { data } = await call('/api/connect')
   assert.equal(data.gateway, true)
-  assert.deepEqual(data.funnel, { state: 'off', url: null, port: '443', web443: null })
+  assert.deepEqual(data.funnel, { state: 'off', url: null, port: '443', signIn: null, web443: null })
   assert.equal(data.pairing, null)
 
   const made = await call('/api/pairing', {})
@@ -372,33 +395,159 @@ test('the Funnel: off with a start from the page, which shows its output; on wit
 
   writeFileSync(FUNNEL_ON, '')
   const { data } = await call('/api/connect') // the start emptied the cache
-  assert.deepEqual(data.funnel, { state: 'on', url: 'https://voice-test.example.ts.net/mcp', port: '443', web443: null })
+  assert.deepEqual(data.funnel, { state: 'on', url: 'https://voice-test.example.ts.net/mcp', port: '443', signIn: { ok: true }, web443: null })
 })
 
-test('the Funnel with another web server on 443 here: on 8443, its URL with :8443, and why; the file\'s port counts once written', async () => {
-  const secrets = join(TMP, 'secrets-8443')
-  mkdirSync(secrets, { recursive: true })
-  const connect = async () => (await createSetup({ root: ROOT, secretsDir: secrets, env: setupEnv(), platform: 'linux', say }).api['GET /api/connect']({})).funnel
-  // A connect answer needs a gateway on these secrets: its admin socket.
-  const gatewaySocket = createServer(socket => socket.end())
-  await new Promise(resolve => gatewaySocket.listen(join(secrets, 'admin.sock'), resolve))
-  try {
-    writeFileSync(LISTENERS, 'State Recv-Q Send-Q Local Address:Port Peer Address:Port Process\nLISTEN 0 511 *:443 *:* users:(("apache2",pid=812,fd=4))\n')
-    writeFileSync(FUNNEL_ON, '443') // an older Funnel on 443 does not count
-    assert.deepEqual(await connect(), { state: 'off', url: null, port: '8443', web443: { name: 'apache2' } })
-    writeFileSync(FUNNEL_ON, '8443')
-    assert.deepEqual(await connect(), { state: 'on', url: 'https://voice-test.example.ts.net:8443/mcp', port: '8443', web443: { name: 'apache2' } })
+// The sign-in on this computer: the setup's check under the tailnet name, and
+// the marked line in /etc/hosts (here a file of the test) with administrator
+// rights (here a fake pkexec, or osascript for macOS).
+const SIGNIN = join(TMP, 'secrets-signin')
+const BEFORE = '127.0.0.1 localhost\n::1 localhost\n# mine\n10.0.0.5 nas.local\n'
 
-    writeFileSync(join(secrets, 'gateway.env'), 'VOICE_GW_FUNNEL_PORT=443\n')
-    assert.deepEqual(await connect(), { state: 'off', url: null, port: '443', web443: { name: 'apache2' } }, 'chosen against the suggestion')
-    rmSync(LISTENERS)
-    writeFileSync(join(secrets, 'gateway.env'), 'VOICE_GW_FUNNEL_PORT=8443\n')
-    assert.deepEqual(await connect(), { state: 'on', url: 'https://voice-test.example.ts.net:8443/mcp', port: '8443', web443: null })
+async function signInSetup({ platform = 'linux', env = {} } = {}) {
+  mkdirSync(SIGNIN, { recursive: true })
+  const looked = []
+  // The Funnel's public addresses, in place of public resolvers; the check gets the gateway once the line is there.
+  const lookup = async host => (looked.push(host), ['2a05:d014::1', '185.40.234.55', '185.40.234.56'])
+  const probe = async () => (readFileSync(HOSTS, 'utf8').includes('185.40.234.55 voice-test.example.ts.net #') ? { ok: true } : { ok: false, why: 'refused' })
+  const setup = createSetup({ root: ROOT, secretsDir: SIGNIN, env: { ...setupEnv(), ...env }, platform, say, lookup, probe })
+  return { setup, looked, connect: async () => setup.api['GET /api/connect']({ server: null }) }
+}
+
+// A connect answer needs a gateway on these secrets: its admin socket.
+async function withGateway(work) {
+  mkdirSync(SIGNIN, { recursive: true })
+  rmSync(join(SIGNIN, 'admin.sock'), { force: true })
+  const socket = createServer(connection => connection.end())
+  await new Promise(resolve => socket.listen(join(SIGNIN, 'admin.sock'), resolve))
+  try {
+    await work()
   } finally {
-    gatewaySocket.close()
-    rmSync(LISTENERS, { force: true })
-    writeFileSync(FUNNEL_ON, '')
+    await new Promise(resolve => socket.close(resolve))
   }
+}
+
+test('the sign-in on this computer: checked under the tailnet name once the Funnel is on, the other server on 443 named; the port stays 443', async () => {
+  mkdirSync(SIGNIN, { recursive: true })
+  await withGateway(async () => {
+    writeFileSync(HOSTS, BEFORE)
+    rmSync(FUNNEL_ON, { force: true })
+    assert.deepEqual((await (await signInSetup()).connect()).funnel, { state: 'off', url: null, port: '443', signIn: null, web443: null }, 'nothing to check while it is off')
+    writeFileSync(FUNNEL_ON, '443')
+    const { connect, looked } = await signInSetup() // a setup of its own: the Funnel's state is kept for ten seconds
+    let { funnel, prepared } = await connect()
+    assert.deepEqual(funnel, { state: 'on', url: 'https://voice-test.example.ts.net/mcp', port: '443', signIn: { ok: false, why: 'refused' }, web443: null })
+    assert.deepEqual(prepared, [])
+    assert.deepEqual(looked, [], 'no address looked up before the button')
+    writeFileSync(LISTENERS, 'LISTEN 0 511 *:443 *:* users:(("apache2",pid=812,fd=4))\n')
+    ;({ funnel } = await (await signInSetup()).connect())
+    assert.deepEqual(funnel.web443, { name: 'apache2' })
+    assert.equal(funnel.port, '443', 'never moved off 443 by itself')
+    // Set to 8443 in the file: its Funnel, not the one on 443.
+    writeFileSync(join(SIGNIN, 'gateway.env'), 'VOICE_GW_FUNNEL_PORT=8443\n')
+    ;({ funnel } = await (await signInSetup()).connect())
+    assert.deepEqual([funnel.state, funnel.port, funnel.signIn], ['off', '8443', null])
+    rmSync(join(SIGNIN, 'gateway.env'))
+    rmSync(LISTENERS)
+  })
+})
+
+test('"Prepare the sign-in on this computer": one marked line with the public address, a backup, the rest untouched; out again when the assistant ends', async () => {
+  await withGateway(async () => {
+    writeFileSync(HOSTS, BEFORE)
+    writeFileSync(FUNNEL_ON, '443')
+    const { setup, connect, looked } = await signInSetup()
+    const done = await setup.api['POST /api/signin/prepare']({ body: {} })
+    assert.deepEqual(done, { prepared: true, address: '185.40.234.55', host: 'voice-test.example.ts.net', works: true, why: null })
+    assert.deepEqual(looked, ['voice-test.example.ts.net'])
+    const line = `185.40.234.55 voice-test.example.ts.net ${HOSTS_MARK}`
+    assert.equal(readFileSync(HOSTS, 'utf8'), `${BEFORE}${line}\n`)
+    assert.equal(readFileSync(`${HOSTS}.cc-voice-gateway.bak`, 'utf8'), BEFORE, 'a backup next to it')
+    const answer = await connect()
+    assert.deepEqual(answer.funnel.signIn, { ok: true }, 'the check gets the gateway now')
+    assert.deepEqual(answer.prepared, [{ address: '185.40.234.55', host: 'voice-test.example.ts.net' }])
+
+    // Again: still one line.
+    await setup.api['POST /api/signin/prepare']({ body: {} })
+    assert.equal(readFileSync(HOSTS, 'utf8'), `${BEFORE}${line}\n`)
+
+    // "Remove it now", then prepared again and taken out when the assistant ends.
+    assert.deepEqual(await setup.api['POST /api/signin/remove']({ body: {} }), { removed: 1 })
+    assert.equal(readFileSync(HOSTS, 'utf8'), BEFORE)
+    assert.deepEqual(await setup.api['POST /api/signin/remove']({ body: {} }), { removed: 0 })
+    await setup.api['POST /api/signin/prepare']({ body: {} })
+    await setup.close()
+    assert.equal(readFileSync(HOSTS, 'utf8'), BEFORE)
+    assert.ok(terminal.some(text => text === 'setup: the line for the sign-in is out of /etc/hosts again (the assistant ended)'))
+  })
+})
+
+test('the marked line only: other lines kept, also similar ones and a last line without its newline; nothing changes without administrator rights', async () => {
+  const similar = [
+    `185.40.234.55 voice-test.example.ts.net`,
+    `# 185.40.234.55 voice-test.example.ts.net ${HOSTS_MARK}`,
+    `185.40.234.55 voice-test.example.ts.net ${HOSTS_MARK} extra`,
+  ].join('\n')
+  writeFileSync(HOSTS, `127.0.0.1 localhost\n${similar}`) // no newline at the end
+  const line = `185.40.234.55 voice-test.example.ts.net ${HOSTS_MARK}`
+  const run = command => spawnSync('sh', ['-c', command], { encoding: 'utf8' })
+  assert.equal(run(hostsCommand(HOSTS, { add: line })).status, 0)
+  assert.equal(readFileSync(HOSTS, 'utf8'), `127.0.0.1 localhost\n${similar}\n${line}\n`, 'on a line of its own')
+  assert.deepEqual(markedLines(HOSTS).map(m => m.line), [line], 'only its exact form counts as the setup\'s')
+  assert.equal(run(hostsCommand(HOSTS, { remove: [line] })).status, 0)
+  assert.equal(readFileSync(HOSTS, 'utf8'), `127.0.0.1 localhost\n${similar}\n`)
+  assert.throws(() => hostsLine('185.40.234.55', "x'; rm -rf /; '"), /not an address and a host name/)
+  assert.throws(() => hostsCommand('/etc/ho sts', { add: line }), /not a plain path/)
+
+  // Neither pkexec nor sudo here: the command for a terminal, and the file as it was.
+  await withGateway(async () => {
+    writeFileSync(HOSTS, BEFORE)
+    writeFileSync(FUNNEL_ON, '443')
+    const { setup } = await signInSetup({ env: { VOICE_SETUP_PKEXEC_BIN: join(BIN, 'no-pkexec') } })
+    const refused = await setup.api['POST /api/signin/prepare']({ body: {} })
+    assert.equal(refused.prepared, false)
+    assert.match(refused.command, /^sudo sh -c '\(cp -p .*hosts.* grep -qxF -e .*185\.40\.234\.55 voice-test\.example\.ts\.net # cc-voice-gateway setup: /)
+    assert.equal(readFileSync(HOSTS, 'utf8'), BEFORE)
+  })
+})
+
+test('the check from this computer: what answers must be the gateway; a refused connection is not', async () => {
+  const closed = await freePort()
+  assert.deepEqual(await signInCheck(`https://127.0.0.1:${closed}/mcp`), { ok: false, why: 'refused' })
+})
+
+test('macOS: through the system\'s password dialog (osascript, with administrator privileges), and the resolver\'s cache flushed', async () => {
+  await withGateway(async () => {
+    writeFileSync(HOSTS, BEFORE)
+    writeFileSync(FUNNEL_ON, '443')
+    rmSync(OSASCRIPT_LOG, { force: true })
+    const { setup } = await signInSetup({ platform: 'darwin' })
+    const done = await setup.api['POST /api/signin/prepare']({ body: {} })
+    assert.equal(done.prepared, true)
+    const asked = readFileSync(OSASCRIPT_LOG, 'utf8')
+    assert.match(asked, /^-e do shell script ".*" with administrator privileges$/m)
+    assert.match(asked, /\/usr\/bin\/dscacheutil -flushcache; \/usr\/bin\/killall -HUP mDNSResponder/)
+    assert.match(readFileSync(HOSTS, 'utf8'), /^185\.40\.234\.55 voice-test\.example\.ts\.net # cc-voice-gateway setup: /m)
+    await setup.close()
+    assert.equal(readFileSync(HOSTS, 'utf8'), BEFORE)
+  })
+})
+
+test('signed in with the page\'s code: the line goes out of /etc/hosts by itself', async () => {
+  // The real gateway of these tests; a sign-in with a code from this setup.
+  writeFileSync(HOSTS, BEFORE)
+  writeFileSync(FUNNEL_ON, '443')
+  const { call } = flow.page
+  // As "Prepare the sign-in on this computer" leaves it (above).
+  writeFileSync(HOSTS, `${BEFORE}185.40.234.55 voice-test.example.ts.net ${HOSTS_MARK}\n`)
+  assert.deepEqual((await call('/api/connect')).data.prepared, [{ address: '185.40.234.55', host: 'voice-test.example.ts.net' }])
+  const made = (await call('/api/pairing', {})).data.code
+  codes.push(made)
+  assert.equal((await signIn(made)).ok, true)
+  assert.equal((await call('/api/connect')).data.pairing.state, 'used')
+  for (let i = 0; i < 100 && readFileSync(HOSTS, 'utf8') !== BEFORE; i++) await sleep(50)
+  assert.equal(readFileSync(HOSTS, 'utf8'), BEFORE)
+  assert.ok(terminal.includes('setup: the line for the sign-in is out of /etc/hosts again (the pairing code was used)'))
 })
 
 test('expiry: a code from the page signs in until its ten minutes are up, not after; one from pair.mjs lasts five', () => {
@@ -467,7 +616,7 @@ test('the overall limit moves only forward, and never by more than the limit its
 
 test('writing with "stay": the assistant stays open for the pairing, until "End the assistant"', async () => {
   const secrets = join(TMP, 'secrets-stay')
-  const setup = createSetup({ root: ROOT, secretsDir: secrets, env: setupEnv(), platform: 'linux', say })
+  const setup = createSetup({ root: ROOT, secretsDir: secrets, env: setupEnv(), platform: 'linux', say, probe: reached })
   const server = await startSetupServer({ host: '127.0.0.1', port: 0, api: setup.api, redact: setup.redact, say })
   const page = await browser(server)
   let ended = null
@@ -546,10 +695,13 @@ test('the page: what to do while the gateway is down, then a code with its time,
   let connect = { gateway: false, tmux: true, pairing: null, remaining }
   let next = 0
   const made = ['1234 5678', '8765 4321', '1357 2468']
+  const answers = { prepare: null, remove: null } // the sign-in on this computer
   const ui = await page({
     '/api/state': state,
     '/api/connect': () => connect,
     '/api/pairing': () => ({ code: made[next++], expiresIn: 600 }),
+    '/api/signin/prepare': () => answers.prepare,
+    '/api/signin/remove': () => answers.remove,
   })
   const { $ } = ui
   assert.equal($('#connect-gateway').textContent, 'not running yet')
@@ -594,16 +746,58 @@ test('the page: what to do while the gateway is down, then a code with its time,
   assert.equal($('#funnel-row').hidden, true, 'no start while it is on')
   assert.equal($('#connect-port-note').hidden, true, 'on 443, with nothing else there')
 
-  // Another web server has 443 here: the Funnel on 8443, and why, in a sentence or two.
-  connect = { gateway: true, funnel: { state: 'on', url: 'https://voice-test.example.ts.net:8443/mcp', port: '8443', web443: { name: 'httpd' } }, pairing: null, remaining }
+  // The check under the tailnet name did not get the gateway: what goes on, and two ways.
+  const funnel = { state: 'on', url: 'https://voice-test.example.ts.net/mcp', port: '443' }
+  connect = { gateway: true, funnel: { ...funnel, signIn: { ok: false, why: 'certificate' }, web443: { name: 'httpd' } }, prepared: [], pairing: null, remaining }
+  await ui.poll()
+  assert.equal($('#signin-box').hidden, false)
+  assert.equal(
+    $('#signin-note').textContent,
+    'The Claude app reaches the gateway over the Funnel, but a browser on this computer cannot sign in: under the tailnet name it reaches this ' +
+      'computer itself, where another web server (httpd) holds port 443. Sign in from another device, for example claude.ai in a browser on ' +
+      'your phone with a pairing code from this page, or prepare the sign-in on this computer: with your administrator password, a marked ' +
+      "line in /etc/hosts sends the name to the Funnel's public address until you have signed in.",
+  )
+  assert.equal($('#connect-port-note').hidden, true)
+  connect = { gateway: true, funnel: { ...funnel, signIn: { ok: false, why: 'refused' }, web443: null }, prepared: [], pairing: null, remaining }
+  await ui.poll()
+  assert.match($('#signin-note').textContent, /it reaches this computer itself, where the Tailscale app cannot take port 443\./)
+
+  // The button: prepared, and the line shown with "Remove it now".
+  answers.prepare = { prepared: true, address: '185.40.234.55', host: 'voice-test.example.ts.net', works: true, why: null }
+  connect = { gateway: true, funnel: { ...funnel, signIn: { ok: true }, web443: null }, prepared: [{ address: '185.40.234.55', host: 'voice-test.example.ts.net' }], pairing: null, remaining }
+  await ui.click('#signin-prepare')
+  assert.ok(ui.asked.includes('POST /api/signin/prepare'))
+  assert.equal($('#signin-state').textContent, 'Prepared: voice-test.example.ts.net now reaches the gateway from this computer too. Sign in.')
+  await ui.poll()
+  assert.equal($('#signin-box').hidden, true, 'the check gets the gateway now')
+  assert.equal($('#signin-prepared').hidden, false)
+  assert.equal(
+    $('#signin-prepared-text').textContent,
+    "The sign-in on this computer is prepared: /etc/hosts sends voice-test.example.ts.net to 185.40.234.55, the Funnel's public address. Sign in now; the line goes again by itself once the code is used or this page ends.",
+  )
+  answers.remove = { removed: 1 }
+  await ui.click('#signin-remove')
+  assert.equal($('#signin-remove-state').textContent, 'Removed from /etc/hosts.')
+  // Without administrator rights: the command for a terminal.
+  answers.prepare = { prepared: false, command: "sudo sh -c '(cp -p …)'" }
+  await ui.click('#signin-prepare')
+  assert.equal($('#signin-state').textContent, 'The setup has no administrator rights here: run the command below, then sign in.')
+  assert.equal($('#signin-command').hidden, false)
+  assert.equal($('#signin-command').textContent, "In a terminal on this computer:\nsudo sh -c '(cp -p …)'")
+
+  // Another port, set by hand: the connector did not connect there.
+  connect = { gateway: true, funnel: { state: 'on', url: 'https://voice-test.example.ts.net:8443/mcp', port: '8443', signIn: { ok: true }, web443: null }, prepared: [], pairing: null, remaining }
   await ui.poll()
   assert.equal($('#connect-url').textContent, 'https://voice-test.example.ts.net:8443/mcp')
-  assert.equal($('#connect-port-note').hidden, false)
   assert.equal(
     $('#connect-port-note').textContent,
-    'Another web server on this computer (httpd) already uses port 443, so the Funnel uses port 8443, and the connector URL ends in :8443/mcp. That server stays as it is.',
+    "The Funnel is set to port 8443: Funnel serves it publicly, but claude.ai's connector did not connect to it in our test. Keep 443 for the connector.",
   )
+  assert.equal($('#signin-prepared').hidden, true)
   assert.match(html, /<p>Tailscale Funnel: <span id="connect-funnel" class="state"><\/span><\/p>\s*<p id="connect-port-note" class="notice" hidden><\/p>/)
+  assert.match(html, /<button id="signin-prepare">Prepare the sign-in on this computer<\/button>/)
+  assert.match(html, /<button id="signin-remove">Remove it now<\/button>/)
 
   await ui.click('#pairing-new')
   assert.ok(ui.asked.includes('POST /api/pairing'))

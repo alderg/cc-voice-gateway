@@ -226,18 +226,15 @@ elif [ "$quick" = 0 ]; then
     tests=$(cat test/*.test.mjs | grep -c '^test(')
     info "the test suite runs now, as npm test: about $(((tests + 5) / 10 * 10)) tests, about two minutes; a dot per test, X for a failure"
   fi
-  # Without this session's settings, as a clean terminal would run it. The
-  # files of npm test, with node itself: options given to npm test land after
-  # the files, where node does not take them, and NODE_OPTIONS would reach the
-  # gateways the tests start. TAP into the file, for the counts below (Node 23
-  # and later write their default reporter, spec, into a file too), and the
-  # line or the dots to the terminal.
-  (
-    for name in $(compgen -e -X '!VOICE_GW_*'); do unset "$name"; done
-    unset INVOCATION_ID XPC_SERVICE_NAME
-    node --test --test-reporter=tap --test-reporter-destination="$results" \
-      --test-reporter="$reporter" --test-reporter-destination=stdout test/*.test.mjs
-  )
+  # Without this session's settings, as a clean terminal would run it: the
+  # preload of npm test clears them (test/env.cjs). The files of npm test,
+  # with node itself: options given to npm test land after the files, where
+  # node does not take them, and NODE_OPTIONS would reach the gateways the
+  # tests start. TAP into the file, for the counts below (Node 23 and later
+  # write their default reporter, spec, into a file too), and the line or the
+  # dots to the terminal.
+  node --require ./test/env.cjs --test --test-reporter=tap --test-reporter-destination="$results" \
+    --test-reporter="$reporter" --test-reporter-destination=stdout test/*.test.mjs
   passed=$(sed -n 's/^# pass //p' "$results" | tail -n 1)
   failing=$(sed -n 's/^# fail //p' "$results" | tail -n 1)
   if [ "${failing:-x}" = 0 ] && [ -n "$passed" ]; then

@@ -96,8 +96,10 @@ Linux or macOS ([install and test on a Mac](docs/macos.md)); on Windows, inside 
    On Linux, run `sudo tailscale set --operator=$USER` once before; the macOS app needs nothing.
    Either way it reports when all Funnel relays answer, which can take a few minutes the first
    time, and prints the connector URL `https://<host>.ts.net/mcp`, which the page then shows too.
-   Where another web server on this computer already uses port 443, the setup chooses port 8443
-   for the Funnel and the URL ends in `:8443/mcp` ([known issues](#810-known-issues)).
+   A browser on this computer may not reach the gateway under that URL, on a Mac with the Tailscale
+   app or where another web server holds port 443 here; the Claude app does. Section 10 of the page
+   checks it once the Funnel is on, and then offers "Prepare the sign-in on this computer", or sign
+   in from another device ([known issues](#810-known-issues)).
    The URL holds no secret; the sign-in needs the pairing code from step 7. Without Tailscale, any
    HTTPS address on port 443 that forwards to `127.0.0.1:8787` will do
    ([7.3](#73-publishing-the-endpoint)).
@@ -208,10 +210,12 @@ Things that did not work and were replaced:
 - **Claude Code's Bash sandbox** for the controller: on Ubuntu 24.04 and later, AppArmor's
   `bwrap-userns-restrict` profile stops it from starting ([sandboxing][sandbox]). A PreToolUse hook
   with a command allowlist confines the controller instead.
-- **Tailscale Funnel on port 443 next to another web server:** a web server of the computer itself
-  that listens on 443 takes the connections from that computer to its own tailnet address, so the
-  sign-in in a browser there fails. Port 8443 is used there instead (`VOICE_GW_FUNNEL_PORT`); early
-  tests had not reached the Funnel on 8443, a later one did, also from the computer itself.
+- **Tailscale Funnel on port 8443:** Funnel serves it publicly, also with a valid certificate, but
+  claude.ai's connector did not connect to it in our tests ("no server answered", and no request
+  in the log); port 443 works.
+- **Another web server's port 443 on the gateway's computer limited to 127.0.0.1:** the Tailscale
+  app on macOS still did not take 443 on the tailnet address
+  ([known issues](#810-known-issues)).
 - **Skipping the development-channel prompt:** there is no supported way for a channel that is not
   on the approved list ([channels reference][ref]). The plugin on the organisation's allowlist is
   the way without a prompt.
@@ -1156,7 +1160,7 @@ is guarded as follows:
 | systemd user services | – | Optional: autostart at boot on Linux | With lingering (`loginctl enable-linger`), which the setup assistant turns on; without it, only at a login and until the last logout |
 | launchd (macOS) | – | Optional: autostart at login on macOS | A LaunchAgent, which the setup assistant writes and loads; at boot only with automatic login |
 | bash | 3.2 or later | The start scripts | macOS's `/bin/bash` 3.2 will do; no GNU tools needed |
-| A public HTTPS address on port 443 | – | Claude's servers reach the gateway | Tailscale Funnel (tested, 1.104.2) or a reverse proxy; with the Funnel 8443 too, where another web server has 443 |
+| A public HTTPS address on port 443 | – | Claude's servers reach the gateway | Tailscale Funnel (tested, 1.104.2) or a reverse proxy |
 | Claude app | Current | Voice mode with the connector | Used on the iPhone |
 
 **What `npm install` installs:**
@@ -1236,7 +1240,7 @@ the `localhost` link).
 | Step | What the assistant does | What you give it |
 |---|---|---|
 | This computer | Checks Node.js, `npm install`, Claude Code (2.1.80+), git, the `gh` login, Docker, tmux, Tailscale | Fixes for what is marked as needed |
-| Gateway | Port, repositories folder, runs at a time and per repository (both apply at once in a running gateway), time limit, pull requests ready for review or drafts, review comments fixed without asking (on by default) and how many automatic rounds per pull request ([automatic fixes](#automatic-fixes-for-review-comments)), approvals by voice, Remote Control for the controller (off by default), what the controller may do (with a warning above `confined`), what locks the kill switch (with a warning below `auto`), the Funnel off when idle and after how many minutes, the Funnel's port: 443, or 8443 by itself when another web server on this computer listens on 443, which it looks for with `netstat -anv -p tcp` on macOS and `ss -ltnp` on Linux, best effort, Tailscale's own listeners left out (with a line that says so, naming that server if known) | Choices |
+| Gateway | Port, repositories folder, runs at a time and per repository (both apply at once in a running gateway), time limit, pull requests ready for review or drafts, review comments fixed without asking (on by default) and how many automatic rounds per pull request ([automatic fixes](#automatic-fixes-for-review-comments)), approvals by voice, Remote Control for the controller (off by default), what the controller may do (with a warning above `confined`), what locks the kill switch (with a warning below `auto`), the Funnel off when idle and after how many minutes, the Funnel's port, 443 by default and never changed by itself (with a line about the connector for another port) | Choices |
 | Models | Model and effort for the controller (`--model`, `--effort` from `start-controller.sh`) and for every worker run, on the host and in Docker. Claude in Chrome for the controller (off by default); turned on, a warning unless Claude in Chrome's notice for the first start is confirmed already (below) | Choices, or Claude Code's defaults |
 | Telegram | Checks the token (`getMe`), finds your private chat with `getUpdates` once you wrote to the bot, sends a test message | A token from [@BotFather](https://t.me/BotFather), one message to the bot |
 | Workers in Docker | Checks the GitHub token and shows the level per repository with the gateway's detection. Builds the image with its progress shown. Starts the container, sets git's name and email in it, and clones the chosen repositories inside it. While Docker does not answer (section 1), the checkbox is greyed out, with a line why and what it takes; one on from before stays as it is, and the line says that the container cannot run until Docker answers | A token from `claude setup-token`, optionally a GitHub token ([5.6](#56-access-levels-and-their-detection)), the repositories |
@@ -1244,7 +1248,7 @@ the `localhost` link).
 | Watchdog | On Linux, writes and enables a systemd user service that starts the controller in tmux at boot, and turns on lingering for your user so that it keeps running without a login (if that is refused, it shows the `sudo` command); or starts it now in tmux. On macOS it writes a LaunchAgent that starts it in tmux at login, checks it with `plutil`, and with "start it now" loads it with `launchctl bootstrap`, which starts it (`kickstart` if it is loaded already); without, launchd loads it at the next login | Choices |
 | Plugin | Shows whether `voice@cc-voice-gateway` is on the organisation's channel allowlist; registers the marketplace if it is; otherwise shows the admin steps | The admin |
 | Finish | Writes `.secrets/` (5.10). Then it ends, or with "keep this page open" (the default) stays for the next step | Whether to stay |
-| Connect the Claude app | Shows whether the gateway runs; until it does, what to do: start the controller, or, while its tmux session runs, confirm what Claude Code waits for at the terminal, in a notice with the keys to press (`tmux attach -t voice`, the down arrow to "Yes, I trust this folder" and Enter, Enter for further questions, Ctrl-b d). It looks at the tmux pane (`tmux capture-pane`) for the folder trust question or the development channel's confirmation and names the one it sees; only which one reaches the page, never the pane's text. It notices by itself when the gateway runs. Then the Funnel's state on its port, a button that starts it with `scripts/funnel.sh start` and its output, the connector URL while it is on, why the port is 8443 when another web server has 443, and a pairing code with a countdown, valid ten minutes and one sign-in, with "New code"; says when a client signed in with it, or why the code no longer works. Works before writing too, if a gateway runs already | Clicks |
+| Connect the Claude app | Shows whether the gateway runs; until it does, what to do: start the controller, or, while its tmux session runs, confirm what Claude Code waits for at the terminal, in a notice with the keys to press (`tmux attach -t voice`, the down arrow to "Yes, I trust this folder" and Enter, Enter for further questions, Ctrl-b d). It looks at the tmux pane (`tmux capture-pane`) for the folder trust question or the development channel's confirmation and names the one it sees; only which one reaches the page, never the pane's text. It notices by itself when the gateway runs. Then the Funnel's state on its port, a button that starts it with `scripts/funnel.sh start` and its output, the connector URL while it is on, and, once the Funnel is on, whether this computer gets the gateway's sign-in metadata under the connector URL as a browser here would; if not, why (naming another web server on 443 if `netstat -anv -p tcp` on macOS or `ss -ltnp` on Linux shows one, Tailscale's own left out) and two ways: another device, or "Prepare the sign-in on this computer", a marked line in `/etc/hosts` with administrator rights that it removes again by itself, with "Remove it now" ([known issues](#810-known-issues)); and a pairing code with a countdown, valid ten minutes and one sign-in, with "New code"; says when a client signed in with it, or why the code no longer works. Works before writing too, if a gateway runs already | Clicks |
 
 #### Claude in Chrome
 
@@ -1368,8 +1372,8 @@ Then go on with [Getting started](#getting-started) from step 4.
 
 Claude's servers call the connector from Anthropic's cloud. Any tunnel or reverse proxy works that:
 
-- serves **HTTPS on port 443** with a valid certificate; Tailscale Funnel on 8443 works too, for a
-  computer where another web server has 443 ([known issues](#810-known-issues));
+- serves **HTTPS on port 443** with a valid certificate (Tailscale Funnel serves 8443 publicly too,
+  but claude.ai's connector did not connect to it in our tests);
 - forwards **every path** to `127.0.0.1:8787`, not only `/mcp`: the sign-in uses
   `/.well-known/…` and `/oauth/…`. Do not open port 8787 itself;
 - passes the **public host name** in `Host` or `X-Forwarded-Host`, and sends
@@ -1391,11 +1395,12 @@ scripts/funnel.sh url
 ```
 
 The first start fetches a certificate; the name and all relays can take a few minutes. The port is
-`VOICE_GW_FUNNEL_PORT` from `.secrets/gateway.env`: 443 by default, 8443 or 10000, the only ones
-Funnel allows; `FUNNEL_PORT` overrides it for one call. With another port the URL ends in
-`:<port>/mcp`, and the gateway builds its sign-in metadata with that port by itself. The setup
-assistant chooses 8443 when another web server on this computer listens on 443
-([known issues](#810-known-issues)).
+`VOICE_GW_FUNNEL_PORT` from `.secrets/gateway.env`: 443 by default, or 8443 or 10000, the only
+other ones Funnel allows; `FUNNEL_PORT` overrides it for one call. With another port the URL ends
+in `:<port>/mcp`, and the gateway builds its sign-in metadata with that port by itself, but
+claude.ai's connector did not connect to the Funnel on 8443 in our test: keep 443 for it. Neither
+the setup assistant nor the script changes the port by itself. Another web server on port 443 of
+the computer: [known issues](#810-known-issues).
 
 **The Funnel on demand** (`src/funnel.mjs`), so that the endpoint is public only while you use it:
 
@@ -2028,7 +2033,7 @@ limits at once.
 | `VOICE_GW_TELEGRAM_POLL` | `25` | Seconds one poll of the bot for `/stop` waits |
 | `VOICE_GW_TELEGRAM_API` | `https://api.telegram.org` | Bot API; tests use a stand-in |
 | `VOICE_GW_FUNNEL_IDLE` | `0`, off | Minutes after the last voice call before the gateway turns the Funnel off ([7.3](#73-publishing-the-endpoint)) |
-| `VOICE_GW_FUNNEL_PORT` | `443` | The Funnel's public port, for `scripts/funnel.sh` and the setup assistant: `443`, `8443` or `10000`, the only ones Funnel allows. The assistant writes `8443` when another web server on this computer listens on 443 ([known issues](#810-known-issues)) |
+| `VOICE_GW_FUNNEL_PORT` | `443` | The Funnel's public port, for `scripts/funnel.sh` and the setup assistant: `443`, `8443` or `10000`, the only ones Funnel allows. Keep `443` for claude.ai's connector, which did not connect on 8443 in our test ([7.3](#73-publishing-the-endpoint)) |
 | `VOICE_GW_FUNNEL_SCRIPT` | `scripts/funnel.sh` | What the gateway runs to switch the Funnel; tests use a stand-in |
 | `VOICE_GW_DOCKER` | empty | Worker container; empty: workers on this computer |
 | `VOICE_GW_DOCKER_REPOS` | `/repos` | The mounted folder inside the container |
@@ -2091,7 +2096,8 @@ gateway; do not set them.
 | `VOICE_SETUP_PORT` | `8790` | Port |
 | `VOICE_SETUP_TIMEOUT` | `30` | Minutes at most |
 | `VOICE_SETUP_IDLE` | `10` | Minutes without activity |
-| `VOICE_SETUP_GIT_BIN`, `VOICE_SETUP_TMUX_BIN`, `VOICE_SETUP_SYSTEMCTL_BIN`, `VOICE_SETUP_LOGINCTL_BIN`, `VOICE_SETUP_LAUNCHCTL_BIN`, `VOICE_SETUP_PLUTIL_BIN`, `VOICE_SETUP_NETSTAT_BIN`, `VOICE_SETUP_SS_BIN`, `VOICE_SETUP_TAILSCALE_BIN` | `git`, `tmux`, `systemctl`, `loginctl`, `launchctl`, `plutil`, `netstat`, `ss`, `tailscale` | Commands the assistant runs; tests use stand-ins. On macOS it also looks in Homebrew's folders, and for Tailscale in the app |
+| `VOICE_SETUP_GIT_BIN`, `VOICE_SETUP_TMUX_BIN`, `VOICE_SETUP_SYSTEMCTL_BIN`, `VOICE_SETUP_LOGINCTL_BIN`, `VOICE_SETUP_LAUNCHCTL_BIN`, `VOICE_SETUP_PLUTIL_BIN`, `VOICE_SETUP_NETSTAT_BIN`, `VOICE_SETUP_SS_BIN`, `VOICE_SETUP_OSASCRIPT_BIN`, `VOICE_SETUP_PKEXEC_BIN`, `VOICE_SETUP_SUDO_BIN`, `VOICE_SETUP_TAILSCALE_BIN` | `git`, `tmux`, `systemctl`, `loginctl`, `launchctl`, `plutil`, `netstat`, `ss`, `osascript`, `pkexec`, `sudo`, `tailscale` | Commands the assistant runs; tests use stand-ins. On macOS it also looks in Homebrew's folders, and for Tailscale in the app |
+| `VOICE_SETUP_HOSTS_FILE` | `/etc/hosts` | The hosts file of "Prepare the sign-in on this computer"; tests use a file of their own |
 | `VOICE_GW_TAILSCALE_BIN` | `tailscale`, on macOS else the Tailscale app's | The tailscale command `scripts/funnel.sh` runs |
 | `FUNNEL_PORT` | `VOICE_GW_FUNNEL_PORT`, else `443` | Public port of the Funnel for one call of `scripts/funnel.sh`, over the setting |
 
@@ -2099,8 +2105,8 @@ gateway; do not set them.
 
 | Symptom | Cause and fix |
 |---|---|
-| Connector dialog says no server answered, and nothing is in the log | The public address is not on port 443 (or the Funnel's 8443), or it was only just set up. Tailscale Funnel needs a few minutes on the first start; `scripts/funnel.sh start` reports when all relays answer. |
-| The sign-in in a browser on the gateway's own computer says "Not secure" and shows another server's page, such as Apache's "Not Found", while other devices connect | Another web server on that computer listens on port 443, and connections from the computer to its own tailnet address reach it, not the Funnel. Use the Funnel on 8443 ([known issues](#810-known-issues)). |
+| Connector dialog says no server answered, and nothing is in the log | The public address is not on port 443 (claude.ai's connector did not connect to the Funnel on 8443 in our test, although it answers publicly there), or it was only just set up. Tailscale Funnel needs a few minutes on the first start; `scripts/funnel.sh start` reports when all relays answer. |
+| The sign-in in a browser on the gateway's own computer says "Not secure" and shows another server's page, such as Apache's "Not Found", while other devices connect | Another web server on that computer listens on port 443, and connections from the computer to its own tailnet name reach it, not the Funnel; on a Mac with the Tailscale app such a connection is refused when nothing else listens there. Sign in from another device, or "Prepare the sign-in on this computer" in section 10 of the setup page ([known issues](#810-known-issues)). |
 | Sign-in goes to an `http://` address or to the wrong host | The tunnel or proxy does not pass the public host name or `X-Forwarded-Proto: https` (see [Publishing the endpoint](#73-publishing-the-endpoint)). |
 | Sign-in page says the app is not registered | The sign-in state was reset, for example because `.secrets/oauth.json` was deleted. Remove the connector and add it again. |
 | Sign-in fails with Claude's published identity | Choose to register automatically instead. If the log shows `client id document not allowed: <URL>`, that host is missing from `VOICE_GW_OAUTH_HOSTS`. |
@@ -2223,17 +2229,40 @@ computer. Anthropic documents the allowlist for organisations only, so this is u
 break with any update of Claude Code: if a start waits for the confirmation again, confirm it as
 above and check whether the workaround still holds.
 
-**Another web server on port 443 of this computer: the Funnel uses 8443.** A web server of the
-gateway's computer that listens on port 443 itself, such as macOS's built-in Apache with
-`/etc/apache2/extra/httpd-ssl.conf`, takes the connections from that computer to its own tailnet
-address on 443: Tailscale Funnel still answers other devices and Claude's servers there, but the
-Claude app's sign-in in a browser on that computer gets the other server, "Not secure" and its own
-page. So the setup assistant looks for such a server (`netstat -anv -p tcp` on macOS,
-`ss -ltnp` on Linux) and then chooses port 8443 for the Funnel (`VOICE_GW_FUNNEL_PORT=8443`),
-which it writes and explains in section 10; the connector URL ends in `:8443/mcp`. That server stays
-as it is. By hand: `VOICE_GW_FUNNEL_PORT=8443` in `.secrets/gateway.env`, then
-`scripts/funnel.sh start`, and in the Claude app a connector with the new URL. A Funnel left on
-443 from before keeps running until `FUNNEL_PORT=443 scripts/funnel.sh stop`.
+**A browser on the gateway's own computer cannot sign in under the tailnet name.** The Funnel
+answers other devices and Claude's servers as it should, so the Claude app reaches the gateway; only
+the sign-in in a browser on the computer the gateway runs on fails. On macOS the Tailscale app's
+network extension binds the tailnet address only for ports from 1024 up (`netstat -anv -p tcp`
+shows `IPNExtension` on 8443, never on 443), so a connection from the Mac to its own tailnet name
+on 443 is refused, or, where another web server listens on `*:443`, such as macOS's built-in Apache
+with `/etc/apache2/extra/httpd-ssl.conf`, gets that server: "Not secure" and its own page. Letting
+that server listen only on `127.0.0.1` does not help: the Tailscale app still does not take 443 on
+the tailnet address. On Linux the same happens where another web server listens on 443.
+
+Section 10 of the setup page finds out instead of guessing: once the Funnel is on, the assistant
+fetches `https://<host>.ts.net/.well-known/oauth-authorization-server` from this computer, as a
+browser here would, and only if what answers is not the gateway (refused, the wrong certificate,
+another server's page) it says so, naming another web server on 443 if `netstat -anv -p tcp` on
+macOS or `ss -ltnp` on Linux shows one. Then, for the one-time sign-in:
+
+- add the connector and sign in from another device, for example claude.ai in a browser on your
+  phone, with a pairing code from the setup page or `node scripts/pair.mjs`;
+- or "Prepare the sign-in on this computer": the assistant looks up one of the Funnel's public
+  addresses through public resolvers (1.1.1.1, 8.8.8.8; not MagicDNS) and adds one marked line to
+  `/etc/hosts`, `<address> <host>.ts.net # cc-voice-gateway setup: …`, so that the browser goes
+  out through the public Funnel with its valid certificate. It asks for administrator rights: on
+  macOS the system's password dialog (`osascript … with administrator privileges`), which also
+  flushes the resolver's cache (`dscacheutil -flushcache`, `killall -HUP mDNSResponder`); on Linux
+  `pkexec`, or `sudo -n` where no password is needed; otherwise the page shows the exact command for
+  a terminal. It keeps a backup next to the file (`/etc/hosts.cc-voice-gateway.bak`), never touches
+  another line, and checks again whether the gateway answers now. It removes the line again, by an
+  exact match, as soon as the page's pairing code is used, when the page or the assistant ends, and
+  with "Remove it now"; that may ask for the password a second time. A line an assistant left
+  behind, after a crash for example, shows on the page with "Remove it now" too.
+
+The setup never changes that other server, and never moves the Funnel off 443: Funnel serves 8443
+publicly, but claude.ai's connector did not connect to it in our test ("no server answered at this
+URL", and no request from Anthropic's addresses in the log).
 
 ## 9. Repository layout
 
@@ -2295,6 +2324,8 @@ scripts/
   test-progress.mjs            the tests as one line in a terminal, written over, for check-macos.sh
 test/                one file per area; npm test runs them all, with stand-ins for Claude Code,
                      gh, docker, the GitHub API and Telegram
+  env.cjs            loaded first: clears the caller's settings (VOICE_GW_*, Claude Code's
+                     session), so the tests run alike from any shell, the controller's too
 docs/
   *.drawio.svg       the diagrams, made with draw.io
   index.html         the product page (GitHub Pages, from this folder)
