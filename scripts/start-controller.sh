@@ -315,10 +315,13 @@ elapsed() {
 
 # The gateway in one line, for --status: its process, the session's child
 # ($1), or one of this checkout that belongs to no session of the watchdog;
-# how long it runs; whether its port answers.
+# how long it runs; whether its port answers. The port first: a gateway that
+# answers is then in the list, also one that started just now (the list takes
+# a while on macOS, with lsof for each process).
 gateway_line() {
   local session=${1:-} pid ppid etime script found=() answers joined
   gateway_port
+  if healthy; then answers="port $port answers"; else answers="port $port does not answer"; fi
   while read -r pid ppid etime script; do
     [ -n "$pid" ] || continue
     if [ -n "$session" ] && [ "$ppid" = "$session" ]; then
@@ -327,7 +330,6 @@ gateway_line() {
       found+=("process $pid ($script, of no session of the watchdog), running for $(elapsed "$etime")")
     fi
   done < <(gateway_processes)
-  if healthy; then answers="port $port answers"; else answers="port $port does not answer"; fi
   if [ "${#found[@]}" = 0 ]; then
     echo "start-controller: no gateway process of this checkout; $answers"
   else
