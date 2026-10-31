@@ -120,7 +120,8 @@ const SESSION_ENV = [
 
 // Beyond the repository: the Claude account's connectors (Gmail, Slack, ...),
 // other sessions, scheduled and remote agents. And nobody can fill in a form
-// during a run.
+// during a run. The security-review skill puts its own prompt in place of the
+// task and ends the run with its report, before the commit and the push.
 export const WORKER_DENY = [
   'mcp__claude_ai_*',
   'SendMessage',
@@ -133,6 +134,7 @@ export const WORKER_DENY = [
   'EnterWorktree',
   'AskUserQuestion',
   'EnterPlanMode',
+  'Skill(security-review)',
 ]
 
 // How a worker opens a pull request (VOICE_GW_PR_DRAFT): ready for review by
@@ -178,6 +180,10 @@ summarise your result for them. Nobody can answer you during the run.
 - At the end, switch back to the starting branch, so the checkout is as the driver left it.
 - Run the tests that cover your change. Tasks that change nothing, such as questions or test runs, need no
   branch.
+- Finish the job yourself: once the work is done and tested, commit, push and open the pull request as the
+  Publish rule says, without asking first. Whatever you run near the end, a review, a subagent or a skill,
+  carry on afterwards: its report is not your result. For a security review, read the diff yourself or give
+  it to a subagent; the security-review skill is not available to you.
 - Before you end, look at git status and git log --branches --not --remotes. Never end a run with commits of
   yours on no remote, or uncommitted changes of yours, without naming them in your result. Where the Publish
   rule lets you push and you did not, end by asking whether to push. The gateway checks git after every run

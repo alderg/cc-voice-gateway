@@ -560,7 +560,11 @@ What applies to every worker run (`src/workers.mjs`):
 - **Options:** `claude -p --permission-mode bypassPermissions --permission-prompts none
   --strict-mcp-config`. A repository's own MCP servers do not start.
 - **Denied tools:** claude.ai connectors, messages to other sessions, remote and scheduled agents,
-  artifacts, workflows, Monitor, worktrees, `AskUserQuestion` and plan mode.
+  artifacts, workflows, Monitor, worktrees, `AskUserQuestion`, plan mode and the `security-review`
+  skill. That skill puts its own prompt in place of the task, so a run that called it near the end
+  stopped with the review's report, before its commit and push. The rules ask workers to finish
+  the job themselves (commit, push, pull request, without asking first) and to carry on after any
+  review, subagent or skill.
 - **Environment:** the controller session's variables (`CLAUDECODE`, its messaging socket and
   token, the session id) are removed, so a worker cannot reach the controller.
 - **Before a run:** the gateway refuses a dispatch without your words from a recent voice request
