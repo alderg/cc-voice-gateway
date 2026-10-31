@@ -493,6 +493,17 @@ if (telegram) {
 // on Telegram, throttled. Without Telegram, the log has them.
 const alerts = new Alerts({ send: telegram ? text => telegram.send(text) : null })
 if (standby.active) alerts.pause() // in a standby: at most one summary a day
+// /funnel off on Telegram takes the gateway off the internet (funnel.mjs):
+// the alerts about suspicious requests say so, where it works, with the
+// Telegram commands on and scripts/funnel.sh able to tell the Funnel's state.
+if (telegramCommands) {
+  funnel
+    .state()
+    .then(state => {
+      if (state) alerts.advice = 'Send /funnel off to take the gateway off the internet.'
+    })
+    .catch(() => {})
+}
 const ipGuard = new IpGuard({ allow: config.mcpAllow, alerts })
 auth.on('pairing', event => ipGuard.pairing(event))
 log(`${ipGuard.describe()}; suspicious requests ${telegram ? 'reported on Telegram' : 'only in the log'}`)

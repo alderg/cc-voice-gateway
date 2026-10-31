@@ -212,6 +212,34 @@ test('the throttle: one message per kind and address, a cap per window; held one
   }
 })
 
+test('where /funnel off works: the suspicious-activity alert and the summary of more suspicious requests say how to take the gateway off the internet; the other alerts do not', async () => {
+  const sent = []
+  const advice = 'Send /funnel off to take the gateway off the internet.'
+  const alerts = new Alerts({ send: async text => sent.push(text), log: quiet, perKeyMs: 400, windowMs: 1200, perWindow: 4, host: 'raspberrypi', advice })
+  const p = 'cc-voice-gateway on raspberrypi: '
+  try {
+    alerts.notify('blocked', '203.0.113.50', 'suspicious activity. A voice request came from 203.0.113.50, and was blocked.')
+    alerts.notify('token', '160.79.104.10', 'a voice request without a token came from 160.79.104.10, and was refused.')
+    alerts.notify('accepted', '198.51.100.1', 'signed in with the pairing code.', { urgent: true })
+    alerts.notify('wrong', '203.0.113.4', 'wrong pairing code.')
+    alerts.notify('token', '160.79.104.11', 'another one.') // the window is full: held for the summary
+    await alerts.queue
+    assert.deepEqual(sent, [
+      `${p}suspicious activity. A voice request came from 203.0.113.50, and was blocked. ${advice}`,
+      `${p}a voice request without a token came from 160.79.104.10, and was refused.`,
+      `${p}signed in with the pairing code.`,
+      `${p}wrong pairing code.`,
+    ])
+    await waitFor(() => sent.length === 5, 4000)
+    assert.equal(
+      sent[4],
+      `${p}more suspicious requests, not reported one by one: 1 voice request without a valid token, from 1 address. The gateway log has each of them. ${advice}`,
+    )
+  } finally {
+    alerts.close()
+  }
+})
+
 test('the throttle without Telegram sends nothing, and a failing send is only logged', async () => {
   const silent = new Alerts({ log: quiet })
   silent.notify('blocked', '203.0.113.1', 'nobody hears this.')
@@ -562,5 +590,28 @@ test('VOICE_GW_MCP_ALLOW=any: /mcp from every address, the token still decides',
     assert.equal((await any.mcp({ 'x-forwarded-for': '203.0.113.50' })).status, 401)
   } finally {
     await any.stop()
+  }
+})
+
+test('with Telegram and a Funnel that answers: the suspicious-activity alert says that /funnel off takes the gateway off the internet; a refused token does not', async () => {
+  const folder = join(TMP, 'advice-funnel')
+  mkdirSync(folder, { recursive: true })
+  const script = join(folder, 'funnel.sh') // as scripts/funnel.sh answers where Tailscale runs
+  writeFileSync(script, '#!/bin/bash\n[ "$1" = state ] && echo on\n')
+  const before = ours().length
+  const advice = await startGateway('advice', { telegram: true, env: { VOICE_GW_FUNNEL_SCRIPT: script } })
+  try {
+    await sleep(500) // the Funnel's state, asked once at the start
+    assert.equal((await advice.mcp({ 'x-forwarded-for': '203.0.113.60', ...FUNNEL })).status, 403)
+    await waitFor(() => ours().length > before)
+    assert.match(
+      ours().at(-1),
+      /^cc-voice-gateway on .*: suspicious activity\. A voice request \(POST \/mcp\) came from 203\.0\.113\.60, which is not one of Anthropic's addresses, and was blocked before its token was looked at\. Claude voice mode calls only from Anthropic\. Send \/funnel off to take the gateway off the internet\.$/,
+    )
+    assert.equal((await advice.mcp({ 'x-forwarded-for': '160.79.106.40', ...FUNNEL })).status, 401)
+    await waitFor(() => ours().length > before + 1)
+    assert.match(ours().at(-1), /: a voice request without a token came from 160\.79\.106\.40, .* nobody can sign in\.$/, 'a refused token: as it was')
+  } finally {
+    await advice.stop()
   }
 })

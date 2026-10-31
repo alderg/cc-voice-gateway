@@ -226,6 +226,11 @@ const KINDS = {
 
 const MAX_ADDRESSES = 1000 // counted one by one per summary; beyond that, "more than"
 
+// The alerts that call a request suspicious, and so get the advice, as the
+// summary of more suspicious requests does: a voice request from outside the
+// allowed addresses.
+const SUSPICIOUS = ['blocked']
+
 // At most one message per kind and address within perKeyMs, and perWindow
 // messages within windowMs in all. What is held back is counted and named in
 // the next message; if none comes, in a summary once messages may go out
@@ -233,7 +238,10 @@ const MAX_ADDRESSES = 1000 // counted one by one per summary; beyond that, "more
 // failed ones must not hide it. Without send (no Telegram), nothing goes out;
 // the gateway log has every event anyway. While the gateway is in standby
 // (pause), everything but an urgent alert is only counted, for at most one
-// summary per pausedMs, a day.
+// summary per pausedMs, a day. advice: a sentence at the end of the alerts
+// that call a request suspicious (SUSPICIOUS) and of the summary of more
+// suspicious requests, not of the others: where Telegram's /funnel off works,
+// that it takes the gateway off the internet (gateway.mjs).
 export class Alerts {
   constructor({
     send = null,
@@ -243,8 +251,10 @@ export class Alerts {
     perWindow = 6,
     pausedMs = 24 * 60 * 60 * 1000,
     host = hostname(),
+    advice = '',
   } = {}) {
     this.send = send
+    this.advice = advice
     this.log = log
     this.perKeyMs = perKeyMs
     this.windowMs = windowMs
@@ -302,7 +312,13 @@ export class Alerts {
     this.last.set(key, now)
     this.sent.push(now)
     const held = this.paused ? '' : this.takeHeld(now) // in a standby, what is held waits for its summary
-    this.deliver(`${this.prefix}${text}${held ? `\n\nNot reported one by one since the last message: ${held}` : ''}`)
+    const advice = SUSPICIOUS.includes(kind) ? this.withAdvice('') : ''
+    this.deliver(`${this.prefix}${text}${held ? `\n\nNot reported one by one since the last message: ${held}` : ''}${advice}`)
+  }
+
+  // The advice after a text, as its own sentence, if there is one.
+  withAdvice(text) {
+    return this.advice ? `${text} ${this.advice}` : text
   }
 
   prune(now) {
@@ -361,7 +377,7 @@ export class Alerts {
       return
     }
     this.sent.push(now)
-    this.deliver(`${this.prefix}more suspicious requests, not reported one by one: ${this.takeHeld(now)}`)
+    this.deliver(this.withAdvice(`${this.prefix}more suspicious requests, not reported one by one: ${this.takeHeld(now)}`))
   }
 
   deliver(text) {

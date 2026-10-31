@@ -407,7 +407,10 @@ to a lost phone or a leaked token.
   the address. An expired token of a known connection, the hourly refresh, is only logged.
   Throttled: one message per kind and address in 15 minutes, six an hour in all; what is held back
   is counted in the next message, or in a summary once messages may go out again. A successful
-  sign-in always goes out.
+  sign-in always goes out. Where Telegram's `/funnel off` works (Telegram set up, and
+  `scripts/funnel.sh` answers), the suspicious-activity alert about a request from outside the range
+  and the summary of more suspicious requests end with "Send /funnel off to take the gateway off the
+  internet."; `/funnel off` from your chat removes the Funnel, `/funnel on` brings it back.
 - **The gateway is its own OAuth server.** OAuth metadata, dynamic client registration, client ID
   metadata documents, and the authorisation code flow with PKCE (S256).
 - **Redirect addresses** must be HTTPS on `claude.ai` or `claude.com` (`VOICE_GW_OAUTH_HOSTS`), or
