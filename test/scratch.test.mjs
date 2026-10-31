@@ -21,7 +21,9 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import { z } from 'zod'
 
-const TMP = realpathSync(mkdtempSync(join(tmpdir(), 'voice-gw-scratch-')))
+// Short and resolved: the gateways' admin sockets are in folders below it, and
+// macOS allows Unix socket paths of at most 103 bytes, however TMPDIR is spelled.
+const TMP = realpathSync(mkdtempSync(join(tmpdir(), 'vgw-')))
 const BIN = join(TMP, 'bin')
 const CALLS = join(TMP, 'claude-calls.jsonl')
 
@@ -71,11 +73,12 @@ setTimeout(() => {
 
 // The stand-in for docker, as in docker.test.mjs: it runs what docker exec
 // would run in the container right here, where the container's folder is a
-// temporary one, and logs every call.
+// temporary one, and logs every call. Where find here has no -printf (BSD
+// find, on macOS), it lists a folder as the container's GNU find does.
 const DOCKER_LOG = join(TMP, 'docker-calls.jsonl')
 const FAKE_DOCKER = `#!/usr/bin/env node
 import { spawn, spawnSync } from 'node:child_process'
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { appendFileSync, lstatSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 const argv = process.argv.slice(2)
 appendFileSync(process.env.FAKE_DOCKER_LOG, JSON.stringify(argv) + '\\n')
@@ -100,6 +103,24 @@ if (command === 'voice-run') {
   spawn(run, rest, { cwd, stdio: 'inherit', env }).on('exit', code => process.exit(code ?? 1))
 } else if (command === 'voice-stop') {
   try { process.kill(-Number(readFileSync(join(runs, args[0]), 'utf8')), 'SIGTERM') } catch {}
+} else if (command === 'sh' && args[1]?.includes('-printf') && spawnSync('find', ['.', '-maxdepth', '0', '-printf', '']).status !== 0) {
+  // The listing of DockerRunner.files: sh -c <script> sh <folder> <lines>,
+  // one line per file, with its path in the folder, size and mtime.
+  const [dir, lines] = args.slice(3)
+  if (!statSync(dir, { throwIfNoEntry: false })?.isDirectory()) process.exit(3)
+  const found = []
+  const walk = rel => {
+    for (const entry of readdirSync(join(dir, rel), { withFileTypes: true })) {
+      const path = rel ? rel + '/' + entry.name : entry.name
+      if (entry.isDirectory()) walk(path)
+      else {
+        const stat = lstatSync(join(dir, path))
+        found.push(path + '\\t' + stat.size + '\\t' + stat.mtimeMs / 1000 + '\\n')
+      }
+    }
+  }
+  walk('')
+  process.stdout.write(found.slice(0, Number(lines)).join(''))
 } else {
   process.exit(spawnSync(command, args, { cwd, stdio: 'inherit', env }).status ?? 1)
 }
