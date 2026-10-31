@@ -10,7 +10,7 @@
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync, spawn, spawnSync } from 'node:child_process'
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { createServer as createSocketServer } from 'node:net'
 import { tmpdir } from 'node:os'
@@ -1175,6 +1175,46 @@ test('the plugin step: without the allowlist, a warning that every start waits f
     /the channel: the plugin is not on an allowlist, so every start of the controller, also after a crash, by the watchdog and by scripts\/restart-everything\.sh, waits for the development channel's confirmation at the terminal \(tmux attach -t voice, then Enter\); personal accounts \(Pro, Max\) have no allowlist, see "Known issues" in the README/,
   )
   assert.doesNotMatch(await finish('plugin', { VOICE_GW_CHANNEL: 'plugin' }), /the channel: /)
+})
+
+test('starting the controller: its folder marked as trusted in Claude Code\'s config first; not while a controller session runs', async () => {
+  const config = join(TMP, 'trust-config')
+  mkdirSync(config, { recursive: true })
+  const file = join(config, '.claude.json')
+  const start = async name => {
+    const setup = createSetup({ root: ROOT, secretsDir: join(TMP, `secrets-trust-${name}`), env: { ...setupEnv(), CLAUDE_CONFIG_DIR: config }, home: HOME, platform: 'linux', say })
+    const { job } = await setup.api['POST /api/finish']({
+      body: { settings: { VOICE_GW_PORT: '8787', VOICE_GW_DOCKER: '' }, telegram: { enabled: false }, docker: { enabled: false }, watchdog: { startNow: true } },
+    })
+    let done
+    for (let i = 0; i < 250 && (done = setup.api['GET /api/jobs/:id']({ id: job })).state === 'running'; i++) await sleep(20)
+    assert.equal(done.state, 'done', done.lines.join('\n'))
+    return done.lines.join('\n')
+  }
+  const controller = realpathSync(join(ROOT, 'controller'))
+  try {
+    rmSync(SESSION, { force: true })
+    writeFileSync(file, JSON.stringify({ numStartups: 2, projects: { '/x': { allowedTools: [] } } }, null, 2))
+    const text = await start('first')
+    assert.match(text, /the controller folder is marked as trusted in Claude Code's config: its first start does not wait at the folder trust question/)
+    assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')), { numStartups: 2, projects: { '/x': { allowedTools: [] }, [controller]: { hasTrustDialogAccepted: true } } })
+    assert.ok(calls().some(c => c.command === 'tmux' && c.argv.slice(0, 4).join(' ') === 'new-session -d -s voice'))
+
+    // The session runs (the fake tmux's session): nothing started, nothing written.
+    writeFileSync(SESSION, '')
+    writeFileSync(file, '{"numStartups": 3}')
+    const running = await start('running')
+    assert.match(running, /the tmux session "voice" already runs; not started again/)
+    assert.equal(readFileSync(file, 'utf8'), '{"numStartups": 3}')
+
+    // A config that does not parse: left alone, and the line says what that means.
+    rmSync(SESSION, { force: true })
+    writeFileSync(file, '{"numStartups": 3,')
+    assert.match(await start('broken'), /the controller folder could not be marked as trusted \(\S*\.claude\.json is not valid JSON\); at its first start Claude Code may ask at the terminal: tmux attach -t voice, the down arrow to "Yes, I trust this folder", then Enter/)
+    assert.equal(readFileSync(file, 'utf8'), '{"numStartups": 3,')
+  } finally {
+    rmSync(SESSION, { force: true })
+  }
 })
 
 test('the settings file: one line per setting, read without running anything', () => {

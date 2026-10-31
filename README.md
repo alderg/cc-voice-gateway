@@ -77,15 +77,17 @@ Linux or macOS ([install and test on a Mac](docs/macos.md)); on Windows, inside 
    tmux new -s voice scripts/start-controller.sh
    ```
 
-   Claude Code opens in `controller/` and asks at the terminal, and until you answer, the gateway
-   does not start: once whether you trust the folder (and the MCP server), and with the
-   development flag the channel warning at every start ([8.1](#81-starting-and-stopping)). Attach
-   with `tmux attach -t voice`. At "Is this a project you created or one you trust?" press the
-   down arrow once to "Yes, I trust this folder", then Enter: Enter alone picks "No, exit". Answer
-   any further question with Enter, then detach with Ctrl-b, then d. While the assistant runs, its
-   own terminal is busy: attach from another one on this computer, or over SSH. While the tmux
-   session runs and the gateway does not answer, section 10 of the page says how, names the
-   question when it sees it in the tmux session, and notices by itself when the gateway is up.
+   Claude Code opens in `controller/`, and until it is through its questions at the terminal, the
+   gateway does not start. Its folder trust question does not come: the setup assistant and the
+   start script mark `controller/` as trusted in Claude Code's config beforehand
+   ([8.1](#81-starting-and-stopping)). With the development flag, the channel warning comes at
+   every start: attach with `tmux attach -t voice`, press Enter, and detach with Ctrl-b, then d.
+   Should Claude Code ask "Is this a project you created or one you trust?" all the same, press the
+   down arrow once to "Yes, I trust this folder", then Enter: Enter alone picks "No, exit". While
+   the assistant runs, its own terminal is busy: attach from another one on this computer, or over
+   SSH. While the tmux session runs and the gateway does not answer, section 10 of the page says
+   how, names the question when it sees it in the tmux session, and notices by itself when the
+   gateway is up.
 
 5. **Start the funnel:** "Start the Funnel" in section 10 of the page, or at the computer:
 
@@ -1245,7 +1247,7 @@ the `localhost` link).
 | Telegram | Checks the token (`getMe`), finds your private chat with `getUpdates` once you wrote to the bot, sends a test message | A token from [@BotFather](https://t.me/BotFather), one message to the bot |
 | Workers in Docker | Checks the GitHub token and shows the level per repository with the gateway's detection. Builds the image with its progress shown. Starts the container, sets git's name and email in it, and clones the chosen repositories inside it. While Docker does not answer (section 1), the checkbox is greyed out, with a line why and what it takes; one on from before stays as it is, and the line says that the container cannot run until Docker answers | A token from `claude setup-token`, optionally a GitHub token ([5.6](#56-access-levels-and-their-detection)), the repositories |
 | Work folders | Off by default. Turned on: checks their folder as the gateway does, and with a container of their own, builds the image if it is missing and starts the container with `start-workers-container.sh --scratch` ([work folders](#work-folders)). The container's checkbox is greyed out while Docker does not answer, as in section 5 | The folder, the days they are kept, and for the container its name and the token from `claude setup-token` |
-| Watchdog | On Linux, writes and enables a systemd user service that starts the controller in tmux at boot, and turns on lingering for your user so that it keeps running without a login (if that is refused, it shows the `sudo` command); or starts it now in tmux. On macOS it writes a LaunchAgent that starts it in tmux at login, checks it with `plutil`, and with "start it now" loads it with `launchctl bootstrap`, which starts it (`kickstart` if it is loaded already); without, launchd loads it at the next login | Choices |
+| Watchdog | On Linux, writes and enables a systemd user service that starts the controller in tmux at boot, and turns on lingering for your user so that it keeps running without a login (if that is refused, it shows the `sudo` command); or starts it now in tmux. On macOS it writes a LaunchAgent that starts it in tmux at login, checks it with `plutil`, and with "start it now" loads it with `launchctl bootstrap`, which starts it (`kickstart` if it is loaded already); without, launchd loads it at the next login. Before it starts the controller, it marks `controller/` as trusted in Claude Code's config, so that the first start does not wait at the folder trust question ([8.1](#81-starting-and-stopping)) | Choices |
 | Plugin | Shows whether `voice@cc-voice-gateway` is on the organisation's channel allowlist; registers the marketplace if it is; otherwise shows the admin steps | The admin |
 | Finish | Writes `.secrets/` (5.10). Then it ends, or with "keep this page open" (the default) stays for the next step | Whether to stay |
 | Connect the Claude app | Shows whether the gateway runs; until it does, what to do: start the controller, or, while its tmux session runs, confirm what Claude Code waits for at the terminal, in a notice with the keys to press (`tmux attach -t voice`, the down arrow to "Yes, I trust this folder" and Enter, Enter for further questions, Ctrl-b d). It looks at the tmux pane (`tmux capture-pane`) for the folder trust question or the development channel's confirmation and names the one it sees; only which one reaches the page, never the pane's text. It notices by itself when the gateway runs. Then the Funnel's state on its port, a button that starts it with `scripts/funnel.sh start` and its output, the connector URL while it is on, and, once the Funnel is on, whether this computer gets the gateway's sign-in metadata under the connector URL as a browser here would; if not, why (naming another web server on 443 if `netstat -anv -p tcp` on macOS or `ss -ltnp` on Linux shows one, Tailscale's own left out) and two ways: another device, or "Prepare the sign-in on this computer", a marked line in `/etc/hosts` with administrator rights that it removes again by itself, with "Remove it now" ([known issues](#810-known-issues)); and a pairing code with a countdown, valid ten minutes and one sign-in, with "New code"; says when a client signed in with it, or why the code no longer works. Works before writing too, if a gateway runs already | Clicks |
@@ -1512,6 +1514,17 @@ either case.
   `VOICE_GW_CONTROLLER_EFFORT`, `--chrome` with `VOICE_GW_CONTROLLER_CHROME=1`, and
   `--remote-control "Voice controller"` with `VOICE_GW_REMOTE_CONTROL=1`
   ([below](#remote-control-from-the-claude-app)); options given to the script come last and win.
+- **The folder trust question:** at the first start in a folder, Claude Code asks "Quick safety
+  check: Is this a project you created or one you trust?", with "No, exit" chosen, and waits at
+  the terminal. Before every start, `scripts/folder-trust.mjs` therefore marks `controller/` as
+  trusted where Claude Code notes the answer: `projects["<folder>"].hasTrustDialogAccepted` in
+  `~/.claude.json` (`$CLAUDE_CONFIG_DIR/.claude.json` if set), on the exact folder as the system
+  names it, also where a parent folder is trusted already. Only that key of that project, only when
+  it is missing, under Claude Code's own lock, the new file in place of the old in one step; a file
+  that does not parse is left alone. So it holds after the folder moved or the config was reset
+  too. The setup assistant does the same right before it starts the controller. If it cannot (no
+  such file yet, not valid JSON, locked for 5 s), the log line `watchdog: trust: …` says that the
+  start may ask at the terminal.
 - **Claude in Chrome's notice for the first start:** at the first interactive start with
   `--chrome`, Claude Code shows a notice about Claude in Chrome before the session starts ("Enter to
   confirm · Esc to cancel") and waits for a key, so a start by the watchdog or the autostart would
@@ -2311,6 +2324,8 @@ scripts/
   channel-mode.mjs             plugin or development flag
   controller-settings.mjs      the session's --settings for its level
   chrome-onboarding.mjs        Claude in Chrome's notice for the first start, marked as seen
+  folder-trust.mjs             controller/ marked as trusted, so that no folder trust question waits
+  claude-config.mjs            both changes to Claude Code's ~/.claude.json, under its lock, in one step
   settings.sh                  .secrets/gateway.env for the shell scripts
   start-workers-container.sh   the worker container, or with --scratch the work folders'; read-only while locked
   fetch-from-container.sh      a branch from the container into a clean clone, as a bundle

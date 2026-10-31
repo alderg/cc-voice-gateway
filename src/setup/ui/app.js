@@ -561,10 +561,11 @@ function showCode(text, expiresIn) {
 
 // While the tmux session runs and the gateway does not answer, Claude Code
 // most likely waits for a confirmation at the terminal. The server looks at
-// the tmux pane and names the question it sees (status.waiting): the folder
-// trust question, once for the folder, whose default is "No, exit"; or the
+// the tmux pane and names the question it sees (status.waiting): the
 // development channel's, at every start without the allowlist (section 8),
-// whose default goes on. Otherwise both, in one text.
+// whose default goes on; or the folder trust question, whose default is "No,
+// exit", which should not come, as the setup and the start script mark the
+// folder as trusted beforehand. Otherwise both, in one text.
 const TRUST_STEP =
   'press the down arrow once to "Yes, I trust this folder" (Enter alone picks "No, exit"), then Enter'
 const LEAVE = 'then leave tmux with Ctrl-b, then d. This page notices by itself when the gateway runs.'
@@ -580,10 +581,10 @@ const WAIT_TMUX = {
     LEAVE,
   unknown:
     'Action needed: the controller runs in the tmux session "voice", but its gateway does not answer yet. Most likely ' +
-    'Claude Code waits for a confirmation at the terminal. In a terminal on this computer, or over SSH: run tmux ' +
-    `attach -t voice. If it asks whether you trust this folder, which it does once, ${TRUST_STEP}. Answer any further ` +
-    'question with Enter, such as the development channel\'s confirmation, which comes at every start while the ' +
-    `plugin is not on the allowlist (section 8); ${LEAVE}`,
+    'Claude Code waits for a confirmation at the terminal, such as the development channel\'s, which comes at every ' +
+    'start while the plugin is not on the allowlist (section 8). In a terminal on this computer, or over SSH: run tmux ' +
+    'attach -t voice and answer it with Enter. Should it ask whether you trust this folder, which the setup marks ' +
+    `as trusted beforehand, ${TRUST_STEP}; ${LEAVE}`,
 }
 const WAIT_START =
   'The controller is not running. Start it: tick "Start it now" in section 7 and write the setup, or at the computer: ' +

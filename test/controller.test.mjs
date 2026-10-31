@@ -15,6 +15,7 @@ import { homedir, tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { markChromeOnboarding } from '../scripts/chrome-onboarding.mjs'
+import { folderTrusted, markFolderTrust } from '../scripts/folder-trust.mjs'
 import { CONTROLLER_DENY, UNRESTRICTED_ALLOW } from '../scripts/controller-settings.mjs'
 
 const SCRIPT = fileURLToPath(new URL('../scripts/start-controller.sh', import.meta.url))
@@ -155,7 +156,12 @@ test('start-controller.sh with VOICE_GW_CONTROLLER_CHROME=1: --chrome, with Clau
   // Seen at a restart by the autostart with Claude Code 2.1.310: the notice
   // waited a quarter of an hour for Enter at the terminal, and no voice
   // request arrived meanwhile.
-  const config = { numStartups: 7, oauthAccount: { emailAddress: 'driver@example.com' }, projects: { '/x': { hasTrustDialogAccepted: true } } }
+  // The controller folder trusted already (folder-trust.mjs, at every start), so that only the notice changes here.
+  const config = {
+    numStartups: 7,
+    oauthAccount: { emailAddress: 'driver@example.com' },
+    projects: { '/x': { hasTrustDialogAccepted: true }, [realpathSync(CONTROLLER)]: { hasTrustDialogAccepted: true } },
+  }
   const on = runWithStub(['--debug'], withClaudeJson(config), chrome('1'))
   assert.ok(on.argv.includes('--chrome'))
   assert.equal(on.argv.at(-1), '--debug', 'options given to the script still come last')
@@ -250,6 +256,106 @@ test('chrome-onboarding: waits while Claude Code holds its lock, takes over one 
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
+})
+
+test('folder-trust: marks the exact folder as trusted, keeps every other key of it and of the file, its form, mode and link', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'voice-gw-trust-'))
+  try {
+    const folder = join(dir, 'cc-voice-gateway', 'controller')
+    mkdirSync(folder, { recursive: true })
+    const target = join(dir, 'dotfiles', 'claude.json')
+    mkdirSync(dirname(target))
+    const config = {
+      numStartups: 3,
+      oauthAccount: { emailAddress: 'driver@example.com' },
+      projects: { '/elsewhere': { hasTrustDialogAccepted: true, allowedTools: ['Bash'] }, [realpathSync(folder)]: { history: [1, 2], lastCost: 0.5 } },
+    }
+    writeFileSync(target, JSON.stringify(config, null, 2) + '\n')
+    chmodSync(target, 0o640)
+    symlinkSync(target, join(dir, '.claude.json'))
+    const env = { CLAUDE_CONFIG_DIR: dir }
+    assert.equal(folderTrusted(folder, { env }), false)
+    assert.deepEqual(await markFolderTrust(folder, { env }), { state: 'marked' })
+    const after = JSON.parse(readFileSync(target, 'utf8'))
+    assert.deepEqual(after, {
+      ...config,
+      projects: { ...config.projects, [realpathSync(folder)]: { history: [1, 2], lastCost: 0.5, hasTrustDialogAccepted: true } },
+    })
+    assert.ok(readFileSync(target, 'utf8').endsWith('}\n'), 'its form: indented, with the newline at the end')
+    assert.ok(lstatSync(join(dir, '.claude.json')).isSymbolicLink(), 'the link stays')
+    assert.equal(statSync(target).mode & 0o777, 0o640)
+    assert.deepEqual(readdirSync(dirname(target)), ['claude.json'], 'no temporary file left')
+    assert.equal(folderTrusted(folder, { env }), true)
+
+    const written = statSync(target).mtimeMs
+    assert.deepEqual(await markFolderTrust(folder, { env }), { state: 'seen' })
+    assert.equal(statSync(target).mtimeMs, written, 'not written again')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('folder-trust: a new entry where there was none, also with a parent folder trusted already; an unparsable or missing file is left alone', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'voice-gw-trust-'))
+  const file = join(dir, '.claude.json')
+  const env = { CLAUDE_CONFIG_DIR: dir }
+  try {
+    const repo = realpathSync(mkdtempSync(join(tmpdir(), 'voice-gw-repo-')))
+    const folder = join(repo, 'controller')
+    mkdirSync(folder)
+    // Trust on the repository root, as on the computer that showed it: it counts for the controller folder too,
+    // but the exact folder gets its own entry, to be safe.
+    writeFileSync(file, JSON.stringify({ projects: { [repo]: { hasTrustDialogAccepted: true, allowedTools: [] } } }))
+    assert.equal(folderTrusted(folder, { env }), true, 'through its parent')
+    assert.equal(folderTrusted(`${repo}-other`, { env }), false, 'not a folder whose name only starts the same')
+    assert.deepEqual(await markFolderTrust(folder, { env }), { state: 'marked' })
+    assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')).projects, {
+      [repo]: { hasTrustDialogAccepted: true, allowedTools: [] },
+      [folder]: { hasTrustDialogAccepted: true },
+    })
+
+    // No projects at all yet.
+    writeFileSync(file, JSON.stringify({ numStartups: 1 }))
+    assert.deepEqual(await markFolderTrust(folder, { env }), { state: 'marked' })
+    assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')), { numStartups: 1, projects: { [folder]: { hasTrustDialogAccepted: true } } })
+
+    // Not valid JSON, no object, or no file at all: nothing written or made.
+    for (const broken of ['{"projects": {', '[]']) {
+      writeFileSync(file, broken)
+      const result = await markFolderTrust(folder, { env })
+      assert.equal(result.state, 'failed', broken)
+      assert.match(result.why, /\.claude\.json (is not valid JSON|holds no JSON object)$/)
+      assert.equal(readFileSync(file, 'utf8'), broken)
+      assert.equal(folderTrusted(folder, { env }), null, 'it cannot tell')
+    }
+    const none = await markFolderTrust(folder, { env: { CLAUDE_CONFIG_DIR: join(dir, 'none') } })
+    assert.equal(none.state, 'failed')
+    assert.match(none.why, /\.claude\.json does not exist yet: Claude Code has not run here as this user$/)
+    assert.ok(!existsSync(join(dir, 'none')))
+
+    // While a running Claude Code holds its lock: wait, then give up without writing.
+    writeFileSync(file, '{}')
+    mkdirSync(`${file}.lock`)
+    const held = await markFolderTrust(folder, { env, waitMs: 300 })
+    assert.match(held.why, /^another Claude Code process held the lock on \S*\.claude\.json for 0\.3 s$/)
+    assert.equal(readFileSync(file, 'utf8'), '{}')
+    rmSync(repo, { recursive: true, force: true })
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('start-controller.sh marks the controller folder as trusted before every start; quiet once it is', () => {
+  const config = { numStartups: 7, projects: { '/x': { hasTrustDialogAccepted: true } } }
+  const first = runWithStub([], withClaudeJson(config))
+  const controller = realpathSync(CONTROLLER)
+  assert.deepEqual(first.claudeJson, { ...config, projects: { ...config.projects, [controller]: { hasTrustDialogAccepted: true } } })
+  assert.match(first.log, /watchdog: trust: marked the controller folder as trusted in Claude Code's config, so that the session does not wait at the folder trust question/)
+  const again = runWithStub([], withClaudeJson(first.claudeJson))
+  assert.doesNotMatch(again.log, / trust: /)
+  const missing = runWithStub([], () => {})
+  assert.equal(missing.claudeJson, null, 'no config made up')
+  assert.match(missing.log, /watchdog: trust: the controller folder could not be marked as trusted, since \S*\.claude\.json does not exist yet: .*; at its first start there Claude Code asks at the terminal \(tmux attach -t voice: the down arrow to "Yes, I trust this folder", then Enter\)/)
 })
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url)).replace(/\/$/, '')

@@ -25,6 +25,12 @@
 # VOICE_GW_REMOTE_CONTROL=1 Remote Control (--remote-control): the session can
 # then be followed and steered from claude.ai/code and the Claude app.
 #
+# Claude Code asks at the first start in a folder whether you trust it, with
+# "No, exit" chosen, and waits at the terminal. So before every start,
+# scripts/folder-trust.mjs marks the controller folder as trusted in Claude
+# Code's own config (~/.claude.json), where Claude Code notes the answer too;
+# if that fails, the log says that the start may ask.
+#
 # Claude in Chrome shows a notice at the first interactive start with --chrome,
 # before the session starts, and waits for Enter or Esc at the terminal. So
 # before every start with it, scripts/chrome-onboarding.mjs marks that notice
@@ -485,6 +491,24 @@ chrome_onboarding() {
   esac
 }
 
+# Claude Code's folder trust question at the first start in a folder waits at
+# the terminal, with "No, exit" chosen: the controller's folder is marked as
+# trusted beforehand (scripts/folder-trust.mjs), before every start, so that
+# it also holds after the folder moved or the config was reset. Quiet when it
+# was trusted already; if it cannot be marked, the log says that the start
+# may ask at the terminal.
+folder_trust() {
+  local line
+  line=$(node "$ROOT/scripts/folder-trust.mjs" "$CONTROLLER" 2>/dev/null || echo 'failed the check did not run (scripts/folder-trust.mjs)')
+  case $line in
+    seen) ;;
+    marked)
+      log "trust: marked the controller folder as trusted in Claude Code's config, so that the session does not wait at the folder trust question" ;;
+    *)
+      log "trust: the controller folder could not be marked as trusted, since ${line#failed }; at its first start there Claude Code asks at the terminal (tmux attach -t voice: the down arrow to \"Yes, I trust this folder\", then Enter)" ;;
+  esac
+}
+
 # Claude in Chrome needs a desktop of this user: someone signed in at it, or a
 # remote desktop session that stays when disconnected, with Chrome open and
 # the Claude extension signed in. Otherwise its tools answer that the
@@ -557,6 +581,9 @@ choose_channel() {
     unrestricted)
       log "controller level unrestricted: the confinement is off. By voice, the controller can run any command as $(id -un), read and change any file, .secrets/ included, and use the web" ;;
   esac
+  # No folder trust question at the start (before it, as the session is not
+  # running yet).
+  folder_trust
   # The session's model, effort and Claude in Chrome from the settings;
   # options given to this script come later and win.
   if [ -n "${VOICE_GW_CONTROLLER_MODEL:-}" ]; then claude_args+=(--model "$VOICE_GW_CONTROLLER_MODEL"); fi

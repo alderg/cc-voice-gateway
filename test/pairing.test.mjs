@@ -708,9 +708,9 @@ test('the page: what to do while the gateway is down, then a code with its time,
   assert.equal($('#connect-wait').hidden, false)
   // Which question waits is not known: both, with the keys for each.
   const unknown = $('#connect-wait').textContent
-  assert.match(unknown, /^Action needed: the controller runs in the tmux session "voice", but its gateway does not answer yet\. Most likely Claude Code waits for a confirmation at the terminal\./)
-  assert.match(unknown, /run tmux attach -t voice\. If it asks whether you trust this folder, which it does once, press the down arrow once to "Yes, I trust this folder" \(Enter alone picks "No, exit"\), then Enter\./)
-  assert.match(unknown, /Answer any further question with Enter, such as the development channel's confirmation, which comes at every start while the plugin is not on the allowlist \(section 8\); then leave tmux with Ctrl-b, then d\. This page notices by itself when the gateway runs\.$/)
+  assert.match(unknown, /^Action needed: the controller runs in the tmux session "voice", but its gateway does not answer yet\. Most likely Claude Code waits for a confirmation at the terminal, such as the development channel's, which comes at every start while the plugin is not on the allowlist \(section 8\)\./)
+  assert.match(unknown, /run tmux attach -t voice and answer it with Enter\. Should it ask whether you trust this folder, which the setup marks as trusted beforehand, press the down arrow once to "Yes, I trust this folder" \(Enter alone picks "No, exit"\), then Enter; then leave tmux with Ctrl-b, then d\. This page notices by itself when the gateway runs\.$/)
+  assert.doesNotMatch(unknown, /which it does once/, 'no trust question promised that no longer comes')
   assert.equal($('#connect-ready').hidden, true)
   const html = readFileSync(join(ROOT, 'src', 'setup', 'ui', 'index.html'), 'utf8')
   assert.match(html, /<p id="connect-wait" class="notice" role="alert" hidden><\/p>/, 'a notice like the plugin warning')

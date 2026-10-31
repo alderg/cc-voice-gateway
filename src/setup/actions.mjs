@@ -35,6 +35,7 @@ import { scratchProblem } from '../workspaces.mjs'
 import { asAdmin, hostsCommand, hostsLine, markedLines, signInCheck } from './hosts.mjs'
 import { MARKETPLACE, PLUGIN, channelMode } from '../../scripts/channel-mode.mjs'
 import { chromeNoticeSeen } from '../../scripts/chrome-onboarding.mjs'
+import { markFolderTrust } from '../../scripts/folder-trust.mjs'
 
 export const MODELS = ['fable', 'opus', 'sonnet', 'haiku']
 const MIN_CLAUDE = [2, 1, 80]
@@ -824,6 +825,22 @@ export function createSetup({
     ].join('\n')
   }
 
+  // Right before the setup starts the controller, while it does not run: its
+  // folder trusted in Claude Code's config, so that the first start does not
+  // wait at the folder trust question (scripts/folder-trust.mjs, which the
+  // start script runs before every start too).
+  async function trustFolder(line) {
+    const { state, why } = await markFolderTrust(join(root, 'controller'), { env })
+    if (state === 'marked') {
+      line("the controller folder is marked as trusted in Claude Code's config: its first start does not wait at the folder trust question")
+    } else if (state === 'failed') {
+      line(
+        `the controller folder could not be marked as trusted (${redact(why)}); at its first start Claude Code may ask at ` +
+          'the terminal: tmux attach -t voice, the down arrow to "Yes, I trust this folder", then Enter',
+      )
+    }
+  }
+
   // macOS: the LaunchAgent, checked with plutil. launchd loads it at every
   // login and then starts the controller. Loading it now (bootstrap) starts
   // it at once, so only when it is to start now; loaded already, a kickstart
@@ -851,6 +868,7 @@ export function createSetup({
       line(`the tmux session "voice" already runs; not started again${loaded ? '' : `. The LaunchAgent starts it at your next login, or: launchctl bootstrap ${domain} ${file}`}`)
       return null
     }
+    await trustFolder(line)
     const args = loaded ? ['kickstart', service] : ['bootstrap', domain, file]
     const code = await runCommand(bin.launchctl, args, { env, onLine: line, timeoutMs: 30000 })
     if (code !== 0) {
@@ -914,6 +932,7 @@ export function createSetup({
       if (await tmuxSession()) {
         line('the tmux session "voice" already runs; not started again')
       } else {
+        await trustFolder(line)
         const code = await runCommand(bin.tmux, ['new-session', '-d', '-s', 'voice', join(root, 'scripts', 'start-controller.sh')], {
           env,
           cwd: root,
