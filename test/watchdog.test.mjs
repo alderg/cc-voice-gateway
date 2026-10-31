@@ -678,25 +678,35 @@ test('Claude in Chrome: marked as seen, a restart needs no confirmation; if it c
   ])
 })
 
-test('Claude in Chrome: each start logs whether a desktop session of the user and a Chrome run, the log only', async () => {
+test('Claude in Chrome: each start logs whether a desktop session of the user and a Chrome run, the log only; on Linux and on macOS', async () => {
   const user = process.env.USER ?? process.env.LOGNAME
-  // Stand-ins: loginctl with or without the user's graphical session, pgrep with or without a Chrome.
-  const fakes = (name, { display, chrome }) => {
+  // Stand-ins: uname for the platform; on Linux loginctl with or without the
+  // user's graphical session, on macOS stat with the console's owner; pgrep
+  // with or without a Chrome.
+  const fakes = (name, { system = 'Linux', display = '', owner = 'root', chrome }) => {
     const dir = join(TMP, name)
     mkdirSync(dir, { recursive: true })
-    writeFileSync(join(dir, 'loginctl'), `#!/bin/sh\ncase "$*" in\n  *show-user*) echo "${display}" ;;\n  *show-session*) echo x11 ;;\nesac\n`)
-    writeFileSync(join(dir, 'pgrep'), `#!/bin/sh\nexit ${chrome ? 0 : 1}\n`)
-    chmodSync(join(dir, 'loginctl'), 0o755)
-    chmodSync(join(dir, 'pgrep'), 0o755)
+    const script = (command, body) => {
+      writeFileSync(join(dir, command), `#!/bin/sh\n${body}\n`)
+      chmodSync(join(dir, command), 0o755)
+    }
+    script('uname', `echo ${system}`)
+    script('loginctl', `case "$*" in\n  *show-user*) echo "${display}" ;;\n  *show-session*) echo x11 ;;\nesac`)
+    script('stat', `echo ${owner}`)
+    script('pgrep', `exit ${chrome ? 0 : 1}`)
     return `${dir}:${BIN}:${process.env.PATH}`
   }
+  const logged = async (name, platform) => {
+    const c = setup([{ exit: 0 }], { env: { VOICE_GW_CONTROLLER_CHROME: '1', PATH: fakes(name, platform) } })
+    assert.equal((await run(c)).status, 0)
+    return c.log()
+  }
   const before = telegram.messages.length
-  const none = setup([{ exit: 0 }], { env: { VOICE_GW_CONTROLLER_CHROME: '1', PATH: fakes('chrome-none', { display: '', chrome: false }) } })
-  assert.equal((await run(none)).status, 0)
-  assert.match(none.log(), new RegExp(`watchdog: chrome desktop: no desktop session of ${user}, and no Chrome of the user runs: until someone is signed in at the desktop, or in a remote desktop session that stays, with Chrome open and the Claude extension signed in, Claude in Chrome's tools answer that the extension is not connected`))
-  const both = setup([{ exit: 0 }], { env: { VOICE_GW_CONTROLLER_CHROME: '1', PATH: fakes('chrome-both', { display: 'c2', chrome: true }) } })
-  assert.equal((await run(both)).status, 0)
-  assert.match(both.log(), new RegExp(`watchdog: chrome desktop: a desktop session of ${user} \\(session c2, x11\\), and a Chrome of the user runs; Claude in Chrome works if its extension is signed in to the same claude\\.ai account`))
+  assert.match(await logged('chrome-none', { chrome: false }), new RegExp(`watchdog: chrome desktop: no desktop session of ${user}, and no Chrome of the user runs: until someone is signed in at the desktop, or in a remote desktop session that stays, with Chrome open and the Claude extension signed in, Claude in Chrome's tools answer that the extension is not connected`))
+  assert.match(await logged('chrome-both', { display: 'c2', chrome: true }), new RegExp(`watchdog: chrome desktop: a desktop session of ${user} \\(session c2, x11\\), and a Chrome of the user runs; Claude in Chrome works if its extension is signed in to the same claude\\.ai account`))
+  // macOS: the desktop is the console's, at the login window root's.
+  assert.match(await logged('chrome-mac', { system: 'Darwin', owner: user, chrome: true }), new RegExp(`watchdog: chrome desktop: a desktop session of ${user} \\(the console\\), and a Chrome of the user runs; Claude in Chrome works`))
+  assert.match(await logged('chrome-mac-login', { system: 'Darwin', chrome: true }), new RegExp(`watchdog: chrome desktop: no desktop session of ${user}, and a Chrome of the user runs: until someone is signed in`))
   assert.equal(telegram.messages.length, before, 'no message')
 })
 
