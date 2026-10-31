@@ -7,7 +7,7 @@
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -22,7 +22,8 @@ const { Workers, auditSummary, auditText } = await import('../src/workers.mjs')
 const { Ledger, decisionLine } = await import('../src/ledger.mjs')
 
 // COMMIT: a commit on a voice branch, not pushed, back on the start branch.
-// LEAVE: a new file, not committed. Then a result.
+// LEAVE: a new file, not committed. Then a result; SLOW: none, it runs until
+// it is stopped.
 const FAKE_CLAUDE = `#!/usr/bin/env node
 const fs = require('fs')
 const cp = require('child_process')
@@ -39,7 +40,8 @@ if (/COMMIT/.test(input)) {
 if (/LEAVE/.test(input)) fs.writeFileSync('left-over.txt', 'x')
 const args = process.argv.slice(2)
 const session = args[args.indexOf(args.includes('--session-id') ? '--session-id' : '--resume') + 1]
-console.log(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'Done.', session_id: session }))
+if (/SLOW/.test(input)) setInterval(() => {}, 1000)
+else console.log(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'Done.', session_id: session }))
 `
 
 before(() => {
@@ -202,6 +204,39 @@ test('a question back on the answer is the same decision, and the follow-up for 
     await until(() => follow.task.reported)
     assert.equal(ledger.open().length, 1, 'it did not push: the commit counts again')
     assert.match(decisionLine(ledger.open()[0]), /^d[a-z0-9]{3} push, alpha, not asked yet \(request r/)
+  } finally {
+    workers.close()
+  }
+})
+
+test('a run stopped by the controller is checked from its end: the next queued task waits for that, and for the decision it raises', async () => {
+  // As stop_worker does it, but with the poll first to see the end: it
+  // started the next queued task in the same go, before stop_worker got to
+  // the check (seen in workers.test.mjs on a Mac, and often under load).
+  const { dir, ledger, workers } = setup('stopped')
+  try {
+    const slow = await workers.dispatch({ worker: 'alpha', task: 'SLOW LEAVE: write the notes.', words: 'the words' })
+    assert.equal(slow.status, 'started')
+    await until(() => existsSync(join(dir, 'left-over.txt')))
+    const next = await workers.dispatch({ worker: 'alpha', task: 'Then count the notes.', words: 'the words', allowDirty: true })
+    assert.equal(next.status, 'queued')
+    const [task] = workers.stopRuns('alpha')
+    await until(() => !workers.ownAlive(task))
+    workers.poll()
+    assert.equal(task.state, 'stopped')
+    assert.equal(workers.blocked(next.entry), 'busy', 'its check is going')
+    assert.equal(await workers.ended(task), true)
+    await workers.audit(task)
+    const decision = ledger.get(task.decision)
+    assert.deepEqual(decision.details.files, ['left-over.txt'])
+    workers.poll()
+    await new Promise(r => setTimeout(r, 300))
+    assert.deepEqual(workers.queued('alpha'), [next.entry], 'not started')
+    assert.equal(workers.blocked(next.entry), 'decision')
+    ledger.close(decision, { outcome: 'keep it', by: 'driver' })
+    workers.poll()
+    const started = await until(() => workers.state.tasks.find(t => t.queued === next.entry.id))
+    await until(() => started.reported)
   } finally {
     workers.close()
   }

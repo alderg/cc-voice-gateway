@@ -1985,6 +1985,14 @@ export class Workers extends EventEmitter {
     }
     log(`worker ${state}`, task.repo, task.id, `after ${duration(task.finishedAt - task.startedAt)}`, error ? preview(error, 120) : '')
     this.emit('ended', task)
+    // Stopped by the controller (stopRuns): no result event, and stop_worker's
+    // answer brings the check. It starts now, with the end: the poll may see
+    // the end before stop_worker does, and would start the next queued task
+    // in the same go, before the check could raise the decision that is to
+    // hold it. Also when nobody waits for it any more, after a restart.
+    if (task.stopping?.reason && !task.stopping.lock && task.reported) {
+      this.audit(task).catch(auditError => log('worker audit failed', task.repo, task.id, auditError.message))
+    }
     if (unsaved) throw unsaved
   }
 
