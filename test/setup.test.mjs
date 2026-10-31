@@ -412,6 +412,11 @@ test('the start: checks, current settings, repositories and the plugin, without 
   assert.equal(data.settings.VOICE_GW_PORT, '8787')
   assert.equal(data.settings.VOICE_GW_KILLSWITCH, 'auto', 'the kill switch locks by itself, by default')
   assert.equal(data.settings.VOICE_GW_PR_DRAFT, '0', 'pull requests ready for review, by default')
+  assert.equal(data.settings.VOICE_GW_AUTO_FIX_REVIEWS, '1', 'review comments fixed without asking, by default')
+  assert.equal(data.settings.VOICE_GW_AUTO_FIX_ROUNDS, '3')
+  const html = readFileSync(join(ROOT, 'src', 'setup', 'ui', 'index.html'), 'utf8')
+  assert.match(html, /<select data-setting="VOICE_GW_AUTO_FIX_REVIEWS"><option value="1">fixed without asking \(default\)<\/option><option value="0">fixed only when you ask<\/option><\/select>/)
+  assert.match(html, /<input data-setting="VOICE_GW_AUTO_FIX_ROUNDS" inputmode="numeric">/)
   assert.equal(data.settings.VOICE_GW_SCRATCH, '0', 'work folders off, by default')
   assert.equal(data.settings.VOICE_GW_SCRATCH_DOCKER, '', 'and on this computer when turned on')
   assert.equal(data.settings.VOICE_GW_SCRATCH_DAYS, '60')
@@ -497,10 +502,15 @@ test('finishing: invalid input is refused before anything is written', async () 
       VOICE_GW_SCRATCH_DAYS: '366',
       VOICE_GW_SCRATCH_DOCKER: 'a b',
       VOICE_GW_REMOTE_CONTROL: 'yes',
+      VOICE_GW_AUTO_FIX_REVIEWS: 'yes',
+      VOICE_GW_AUTO_FIX_ROUNDS: '11',
       NOPE: '1',
     },
   })
   assert.equal(refused.status, 400)
+  for (const name of ['VOICE_GW_AUTO_FIX_REVIEWS', 'VOICE_GW_AUTO_FIX_ROUNDS']) {
+    assert.match(refused.data.error, new RegExp(`${name}: not a valid value`))
+  }
   assert.match(refused.data.error, /VOICE_GW_REMOTE_CONTROL: not a valid value/)
   assert.match(refused.data.error, /VOICE_GW_PORT: not a valid value/)
   assert.match(refused.data.error, /VOICE_GW_WORKER_MODEL: not a valid value/)

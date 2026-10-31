@@ -186,6 +186,21 @@ export const config = {
   // seconds, and for how many hours at most.
   prPollSeconds: num(env.VOICE_GW_PR_POLL, 60),
   prWatchHours: num(env.VOICE_GW_PR_WATCH_HOURS, 24),
+  // Review comments on them, fixed without asking (pulls.mjs): new reviews
+  // and comments that ask for changes, of the repository's owner, members
+  // and collaborators or of a review bot in VOICE_GW_REVIEW_BOTS, get a fix
+  // the gateway queues itself, as a follow-up of the run that pushed the pull
+  // request; at most this many rounds per pull request, until the driver
+  // dispatches something for it again. On by default; 0 leaves fixing to the
+  // driver's word.
+  autoFixReviews: env.VOICE_GW_AUTO_FIX_REVIEWS !== '0',
+  autoFixRounds: Math.floor(num(env.VOICE_GW_AUTO_FIX_ROUNDS, 3)) || 1,
+  // The review bots, by their GitHub login without [bot]: the Claude app,
+  // and Copilot's reviewer under both names GitHub gives it.
+  reviewBots: (env.VOICE_GW_REVIEW_BOTS || 'claude,copilot-pull-request-reviewer,copilot')
+    .split(',')
+    .map(name => name.trim())
+    .filter(Boolean),
 
   // Telegram fallback, on when both of its files in the secrets folder are set:
   // after this many seconds without a voice tool call, the voice mode counts

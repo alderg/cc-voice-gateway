@@ -1236,7 +1236,7 @@ the `localhost` link).
 | Step | What the assistant does | What you give it |
 |---|---|---|
 | This computer | Checks Node.js, `npm install`, Claude Code (2.1.80+), git, the `gh` login, Docker, tmux, Tailscale | Fixes for what is marked as needed |
-| Gateway | Port, repositories folder, runs at a time and per repository (both apply at once in a running gateway), time limit, approvals by voice, Remote Control for the controller (off by default), what the controller may do (with a warning above `confined`), what locks the kill switch (with a warning below `auto`), the Funnel off when idle and after how many minutes, the Funnel's port: 443, or 8443 by itself when another web server on this computer listens on 443, which it looks for with `netstat -anv -p tcp` on macOS and `ss -ltnp` on Linux, best effort, Tailscale's own listeners left out (with a line that says so, naming that server if known) | Choices |
+| Gateway | Port, repositories folder, runs at a time and per repository (both apply at once in a running gateway), time limit, pull requests ready for review or drafts, review comments fixed without asking (on by default) and how many automatic rounds per pull request ([automatic fixes](#automatic-fixes-for-review-comments)), approvals by voice, Remote Control for the controller (off by default), what the controller may do (with a warning above `confined`), what locks the kill switch (with a warning below `auto`), the Funnel off when idle and after how many minutes, the Funnel's port: 443, or 8443 by itself when another web server on this computer listens on 443, which it looks for with `netstat -anv -p tcp` on macOS and `ss -ltnp` on Linux, best effort, Tailscale's own listeners left out (with a line that says so, naming that server if known) | Choices |
 | Models | Model and effort for the controller (`--model`, `--effort` from `start-controller.sh`) and for every worker run, on the host and in Docker. Claude in Chrome for the controller (off by default); turned on, a warning unless Claude in Chrome's notice for the first start is confirmed already (below) | Choices, or Claude Code's defaults |
 | Telegram | Checks the token (`getMe`), finds your private chat with `getUpdates` once you wrote to the bot, sends a test message | A token from [@BotFather](https://t.me/BotFather), one message to the bot |
 | Workers in Docker | Checks the GitHub token and shows the level per repository with the gateway's detection. Builds the image with its progress shown. Starts the container, sets git's name and email in it, and clones the chosen repositories inside it. While Docker does not answer (section 1), the checkbox is greyed out, with a line why and what it takes; one on from before stays as it is, and the line says that the container cannot run until Docker answers | A token from `claude setup-token`, optionally a GitHub token ([5.6](#56-access-levels-and-their-detection)), the repositories |
@@ -1754,7 +1754,7 @@ at most three short sentences, without code, paths or lists.
 | "Rechne mir die Fahrtkosten nach Basel aus." / "Draft a reply to the landlord." | With work folders on: `dispatch` with `scratch/new`; you hear the result, and the files are in that folder at the desk. "Make it shorter." goes to the same folder |
 | "Is anyone reviewing pull request 12 in alpha?" / "Did the last CI run on main pass?" | The controller answers itself with read-only `gh` |
 | "Request a review for pull request 12 in alpha." | Only on your word: the worker reviews the diff and posts a review, or adds the person you name as reviewer |
-| "Fix the review comments on pull request 12." | Only on your word: the worker fixes them, runs the tests, pushes to the same branch, replies on each thread, and says what is left open |
+| "Fix the review comments on pull request 12." | Without a word from you while `VOICE_GW_AUTO_FIX_REVIEWS` is on, the default: the gateway queues the fix itself when new review comments ask for changes, and you hear it as news ([below](#automatic-fixes-for-review-comments)). Said anyway, or with the setting off, or after the automatic rounds are used up: the worker fixes them, runs the tests, pushes to the same branch, replies on each thread, and says what is left open |
 | "Merge pull request 12 in alpha." | The controller asks back with the title and the method; after your yes, `gh pr merge` raises an approval; you confirm a second time |
 | "Push it straight to main." | Only in Docker at level `full`: `dispatch` with `direct`. Otherwise the controller says why it stays a pull request |
 | "Emergency stop!" | The kill switch locks before anything reaches the controller ([5.9](#59-the-kill-switch)) |
@@ -1782,7 +1782,9 @@ that needs no repository:
 **Your words.** The controller passes your words with every dispatch. If they are not from a voice
 request of the last `VOICE_GW_DISPATCH_WINDOW` minutes, the gateway starts nothing and the
 controller asks you first ([5.4](#54-approvals-by-voice)). When a worker result or a review asks
-for something, the controller is told to tell you and let you decide.
+for something, the controller is told to tell you and let you decide. The one exception is your
+standing instruction to fix review comments, which the gateway carries out itself, not the
+controller ([below](#automatic-fixes-for-review-comments)).
 
 **Open items** (`src/ledger.mjs`), so that nothing is forgotten while you drive:
 
@@ -1836,11 +1838,42 @@ for something, the controller is told to tell you and let you decide.
   - new reviews and comments, except those of the account `gh` is logged in as;
   - their text only from the repository's owner, members and collaborators. Of anyone else, which
     as a rule includes bots such as Copilot, you hear who reviewed or commented, not what;
+  - the fix the gateway queued for them, or why it queued none ([below](#automatic-fixes-for-review-comments));
   - you hear them as a sentence or two. The controller gets them marked `trusted="no"`.
 - **When the watch stops:**
   - nothing shows up in the first five looks;
   - the pull request is merged or closed;
   - after `VOICE_GW_PR_WATCH_HOURS` (24); a later push starts it again (above).
+
+#### Automatic fixes for review comments
+
+Your standing instruction: review comments on the workers' pull requests are fixed without
+asking, round after round (`VOICE_GW_AUTO_FIX_REVIEWS`, on by default; the setup assistant offers
+it). The watch above does it, in code (`src/pulls.mjs`, `Workers.reviewFix`):
+
+- **What starts a fix:** new inline comments, reviews that request changes or have a text, and
+  comments with a text, from the repository's owner, members and collaborators, or from a review
+  bot of `VOICE_GW_REVIEW_BOTS` (the Claude app, `claude`, and Copilot's reviewer). A login on that
+  list counts only where GitHub does not say it is a person. Anyone else's reviews and comments
+  start nothing, as their text is not forwarded either. Approvals without a comment start nothing.
+- **The fix** is a task in the gateway's own words, naming the pull request and its branch, never
+  what the reviews say: the worker reads the threads on GitHub itself, under its rules, and acts
+  only on those of collaborators and review bots. Its prompt says that the gateway queued it, with
+  no words of yours.
+- **Through the queue,** always, as the follow-up of the run that pushed the pull request: in its
+  worktree if it had one, with its session. So it waits like any task: behind a run going there,
+  while an open decision holds the repository, for a free run slot. One that waits already takes
+  newer comments too. While the kill switch is locked nothing is queued, and the lock empties the
+  queue as always.
+- **Rounds.** The fix pushes, the automatic reviews run again, and new comments start the next
+  round. At most `VOICE_GW_AUTO_FIX_ROUNDS` (3) per pull request; then the news says they are used
+  up, and the controller tells you. A further fix takes your word, and a run you dispatch that
+  works on the pull request gives it its rounds again.
+- **What you hear:** the news about the review, which says that a fix was queued (with
+  `fix="q…"` for the controller, which dispatches nothing for it), and later the fix's result.
+  `open_items`, `list_workers` and `worker_status` show such a task as "from the review of pull
+  request 12"; its runs count in the statistics like any other.
+- **Off,** with `VOICE_GW_AUTO_FIX_REVIEWS=0`: news only, and a fix only when you ask for it.
 
 A worker's checkout must not be used at the desk while it runs there: workers switch branches in
 your checkouts. A worker never commits, stashes or discards changes it did not make.
@@ -1988,6 +2021,9 @@ limits at once.
 | `VOICE_GW_DOCKER_SCRATCH` | `/scratch` | Where that container mounts `VOICE_GW_SCRATCH_ROOT` |
 | `VOICE_GW_PR_POLL` | `60` | Seconds between looks at a watched pull request |
 | `VOICE_GW_PR_WATCH_HOURS` | `24` | Hours before a watch ends |
+| `VOICE_GW_AUTO_FIX_REVIEWS` | `1` | `1`: new review comments that ask for changes, from collaborators and review bots, get a fix the gateway queues itself ([automatic fixes](#automatic-fixes-for-review-comments)); `0`: only on the driver's word |
+| `VOICE_GW_AUTO_FIX_ROUNDS` | `3` | Automatic fixes per pull request, until the driver dispatches something for it again |
+| `VOICE_GW_REVIEW_BOTS` | `claude,copilot-pull-request-reviewer,copilot` | Review bots whose reviews and comments start a fix, by GitHub login without `[bot]` |
 | `VOICE_GW_TELEGRAM_AFTER` | `600` | Seconds without a voice call before questions and approvals also go to Telegram ([5.8](#58-the-telegram-fallback)) |
 | `VOICE_GW_TELEGRAM_POLL` | `25` | Seconds one poll of the bot for `/stop` waits |
 | `VOICE_GW_TELEGRAM_API` | `https://api.telegram.org` | Bot API; tests use a stand-in |

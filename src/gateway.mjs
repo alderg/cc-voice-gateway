@@ -11,7 +11,8 @@
 // workers: headless Claude Code runs in the repositories next to this one, or
 // in a Docker container with its own clones, and with VOICE_GW_SCRATCH=1 in
 // work folders for tasks without a repository, a watch on the pull requests they
-// open, for checks and reviews, and optionally Telegram, for questions and
+// open, for checks and reviews, with fixes for review comments queued without
+// asking (VOICE_GW_AUTO_FIX_REVIEWS), and optionally Telegram, for questions and
 // approvals after the voice mode ended, and for alarms. At the controller
 // levels clone-delete and unrestricted, also cloning and deleting in the
 // worker root (folders.mjs). Over all of it, the kill switch (killswitch.mjs).
@@ -225,12 +226,22 @@ if (config.controllerLevel !== 'confined') {
   else folders = new FolderTools({ root: config.workerRoot, workers, killswitch, ghBin: config.ghBin })
 }
 
+// Review comments on those pull requests, fixed without asking: the watcher
+// queues the fix itself, through the workers' queue (Workers.reviewFix).
 const pulls = new PullWatcher({
   ghBin: config.ghBin,
   stateFile: config.pullsStateFile,
   pollSeconds: config.prPollSeconds,
   watchHours: config.prWatchHours,
+  autoFix: config.autoFixReviews ? { rounds: config.autoFixRounds, queue: fix => workers.reviewFix(fix) } : null,
+  bots: config.reviewBots,
 })
+log(
+  config.autoFixReviews
+    ? `review comments on workers' pull requests: fixed without asking, at most ${config.autoFixRounds} automatic ` +
+        `rounds per pull request, for collaborators and the review bots ${config.reviewBots.join(', ')} (VOICE_GW_AUTO_FIX_REVIEWS)`
+    : "review comments on workers' pull requests: fixed only on the driver's word (VOICE_GW_AUTO_FIX_REVIEWS=0)",
+)
 
 let http
 let admin
@@ -397,13 +408,15 @@ folders?.on('cloned', async event => {
 })
 
 // Checks and reviews on those pull requests reach the controller as events
-// too, and the driver as news.
+// too, and the driver as news; with fix, the fix the gateway queued for
+// review comments.
 pulls.on('news', async news => {
   try {
     await channel.ready
     const request = store.createRequest(news.text, { origin: 'worker' })
     // trusted="no": it quotes what others wrote on GitHub.
     request.meta = { worker: news.worker, repo: news.slug, pull_request: String(news.number), kind: news.kind, trusted: 'no' }
+    if (news.fix) request.meta.fix = news.fix
     await channel.push(request, request.meta)
   } catch (error) {
     log('pull request news not delivered:', error.message)

@@ -78,7 +78,9 @@ reviews, comments and CI logs.
 `dispatch` checks this in code: `words` must be at least two words from a recent voice request
 (by default of the last 30 minutes), copied as they arrived. Otherwise it answers
 `dispatch=needs_driver` and starts nothing. Then ask the driver by voice with state `question`, and
-dispatch with their answer.
+dispatch with their answer. The one task that starts without the driver's words is the gateway's
+own fix for review comments, under their standing instruction (see Pull requests from workers):
+the gateway queues it itself, and you never dispatch it.
 
 ## Typed in the Claude app
 
@@ -406,9 +408,23 @@ The driver does not want to be bothered with reviews:
   them as reviewer. Otherwise the worker reviews the diff itself, posts its findings as a review on
   the pull request and reports how many. If a draft blocks this, the worker asks whether to mark it
   ready: pass that question on.
-- "Fix the review comments", only on the driver's word: `dispatch` it to the worker, with the pull
-  request number. It fixes what the reviews ask for, runs the tests, pushes to the same branch,
-  replies on each thread it addressed, and reports what it fixed and what it left open.
+- Review comments are fixed without asking: the driver's standing instruction, which the gateway
+  carries out itself while `VOICE_GW_AUTO_FIX_REVIEWS` is on, the default; your instructions say
+  whether it is. When new reviews or comments of the repository's owner, members or collaborators,
+  or of a review bot (Copilot, the Claude app), ask for changes, the gateway queues a fix for the
+  worker that pushed the pull request, as that run's follow-up, through the queue like any task.
+  Its event says so and carries `fix="<queued id>"`. Relay it as news in a sentence, "A fix for
+  the review comments on pull request 12 in alpha is on its way"; dispatch nothing for it, and ask
+  nothing: it needs no words of the driver. The fix's result arrives like any run's; tell it as
+  news too. Its push runs the reviews again, and new comments start the next round by themselves.
+  Anyone else's comments start nothing.
+- After the automatic rounds for a pull request are used up (3 by default), the event says so: tell
+  the driver in a sentence. A further fix then takes their word, as below, and their dispatch for
+  that pull request gives the automatic fixing its rounds again.
+- "Fix the review comments", on the driver's word, also with the setting off: `dispatch` it to the
+  worker, with the pull request number. It fixes what the reviews ask for, runs the tests, pushes
+  to the same branch, replies on each thread it addressed, and reports what it fixed and what it
+  left open.
 - Workers in Docker at access level `read-only` open no pull requests, so there is nothing to
   watch, review or fix there; say so if the driver asks.
 

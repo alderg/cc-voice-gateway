@@ -52,6 +52,15 @@
     </label>
     <p class="guide">Ready for review, automatic reviews start at once. A draft usually gets them only once it is
       marked ready, and cannot be merged before.</p>
+    <label>Review comments on their pull requests
+      <select data-setting="VOICE_GW_AUTO_FIX_REVIEWS"><option value="1">fixed without asking (default)</option><option value="0">fixed only when you ask</option></select>
+    </label>
+    <p class="guide">New reviews and comments that ask for changes, from the repository's owner, members and
+      collaborators or from Copilot and the Claude app, get a fix by the worker that pushed the pull request, round after
+      round as the reviews run again; the controller tells you as news. Anyone else's comments start nothing.</p>
+    <label>Automatic rounds per pull request <input data-setting="VOICE_GW_AUTO_FIX_ROUNDS" inputmode="numeric"></label>
+    <p class="guide">After that many, the controller tells you, and a further fix takes your word, until you have
+      something done for that pull request again. 3 by default.</p>
     <label>Approvals by voice
       <select data-setting="VOICE_GW_PERMISSION_RELAY"><option value="1">on</option><option value="0">off, only at the terminal</option></select>
     </label>

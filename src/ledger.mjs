@@ -370,7 +370,9 @@ export function openItems({ ledger, workers = null, store, interrupted = [], now
       'Queued tasks:',
       ...queued.map(entry => {
         const holds = held(entry).map(d => d.id)
-        // How it waits, when not behind the others (workers.mjs).
+        // A fix the gateway queued for review comments, and how it waits,
+        // when not behind the others (workers.mjs, queueMarks).
+        const review = entry.review ? `, from the review of pull request ${entry.review.number}` : ''
         const marks = entry.requeued
           ? `, resumes ${entry.continues} in its worktree`
           : entry.after?.length
@@ -379,7 +381,7 @@ export function openItems({ ledger, workers = null, store, interrupted = [], now
               ? ', parallel'
               : ''
         return (
-          `- ${entry.id} for ${entry.worker}, queued ${ago(entry.queuedAt, now)}${marks}` +
+          `- ${entry.id} for ${entry.worker}, queued ${ago(entry.queuedAt, now)}${review}${marks}` +
           `${holds.length ? `, held by ${holds.join(', ')}` : ''}: "${preview(entry.task, 100)}"`
         )
       }),
@@ -388,7 +390,10 @@ export function openItems({ ledger, workers = null, store, interrupted = [], now
   if (running.length) {
     lines.push(
       'Runs going:',
-      ...running.map(t => `- ${t.repo} ${t.id}${t.worktree ? ' in a worktree' : ''}, started ${ago(t.startedAt, now)}: "${preview(t.task, 100)}"`),
+      ...running.map(t => {
+        const review = t.review ? `, from the review of pull request ${t.review.number}` : ''
+        return `- ${t.repo} ${t.id}${t.worktree ? ' in a worktree' : ''}${review}, started ${ago(t.startedAt, now)}: "${preview(t.task, 100)}"`
+      }),
     )
   }
   if (voice.length) {

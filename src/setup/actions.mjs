@@ -89,6 +89,8 @@ export function fields(root) {
     VOICE_GW_MAX_WORKERS_PER_REPO: { default: '1', valid: INT(1, 10) },
     VOICE_GW_WORKER_TIMEOUT: { default: '360', valid: value => value === '0' || INT(5, 1440)(value) },
     VOICE_GW_PR_DRAFT: { default: '0', valid: ONE_OF('0', '1') },
+    VOICE_GW_AUTO_FIX_REVIEWS: { default: '1', valid: ONE_OF('1', '0') },
+    VOICE_GW_AUTO_FIX_ROUNDS: { default: '3', valid: INT(1, 10) },
     VOICE_GW_SCRATCH: { default: '0', valid: ONE_OF('0', '1') },
     VOICE_GW_SCRATCH_ROOT: { default: join(homedir(), 'voice-scratch'), valid: PATH },
     VOICE_GW_SCRATCH_DAYS: { default: '60', valid: value => value === '0' || INT(1, 365)(value) },

@@ -30,6 +30,18 @@
 // the pull request is merged or closed, or after VOICE_GW_PR_WATCH_HOURS.
 // Without a gh login it does nothing. It only reads JSON from gh; no token
 // passes through it.
+//
+// Review comments, fixed without asking (VOICE_GW_AUTO_FIX_REVIEWS, on by
+// default; autoFix): new inline comments, reviews that request changes or
+// say something, and comments, of the repository's owner, members and
+// collaborators or of a review bot (bots, VOICE_GW_REVIEW_BOTS), get a fix
+// that the watcher queues itself (Workers.reviewFix): a task in the
+// gateway's words, naming the pull request and its branch, never what the
+// reviews say, as a follow-up of the run that pushed the pull request.
+// Anyone else's text starts nothing. The fix pushes, the reviews run again,
+// and new comments start the next round, at most autoFix.rounds per pull
+// request until a run the driver dispatched works on it again. The news says
+// what was queued, or why nothing was, so the controller only relays it.
 
 import { execFile } from 'node:child_process'
 import { EventEmitter } from 'node:events'
@@ -53,6 +65,9 @@ const FIELDS =
 // reviews and comments, the REST API author_association for inline comments.
 const COLLABORATORS = ['OWNER', 'MEMBER', 'COLLABORATOR']
 const NOT_FORWARDED = 'not a collaborator, the text is not forwarded'
+// Whose reviews and comments a fix is queued for, besides collaborators: the
+// Claude app, and Copilot's reviewer under both names GitHub gives it.
+export const REVIEW_BOTS = ['claude', 'copilot-pull-request-reviewer', 'copilot']
 
 const REVIEW_STATE = {
   APPROVED: 'approved',
@@ -65,6 +80,8 @@ const plural = (n, unit) => `${n} ${unit}${n === 1 ? '' : 's'}`
 const login = name => String(name ?? '').replace(/\[bot\]$/i, '')
 const sameLogin = (a, b) => Boolean(a && b) && login(a).toLowerCase() === login(b).toLowerCase()
 const collaborator = association => COLLABORATORS.includes(String(association ?? '').toUpperCase())
+// Created after a time (ms), or of no known time.
+const since = (at, time) => !at || !time || !(Date.parse(time) < at)
 
 // A check run (GitHub Actions, apps) or a commit status (other CI).
 const isStatus = check => check.__typename === 'StatusContext' || (!('status' in check) && 'state' in check)
@@ -94,12 +111,16 @@ function describeChecks(checks) {
 }
 
 export class PullWatcher extends EventEmitter {
-  constructor({ ghBin = 'gh', stateFile, pollSeconds = 60, watchHours = 24, log = defaultLog }) {
+  // autoFix: { rounds, queue(fix) } to fix review comments without asking,
+  // queue being Workers.reviewFix; null leaves it to the driver.
+  constructor({ ghBin = 'gh', stateFile, pollSeconds = 60, watchHours = 24, autoFix = null, bots = REVIEW_BOTS, log = defaultLog }) {
     super()
     this.ghBin = ghBin
     this.stateFile = stateFile
     this.pollMs = pollSeconds * 1000
     this.watchMs = watchHours * 60 * 60 * 1000
+    this.autoFix = autoFix
+    this.bots = bots
     this.log = log
     this.auth = null // { at, ok, me }
     this.busy = false
@@ -193,7 +214,7 @@ export class PullWatcher extends EventEmitter {
     const add = pr => {
       const opened = !this.watches.some(w => w.key === `${task.slug}#${pr.number}`)
       found.push({ number: pr.number, title: pr.title, isDraft: Boolean(pr.isDraft), url: pr.url, opened })
-      this.note(this.watch({ worker: task.repo, slug: task.slug, number: pr.number, title: pr.title }), pr)
+      this.note(this.watch({ worker: task.repo, slug: task.slug, number: pr.number, title: pr.title, task }), pr)
     }
     for (const number of named) {
       const pr = await this.view(task.slug, number)
@@ -228,23 +249,34 @@ export class PullWatcher extends EventEmitter {
       .slice(-RECHECK)
   }
 
-  // The head commit and draft state as last seen, and when either changed.
+  // The head commit, its branch and the draft state as last seen, and when
+  // the commit or the draft state changed.
   note(entry, pr) {
     const draft = Boolean(pr.isDraft)
     if (entry.head && (entry.head !== pr.headRefOid || entry.draft !== draft)) entry.changedAt = Date.now()
     entry.head = pr.headRefOid
+    entry.branch = pr.headRefName ?? entry.branch ?? null
     entry.draft = draft
   }
 
-  watch({ worker, slug, number, title }) {
+  // task: the run that opened or worked on it, which a fix continues. One
+  // the driver dispatched gives the automatic fixing its rounds again; a fix
+  // the gateway queued does not (task.review).
+  watch({ worker, slug, number, title, task = null }) {
     const key = `${slug}#${number}`
     let entry = this.watches.find(w => w.key === key)
     if (!entry) {
-      entry = { key, worker, slug, number, reviews: [], comments: [], inline: [], checked: [] }
+      // since: what came before the run that started the watch, that run could see.
+      const from = task?.startedAt ?? Date.now()
+      entry = { key, worker, slug, number, reviews: [], comments: [], inline: [], checked: [], fixes: 0, since: from }
       this.watches.push(entry)
     }
     const now = Date.now()
     Object.assign(entry, { worker, title, active: true, stopped: null, until: now + this.watchMs, polls: 0, quiet: 0, nextAt: now })
+    if (task) {
+      entry.task = task.id
+      if (!task.review) entry.fixes = 0
+    }
     this.log('watching pull request', key, `for ${worker}`)
     return entry
   }
@@ -298,6 +330,7 @@ export class PullWatcher extends EventEmitter {
       finished = checkCounts(checks)
     }
     const newReviews = reviews.filter(r => !entry.reviews.includes(r.id))
+    let inline = []
     if (newReviews.length) {
       kinds.push('review')
       entry.reviews = [...entry.reviews, ...newReviews.map(r => r.id)].slice(-200)
@@ -307,7 +340,7 @@ export class PullWatcher extends EventEmitter {
         const said = !body ? '' : collaborator(review.authorAssociation) ? `, "${preview(body, 200)}"` : `; ${NOT_FORWARDED}`
         lines.push(`Review from ${login(review.author?.login)}: ${state}${said}.`)
       }
-      const inline = await this.newInline(entry, own)
+      inline = await this.newInline(entry, own)
       if (inline.length) {
         const shown = inline
           .slice(0, 5)
@@ -330,6 +363,10 @@ export class PullWatcher extends EventEmitter {
         lines.push(`Comment from ${login(comment.author?.login)}: ${said}.`)
       }
     }
+    // Review comments fixed without asking: a fix queued, or why not.
+    const asking = this.autoFix ? this.asking(entry, newReviews, inline, newComments) : []
+    const fix = asking.length ? await this.fix(entry, pr, asking) : null
+    if (fix) lines.push(fix.line)
 
     const expected = checks.length || pr.reviewRequests?.length || reviews.length || comments.length
     if (!expected && ++entry.quiet >= GRACE_POLLS) {
@@ -346,6 +383,7 @@ export class PullWatcher extends EventEmitter {
         checks: finished,
         reviews: newReviews.map(review => String(review.state)),
         comments: newComments.length,
+        fix: fix?.queued ?? null, // the queued fix, for the event's fix attribute
         text: [
           `Pull request ${entry.number} in ${entry.slug} (worker ${entry.worker}): "${preview(pr.title, 80)}".`,
           ...lines,
@@ -353,6 +391,77 @@ export class PullWatcher extends EventEmitter {
         ].join('\n'),
       })
     }
+  }
+
+  // Who asks for a fix, of the new reviews and comments: inline comments,
+  // reviews that request changes or say something, and comments with a
+  // text, of a collaborator or a review bot, made since the run that started
+  // the watch began. Their logins, once each.
+  asking(entry, reviews, inline, comments) {
+    const counts = (author, association, time) => (collaborator(association) || this.isBot(author)) && since(entry.since, time)
+    const said = text => String(text ?? '').trim() !== ''
+    const who = [
+      ...reviews
+        .filter(r => (r.state === 'CHANGES_REQUESTED' || (r.state === 'COMMENTED' && said(r.body))) && counts(r.author, r.authorAssociation, r.submittedAt))
+        .map(r => r.author?.login),
+      ...inline.filter(c => counts(c.user, c.author_association, c.created_at)).map(c => c.user?.login),
+      ...comments.filter(c => said(c.body) && counts(c.author, c.authorAssociation, c.createdAt)).map(c => c.author?.login),
+    ]
+    return [...new Set(who.map(name => login(name) || 'someone'))]
+  }
+
+  // A review bot: its login on the list, unless GitHub says it is a person
+  // (type in the REST API, is_bot from gh, __typename in GraphQL).
+  isBot(author) {
+    if (!author || author.type === 'User' || author.is_bot === false || author.__typename === 'User') return false
+    return this.bots.some(name => sameLogin(name, author.login))
+  }
+
+  // A fix for those who ask (autoFix.queue, Workers.reviewFix), or why there
+  // is none: { line, queued }, the line for the news and the queued task.
+  // Each fix queued is one of the pull request's automatic rounds.
+  async fix(entry, pr, asking) {
+    const { rounds, queue } = this.autoFix
+    const done = entry.fixes ?? 0
+    const head = `Automatic fixing: new review comments from ${asking.join(', ')} ask for changes`
+    const relay = 'Relay it as news; dispatch nothing for it.'
+    if (done >= rounds) {
+      return {
+        line:
+          `${head}, but the automatic rounds for this pull request are used up (${done} of ${rounds}), so the gateway ` +
+          'queued no fix. Tell the driver; another fix takes their word, like any dispatch.',
+      }
+    }
+    let result
+    try {
+      result = await queue({
+        worker: entry.worker,
+        slug: entry.slug,
+        number: entry.number,
+        branch: pr.headRefName ?? entry.branch ?? null,
+        task: entry.task ?? null,
+        round: done + 1,
+        rounds,
+      })
+    } catch (error) {
+      result = { status: 'failed', why: `it could not be queued: ${error.message}` }
+    }
+    if (result?.status === 'queued') {
+      entry.fixes = done + 1
+      this.log('review fix queued', entry.key, result.entry.id, `round ${entry.fixes} of ${rounds}`)
+      return {
+        queued: result.entry.id,
+        line:
+          `${head}: the gateway queued a fix for worker ${entry.worker} by itself, as ${result.entry.id}, automatic round ` +
+          `${entry.fixes} of ${rounds}, as the driver's standing instruction says. ${relay}`,
+      }
+    }
+    if (result?.status === 'waiting') {
+      return { queued: result.entry.id, line: `${head}: the fix queued before as ${result.entry.id} has not started yet and takes them too. ${relay}` }
+    }
+    const why = result?.status === 'locked' ? 'the kill switch is locked' : (result?.why ?? `it could not be queued (${result?.status})`)
+    this.log('review fix not queued', entry.key, why)
+    return { line: `${head}, but the gateway queued no fix: ${why}. Tell the driver.` }
   }
 
   // Inline review comments from others that were not news yet.

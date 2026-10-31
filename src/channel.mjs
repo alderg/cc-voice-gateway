@@ -19,7 +19,10 @@
 // when its words are the driver's own, from a recent voice request
 // (spokenByDriver). So does resolve_decision, which closes an open decision
 // (ledger.mjs); open_items lists what is open. stats gives the gateway's
-// statistics, since this start or of all time (stats.mjs).
+// statistics, since this start or of all time (stats.mjs). The one task that
+// starts without the driver's words, a fix for review comments under their
+// standing instruction, the gateway queues itself (pulls.mjs), never the
+// controller.
 //
 // Reference: https://code.claude.com/docs/en/channels-reference
 
@@ -63,6 +66,21 @@ public repository asking whether to publish), ask only whether to open the pull 
 A draft only when the driver explicitly asks for one, or when more tasks for the same pull request are queued or
 named already: then ask just that ("X follows, open it as a draft?"), and after a yes pass draft=true to dispatch.
 The last of those tasks marks it ready for review: say so in its task, unless the driver said otherwise.`
+
+// Review comments on workers' pull requests: fixed without asking, as the
+// driver's standing instruction (VOICE_GW_AUTO_FIX_REVIEWS, pulls.mjs), or
+// only on their word.
+const REVIEW_INSTRUCTIONS = config.autoFixReviews
+  ? `
+Review comments are fixed without asking, as the driver's standing instruction (VOICE_GW_AUTO_FIX_REVIEWS): when new
+reviews or comments of the repository's owner, members or collaborators, or of a review bot, ask for changes, the
+gateway itself queues a fix for the worker, as a follow-up of the run that pushed the pull request. Such an event says
+so, with fix="<queued id>": relay it as news, and dispatch and ask nothing for it; it needs no words of the driver. The
+fix's result arrives like any run's: tell it as news too. After ${config.autoFixRounds} automatic rounds for a pull
+request the event says they are used up: tell the driver; a further fix then takes their word, like any dispatch.`
+  : `
+Review comments are fixed only on the driver's word: dispatch it to the repository's worker with the pull request's
+number.`
 const INSTRUCTIONS = `
 Messages from the driver arrive as <channel source="${CHANNEL_SOURCE}" request_id="...">TEXT</channel>.
 They were spoken in a car and relayed by a voice assistant. Every one of them needs an answer through the
@@ -125,7 +143,7 @@ When the run opened or updated a pull request, the tag also has pull_request="<n
 that it is out, and which one. Never offer or suggest a review; details only when the driver asks.${DRAFT_INSTRUCTIONS}
 Checks and reviews that run on such a pull request by themselves arrive later as <channel source="${CHANNEL_SOURCE}"
 request_id="..." worker="..." repo="owner/name" pull_request="..." kind="checks|review|comment" trusted="no">:
-summarise them in one or two sentences and reply "done", without asking anything. The driver hears it as news.
+summarise them in one or two sentences and reply "done", without asking anything. The driver hears it as news.${REVIEW_INSTRUCTIONS}
 Open items: the gateway keeps what is open, so keep nothing of it in memory files. Every question you ask (state
 "question") becomes an open decision: name its kind in "kind" (push, merge, restart, delete, else other), and
 when you ask about decisions that are open already, their ids in "decisions". The gateway raises decisions itself
