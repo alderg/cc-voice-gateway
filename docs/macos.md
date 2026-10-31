@@ -51,6 +51,15 @@ running", tick both "Start it automatically" (the LaunchAgent) and "Start it now
 writes `~/Library/LaunchAgents/com.drawio.cc-voice-gateway.plist`, checks it with `plutil` and
 loads it with `launchctl bootstrap`, which starts the controller in the tmux session `voice`.
 
+Leave "keep this page open" ticked in "Write the setup": the assistant then stays up, and its
+section 10, "Connect the Claude app", takes you through the rest of the README's Getting started.
+Until the gateway runs it says what to do: at the first start Claude Code waits for a few
+questions, which you answer in a second Terminal tab with `tmux attach -t voice`, then Ctrl-b d.
+Then "Start the Funnel" publishes the endpoint and the page shows the connector URL, and "Show a
+pairing code" a code for the sign-in page, valid ten minutes, with "New code" for another. Neither
+`scripts/funnel.sh` nor `node scripts/pair.mjs` is needed. "End the assistant" when the connector
+is signed in.
+
 ## 4. Starting and stopping
 
 By hand, without the LaunchAgent:
@@ -105,6 +114,8 @@ behave so, with `grep watchdog .logs/gateway.log | tail -20` and
    development flag, Enter at the channel warning), Ctrl-b d. Then `curl -s 127.0.0.1:8787/healthz`
    answers, `.logs/gateway.log` has `started by the LaunchAgent com.drawio.cc-voice-gateway` and
    `caffeinate: this Mac does not go to sleep`, and `pmset -g assertions | grep caffeinate` shows it.
+   If the setup page is still open, its section 10 says "running" within a few seconds, and "Show a
+   pairing code" shows eight digits with a countdown from 10:00.
 5. **A voice request.** `node scripts/fake-voice.mjs`, then `ask Is the gateway up?`. Expected: a
    short answer from the controller within a minute. Leave fake-voice open for the next steps.
 6. **A worker run and the git check.** A sample repository next to the gateway, with a local

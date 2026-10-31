@@ -10,7 +10,8 @@
 <body>
 <div id="local-notice" class="local-notice" role="note">
   <strong>Local setup: use it only on your own network.</strong>
-  This page has no HTTPS, so the one-time token and the keys you enter here travel unencrypted.
+  This page has no HTTPS, so the one-time token and the keys you enter here travel unencrypted, and so
+  do the pairing codes it shows.
   From anywhere else, use an SSH tunnel: <code>ssh -L 8790:localhost:8790 &lt;server&gt;</code>, then open
   the link with <code>localhost</code>.
 </div>
@@ -316,7 +317,9 @@
 
 <section id="s-finish">
   <h2>9. Write the setup</h2>
-  <p class="guide">Writes the settings and the secrets into <code>.secrets</code> (folder 0700, files 0600), then sets up what you chose above. The assistant ends by itself afterwards.</p>
+  <p class="guide">Writes the settings and the secrets into <code>.secrets</code> (folder 0700, files 0600), then sets up what you chose above. Afterwards the assistant ends by itself, or stays open for section 10.</p>
+  <label><input type="checkbox" id="stay" checked> Then keep this page open to connect the Claude app (section 10): the
+    connector URL and a pairing code here, without a second terminal</label>
   <div class="row">
     <button id="finish" class="primary">Write the setup</button>
     <button id="cancel">Cancel without writing</button>
@@ -326,11 +329,47 @@
   <div id="next" hidden>
     <h3>What is left</h3>
     <ol class="guide">
-      <li>Publish the endpoint at a public HTTPS address, for example <code>scripts/funnel.sh start</code> with Tailscale Funnel.</li>
+      <li>If the controller waits for its questions at the first start: <code>tmux attach -t voice</code>, answer them, then Ctrl-b d.</li>
+      <li>Publish the endpoint at a public HTTPS address: "Start the Funnel" in section 10, or <code>scripts/funnel.sh start</code> with Tailscale Funnel.</li>
       <li>In the Claude app, add a custom connector with that address followed by <code>/mcp</code>, and sign in.</li>
-      <li>On this computer, with the controller running: <code>node scripts/pair.mjs</code>, and enter the code on the sign-in page.</li>
+      <li>Enter a pairing code on the sign-in page: "Show a pairing code" in section 10 while this page is open, or on this computer <code>node scripts/pair.mjs</code>.</li>
       <li>Allow the connector's tools, then try it in voice mode: "Ask Claude Code whether the gateway is up."</li>
     </ol>
+  </div>
+</section>
+
+<section id="s-connect">
+  <h2>10. Connect the Claude app</h2>
+  <p class="guide">Once the gateway runs (the controller starts it), this shows the connector URL and makes pairing codes for
+    the sign-in page. A code from here is valid for ten minutes and one sign-in; a new one replaces the one before, also
+    one from <code>scripts/pair.mjs</code>. It is shown only on this page, never in the terminal or a log.</p>
+  <p>Gateway: <span id="connect-gateway" class="state">checking…</span></p>
+  <p id="connect-wait" class="notice" hidden></p>
+  <div id="connect-ready" hidden>
+    <h3>The endpoint</h3>
+    <p>Tailscale Funnel: <span id="connect-funnel" class="state"></span></p>
+    <p id="connect-url-row" hidden>Connector URL: <code id="connect-url"></code></p>
+    <div id="funnel-row" class="row" hidden>
+      <button id="funnel-start">Start the Funnel</button>
+      <span id="funnel-start-state" class="state"></span>
+    </div>
+    <pre id="funnel-log" class="log" hidden></pre>
+    <h3>The connector</h3>
+    <p class="guide">In the Claude app (Claude Desktop: Customize → Connectors), add a custom connector with the URL above and
+      sign in; labels vary between versions. Claude opens the sign-in page "Connect to Claude Code", which asks for a
+      pairing code.</p>
+    <h3>The pairing code</h3>
+    <div class="row">
+      <button id="pairing-new" class="primary">Show a pairing code</button>
+      <span id="pairing-state" class="state"></span>
+    </div>
+    <p id="pairing-box" class="pairing" hidden><span id="pairing-code" class="code"></span> <span id="pairing-timer" class="sub"></span></p>
+    <p class="guide">Then choose "Always allow" for the connector's tools, and try it in voice mode: "Ask Claude Code
+      whether the gateway is up."</p>
+  </div>
+  <div id="end-row" class="row" hidden>
+    <button id="end">End the assistant</button>
+    <span id="end-note" class="sub"></span>
   </div>
 </section>
 

@@ -12,6 +12,7 @@
   color: var(--text);
 }
 body { max-width: 860px; margin: 0 auto; padding: 16px 20px 60px; }
+[hidden] { display: none !important; } /* also for .row and .grid, which set a display of their own */
 header h1 { margin: 0 0 4px; font-size: 24px; }
 h2 { font-size: 18px; margin: 0 0 8px; }
 h3 { font-size: 15px; margin: 18px 0 6px; }
@@ -43,4 +44,6 @@ td.mark { width: 1.5em; font-weight: bold; }
 .log { background: #f7f7f7; border: 1px solid var(--line); border-radius: 4px; padding: 8px; font-size: 12px; max-height: 260px; overflow: auto; white-space: pre-wrap; }
 .checks label { display: block; font-size: 14px; }
 code { background: #f3f3f3; padding: 0 3px; border-radius: 3px; }
+.pairing { margin: 8px 0; }
+.pairing .code { font: 600 28px/1.2 ui-monospace, Menlo, Consolas, monospace; letter-spacing: 0.12em; margin-right: 10px; }
 @media (max-width: 640px) { .grid { grid-template-columns: 1fr; } }

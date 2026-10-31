@@ -9,7 +9,8 @@
 // - Wrong tokens are rate-limited, per address and in total.
 // - Every write request must come from the page's own origin.
 // - It ends by itself after an overall and an idle timeout, after finishing,
-//   and on cancel.
+//   and on cancel. The page's polling does not count as activity, and the
+//   overall limit only ever moves for the pairing after finishing (extend).
 //
 // Neither the token nor any secret entered on the page reaches a log line,
 // the terminal or a response. Request URLs are never printed.
@@ -107,7 +108,8 @@ function cookies(req) {
 //   idleMs         time without a request from the page before it ends
 //   api            { 'GET /api/state': async ({ body, server }) => data, ... };
 //                  a handler may throw an error with .status and a message
-//                  that is safe to show
+//                  that is safe to show. A handler with .passive = true, the
+//                  page's polling, does not reset the idle time
 //   redact         text -> text without any secret, for error messages
 //   say            a line for the terminal, never with a secret
 //   now            for tests
@@ -129,7 +131,7 @@ export async function startSetupServer({
     allFails: [],
     lastSeen: Date.now(),
   }
-  const startedAt = Date.now()
+  let deadline = Date.now() + timeoutMs // the overall limit
   let resolveDone
   const done = new Promise(resolve => (resolveDone = resolve))
   let timers = []
@@ -202,8 +204,12 @@ export async function startSetupServer({
       return res.end()
     }
 
-    state.lastSeen = Date.now()
-    armIdle()
+    const job = /^\/api\/jobs\/([a-f0-9]{12})$/.exec(url.pathname)
+    const handler = api[job ? `${req.method} /api/jobs/:id` : `${req.method} ${url.pathname}`]
+    if (!handler?.passive) {
+      state.lastSeen = Date.now()
+      armIdle()
+    }
 
     if (req.method !== 'GET' && req.method !== 'HEAD') {
       // Write requests only from the page itself.
@@ -219,12 +225,17 @@ export async function startSetupServer({
       return res.end(readFileSync(join(UI, file)))
     }
 
-    const job = /^\/api\/jobs\/([a-f0-9]{12})$/.exec(url.pathname)
-    const handler = api[job ? `${req.method} /api/jobs/:id` : `${req.method} ${url.pathname}`]
     if (!handler) return json(res, 404, { error: 'not found' })
     const body = req.method === 'GET' ? {} : await readBody(req)
     const answer = await handler({ body, id: job?.[1], server: control })
     json(res, 200, answer ?? {})
+  }
+
+  let extended = false
+  const armOverall = () => {
+    const reason = extended ? 'the time limit, extended for the pairing' : `the time limit of ${Math.round(timeoutMs / 60000)} minutes`
+    clearTimeout(timers[0])
+    timers[0] = setTimeout(() => stop(reason), deadline - Date.now())
   }
 
   const control = {
@@ -232,9 +243,18 @@ export async function startSetupServer({
     done,
     get remaining() {
       return {
-        overallMs: Math.max(0, startedAt + timeoutMs - Date.now()),
+        overallMs: Math.max(0, deadline - Date.now()),
         idleMs: Math.max(0, state.lastSeen + idleMs - Date.now()),
       }
+    },
+    // At least ms more before the overall limit, but never more than the
+    // limit itself (--timeout): once the setup is written, time for pairing.
+    extend(ms) {
+      const until = Date.now() + Math.min(ms, timeoutMs)
+      if (ending || until <= deadline) return
+      deadline = until
+      extended = true
+      armOverall()
     },
   }
 
@@ -242,7 +262,7 @@ export async function startSetupServer({
     server.once('error', reject)
     server.listen(port, host, resolve)
   })
-  timers = [setTimeout(() => stop(`the time limit of ${Math.round(timeoutMs / 60000)} minutes`), timeoutMs)]
+  armOverall()
   armIdle()
   const bound = server.address()
   return { ...control, token, port: bound.port, host, server }

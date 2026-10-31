@@ -5,8 +5,8 @@
 // container does not have it, and voice and Telegram have no route to it. The folder is mode 0700, so only processes of the
 // same user reach the socket, and the tunnel never exposes it.
 //
-// The server runs inside the gateway; scripts/pair.mjs and fake-voice use
-// adminRequest() as the client.
+// The server runs inside the gateway; scripts/pair.mjs, fake-voice and the
+// setup assistant's page (pairing codes) use adminRequest() as the client.
 
 import { createServer, request } from 'node:http'
 import { chmodSync, existsSync, mkdirSync, unlinkSync } from 'node:fs'
@@ -54,7 +54,8 @@ export async function startAdmin(auth, socketPath, { killswitch = null } = {}) {
     try {
       const body = req.method === 'POST' ? JSON.parse((await readBody(req, 4096)) || '{}') : {}
       const route = `${req.method} ${req.url}`
-      if (route === 'POST /pairing') return sendJson(res, 200, auth.newPairingCode())
+      if (route === 'POST /pairing') return sendJson(res, 200, auth.newPairingCode({ minutes: body.minutes }))
+      if (route === 'GET /pairing') return sendJson(res, 200, auth.pendingPairing())
       if (route === 'GET /grants') return sendJson(res, 200, auth.listGrants())
       if (route === 'POST /revoke') return sendJson(res, 200, { revoked: auth.revoke(String(body.id ?? '')) })
       if (route === 'POST /token') return sendJson(res, 200, auth.issueLocal(body.name))
@@ -83,7 +84,8 @@ export async function startAdmin(auth, socketPath, { killswitch = null } = {}) {
   return server
 }
 
-export function adminRequest(socketPath, method, path, body) {
+// timeoutMs: give up on a gateway that takes the connection but does not answer.
+export function adminRequest(socketPath, method, path, body, { timeoutMs = 0 } = {}) {
   return new Promise((resolve, reject) => {
     const req = request({ socketPath, method, path, headers: { 'content-type': 'application/json' } }, res => {
       let data = ''
@@ -101,6 +103,7 @@ export function adminRequest(socketPath, method, path, body) {
         reject(error)
       }
     })
+    if (timeoutMs) req.setTimeout(timeoutMs, () => req.destroy(new Error('The gateway did not answer.')))
     req.end(body ? JSON.stringify(body) : undefined)
   })
 }

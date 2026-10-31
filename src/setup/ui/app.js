@@ -1,6 +1,7 @@
 // The setup page. Secrets typed here go to the server once, to be checked,
 // and are cleared from the page right after; the server only ever answers
-// whether one is saved or new.
+// whether one is saved or new. A pairing code (section 10) comes the other way,
+// once, in the answer that made it; it stays on the page only while valid.
 
 const $ = selector => document.querySelector(selector)
 const $$ = selector => [...document.querySelectorAll(selector)]
@@ -8,11 +9,14 @@ const MASK = '••••••••'
 
 let state = null
 let clock = null
+let overallEnd = 0 // when the server ends at the latest
+let connectTimer = null // section 10's poll
 let ended = false
 
 function end() {
   ended = true
   clearInterval(clock)
+  clearInterval(connectTimer)
   $('#ended').hidden = false
   for (const element of $$('button, input, select')) element.disabled = true
   $('#clock').textContent = 'Ended.'
@@ -73,17 +77,25 @@ function minutes(ms) {
 }
 
 function startClock() {
-  const started = Date.now()
   const { overallMs, idleMs } = state.remaining
+  overallEnd = Date.now() + overallMs
   state.idleTotal = idleMs
   let last = Date.now()
   clock = setInterval(() => {
     state.remaining.idleMs -= Date.now() - last
     last = Date.now()
-    const overall = overallMs - (Date.now() - started)
+    const overall = overallEnd - Date.now()
     $('#clock').textContent = `Ends by itself in ${minutes(Math.min(overall, state.remaining.idleMs))} (${minutes(overall)} at most; any action resets the idle time).`
     if (overall <= 0 || state.remaining.idleMs <= 0) end()
   }, 1000)
+}
+
+// The server's own count: after a poll, which is no activity, and after
+// writing, which may have moved the limit for the pairing.
+function syncClock(remaining) {
+  if (!state?.remaining || !(remaining?.overallMs >= 0) || !(remaining?.idleMs >= 0)) return
+  overallEnd = Date.now() + remaining.overallMs
+  state.remaining.idleMs = remaining.idleMs
 }
 
 function secretState(name, target) {
@@ -396,6 +408,7 @@ function collect() {
   if (!scratchDocker()) settings.VOICE_GW_SCRATCH_DOCKER = ''
   return {
     settings,
+    stay: $('#stay').checked,
     telegram: { enabled: $('#telegram-on').checked },
     docker: docker
       ? { enabled: true, repos: chosenRepos(), gitName: $('#git-name').value.trim(), gitEmail: $('#git-email').value.trim() }
@@ -406,21 +419,139 @@ function collect() {
 }
 
 action('#finish', '#finish-state', async () => {
-  const { job } = await api('/api/finish', collect())
+  const body = collect()
+  const { job } = await api('/api/finish', body)
   $('#cancel').disabled = true
   const result = await follow(job, '#finish-log', '#finish-state')
   $('#next').hidden = false
-  setTimeout(end, 1500)
+  if (body.stay) stayForPairing()
+  else setTimeout(end, 1500)
   if (result.state !== 'done') throw new Error('Written, but not everything worked; see above.')
   return 'Done.'
 })
 
-$('#cancel').addEventListener('click', async () => {
-  try {
-    await api('/api/cancel', {})
-  } finally {
-    end()
+for (const id of ['#cancel', '#end']) {
+  $(id).addEventListener('click', async () => {
+    try {
+      await api('/api/cancel', {})
+    } finally {
+      end()
+    }
+  })
+}
+
+// --- section 10: the endpoint and a pairing code --------------------------------
+
+let code = null // { text, until } while the code on the page is valid
+let codeTimer = null
+let polling = false
+
+// Written, and staying for the pairing: the sections above are done.
+function stayForPairing() {
+  for (const element of $$('main > section:not(#s-connect) :is(button, input, select)')) element.disabled = true
+  $('#finish').hidden = true
+  $('#cancel').hidden = true
+  $('#end-row').hidden = false
+  $('#end-note').textContent =
+    `This page stays open for connecting the Claude app. When you are done, end it here; otherwise it ends by itself ` +
+    `after ${Math.round((state.idleTotal ?? 600000) / 60000)} minutes without activity (waiting for the gateway does not count).`
+  $('#s-connect').scrollIntoView?.({ behavior: 'smooth' })
+  connect()
+}
+
+function hideCode(text, kind = '') {
+  code = null
+  clearInterval(codeTimer)
+  $('#pairing-code').textContent = ''
+  $('#pairing-timer').textContent = ''
+  $('#pairing-box').hidden = true
+  if (text !== undefined) show('#pairing-state', text, kind)
+}
+
+function tickCode() {
+  if (!code) return
+  const left = code.until - Date.now()
+  if (left <= 0) return hideCode('The code has expired. Make a new one.', 'bad')
+  $('#pairing-timer').textContent = `valid for ${minutes(left)}, for one sign-in`
+}
+
+function showCode(text, expiresIn) {
+  code = { text, until: Date.now() + expiresIn * 1000 }
+  $('#pairing-code').textContent = text
+  $('#pairing-box').hidden = false
+  $('#pairing-new').textContent = 'New code'
+  clearInterval(codeTimer)
+  codeTimer = setInterval(tickCode, 1000)
+  tickCode()
+}
+
+const WAIT_TMUX =
+  'The controller runs in the tmux session "voice", but its gateway does not answer yet. At its first start Claude Code ' +
+  'waits at the terminal for a few questions: in a terminal on this computer, or over SSH, run tmux attach -t voice, ' +
+  'answer them, then Ctrl-b d. This page notices by itself when the gateway runs.'
+const WAIT_START =
+  'The controller is not running. Start it: tick "Start it now" in section 7 and write the setup, or at the computer: ' +
+  'tmux new -s voice scripts/start-controller.sh. This page notices by itself when the gateway runs.'
+
+function showPairing(pairing) {
+  if (!pairing || !code) return
+  if (pairing.state === 'valid') code.until = Date.now() + pairing.expiresInMs
+  else if (pairing.state === 'used') {
+    const at = pairing.at ? ` at ${new Date(pairing.at).toLocaleTimeString()}` : ''
+    hideCode(`Used: ${pairing.client || 'a client'} signed in${at}. The connector is connected.`, 'ok')
+  } else if (pairing.state === 'expired') hideCode('The code has expired. Make a new one.', 'bad')
+  else if (pairing.state === 'gone') {
+    hideCode('This code no longer works: used, replaced by a newer one (scripts/pair.mjs), burnt by wrong attempts, or the gateway restarted. Make a new one.', 'bad')
   }
+}
+
+// The poll: the gateway, the Funnel, and whether the code is still valid.
+async function connect() {
+  if (polling || ended) return
+  polling = true
+  try {
+    const status = await api('/api/connect')
+    syncClock(status.remaining)
+    const running = status.gateway === true
+    show('#connect-gateway', running ? 'running' : 'not running yet', running ? 'ok' : '')
+    $('#connect-wait').hidden = running
+    $('#connect-wait').textContent = running ? '' : status.tmux ? WAIT_TMUX : WAIT_START
+    $('#connect-ready').hidden = !running
+    if (running) {
+      const funnel = status.funnel ?? {}
+      show(
+        '#connect-funnel',
+        funnel.state === 'on'
+          ? 'on: the endpoint is public'
+          : funnel.state === 'off'
+            ? 'off'
+            : 'not available here (Tailscale missing or not logged in); publish the endpoint another way, README 7.3',
+        funnel.state === 'on' ? 'ok' : '',
+      )
+      $('#connect-url').textContent = funnel.url ?? ''
+      $('#connect-url-row').hidden = !funnel.url
+      $('#funnel-row').hidden = funnel.state !== 'off'
+      showPairing(status.pairing)
+    }
+  } catch {
+    // The page shows the end by itself when the server is gone.
+  } finally {
+    polling = false
+  }
+}
+
+action('#pairing-new', '#pairing-state', async () => {
+  const made = await api('/api/pairing', {})
+  showCode(made.code, made.expiresIn)
+  return 'Enter it on the sign-in page. A new code replaces this one.'
+})
+
+action('#funnel-start', '#funnel-start-state', async () => {
+  const { job } = await api('/api/funnel/start', {})
+  const result = await follow(job, '#funnel-log', '#funnel-start-state')
+  connect()
+  if (result.state !== 'done') throw new Error('The Funnel did not start; see above.')
+  return 'Started.'
 })
 
 // --- start ------------------------------------------------------------------------
@@ -443,4 +574,6 @@ $('#cancel').addEventListener('click', async () => {
   secretState('githubToken', '#github-token-state')
   if (state.secrets.telegramChatId) show('#telegram-test-state', `${MASK} chat saved`)
   startClock()
+  connect()
+  connectTimer = setInterval(connect, 4000)
 })()

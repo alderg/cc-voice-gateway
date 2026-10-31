@@ -3,11 +3,15 @@
 // GitHub token, builds the worker image, and at the end writes everything
 // into .secrets: the secrets as files of their own, the settings as
 // gateway.env (src/settings.mjs), the folders mode 0700, the files 0600.
+// Once the gateway runs, it also shows the connector URL and pairing codes
+// for the sign-in, so that connecting the Claude app needs no second terminal.
 //
 // Secrets entered on the page stay in memory until then. Nothing here sends a
 // secret back to the browser, prints it, or logs it: the page only learns
 // whether one is saved or new, and every line of output and every error
-// message passes redact() first.
+// message passes redact() first. The one exception is a pairing code, which
+// the page asks for: it goes to the page once, in the answer to that request,
+// and nowhere else.
 
 import { spawn } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
@@ -15,6 +19,7 @@ import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync
 import { homedir, hostname, platform as osPlatform } from 'node:os'
 import { dirname, isAbsolute, join } from 'node:path'
 import { ACCESS_LEVELS, GitHubAccess } from '../access.mjs'
+import { adminRequest } from '../admin.mjs'
 import { connect } from 'node:net'
 import { CONTROLLER_LEVELS, EFFORTS, KILLSWITCH_MODES, WORKER_LIMITS } from '../config.mjs'
 import { LAUNCH_AGENT, MAC_TAILSCALE, SERVICE, findCommand, servicePath } from '../platform.mjs'
@@ -29,6 +34,9 @@ import { chromeNoticeSeen } from '../../scripts/chrome-onboarding.mjs'
 export const MODELS = ['fable', 'opus', 'sonnet', 'haiku']
 const MIN_CLAUDE = [2, 1, 80]
 const MAX_LINES = 400
+export const PAIRING_MINUTES = 10 // a code from the page; scripts/pair.mjs makes one for five
+export const STAY_MS = 20 * 60 * 1000 // after writing, at least this long for connecting the Claude app
+const FUNNEL_CACHE_MS = 10000 // the page polls; tailscale is asked at most this often
 
 // The settings the page sets, with their defaults (as in config.mjs and the
 // start scripts) and what a valid value looks like. A value equal to its
@@ -192,6 +200,7 @@ export function createSetup({
   const known = { telegramBot: null, githubUser: null }
   const jobs = new Map()
   let finishing = null
+  let stay = false // the page stays open after writing, for connecting the Claude app
 
   function redact(text) {
     let clean = String(text)
@@ -882,10 +891,108 @@ export function createSetup({
         'claude --chrome, confirm the Claude in Chrome notice with Enter and leave with /exit; otherwise a restart can hang ' +
         'on that notice'
 
+  // --- connecting the Claude app: the endpoint and a pairing code -------------
+  //
+  // The page polls connectState while it is open; that does not count as
+  // activity (.passive), so the idle time still ends a page left alone. A
+  // pairing code comes from the running gateway over its admin socket, as for
+  // scripts/pair.mjs, and goes to the page only in the answer to its POST: never
+  // into a URL, the terminal, a log line or a later answer. Here only its id and
+  // expiry stay, to tell whether it is still the one the gateway waits for; a
+  // new one replaces it in the gateway, also one from pair.mjs.
+
+  const admin = (method, path, body) => adminRequest(join(secretsDir, 'admin.sock'), method, path, body, { timeoutMs: 5000 })
+  const funnelScript = join(root, 'scripts', 'funnel.sh')
+  const funnelEnv = () => ({
+    ...env,
+    VOICE_GW_SECRETS_DIR: secretsDir,
+    VOICE_GW_TAILSCALE_BIN: env.VOICE_SETUP_TAILSCALE_BIN || env.VOICE_GW_TAILSCALE_BIN || bin.tailscale,
+  })
+  let pairing = null // the page's last code: { id, askedAt, expiresAt }
+  let funnelSeen = null // { at, value }
+  let funnelJob = null
+
+  // { state: 'on' | 'off' | null, url }: null when Tailscale is missing or
+  // does not answer; the URL only while the Funnel publishes the endpoint.
+  async function funnel() {
+    const starting = jobs.get(funnelJob)?.state === 'running'
+    if (funnelSeen && !starting && Date.now() - funnelSeen.at < FUNNEL_CACHE_MS) return funnelSeen.value
+    const said = await output('bash', [funnelScript, 'state'], { env: funnelEnv() })
+    const words = said.text.split('\n').map(word => word.trim())
+    const state = said.code !== 0 ? null : words.includes('on') ? 'on' : words.includes('off') ? 'off' : null
+    let url = null
+    if (state === 'on') {
+      const printed = (await output('bash', [funnelScript, 'url'], { env: funnelEnv() })).text.trim()
+      url = /^https:\/\/[A-Za-z0-9.-]+(:\d{1,5})?\/mcp$/.test(printed) ? printed : null
+    }
+    funnelSeen = { at: Date.now(), value: { state, url } }
+    return funnelSeen.value
+  }
+
+  // Whether the page's last code still waits for a sign-in, and if not, why.
+  async function pairingState() {
+    if (!pairing) return null
+    const now = Date.now()
+    // An older gateway has no GET /pairing: then only the expiry counts.
+    const pending = await admin('GET', '/pairing').catch(() => undefined)
+    const waiting = pending === undefined ? pairing.expiresAt > now : pending.id === pairing.id && pending.expiresAt > now
+    if (waiting) return { state: 'valid', expiresInMs: (pending?.expiresAt ?? pairing.expiresAt) - now }
+    const grants = await admin('GET', '/grants').catch(() => [])
+    const signedIn = grants.filter(grant => grant.createdAt >= pairing.askedAt).sort((a, b) => b.createdAt - a.createdAt)[0]
+    if (signedIn) return { state: 'used', client: String(signedIn.client ?? ''), at: signedIn.createdAt }
+    return { state: pairing.expiresAt <= now ? 'expired' : 'gone' }
+  }
+
+  // The page's poll: whether the gateway runs (else whether the tmux session
+  // does, where the controller may wait for its questions), the Funnel, the
+  // code, and the server's time left. Never the code itself.
+  async function connectState({ server }) {
+    const answer = { gateway: await gatewayRuns(), written: Boolean(finishing), stay }
+    if (answer.gateway) {
+      answer.funnel = await funnel()
+      answer.pairing = await pairingState()
+    } else {
+      answer.tmux = await tmuxSession()
+      answer.pairing = pairing ? { state: pairing.expiresAt > Date.now() ? 'unknown' : 'expired' } : null
+    }
+    answer.remaining = server?.remaining ?? null
+    return answer
+  }
+  connectState.passive = true
+
+  async function pairingCode() {
+    if (!(await gatewayRuns())) {
+      throw fail('The gateway is not running yet. Start the controller, and at its first start answer its questions: tmux attach -t voice.', 409)
+    }
+    const askedAt = Date.now()
+    let made
+    try {
+      made = await admin('POST', '/pairing', { minutes: PAIRING_MINUTES })
+    } catch (error) {
+      throw fail(`The gateway made no code: ${redact(error.message)}`, 502)
+    }
+    const expiresIn = Number(made?.expiresIn)
+    if (!/^\d{4} \d{4}$/.test(made?.code ?? '') || !(expiresIn > 0)) throw fail('The gateway answered without a code.', 502)
+    pairing = { id: made.id ?? null, askedAt, expiresAt: askedAt + expiresIn * 1000 }
+    say(`setup: a pairing code for the page, valid ${Math.round(expiresIn / 60)} minutes`)
+    return { code: made.code, expiresIn }
+  }
+
+  async function funnelStart() {
+    if (jobs.get(funnelJob)?.state === 'running') throw fail('The Funnel is being started already.', 409)
+    funnelJob = startJob('starting the Funnel', async line => {
+      const code = await runCommand('bash', [funnelScript, 'start'], { env: funnelEnv(), onLine: line, timeoutMs: 5 * 60 * 1000 })
+      funnelSeen = null
+      return code === 0
+    }).job
+    return { job: funnelJob }
+  }
+
   async function finish({ body, server }) {
     if (finishing) throw fail('The setup is already being written.', 409)
     const { values, docker, scratchDocker } = validate(body)
     const telegramOn = Boolean(body.telegram?.enabled)
+    stay = Boolean(body.stay)
     finishing = startJob('writing the setup', async line => {
       const settings = writeFiles({ values, docker, scratchDocker, telegramOn }, line)
       await liveNote(settings, line)
@@ -903,15 +1010,23 @@ export function createSetup({
         const code = await runCommand(bin.claude, ['plugin', 'marketplace', 'add', root], { env, onLine: line, timeoutMs: 60000 })
         line(code === 0 ? `registered this repository as the marketplace ${MARKETPLACE}` : 'registering the marketplace failed; the start script tries again')
       }
+      if (stay) line('this page stays open for connecting the Claude app (section 10); "End the assistant" there when you are done')
       line(ok ? 'done' : 'done, with problems above')
       return ok
     }).job
-    // The server ends by itself once the page has seen the result, or soon after.
+    // The server ends by itself once the page has seen the result, or soon
+    // after; staying for the pairing, it has at least STAY_MS left from now
+    // and ends on the page's "End the assistant", when idle, or at that limit.
     const watch = setInterval(() => {
       const job = jobs.get(finishing)
       if (job.state === 'running') return
       clearInterval(watch)
-      setTimeout(() => server?.stop('the setup is written'), job.seen ? 1500 : 20000).unref?.()
+      if (stay) {
+        server?.extend?.(STAY_MS)
+        say('setup: the setup is written; the assistant stays open for connecting the Claude app')
+      } else {
+        setTimeout(() => server?.stop('the setup is written'), job.seen ? 1500 : 20000).unref?.()
+      }
     }, 200)
     return { job: finishing }
   }
@@ -921,13 +1036,13 @@ export function createSetup({
     if (!job) throw fail('no such job', 404)
     if (job.state !== 'running') {
       job.seen = true
-      if (id === finishing) setTimeout(() => server?.stop('the setup is written'), 1500).unref?.()
+      if (id === finishing && !stay) setTimeout(() => server?.stop('the setup is written'), 1500).unref?.()
     }
     return snapshot(job)
   }
 
   async function cancel({ server }) {
-    setTimeout(() => server?.stop('cancelled in the browser, nothing written'), 200)
+    setTimeout(() => server?.stop(finishing ? 'ended in the browser' : 'cancelled in the browser, nothing written'), 200)
     return { cancelled: true }
   }
 
@@ -945,6 +1060,9 @@ export function createSetup({
       'POST /api/finish': finish,
       'POST /api/cancel': cancel,
       'GET /api/jobs/:id': jobState,
+      'GET /api/connect': connectState,
+      'POST /api/pairing': pairingCode,
+      'POST /api/funnel/start': funnelStart,
     },
   }
 }

@@ -54,7 +54,8 @@ Linux or macOS ([install and test on a Mac](docs/macos.md)); on Windows, inside 
    95 packages land in `node_modules`; nothing is compiled ([what it installs](#6-prerequisites)).
 
 3. **Run the setup assistant,** a temporary web server on this computer that writes the
-   configuration files. Without it, the gateway runs with its defaults.
+   configuration files and then helps you connect the Claude app. Without it, the gateway runs with
+   its defaults.
 
    ```bash
    node scripts/setup.mjs
@@ -63,12 +64,14 @@ Linux or macOS ([install and test on a Mac](docs/macos.md)); on Windows, inside 
    It prints a one-time link per address of this computer, `http://<address>:8790/?t=<token>`. Open
    one in a browser on your own network, since it is plain HTTP; from elsewhere use an SSH tunnel.
    The page writes `.secrets/gateway.env`, plus Telegram, Docker workers and the autostart if you
-   choose them, and the assistant ends ([7.1](#71-with-the-setup-assistant),
-   [files](#510-secrets-and-files)).
+   choose them ([7.1](#71-with-the-setup-assistant), [files](#510-secrets-and-files)). Tick "Start
+   it now" in its section 7, and leave "keep this page open" ticked in section 9: after writing,
+   the assistant stays up, and its section 10, "Connect the Claude app", goes with you through
+   steps 4 to 7, with the connector URL and the pairing code. No second terminal is needed for them.
 
-4. **Start the controller,** unless the assistant did; then attach with `tmux attach -t voice`. It
-   comes before the funnel and the pairing code: Claude Code starts the gateway inside it, and both
-   need the running gateway.
+4. **The controller** runs in the tmux session `voice` once the assistant started it; without the
+   assistant, start it yourself. It comes before the funnel and the pairing code: Claude Code starts
+   the gateway inside it, and both need the running gateway.
 
    ```bash
    tmux new -s voice scripts/start-controller.sh
@@ -76,19 +79,23 @@ Linux or macOS ([install and test on a Mac](docs/macos.md)); on Windows, inside 
 
    Claude Code opens in `controller/` and asks at the terminal: trust and the MCP server on the
    first start, and with the development flag the channel warning at every start
-   ([8.1](#81-starting-and-stopping)). Run the next steps in a second terminal.
+   ([8.1](#81-starting-and-stopping)). Answer them with `tmux attach -t voice`, then detach with
+   Ctrl-b d. While the assistant runs, its own terminal is busy: attach from another one on this
+   computer, or over SSH. Section 10 of the page says so while the gateway is not up yet, and
+   notices by itself when it is.
 
-5. **Start the funnel.** On Linux, run `sudo tailscale set --operator=$USER` once before; the
-   macOS app needs nothing.
+5. **Start the funnel:** "Start the Funnel" in section 10 of the page, or at the computer:
 
    ```bash
    scripts/funnel.sh start
    ```
 
-   It prints the connector URL `https://<host>.ts.net/mcp` and reports when all Funnel relays
-   answer, which can take a few minutes the first time. The URL holds no secret; the sign-in needs
-   the pairing code from step 7. Without Tailscale, any HTTPS address on port 443 that forwards
-   to `127.0.0.1:8787` will do ([7.3](#73-publishing-the-endpoint)).
+   On Linux, run `sudo tailscale set --operator=$USER` once before; the macOS app needs nothing.
+   Either way it reports when all Funnel relays answer, which can take a few minutes the first
+   time, and prints the connector URL `https://<host>.ts.net/mcp`, which the page then shows too.
+   The URL holds no secret; the sign-in needs the pairing code from step 7. Without Tailscale, any
+   HTTPS address on port 443 that forwards to `127.0.0.1:8787` will do
+   ([7.3](#73-publishing-the-endpoint)).
 
 6. **Add the connector in Claude Desktop:** Customize → Connectors → add a custom connector, with
    the URL from step 5. Use Claude's published OAuth client; if signing in fails with it, choose to
@@ -97,15 +104,19 @@ Linux or macOS ([install and test on a Mac](docs/macos.md)); on Windows, inside 
 
    Claude opens the sign-in page "Connect to Claude Code", which asks for a pairing code.
 
-7. **Get the pairing code:**
+7. **Get the pairing code:** "Show a pairing code" in section 10 of the setup page. It shows an
+   eight-digit code for the sign-in page with a countdown, valid for ten minutes and one sign-in;
+   "New code" replaces it, and the page says when a client signed in with it. Without the page, at
+   the computer:
 
    ```bash
    node scripts/pair.mjs
    ```
 
-   It prints an eight-digit code for the page, valid for five minutes and one sign-in
+   It prints a code valid for five minutes, or up to ten with `--minutes 10`
    ([5.2](#52-the-voice-endpoint-and-oauth)). Then choose "Always allow" for the connector's tools,
-   or voice mode asks at every call.
+   or voice mode asks at every call. Last, "End the assistant" on the page; otherwise it ends by
+   itself after ten minutes without activity.
 
 Then try it in voice mode with the same account: "Ask Claude Code whether the gateway is up."
 
@@ -387,17 +398,20 @@ to a lost phone or a leaked token.
   metadata documents, and the authorisation code flow with PKCE (S256).
 - **Redirect addresses** must be HTTPS on `claude.ai` or `claude.com` (`VOICE_GW_OAUTH_HOSTS`), or
   a loopback address.
-- **Sign-in needs a pairing code** from `node scripts/pair.mjs` on your computer: eight digits,
-  valid for five minutes and one sign-in. Five wrong attempts lock out the client and the address
-  they came from (the last `X-Forwarded-For` entry, set by the tunnel), so a stranger cannot burn
-  your code; twenty wrong attempts in all burn it.
+- **Sign-in needs a pairing code** from your computer: on the setup assistant's page
+  ([5.11](#511-the-setup-assistant)), or from `node scripts/pair.mjs`. Eight digits, valid for one
+  sign-in: ten minutes from the page, five from `pair.mjs` (`--minutes` up to ten, never more).
+  Only one code is valid at a time; a new one replaces the one before, wherever it came from. Five
+  wrong attempts lock out the client and the address they came from (the last `X-Forwarded-For`
+  entry, set by the tunnel), so a stranger cannot burn your code; twenty wrong attempts in all burn
+  it.
 - **Tokens.** Access tokens last one hour. The refresh token rotates on every use and expires after
   30 days. Local tokens for `scripts/fake-voice.mjs` last 12 hours.
 - **Stored as hashes only:** tokens, codes and client secrets are stored as SHA-256 hashes in
   `.secrets/oauth.json`.
 - **Revocation:** `node scripts/pair.mjs list`, `revoke <id>`, `revoke all`.
 - **The admin socket** `.secrets/admin.sock` (pairing, unlocking) is a Unix socket in a folder
-  with mode 0700.
+  with mode 0700. `pair.mjs` and the setup assistant, run as the same user, ask it for codes.
 
 ### 5.3 The controller's confinement
 
@@ -1043,12 +1057,23 @@ is guarded as follows:
 - **Write requests** must come from the page's own origin, as JSON. The page has a strict Content
   Security Policy, sends no referrer and is not cached.
 - **It ends by itself:** after 10 minutes without activity (`--idle`), after 30 minutes at most
-  (`--timeout`), after writing, and on Cancel.
+  (`--timeout`), after writing, and on Cancel. With "keep this page open" ticked (the default) it
+  stays after writing, for connecting the Claude app, and ends on "End the assistant", after the
+  idle time, or at its limit, of which writing leaves at least 20 minutes (at most `--timeout`).
+  The page's polling of the gateway does not count as activity.
+- **Pairing codes only for that browser.** Section 10 asks the running gateway for a code over its
+  admin socket only on a click, with the session cookie and from the page's own origin, so only
+  the browser that opened the one-time link gets one: as good as being at the terminal. The code
+  goes to that browser once, in the answer to its request; never into a URL, the terminal or a
+  log. The assistant keeps only its expiry and an id, to tell the page whether it still works or
+  was used, replaced or burnt. Valid ten minutes and one sign-in; a new one replaces the one
+  before in the gateway.
 - **Plain HTTP, by decision:** a notice at the top of the page says to use it only on your own
-  network, since the one-time token and the keys travel unencrypted. From elsewhere, use an SSH
-  tunnel.
+  network, since the one-time token, the keys and the pairing codes travel unencrypted. From
+  elsewhere, use an SSH tunnel.
 - **No secret leaves it.** None goes back to the browser (saved ones show as `••••••••`), to the
-  terminal or to a log. Output of the commands it runs shows a known secret as `‹secret›`.
+  terminal or to a log; a pairing code goes only to the page that asked for it. Output of the
+  commands it runs shows a known secret as `‹secret›`.
 
 ### 5.12 Limits
 
@@ -1206,7 +1231,8 @@ the `localhost` link).
 | Work folders | Off by default. Turned on: checks their folder as the gateway does, and with a container of their own, builds the image if it is missing and starts the container with `start-workers-container.sh --scratch` ([work folders](#work-folders)) | The folder, the days they are kept, and for the container its name and the token from `claude setup-token` |
 | Watchdog | On Linux, writes and enables a systemd user service that starts the controller in tmux at boot, and turns on lingering for your user so that it keeps running without a login (if that is refused, it shows the `sudo` command); or starts it now in tmux. On macOS it writes a LaunchAgent that starts it in tmux at login, checks it with `plutil`, and with "start it now" loads it with `launchctl bootstrap`, which starts it (`kickstart` if it is loaded already); without, launchd loads it at the next login | Choices |
 | Plugin | Shows whether `voice@cc-voice-gateway` is on the organisation's channel allowlist; registers the marketplace if it is; otherwise shows the admin steps | The admin |
-| Finish | Writes `.secrets/` (5.10) and ends | – |
+| Finish | Writes `.secrets/` (5.10). Then it ends, or with "keep this page open" (the default) stays for the next step | Whether to stay |
+| Connect the Claude app | Shows whether the gateway runs; until it does, what to do (start the controller, or answer its questions with `tmux attach -t voice`), and it notices by itself. Then the Funnel's state, a button that starts it with `scripts/funnel.sh start` and its output, the connector URL while it is on, and a pairing code with a countdown, valid ten minutes and one sign-in, with "New code"; says when a client signed in with it, or why the code no longer works. Works before writing too, if a gateway runs already | Clicks |
 
 #### Claude in Chrome
 
@@ -1251,8 +1277,8 @@ it stay. Unticking Telegram deletes its two files. Options: `--host` (`0.0.0.0`)
 `--timeout` (minutes, `30`), `--idle` (minutes, `10`), or `VOICE_SETUP_HOST`, `VOICE_SETUP_PORT`,
 `VOICE_SETUP_TIMEOUT`, `VOICE_SETUP_IDLE`. Run it again to change something.
 
-Then go on with [Getting started](#getting-started) from step 4: start the controller, publish the
-endpoint, add the connector and pair.
+Then go on with [Getting started](#getting-started) from step 4, with the page's section 10 while
+it is open: start the controller, publish the endpoint, add the connector and pair.
 
 ### 7.2 By hand
 
@@ -1864,14 +1890,16 @@ from zero; a file that cannot be read starts the totals again, with a line in th
 ### 8.6 Connections and testing at the desk
 
 ```bash
-node scripts/pair.mjs                # pairing code for the sign-in page
+node scripts/pair.mjs                # pairing code for the sign-in page, valid five minutes
+node scripts/pair.mjs --minutes 10   # the same, valid up to ten minutes
 node scripts/pair.mjs list           # connected clients and when they last called
 node scripts/pair.mjs revoke <id>    # disconnect one; "revoke all" disconnects every client
 node scripts/fake-voice.mjs          # play the voice AI against the local gateway
 npm test                             # both ends without Claude Code or a phone
 ```
 
-`pair.mjs` and `fake-voice.mjs` talk to the running gateway, so the controller must run. A
+`pair.mjs` and `fake-voice.mjs` talk to the running gateway, so the controller must run. The setup
+assistant's page shows pairing codes too, valid ten minutes (section 10, "Connect the Claude app"). A
 connector unused for more than 30 days must sign in again. `.logs/gateway.log` has one line per
 connector call and sign-in step, and one per HTTP request with the caller's address
 (`http 160.79.106.3 funnel POST /mcp 200`); it shows whether and how far the voice AI got, and who
@@ -2020,7 +2048,7 @@ gateway; do not set them.
 | Sign-in goes to an `http://` address or to the wrong host | The tunnel or proxy does not pass the public host name or `X-Forwarded-Proto: https` (see [Publishing the endpoint](#73-publishing-the-endpoint)). |
 | Sign-in page says the app is not registered | The sign-in state was reset, for example because `.secrets/oauth.json` was deleted. Remove the connector and add it again. |
 | Sign-in fails with Claude's published identity | Choose to register automatically instead. If the log shows `client id document not allowed: <URL>`, that host is missing from `VOICE_GW_OAUTH_HOSTS`. |
-| "Wrong or expired code" | Run `node scripts/pair.mjs` again. A code lasts five minutes and one sign-in. Five wrong attempts from one browser or address, or twenty in all, burn it. |
+| "Wrong or expired code" | "New code" on the setup page, or `node scripts/pair.mjs` again. A code lasts ten minutes from the page, five from `pair.mjs`, and one sign-in; the newest code replaces every one before, and a restart of the gateway forgets it. Five wrong attempts from one browser or address, or twenty in all, burn it. |
 | `pair.mjs` says the gateway is not running | Start the controller; the gateway runs inside its session. |
 | The connector stopped working after weeks unused | The refresh token expired after 30 days. Sign in again from the connector's settings. |
 | Claude asks before every tool call | Choose "Always allow" for the connector's tools. |
@@ -2164,7 +2192,7 @@ src/
   plugin.mjs         the gateway as the MCP server of the plugin voice@cc-voice-gateway
   store.mjs          requests and approvals, persisted across restarts
   folders.mjs        cloning and deleting in the worker root, above the level confined
-  admin.mjs          Unix socket for pair.mjs, unlock.mjs and fake-voice
+  admin.mjs          Unix socket for pair.mjs, unlock.mjs, fake-voice and the setup's pairing codes
   config.mjs         settings from the environment and .secrets/gateway.env
   settings.mjs       reads and writes .secrets/gateway.env
   platform.mjs       what differs on macOS: temporary folders, the autostart's PATH and names
@@ -2189,7 +2217,7 @@ scripts/
   start-workers-container.sh   the worker container, or with --scratch the work folders'; read-only while locked
   fetch-from-container.sh      a branch from the container into a clean clone, as a bundle
   unlock.mjs                   unlock the kill switch, at the server only
-  pair.mjs                     pairing codes, connections
+  pair.mjs                     pairing codes (also on the setup page), connections
   funnel.sh, check-public.mjs  Tailscale Funnel, and a check through its relays
   telegram-notify.mjs          one Telegram message, for the watchdog
   stats.mjs                    the statistics at the desk, and the shutdown message for the watchdog

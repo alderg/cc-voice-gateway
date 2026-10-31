@@ -3,7 +3,8 @@
 // gateway on this computer (src/setup/). It listens on every interface, so
 // that a headless server can be set up from another computer, and shows its
 // one-time link only here, in the terminal. It ends by itself when the setup
-// is written, when cancelled, and after its time limits.
+// is written (or, if the page stays open to connect the Claude app, when it
+// says so), when cancelled, and after its time limits.
 //
 //   node scripts/setup.mjs [--host 0.0.0.0] [--port 8790] [--timeout 30] [--idle 10]
 //

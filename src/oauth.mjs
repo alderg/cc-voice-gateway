@@ -2,8 +2,9 @@
 //
 // The gateway is its own authorization server, so the connector in the Claude
 // app is added with "Sign in" and no secret ever appears in its URL. Signing in
-// needs a pairing code that `node scripts/pair.mjs` shows on this computer; it
-// is valid for five minutes and one sign-in. Claude's servers then hold an
+// needs a pairing code from this computer: the setup assistant's page shows
+// one, valid for ten minutes, and `node scripts/pair.mjs` one for five; either
+// works for one sign-in, and a new one replaces the one before. Claude's servers then hold an
 // access token for an hour and a refresh token that rotates on every use. Each
 // sign-in is one grant that can be listed and revoked.
 //
@@ -35,6 +36,7 @@ const REFRESH_TTL_S = 30 * 24 * 60 * 60
 const LOCAL_TTL_S = 12 * 60 * 60
 const CODE_TTL_MS = 5 * 60 * 1000
 const PAIRING_TTL_MS = 5 * 60 * 1000
+const PAIRING_MAX_MINUTES = 10 // the longest a code may be valid; the setup assistant's page asks for that
 const PAIRING_ATTEMPTS = 5 // wrong ones per client and per address
 const PAIRING_ATTEMPTS_TOTAL = 20 // wrong ones in all; then the code is burnt
 const MAX_CLIENTS = 100
@@ -145,15 +147,31 @@ export class Auth extends EventEmitter {
 
   // --- pairing codes (admin socket) ---------------------------------------
 
-  newPairingCode() {
+  // One code at a time: a new one replaces the one before, used or not.
+  // minutes: how long it is valid, 1 to PAIRING_MAX_MINUTES; five by default.
+  // The id, not secret, tells the setup assistant whether its code is still
+  // the one waiting (pendingPairing).
+  newPairingCode({ minutes } = {}) {
+    if (minutes !== undefined && !(Number.isInteger(minutes) && minutes >= 1 && minutes <= PAIRING_MAX_MINUTES)) {
+      throw new Error(`minutes: a whole number from 1 to ${PAIRING_MAX_MINUTES}`)
+    }
+    const ttl = minutes === undefined ? PAIRING_TTL_MS : minutes * 60 * 1000
     const code = String(randomInt(0, 1e8)).padStart(8, '0')
     this.pairing = {
+      id: randomBytes(6).toString('hex'),
       hash: sha256(code),
-      expiresAt: now() + PAIRING_TTL_MS,
+      expiresAt: now() + ttl,
       wrong: { total: 0, clients: new Map(), addresses: new Map() },
     }
-    log('oauth pairing code issued')
-    return { code: `${code.slice(0, 4)} ${code.slice(4)}`, expiresIn: PAIRING_TTL_MS / 1000 }
+    log(`oauth pairing code issued, valid ${ttl / 60000} minutes`)
+    return { code: `${code.slice(0, 4)} ${code.slice(4)}`, expiresIn: ttl / 1000, id: this.pairing.id }
+  }
+
+  // The code waiting for a sign-in, without the code: { id, expiresAt }, or
+  // nulls once it is used, burnt, expired or replaced.
+  pendingPairing() {
+    const pairing = this.pairing && this.pairing.expiresAt >= now() ? this.pairing : null
+    return { id: pairing?.id ?? null, expiresAt: pairing?.expiresAt ?? null }
   }
 
   // One code, one sign-in, a few attempts: guessing 8 digits is hopeless.
@@ -470,7 +488,7 @@ export class Auth extends EventEmitter {
     }
     const address = clientAddress(req)
     if (!this.checkPairingCode(params.get('pairing_code'), { clientId: client.clientId, clientName: client.name, address })) {
-      sendPage(res, 200, signInPage(params, client, origin, 'Wrong or expired code. Run node scripts/pair.mjs again.'))
+      sendPage(res, 200, signInPage(params, client, origin, 'Wrong or expired code. Get a new one: "New code" on the setup page, or node scripts/pair.mjs.'))
       return
     }
     const code = random()
@@ -653,8 +671,8 @@ function signInPage(params, client, origin, error) {
     <h1>Connect to Claude Code</h1>
     <p><strong>${escapeHtml(client.name)}</strong> wants to use Claude Code on
       <strong>${escapeHtml(new URL(origin).hostname)}</strong>. Afterwards you return to ${escapeHtml(returnHost)}.</p>
-    <p>On that computer, run <code>node scripts/pair.mjs</code> in the cc-voice-gateway folder and enter the code
-      it shows. The code is valid for five minutes.</p>
+    <p>Enter a pairing code from that computer: the setup assistant's page shows one, valid for ten minutes, or
+      run <code>node scripts/pair.mjs</code> in the cc-voice-gateway folder for one valid five minutes.</p>
     ${error ? `<p class="error" role="alert">${escapeHtml(error)}</p>` : ''}
     <form method="post" action="/oauth/authorize">
       ${hidden}
