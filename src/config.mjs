@@ -202,6 +202,20 @@ export const config = {
     .map(name => name.trim())
     .filter(Boolean),
 
+  // Which gateway this is, for the voice assistant when the driver has
+  // several, each a connector (presence.mjs): a label, by default the
+  // computer's name. Inactive on purpose with VOICE_GW_STANDBY=1, a standby
+  // install: the connector answers, but hands nothing over.
+  gatewayName: (env.VOICE_GW_NAME ?? '').trim(),
+  standby: env.VOICE_GW_STANDBY === '1',
+  // A standby by itself when the connector is disconnected (standby.mjs), on
+  // by default, 0 off: after how many minutes without a use of its sign-in
+  // calls without a token count, and how many more minutes it waits for a
+  // use or a new sign-in before.
+  disconnectStandby: env.VOICE_GW_DISCONNECT_STANDBY !== '0',
+  disconnectUnusedMinutes: num(env.VOICE_GW_DISCONNECT_UNUSED, 10),
+  disconnectGraceMinutes: num(env.VOICE_GW_DISCONNECT_GRACE, 15),
+
   // Telegram fallback, on when both of its files in the secrets folder are set:
   // after this many seconds without a voice tool call, the voice mode counts
   // as ended, and questions and approvals also go to Telegram. Results wait
@@ -256,6 +270,8 @@ config.requestsFile = join(config.stateDir, 'requests.json')
 config.jobsFile = join(config.stateDir, 'jobs.json')
 config.adminSocket = join(config.secretsDir, 'admin.sock')
 config.pullsStateFile = join(config.stateDir, 'pulls.json')
+// The standby after the connector was disconnected, so that it holds across a restart.
+config.standbyFile = join(config.stateDir, 'standby.json')
 // The statistics of this running time and of all time (stats.mjs).
 config.statsFile = join(config.stateDir, 'stats.json')
 config.telegramTokenFile = join(config.secretsDir, 'telegram_token')

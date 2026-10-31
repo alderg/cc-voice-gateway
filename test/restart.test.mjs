@@ -226,7 +226,12 @@ async function startGateway(name, { wrapper = false, env = {} } = {}) {
       requestInit: { headers: { authorization: `Bearer ${access_token}` } },
     }),
   )
-  g.call = async (tool, args = {}) => (await g.voice.callTool({ name: tool, arguments: args })).content[0].text
+  // After the line every answer starts with: which gateway, active or not (presence.mjs).
+  g.call = async (tool, args = {}) => {
+    const [line, ...rest] = (await g.voice.callTool({ name: tool, arguments: args })).content[0].text.split('\n')
+    assert.match(line, /^Gateway \S.*: (active|inactive, .*)$/)
+    return rest.join('\n')
+  }
   g.controller = async (tool, args = {}) => (await g.claudeCode.callTool({ name: tool, arguments: args })).content[0].text
   g.close = async () => {
     await g.voice.close()

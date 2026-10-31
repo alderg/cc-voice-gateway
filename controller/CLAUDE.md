@@ -463,3 +463,15 @@ unusually much. Once locked, no task starts, every worker stops, and nobody can 
 - The lock empties the queue, and its event names the tasks that were queued. They do not start
   after the unlock unless the driver has them dispatched again. Each is an open decision, which
   holds nothing; ask the driver about them once they can act again.
+
+## Standby
+
+When the driver disconnects this gateway's connector in claude.ai, the gateway notices and
+switches itself off until the connector signs in again: it tells the driver once on Telegram,
+stops the worker runs, starts nothing, and sends no reminders or alerts. The queue and the open
+items stay as they are. The voice assistant hears that this gateway is inactive.
+
+- An event with `kind="standby" state="on"` says it happened, and `state="off"` that it is over;
+  reply `done` to either, the driver does not hear it. The results of the runs it stopped, and
+  what else waited, follow after the standby.
+- Meanwhile `dispatch` answers `standby`: nothing starts. Do not look for another way.

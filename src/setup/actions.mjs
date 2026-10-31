@@ -94,10 +94,15 @@ const ONE_OF = (...values) => value => values.includes(value)
 const MODEL = value => /^[A-Za-z0-9][A-Za-z0-9._:[\]-]{0,79}$/.test(value)
 const NAME = value => /^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$/.test(value)
 const IMAGE = value => /^[a-z0-9][a-z0-9._/:-]{0,127}$/.test(value)
+// A gateway's name for the voice assistant: letters, digits, spaces, brackets and a few marks.
+const LABEL = value => /^[\p{L}\p{N}][\p{L}\p{N} ()._'-]{0,39}$/u.test(value)
 
 export function fields(root) {
   return {
     VOICE_GW_PORT: { default: '8787', valid: INT(1024, 65535) },
+    VOICE_GW_NAME: { default: '', valid: LABEL },
+    VOICE_GW_STANDBY: { default: '0', valid: ONE_OF('0', '1') },
+    VOICE_GW_DISCONNECT_STANDBY: { default: '1', valid: ONE_OF('1', '0') },
     VOICE_GW_WORKER_ROOT: { default: dirname(root), valid: PATH },
     VOICE_GW_MAX_WORKERS: { default: '2', valid: INT(1, 10) },
     VOICE_GW_MAX_WORKERS_PER_REPO: { default: '1', valid: INT(1, 10) },

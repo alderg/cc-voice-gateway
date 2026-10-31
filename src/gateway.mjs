@@ -49,6 +49,8 @@ import { Alerts, IpGuard } from './ipguard.mjs'
 import { Ledger, openItems, reminderText, startupText } from './ledger.mjs'
 import { ScratchFolders, scratchProblem } from './workspaces.mjs'
 import { Stats, shutdownText, telegramText } from './stats.mjs'
+import { Standby } from './standby.mjs'
+import { Presence } from './presence.mjs'
 
 // How long a shutdown waits at most for its message on Telegram.
 const FAREWELL_MS = 3000
@@ -98,6 +100,21 @@ if (killswitch.locked) {
   if (killswitch.mode !== 'auto') log('kill switch: the setting does not unlock it; only scripts/unlock.mjs does')
 }
 const auth = new Auth({ stateFile: config.oauthStateFile, allowedHosts: config.oauthHosts })
+// The standby after the connector was disconnected (standby.mjs), and which
+// gateway this is for the voice assistant, active or not (presence.mjs).
+const standby = new Standby({
+  file: config.standbyFile,
+  auth,
+  enabled: config.disconnectStandby,
+  unusedMs: config.disconnectUnusedMinutes * 60000,
+  graceMs: config.disconnectGraceMinutes * 60000,
+})
+const presence = new Presence({ name: config.gatewayName, standbySetting: config.standby, killswitch, standby })
+log(
+  `gateway ${presence.label}${config.standby ? ', on standby by its settings (VOICE_GW_STANDBY=1): the connector hands nothing over' : ''}; ` +
+    `standby when the connector is disconnected: ${config.disconnectStandby ? 'on' : 'off (VOICE_GW_DISCONNECT_STANDBY=0)'}`,
+)
+if (standby.active) log(`starting in standby since ${new Date(standby.state.at).toISOString()}: ${standby.state.reason}; a new sign-in ends it`)
 if (config.access && !ACCESS_LEVELS.includes(config.access)) {
   log(`VOICE_GW_ACCESS=${config.access} is not one of ${ACCESS_LEVELS.join(', ')}; detecting the level instead`)
 }
@@ -184,6 +201,7 @@ const workers = new Workers({
     ? new GitHubAccess({ tokenFile: config.githubTokenFile, apiBase: config.githubApi, forced: config.access })
     : null,
   killswitch,
+  standby,
   ledger,
   stateDir: config.stateDir,
   claudeBin: config.claudeBin,
@@ -236,6 +254,7 @@ const pulls = new PullWatcher({
   autoFix: config.autoFixReviews ? { rounds: config.autoFixRounds, queue: fix => workers.reviewFix(fix) } : null,
   bots: config.reviewBots,
 })
+pulls.paused = standby.active // no news, no fixes in a standby
 log(
   config.autoFixReviews
     ? `review comments on workers' pull requests: fixed without asking, at most ${config.autoFixRounds} automatic ` +
@@ -262,6 +281,7 @@ function shutdown(reason, code = process.exitCode ?? 0, { planned = true } = {})
   guard.close()
   telegramCommands?.close()
   funnel?.close()
+  standby.close()
   pulls.close() // so do the watches on pull requests
   store.save() // the requests, with what the voice client has read
   // The last save of the statistics, with the end of this running time,
@@ -339,7 +359,8 @@ const channel = await startChannel(store, {
 // to it reaches the driver as news.
 const reporting = new Set()
 workers.on('finished', async task => {
-  if (reporting.has(task.id)) return
+  // In a standby the result waits; the poll offers it again after it.
+  if (standby.active || reporting.has(task.id)) return
   reporting.add(task.id)
   try {
     await channel.ready
@@ -438,7 +459,7 @@ if (config.funnelIdleMinutes) {
   log(`funnel auto-off: ${config.funnelIdleMinutes} minutes after the last voice call${telegram ? '' : '; without Telegram, only at the computer on again'}`)
 }
 if (telegram) {
-  new TelegramFallback(store, { send: text => telegram.send(text), afterSeconds: config.telegramAfterSeconds })
+  new TelegramFallback(store, { send: text => telegram.send(text), afterSeconds: config.telegramAfterSeconds, paused: () => standby.active })
   log(`telegram fallback ready: questions and approvals after ${config.telegramAfterSeconds} s without a voice call`)
   // Inbound, only the kill switch and the Funnel, only from the configured chat.
   telegramCommands = new TelegramCommands(telegram, { pollSeconds: config.telegramPollSeconds }).start()
@@ -470,10 +491,9 @@ if (telegram) {
 // The door of the voice endpoint (ipguard.mjs): /mcp through the tunnel only
 // from the allowed addresses, and suspicious requests and every sign-in step
 // on Telegram, throttled. Without Telegram, the log has them.
-const ipGuard = new IpGuard({
-  allow: config.mcpAllow,
-  alerts: new Alerts({ send: telegram ? text => telegram.send(text) : null }),
-})
+const alerts = new Alerts({ send: telegram ? text => telegram.send(text) : null })
+if (standby.active) alerts.pause() // in a standby: at most one summary a day
+const ipGuard = new IpGuard({ allow: config.mcpAllow, alerts })
 auth.on('pairing', event => ipGuard.pairing(event))
 log(`${ipGuard.describe()}; suspicious requests ${telegram ? 'reported on Telegram' : 'only in the log'}`)
 
@@ -576,7 +596,7 @@ async function portBusy() {
 }
 
 admin = await startAdmin(auth, config.adminSocket, { killswitch })
-http = startVoiceHttp(store, channel, auth, config, { killswitch, onPortBusy: portBusy, guard: ipGuard })
+http = startVoiceHttp(store, channel, auth, config, { killswitch, onPortBusy: portBusy, guard: ipGuard, presence, standby })
 
 // Once the session is connected: first one event with everything open, so
 // that a restarted controller knows it without memory files; its answer is
@@ -640,8 +660,10 @@ settings.on('change', ({ limits, changed, others }) => {
   if (plan) sendPlan('in the settings file just now, while the gateway runs', othersText(others))
 })
 
-channel.ready.then(async () => {
-  connected = true
+// What a connected controller gets first: everything open, the plan, and the
+// events the previous session never answered. In a standby after the
+// connector was disconnected, it waits until the standby ends (below).
+async function deliverStartup() {
   try {
     const items = openItems({ ledger, workers, store, interrupted: store.interrupted })
     const summary = store.createRequest(startupText(items), { origin: 'gateway' })
@@ -659,7 +681,76 @@ channel.ready.then(async () => {
       log('worker result not sent again:', error.message)
     }
   }
+}
+
+channel.ready.then(async () => {
+  connected = true
+  presence.connected = true // the connector's answers say active from now on
+  if (!standby.active) await deliverStartup()
   restarter.announceReady()
+})
+
+// --- the standby after the connector was disconnected (standby.mjs) -----------
+
+// One message first, on Telegram and to the controller; then the worker runs
+// stop (their results wait), nothing starts, the watches on pull requests,
+// the reminders, the Telegram fallback and the alerts pause (one summary a
+// day at most), and the connector's answers say inactive. The controller
+// session stays: the gateway runs inside it, and so do the sign-in and the
+// pairing codes a reconnect needs; ending it would also leave a development
+// channel's confirmation waiting at the terminal for the wake-up. The queue
+// and the open decisions stay as they are.
+const tell = text =>
+  telegram?.send(`cc-voice-gateway on ${hostname()}: ${text}`).catch(error => log('standby message not sent by Telegram:', error.message)) ??
+  Promise.resolve()
+
+standby.on('enter', async ({ reason }) => {
+  await tell(
+    `the connector was disconnected (${reason}), I am switching off now. Worker runs stop and nothing new starts; no ` +
+      'reminders and no alerts, at most one summary a day. The queue and the open decisions are kept. A new sign-in ' +
+      'with a pairing code (the setup page, or node scripts/pair.mjs) switches me on again.',
+  )
+  alerts.pause()
+  pulls.paused = true
+  let stopped = []
+  try {
+    stopped = workers.stopForStandby(`the gateway went to standby: ${reason}`)
+  } catch (error) {
+    log('standby: worker runs stopped, but their state was not saved:', error.message)
+  }
+  if (stopped.length) log('standby stopped', stopped.map(task => `${task.repo} ${task.id}`).join(', '))
+  if (!connected) return
+  try {
+    const request = store.createRequest(
+      `Standby: the connector in claude.ai was disconnected (${reason}), so the gateway switched off. It stopped ` +
+        `${stopped.length === 1 ? '1 worker run' : `${stopped.length} worker runs`}, whose results follow after the ` +
+        'standby, starts nothing, sends no reminders, and the voice assistant hears that this gateway is inactive. ' +
+        'The queue and the open decisions are kept. A new sign-in of the connector ends it. Reply "done"; the driver ' +
+        'does not hear it.',
+      { origin: 'gateway' },
+    )
+    await channel.push(request, { kind: 'standby', state: 'on' })
+  } catch (error) {
+    log('standby event not delivered to the controller:', error.message)
+  }
+})
+
+standby.on('leave', async ({ why }) => {
+  alerts.resume()
+  pulls.paused = false
+  await tell(`I am back: the connector is connected again (${why}). Queued tasks go on, and what waited reaches the controller.`)
+  if (!connected) return
+  try {
+    const request = store.createRequest(
+      `Standby over: the connector signed in again (${why}). Queued tasks go on, and the events that waited follow. ` +
+        'Reply "done"; the driver does not hear it.',
+      { origin: 'gateway' },
+    )
+    await channel.push(request, { kind: 'standby', state: 'off' })
+  } catch (error) {
+    log('standby event not delivered to the controller:', error.message)
+  }
+  await deliverStartup()
 })
 
 // A decision never put to the driver, or a question they have not answered: a
@@ -670,7 +761,7 @@ channel.ready.then(async () => {
 // or from the kill switch) has one now. trusted="no", as for the summary.
 const reminders = setInterval(
   async () => {
-    if (!connected || killswitch.locked) return
+    if (!connected || killswitch.locked || standby.active) return
     for (const decision of ledger.due()) {
       try {
         const request = store.createRequest(reminderText(decision, ledger.maxReminders), { origin: 'worker' })

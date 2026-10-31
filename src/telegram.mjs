@@ -257,11 +257,14 @@ function describePermission(permission) {
 }
 
 export class TelegramFallback {
-  constructor(store, { send, afterSeconds = 600, log = defaultLog }) {
+  // paused: whether nothing goes out now, in a standby after the connector
+  // was disconnected (standby.mjs); what waits goes out after it.
+  constructor(store, { send, afterSeconds = 600, paused = () => false, log = defaultLog }) {
     this.store = store
     this.send = send
     this.afterSeconds = afterSeconds
     this.afterMs = afterSeconds * 1000
+    this.paused = paused
     this.log = log
     this.voice = false // whether the voice mode was on at the last check
     this.timer = null
@@ -283,6 +286,7 @@ export class TelegramFallback {
   check() {
     try {
       clearTimeout(this.timer)
+      if (this.paused()) return
       const active = this.store.voiceActive(this.afterMs)
       if (active !== this.voice) {
         this.voice = active

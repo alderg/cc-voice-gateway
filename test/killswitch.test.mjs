@@ -610,6 +610,7 @@ async function startGateway({ secrets = SECRETS, state = join(TMP, 'state'), roo
     }
   }
   g.voice = {}
+  g.lines = [] // the first line of each answer: which gateway, and whether it is active (presence.mjs)
   for (const name of ['car', 'phone']) {
     const { access_token } = await adminRequest(join(secrets, 'admin.sock'), 'POST', '/token', { name })
     const client = new Client({ name, version: '0.0.0' })
@@ -618,7 +619,12 @@ async function startGateway({ secrets = SECRETS, state = join(TMP, 'state'), roo
         requestInit: { headers: { authorization: `Bearer ${access_token}` } },
       }),
     )
-    g.voice[name] = async (tool, args = {}) => (await client.callTool({ name: tool, arguments: args })).content[0].text
+    g.voice[name] = async (tool, args = {}) => {
+      const [line, ...rest] = (await client.callTool({ name: tool, arguments: args })).content[0].text.split('\n')
+      assert.match(line, /^Gateway \S.*: (active|inactive, .*; use another connector)$/, "every answer starts with the gateway's line")
+      g.lines.push(line)
+      return rest.join('\n')
+    }
     g.voice[`${name}Client`] = client
   }
   g.controller = async (name, args = {}) => {
@@ -678,7 +684,9 @@ test('voice: "emergency stop" locks before anything reaches the controller; ever
   assert.match(message.text, /KILL SWITCH at .* UTC, by voice: "Emergency stop!" by voice\. No new tasks, workers stopped/)
   assert.equal(statSync(LOCK).mode & 0o777, 0o600)
 
+  assert.match(gw.lines.at(-1), /: inactive, kill switch locked; use another connector$/, 'locked: inactive, from the emergency stop on')
   assert.match(await gw.voice.car('status'), /^\[gateway=ok .* locked=yes\]\n(?!\[ALARM\])/, 'the car heard it already')
+  assert.match(gw.lines.at(-1), /^Gateway \S.*: inactive, kill switch locked; use another connector$/)
   const phone = await gw.voice.phone('status')
   assert.match(phone, /^\[gateway=ok .* locked=yes\]\n\[ALARM\] Kill switch locked since .*, by voice: .* Read this to the user first\./)
   assert.doesNotMatch(await gw.voice.phone('status'), /\[ALARM\]/, 'once per voice chat')
@@ -869,7 +877,7 @@ test('VOICE_GW_KILLSWITCH=off: nothing locks; voice, emergency_stop and raise_al
     assert.match(said, /^\[state=off\] Emergency stop: The kill switch is turned off in the settings \(VOICE_GW_KILLSWITCH=off\), so nothing was locked and the workers go on/)
     assert.ok(!g.events.some(e => e.content.includes('Emergency stop!')), 'the phrase did not reach the controller')
     const tool = await g.voice.carClient.callTool({ name: 'emergency_stop', arguments: { words: 'Notstopp!' } })
-    assert.match(tool.content[0].text, /^\[state=off\] Emergency stop: The kill switch is turned off/)
+    assert.match(tool.content[0].text, /^Gateway \S.*: active\n\[state=off\] Emergency stop: The kill switch is turned off/, 'still active: nothing locked')
     const alarm = await g.controller('raise_alarm', { reason: 'The worker writes to files nobody asked for.' })
     assert.match(alarm.text, /^\[killswitch=off\] The kill switch is turned off .* Tell the driver in one sentence what looks wrong/)
     await g.pushToMain()

@@ -231,7 +231,9 @@ const MAX_ADDRESSES = 1000 // counted one by one per summary; beyond that, "more
 // the next message; if none comes, in a summary once messages may go out
 // again. An urgent alert, a successful sign-in, always goes out: a flood of
 // failed ones must not hide it. Without send (no Telegram), nothing goes out;
-// the gateway log has every event anyway.
+// the gateway log has every event anyway. While the gateway is in standby
+// (pause), everything but an urgent alert is only counted, for at most one
+// summary per pausedMs, a day.
 export class Alerts {
   constructor({
     send = null,
@@ -239,6 +241,7 @@ export class Alerts {
     perKeyMs = 15 * 60 * 1000,
     windowMs = 60 * 60 * 1000,
     perWindow = 6,
+    pausedMs = 24 * 60 * 60 * 1000,
     host = hostname(),
   } = {}) {
     this.send = send
@@ -246,6 +249,8 @@ export class Alerts {
     this.perKeyMs = perKeyMs
     this.windowMs = windowMs
     this.perWindow = perWindow
+    this.pausedMs = pausedMs
+    this.paused = false
     this.prefix = `cc-voice-gateway on ${host}: `
     this.last = new Map() // kind and address -> when the last message about it went out
     this.sent = [] // when the messages within the window went out
@@ -260,18 +265,43 @@ export class Alerts {
     this.timer = null
   }
 
+  // Standby: from now on only counted, for one summary per pausedMs.
+  pause() {
+    if (this.paused) return
+    this.paused = true
+    clearTimeout(this.timer)
+    this.timer = null
+    if (this.held.size) this.schedule(Date.now() + this.pausedMs)
+  }
+
+  // Out of standby: what was held goes out with the next message, or in a
+  // summary as usual.
+  resume() {
+    if (!this.paused) return
+    this.paused = false
+    clearTimeout(this.timer)
+    this.timer = null
+    if (this.held.size) this.schedule(Date.now() + 50)
+  }
+
+  schedule(at) {
+    this.timer = setTimeout(() => this.summary(), Math.max(0, at - Date.now()))
+    this.timer.unref?.()
+  }
+
   notify(kind, address, text, { urgent = false } = {}) {
     if (!this.send) return
     const now = Date.now()
     this.prune(now)
     const key = `${kind} ${address}`
+    if (this.paused && !urgent) return this.hold(kind, address, key, now)
     if (!urgent) {
       const keyFree = !this.last.has(key) || now - this.last.get(key) >= this.perKeyMs
       if (!keyFree || this.sent.length >= this.perWindow) return this.hold(kind, address, key, now)
     }
     this.last.set(key, now)
     this.sent.push(now)
-    const held = this.takeHeld(now)
+    const held = this.paused ? '' : this.takeHeld(now) // in a standby, what is held waits for its summary
     this.deliver(`${this.prefix}${text}${held ? `\n\nNot reported one by one since the last message: ${held}` : ''}`)
   }
 
@@ -288,6 +318,7 @@ export class Alerts {
     if (entry.addresses.size < MAX_ADDRESSES) entry.addresses.add(address)
     this.held.set(kind, entry)
     if (this.timer) return
+    if (this.paused) return this.schedule(now + this.pausedMs)
     // The earliest a summary may go out: once this key, or the window, is free.
     const keyFree = this.last.has(key) ? this.last.get(key) + this.perKeyMs : now
     const windowFree = this.sent.length >= this.perWindow ? this.sent[0] + this.windowMs : now
@@ -319,6 +350,10 @@ export class Alerts {
     this.timer = null
     if (!this.held.size) return
     const now = Date.now()
+    if (this.paused) {
+      this.deliver(`${this.prefix}in standby, as the connector was disconnected; not reported one by one: ${this.takeHeld(now)}`)
+      return
+    }
     this.prune(now)
     if (this.sent.length >= this.perWindow) {
       this.timer = setTimeout(() => this.summary(), this.sent[0] + this.windowMs - now + 50)

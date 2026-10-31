@@ -423,7 +423,10 @@ to a lost phone or a leaked token.
   30 days. Local tokens for `scripts/fake-voice.mjs` last 12 hours.
 - **Stored as hashes only:** tokens, codes and client secrets are stored as SHA-256 hashes in
   `.secrets/oauth.json`.
-- **Revocation:** `node scripts/pair.mjs list`, `revoke <id>`, `revoke all`.
+- **Revocation:** `node scripts/pair.mjs list`, `revoke <id>`, `revoke all` at the computer; a
+  connector may revoke its own token at `/oauth/revoke` (RFC 7009), which the sign-in metadata names.
+  Either, once no connector is left, switches the gateway to standby
+  ([standby](#several-gateways-and-the-standby-after-a-disconnect)).
 - **The admin socket** `.secrets/admin.sock` (pairing, unlocking) is a Unix socket in a folder
   with mode 0700. `pair.mjs` and the setup assistant, run as the same user, ask it for codes.
 
@@ -1242,7 +1245,7 @@ the `localhost` link).
 | Step | What the assistant does | What you give it |
 |---|---|---|
 | This computer | Checks Node.js, `npm install`, Claude Code (2.1.80+), git, the `gh` login, Docker, tmux, Tailscale | Fixes for what is marked as needed |
-| Gateway | Port, repositories folder, runs at a time and per repository (both apply at once in a running gateway), time limit, pull requests ready for review or drafts, review comments fixed without asking (on by default) and how many automatic rounds per pull request ([automatic fixes](#automatic-fixes-for-review-comments)), approvals by voice, Remote Control for the controller (off by default), what the controller may do (with a warning above `confined`), what locks the kill switch (with a warning below `auto`), the Funnel off when idle and after how many minutes, the Funnel's port, 443 by default and never changed by itself (with a line about the connector for another port) | Choices |
+| Gateway | Port, the gateway's name for the voice assistant, whether it is in use or on standby, whether it switches off when its connector is disconnected (on by default; [several gateways](#several-gateways-and-the-standby-after-a-disconnect)), repositories folder, runs at a time and per repository (both apply at once in a running gateway), time limit, pull requests ready for review or drafts, review comments fixed without asking (on by default) and how many automatic rounds per pull request ([automatic fixes](#automatic-fixes-for-review-comments)), approvals by voice, Remote Control for the controller (off by default), what the controller may do (with a warning above `confined`), what locks the kill switch (with a warning below `auto`), the Funnel off when idle and after how many minutes, the Funnel's port, 443 by default and never changed by itself (with a line about the connector for another port) | Choices |
 | Models | Model and effort for the controller (`--model`, `--effort` from `start-controller.sh`) and for every worker run, on the host and in Docker. Claude in Chrome for the controller (off by default); turned on, a warning unless Claude in Chrome's notice for the first start is confirmed already (below) | Choices, or Claude Code's defaults |
 | Telegram | Checks the token (`getMe`), finds your private chat with `getUpdates` once you wrote to the bot, sends a test message | A token from [@BotFather](https://t.me/BotFather), one message to the bot |
 | Workers in Docker | Checks the GitHub token and shows the level per repository with the gateway's detection. Builds the image with its progress shown. Starts the container, sets git's name and email in it, and clones the chosen repositories inside it. While Docker does not answer (section 1), the checkbox is greyed out, with a line why and what it takes; one on from before stays as it is, and the line says that the container cannot run until Docker answers | A token from `claude setup-token`, optionally a GitHub token ([5.6](#56-access-levels-and-their-detection)), the repositories |
@@ -1893,6 +1896,57 @@ it). The watch above does it, in code (`src/pulls.mjs`, `Workers.reviewFix`):
   request 12"; its runs count in the statistics like any other.
 - **Off,** with `VOICE_GW_AUTO_FIX_REVIEWS=0`: news only, and a fix only when you ask for it.
 
+#### Several gateways, and the standby after a disconnect
+
+With several gateways, each a connector in claude.ai (this computer, a Raspberry Pi, a Mac), they
+all look alike to the voice assistant (`src/presence.mjs`):
+
+- **Every answer of the connector starts with one line** that names the gateway and says whether to
+  use it: `Gateway sky (Mac): active`, or `Gateway sky (Mac): inactive, no controller connected; use
+  another connector`. The name is `VOICE_GW_NAME`, by default the computer's, the one in the
+  gateway's Telegram messages, with the kind of computer (Mac, Raspberry Pi, Linux); a name with
+  its own brackets gets none added. `status` gives it first.
+- **Active** means: a controller session is connected to the gateway and the kill switch is not
+  locked. **Inactive:** on standby by its settings (`VOICE_GW_STANDBY=1`, a test install for
+  example), in standby after the connector was disconnected (below), the kill switch locked, or no
+  controller connected yet.
+- **While inactive, `send` and `ask` hand nothing over** and say so (`[state=inactive]`), so that no
+  request waits for a controller that is not there; `status` and `get_reply` answer as usual.
+- **The connector's instructions and every tool description** name the gateway, and a standby by the
+  settings, and tell the voice assistant to call `status` on its connectors first and to use only an
+  active one. They are fetched when the connector connects, so the live state is only in the
+  answers.
+
+**The standby after a disconnect** (`src/standby.mjs`, `VOICE_GW_DISCONNECT_STANDBY`, on by
+default). A connector removed in claude.ai goes on calling the address without a token when a
+voice session starts, and an open question of the controller would go on to Telegram as reminders.
+So the gateway notices the disconnect and switches itself off:
+
+- **What counts as a disconnect:** the connector revokes its token at the gateway's revocation
+  endpoint (RFC 7009, `/oauth/revoke`, named in the sign-in metadata), or its grant is revoked at the
+  computer (`node scripts/pair.mjs revoke`), and no connector grant is left; or voice requests from
+  Anthropic's addresses without a token, or with one the gateway does not know, while the last
+  connector grant has not been used, by a call or a refresh, for `VOICE_GW_DISCONNECT_UNUSED` (10)
+  minutes, and then for `VOICE_GW_DISCONNECT_GRACE` (15) more minutes neither a use nor a new
+  sign-in follows. The hourly refresh never counts: it comes with the expired token, which the
+  gateway knows, and is itself a use. A connector added again signs in within a pairing code's ten
+  minutes, which the grace waits for. Local programs, other addresses and a gateway that was never
+  connected never count.
+- **First one message,** on Telegram ("the connector was disconnected (…), I am switching off now")
+  and as an event to the controller. Then the worker runs stop, their results wait, and nothing new
+  starts; a run in a worktree goes back to the queue. The queue and the open decisions stay as they
+  are. No reminders, no Telegram fallback, no news about pull requests, and no alerts: suspicious
+  requests are only counted, for at most one summary a day; a successful sign-in still goes out at
+  once. The connector's answers say `inactive, connector disconnected, in standby`. The standby
+  holds across a restart (`.state/standby.json`).
+- **The controller session stays running, idle:** the gateway runs inside it, and so do the sign-in
+  and the pairing codes (`scripts/pair.mjs`, the setup page) that a reconnect needs. Ending the
+  session would take them along, and with the development flag the start after it would wait at the
+  terminal for the channel's confirmation.
+- **A new sign-in wakes it up:** one message that it is back, the controller gets an event and what
+  waited (the stopped runs' results, the open items), and the queue goes on.
+- **Off,** with `VOICE_GW_DISCONNECT_STANDBY=0`: the gateway stays on, as before.
+
 A worker's checkout must not be used at the desk while it runs there: workers switch branches in
 your checkouts. A worker never commits, stashes or discards changes it did not make.
 
@@ -2042,6 +2096,10 @@ limits at once.
 | `VOICE_GW_AUTO_FIX_REVIEWS` | `1` | `1`: new review comments that ask for changes, from collaborators and review bots, get a fix the gateway queues itself ([automatic fixes](#automatic-fixes-for-review-comments)); `0`: only on the driver's word |
 | `VOICE_GW_AUTO_FIX_ROUNDS` | `3` | Automatic fixes per pull request, until the driver dispatches something for it again |
 | `VOICE_GW_REVIEW_BOTS` | `claude,copilot-pull-request-reviewer,copilot` | Review bots whose reviews and comments start a fix, by GitHub login without `[bot]` |
+| `VOICE_GW_NAME` | the computer's name | The gateway's name in the first line of every connector answer, in its instructions and tool descriptions, with the kind of computer unless it has brackets of its own ([several gateways](#several-gateways-and-the-standby-after-a-disconnect)) |
+| `VOICE_GW_STANDBY` | `0` | `1`: inactive on purpose, a standby install: the connector answers, says it is inactive, and hands nothing over |
+| `VOICE_GW_DISCONNECT_STANDBY` | `1` | `1`: when the connector is disconnected, one message, then standby until a new sign-in; `0`: stays on |
+| `VOICE_GW_DISCONNECT_UNUSED`, `VOICE_GW_DISCONNECT_GRACE` | `10`, `15` | Minutes: calls without a token count only after the connector's sign-in went unused this long, and the standby follows only if this many more pass without a use or a new sign-in |
 | `VOICE_GW_TELEGRAM_AFTER` | `600` | Seconds without a voice call before questions and approvals also go to Telegram ([5.8](#58-the-telegram-fallback)) |
 | `VOICE_GW_TELEGRAM_POLL` | `25` | Seconds one poll of the bot for `/stop` waits |
 | `VOICE_GW_TELEGRAM_API` | `https://api.telegram.org` | Bot API; tests use a stand-in |
@@ -2134,7 +2192,9 @@ gateway; do not set them.
 | Voice assistant answers itself instead of asking | Say "Ask Claude Code …" explicitly. |
 | Voice assistant says the connector does not work | Look at `.logs/gateway.log`. No `voice initialize`: the request never arrived (URL, tunnel or proxy, DNS). `voice 401`: the client has to sign in again. `voice 403`: the caller's address is not allowed, see the next row. `initialize` and `tools/list` but no `tools/call`: the assistant chose not to call a tool. |
 | `voice 403 … not an allowed address` for Claude's own calls | Anthropic calls from a range missing in `VOICE_GW_MCP_ALLOW`, or the tunnel does not put the caller's address last in `X-Forwarded-For` (then every call shows the same address). Add the range, or set `VOICE_GW_MCP_ALLOW=any`, and restart the controller. |
-| A Telegram alert about a request without a token, or a sign-in | It names the address. A request without a token from Anthropic's addresses comes with every new sign-in of the connector; if you did not connect it, nothing got in, and the pairing code keeps it so. A successful sign-in you did not make: `node scripts/pair.mjs list`, then `revoke`. |
+| A Telegram alert about a request without a token, or a sign-in | It names the address. A request without a token from Anthropic's addresses comes with every new sign-in of the connector, and from a connector removed in claude.ai when a voice session starts: then the gateway soon switches itself off and stays quiet ([standby](#several-gateways-and-the-standby-after-a-disconnect)). If you did not connect it, nothing got in, and the pairing code keeps it so. A successful sign-in you did not make: `node scripts/pair.mjs list`, then `revoke`. |
+| Telegram says "the connector was disconnected (…), I am switching off now", or the voice assistant hears "inactive, connector disconnected, in standby" | The connector was removed in claude.ai, revoked, or its calls came without a token while it went unused ([standby](#several-gateways-and-the-standby-after-a-disconnect)). Add the connector again and sign in with a pairing code (the setup page, or `node scripts/pair.mjs`): the gateway is back at once, with its queue. `.state/standby.json` holds the reason; `VOICE_GW_DISCONNECT_STANDBY=0` turns it off. |
+| The voice assistant uses the wrong one of several connectors | Each answer starts with `Gateway <name> (<computer>): active` or `inactive`; give each gateway a name of its own (`VOICE_GW_NAME`), and set a test install to `VOICE_GW_STANDBY=1`. Tell the assistant which computer you mean, or to check status first. |
 | A repository is missing from `list_workers` | Only folders directly in the worker root with a `.git` count. Check `VOICE_GW_WORKER_ROOT`. |
 | `work folders off: …` in the log, and no `scratch/new` in `list_workers` | `VOICE_GW_SCRATCH=1` is set, but the root is inside a git repository, this checkout or the repositories folder, or is the home folder (a home folder that is itself a git repository counts too), or `VOICE_GW_SCRATCH_DOCKER` names the workers' container. Choose another `VOICE_GW_SCRATCH_ROOT` or container, then restart the controller. |
 | `No work folder "scratch/…"` | It was removed `VOICE_GW_SCRATCH_DAYS` after its last run. Its files are gone with it; a new task starts with `scratch/new`. |
@@ -2286,6 +2346,8 @@ src/
   voice.mjs          HTTP side: the voice tools
   oauth.mjs          sign-in: OAuth metadata, registration, pairing page, tokens
   ipguard.mjs        the door: access log, /mcp only from Anthropic's addresses, alerts on Telegram
+  presence.mjs       which gateway answers the connector, and whether it is active
+  standby.mjs        the standby when the connector is disconnected, until a new sign-in
   workers.mjs        workers: repositories, claude -p runs, the queue, the check after a run, results
   workspaces.mjs     where a run works: a repository, or a work folder, with its rules and check
   worktrees.mjs      the worktrees of further runs of a repository: made, with submodules, removed

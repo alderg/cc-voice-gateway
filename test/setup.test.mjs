@@ -414,6 +414,9 @@ test('the start: checks, current settings, repositories and the plugin, without 
   assert.equal(data.settings.VOICE_GW_PR_DRAFT, '0', 'pull requests ready for review, by default')
   assert.equal(data.settings.VOICE_GW_AUTO_FIX_REVIEWS, '1', 'review comments fixed without asking, by default')
   assert.equal(data.settings.VOICE_GW_AUTO_FIX_ROUNDS, '3')
+  assert.equal(data.settings.VOICE_GW_NAME, '', "the gateway's name: this computer's, by default")
+  assert.equal(data.settings.VOICE_GW_STANDBY, '0', 'in use, by default')
+  assert.equal(data.settings.VOICE_GW_DISCONNECT_STANDBY, '1', 'standby when the connector is disconnected, by default')
   const html = readFileSync(join(ROOT, 'src', 'setup', 'ui', 'index.html'), 'utf8')
   assert.match(html, /<select data-setting="VOICE_GW_AUTO_FIX_REVIEWS"><option value="1">fixed without asking \(default\)<\/option><option value="0">fixed only when you ask<\/option><\/select>/)
   assert.match(html, /<input data-setting="VOICE_GW_AUTO_FIX_ROUNDS" inputmode="numeric">/)
@@ -504,11 +507,14 @@ test('finishing: invalid input is refused before anything is written', async () 
       VOICE_GW_REMOTE_CONTROL: 'yes',
       VOICE_GW_AUTO_FIX_REVIEWS: 'yes',
       VOICE_GW_AUTO_FIX_ROUNDS: '11',
+      VOICE_GW_NAME: 'sky <b>',
+      VOICE_GW_STANDBY: 'yes',
+      VOICE_GW_DISCONNECT_STANDBY: 'no',
       NOPE: '1',
     },
   })
   assert.equal(refused.status, 400)
-  for (const name of ['VOICE_GW_AUTO_FIX_REVIEWS', 'VOICE_GW_AUTO_FIX_ROUNDS']) {
+  for (const name of ['VOICE_GW_AUTO_FIX_REVIEWS', 'VOICE_GW_AUTO_FIX_ROUNDS', 'VOICE_GW_NAME', 'VOICE_GW_STANDBY', 'VOICE_GW_DISCONNECT_STANDBY']) {
     assert.match(refused.data.error, new RegExp(`${name}: not a valid value`))
   }
   assert.match(refused.data.error, /VOICE_GW_REMOTE_CONTROL: not a valid value/)

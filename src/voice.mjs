@@ -7,6 +7,14 @@
 // state lives in the shared Store. Long tasks are followed with short polls
 // (get_reply), because a single tool call has to finish before the client's
 // request deadline (commonly 60 s).
+//
+// The driver may have several gateways, each a connector that looks alike
+// to the voice assistant: every answer starts with a line that names this one
+// and says whether it is active (presence.mjs), and the instructions and tool
+// descriptions name it too. They are fetched when the connector connects, so
+// they carry the name and a standby by the settings, not the live state;
+// status gives that first. While it is inactive, send and ask hand nothing
+// over and say so, so that nothing waits for a controller that is not there.
 
 import { createServer } from 'node:http'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
@@ -35,6 +43,22 @@ News: results of work Claude Code finished in the background arrive with any cal
 Emergency: when the user says "emergency stop" or "kill switch", or the same in another language, call
 emergency_stop at once, without asking back. An [ALARM] line in any result is read out first.
 `.trim()
+
+// Which gateway this connector reaches, for a user with several: the name,
+// and a standby by the settings, which is known when the connector connects.
+function voiceInstructions(presence) {
+  if (!presence) return VOICE_INSTRUCTIONS
+  const lines = [
+    VOICE_INSTRUCTIONS,
+    `This connector is the gateway ${presence.label}. Every answer starts with a line that names the gateway and says ` +
+      'whether it is active. If the user has several such connectors, one per computer, call status on them first and ' +
+      'use only the one whose answer says active; never hand a request to an inactive one.',
+  ]
+  if (presence.standbySetting) {
+    lines.push('This gateway is on standby by its settings: it hands nothing over. Use another connector.')
+  }
+  return lines.join('\n')
+}
 
 const RELAY_RULE =
   "Use it for anything about the user's projects, code, computer or running Claude Code sessions: " +
@@ -191,8 +215,20 @@ function statusText(store, settings, killswitch) {
 const alarmed = new Map() // lock id -> Set of grant ids
 
 // One MCP server instance per HTTP request; cheap, and keeps the endpoint stateless.
-function buildVoiceServer(store, channel, settings, { killswitch = null, grant = null } = {}) {
-  const mcp = new McpServer({ name: 'claude-code-voice', version: VERSION }, { instructions: VOICE_INSTRUCTIONS })
+function buildVoiceServer(store, channel, settings, { killswitch = null, grant = null, presence = null } = {}) {
+  const mcp = new McpServer({ name: 'claude-code-voice', version: VERSION }, { instructions: voiceInstructions(presence) })
+  // The gateway in a tool's description, for a user with several.
+  const named = description =>
+    presence ? `${description} This is the gateway ${presence.label}${presence.standbySetting ? ', on standby by its settings' : ''}.` : description
+
+  // Every answer starts with the line that names this gateway and says
+  // whether it is active, before the machine-readable one.
+  const withLine = handler => async (...args) => {
+    const result = await handler(...args)
+    if (!presence) return result
+    const [first, ...rest] = result.content
+    return { ...result, content: [{ ...first, text: `${presence.line()}\n${first.text}` }, ...rest] }
+  }
 
   const heard = state => {
     if (!alarmed.has(state.id)) alarmed.set(state.id, new Set())
@@ -232,6 +268,14 @@ function buildVoiceServer(store, channel, settings, { killswitch = null, grant =
       heard(killswitch.state)
       return text(`[state=locked] ${alarmText(killswitch.state)} Nothing was handed over. Tell the user.`)
     }
+    // Inactive otherwise: nothing waits here for a controller that is not there.
+    const { active, why } = presence?.state() ?? { active: true }
+    if (!active) {
+      return text(
+        `[state=inactive] Nothing was handed over: this gateway is inactive, ${why}. Tell the user in a few words, and ` +
+          'use another connector whose status says active.',
+      )
+    }
     return null
   }
 
@@ -250,12 +294,15 @@ function buildVoiceServer(store, channel, settings, { killswitch = null, grant =
     'status',
     {
       title: 'Status',
-      description:
+      description: named(
         'Check that the voice gateway is reachable and whether Claude Code is answering; lists open requests ' +
-        'and pending approvals. Use when the user asks if the connection works or what is going on.',
+          'and pending approvals. Use when the user asks if the connection works or what is going on. Its first ' +
+          'line says which gateway this is and whether it is active: when the user has several such connectors, ' +
+          'call status on them first and use only an active one.',
+      ),
       annotations: { readOnlyHint: true },
     },
-    withAlarm(async () => text(statusText(store, settings, killswitch))),
+    withLine(withAlarm(async () => text(statusText(store, settings, killswitch)))),
   )
 
   if (killswitch) {
@@ -263,16 +310,17 @@ function buildVoiceServer(store, channel, settings, { killswitch = null, grant =
       'emergency_stop',
       {
         title: 'Emergency stop',
-        description:
+        description: named(
           'Emergency stop (kill switch). Call it at once, without asking back, when the user says "emergency ' +
-          'stop" or "kill switch", or the same in another language. Locks the gateway: no new tasks, all work on the ' +
-          "user's computer stops. Only someone at the computer can unlock it.",
+            'stop" or "kill switch", or the same in another language. Locks the gateway: no new tasks, all work on the ' +
+            "user's computer stops. Only someone at the computer can unlock it.",
+        ),
         inputSchema: {
           words: z.string().max(400).optional().describe("The user's words, if any."),
         },
         annotations: { destructiveHint: true },
       },
-      async ({ words }) => emergency(words ? `"${preview(words, 80)}" by voice` : 'emergency_stop by voice'),
+      withLine(async ({ words }) => emergency(words ? `"${preview(words, 80)}" by voice` : 'emergency_stop by voice')),
     )
   }
 
@@ -280,12 +328,14 @@ function buildVoiceServer(store, channel, settings, { killswitch = null, grant =
     'send',
     {
       title: 'Send to Claude Code',
-      description:
+      description: named(
         'Send the user\'s request to Claude Code on their computer. ' +
-        RELAY_RULE +
-        ' Returns immediately with an id; then call get_reply with that id until state is done or question. ' +
-        'Prefer this over ask for anything that may take longer than half a minute.' +
-        ACK_RULE,
+          RELAY_RULE +
+          ' Returns immediately with an id; then call get_reply with that id until state is done or question. ' +
+          'Prefer this over ask for anything that may take longer than half a minute. While the gateway is ' +
+          'inactive it hands nothing over and says so (state=inactive).' +
+          ACK_RULE,
+      ),
       inputSchema: {
         message: z.string().min(1).max(4000).describe(MESSAGE_DESCRIPTION),
         in_reply_to: z
@@ -297,7 +347,7 @@ function buildVoiceServer(store, channel, settings, { killswitch = null, grant =
           ),
       },
     },
-    withAlarm(async ({ message, in_reply_to }) => {
+    withLine(withAlarm(async ({ message, in_reply_to }) => {
       const refused = refuse(message)
       if (refused) return refused
       const question = in_reply_to ? store.getRequest(in_reply_to) : null
@@ -315,42 +365,45 @@ function buildVoiceServer(store, channel, settings, { killswitch = null, grant =
           'If you have not told the user yet, say a short okay in their language now. ' +
           `Then call get_reply with id=${request.id}.`,
       )
-    }),
+    })),
   )
 
   mcp.registerTool(
     'ask',
     {
       title: 'Ask Claude Code',
-      description:
+      description: named(
         'Send a short question to Claude Code and wait up to about 40 seconds for the answer in one call. ' +
-        RELAY_RULE +
-        ' If the result says state=working, continue with get_reply and the returned id; never call ask again ' +
-        'for the same request, that would send it twice.' +
-        ACK_RULE,
+          RELAY_RULE +
+          ' If the result says state=working, continue with get_reply and the returned id; never call ask again ' +
+          'for the same request, that would send it twice. While the gateway is inactive it hands nothing over ' +
+          'and says so (state=inactive).' +
+          ACK_RULE,
+      ),
       inputSchema: {
         message: z.string().min(1).max(4000).describe(MESSAGE_DESCRIPTION),
       },
     },
-    withAlarm(async ({ message }, extra) => {
+    withLine(withAlarm(async ({ message }, extra) => {
       const refused = refuse(message)
       if (refused) return refused
       const request = await enqueue(message)
       return waitAndReport(store, request, settings.maxWaitSeconds, extra.signal, settings)
-    }),
+    })),
   )
 
   mcp.registerTool(
     'get_reply',
     {
       title: 'Get reply',
-      description:
+      description: named(
         'Wait for news on a request sent with send or ask, then return what Claude Code said since the last call. ' +
-        'The first line is machine-readable: [state=... id=...]. state=sent or working: tell the user briefly, ' +
-        'in a few varied words of their language, that Claude Code is still on it (never that you are looking ' +
-        'yourself) and call get_reply again with the same id. state=question: read the question ' +
-        'and send the answer with send (in_reply_to=id), then follow the new id. state=done: read the answer. If ' +
-        'an approval is listed, ask the user before calling approve.',
+          'After the line about the gateway, a machine-readable line follows: [state=... id=...]. state=sent or ' +
+          'working: tell the user briefly, in a few varied words of their language, that Claude Code is still on it ' +
+          '(never that you are looking yourself) and call get_reply again with the same id. state=question: read the ' +
+          'question and send the answer with send (in_reply_to=id), then follow the new id. state=done: read the ' +
+          'answer. If an approval is listed, ask the user before calling approve.',
+      ),
       inputSchema: {
         id: z.string().min(1).describe('The id returned by send or ask.'),
         wait_seconds: z
@@ -363,14 +416,14 @@ function buildVoiceServer(store, channel, settings, { killswitch = null, grant =
       },
       annotations: { readOnlyHint: true },
     },
-    withAlarm(async ({ id, wait_seconds }, extra) => {
+    withLine(withAlarm(async ({ id, wait_seconds }, extra) => {
       const request = store.getRequest(id)
       if (!request) {
         return text(`[state=unknown id=${id}] Unknown request. Start a new one with send.`)
       }
       const wait = clamp(wait_seconds ?? settings.defaultWaitSeconds, 1, settings.maxWaitSeconds)
       return waitAndReport(store, request, wait, extra.signal, settings)
-    }),
+    })),
   )
 
   if (settings.permissionRelay) {
@@ -378,11 +431,12 @@ function buildVoiceServer(store, channel, settings, { killswitch = null, grant =
       'approve',
       {
         title: 'Answer approval',
-        description:
+        description: named(
           'Answer a permission prompt from Claude Code, for example running a shell command or writing a file. ' +
-          'Only call this after you read the request to the user and they explicitly said yes (allow) or no ' +
-          '(deny) to this specific action. Never approve on your own. Before the call, confirm their decision in ' +
-          'a few words of their language.',
+            'Only call this after you read the request to the user and they explicitly said yes (allow) or no ' +
+            '(deny) to this specific action. Never approve on your own. Before the call, confirm their decision in ' +
+            'a few words of their language.',
+        ),
         inputSchema: {
           code: z
             .string()
@@ -392,7 +446,7 @@ function buildVoiceServer(store, channel, settings, { killswitch = null, grant =
         },
         annotations: { destructiveHint: true },
       },
-      withAlarm(async ({ code, decision }) => {
+      withLine(withAlarm(async ({ code, decision }) => {
         if (killswitch?.locked && decision === 'allow') {
           return text(`[approval=locked code=${code}] The kill switch is locked: nothing can be allowed now.`)
         }
@@ -406,7 +460,7 @@ function buildVoiceServer(store, channel, settings, { killswitch = null, grant =
             ? `[approval=allow code=${permission.code}] Allowed. Claude Code continues; call get_reply.`
             : `[approval=deny code=${permission.code}] Denied.`,
         )
-      }),
+      })),
     )
   }
 
@@ -452,13 +506,16 @@ function parseUrl(target) {
 
 // onPortBusy: called when another process holds the port (gateway.mjs ends
 // the gateway then); without it, that is only logged. guard: who may call
-// /mcp, and the alerts (ipguard.mjs).
+// /mcp, and the alerts (ipguard.mjs). presence: which gateway this is, and
+// whether it is active (presence.mjs). standby: the standby after a
+// disconnect, which hears of every voice request without a valid token
+// (standby.mjs).
 export function startVoiceHttp(
   store,
   channel,
   auth,
   settings,
-  { killswitch = null, onPortBusy = null, guard = new IpGuard() } = {},
+  { killswitch = null, onPortBusy = null, guard = new IpGuard(), presence = null, standby = null } = {},
 ) {
   const server = createServer(async (req, res) => {
     const caller = guard.caller(req)
@@ -496,6 +553,7 @@ export function startVoiceHttp(
     }
     const { grant, error, reason } = auth.verify(req)
     if (!grant) {
+      standby?.refused(caller, reason)
       guard.refused(caller, reason)
       auth.challenge(res, req, error)
       return
@@ -525,7 +583,7 @@ export function startVoiceHttp(
       res.on('close', () => store.voiceCallEnded())
     }
 
-    const mcp = buildVoiceServer(store, channel, settings, { killswitch, grant })
+    const mcp = buildVoiceServer(store, channel, settings, { killswitch, grant, presence })
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
       enableJsonResponse: true,

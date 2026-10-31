@@ -36,6 +36,21 @@
   <div class="grid">
     <label>Local port <input data-setting="VOICE_GW_PORT" inputmode="numeric"></label>
     <p class="guide">The voice endpoint listens on 127.0.0.1 at this port; the tunnel or proxy forwards to it.</p>
+    <label>Name of this gateway <input data-setting="VOICE_GW_NAME" placeholder="this computer's name" spellcheck="false"></label>
+    <p class="guide">With several gateways, each a connector in the Claude app, every answer of the connector starts with
+      "Gateway &lt;name&gt; (Mac): active" or "inactive", so that the voice assistant uses the right one. Empty: this
+      computer's name.</p>
+    <label>This gateway
+      <select data-setting="VOICE_GW_STANDBY"><option value="0">in use (default)</option><option value="1">on standby: answers, hands nothing over</option></select>
+    </label>
+    <p class="guide">On standby, for a test install for example, the connector says it is inactive and passes no request
+      on, so that the voice assistant uses another one.</p>
+    <label>When its connector is disconnected
+      <select data-setting="VOICE_GW_DISCONNECT_STANDBY"><option value="1">switch off until a new sign-in (default)</option><option value="0">stay on</option></select>
+    </label>
+    <p class="guide">Removed in the Claude app, the connector is detected and the gateway says so once on Telegram, then
+      stops its workers and stays quiet: no reminders, no alerts. A new sign-in with a pairing code switches it on
+      again, queue and open decisions as they were.</p>
     <label>Repositories folder <input data-setting="VOICE_GW_WORKER_ROOT"></label>
     <p class="guide">Every git repository directly in this folder gets a worker (on this computer, without Docker).</p>
     <label>Runs at a time <input data-setting="VOICE_GW_MAX_WORKERS" inputmode="numeric"></label>

@@ -70,8 +70,17 @@ function waitUntil(predicate, ms = 3000) {
 
 const resultText = result => result.content.map(c => c.text).join('\n')
 
+// Every answer of the connector starts with the line that names this gateway
+// and says whether it is active (presence.mjs); the rest follows.
+const LINE = 'Gateway Testbox (e2e): active'
+const afterLine = (text, name = '') => {
+  const [first, ...rest] = text.split('\n')
+  assert.equal(first, LINE, `every answer starts with the gateway's line${name ? ` (${name})` : ''}`)
+  return rest.join('\n')
+}
+
 async function voiceCall(name, args = {}) {
-  return resultText(await voice.callTool({ name, arguments: args }))
+  return afterLine(resultText(await voice.callTool({ name, arguments: args })), name)
 }
 
 async function controllerReply(request_id, state, text) {
@@ -118,6 +127,7 @@ before(async () => {
       VOICE_GW_HINT_AFTER: '1',
       VOICE_GW_LOG_FILE: '',
       VOICE_GW_SELF_CHECKOUT: '', // not this checkout, whatever state it is in
+      VOICE_GW_NAME: 'Testbox (e2e)', // with its own brackets: no kind of computer added
     },
     stderr: 'pipe',
   })
@@ -175,6 +185,20 @@ test('declares the channel and permission capabilities and the reply tool', asyn
 test('voice endpoint exposes the voice tools', async () => {
   const { tools } = await voice.listTools()
   assert.deepEqual(tools.map(t => t.name).sort(), ['approve', 'ask', 'emergency_stop', 'get_reply', 'send', 'status'])
+})
+
+test('the connector names its gateway, for a driver with several: in the instructions, in every tool description, first in every answer', async () => {
+  assert.match(
+    voice.getInstructions(),
+    /\nThis connector is the gateway Testbox \(e2e\)\. Every answer starts with a line that names the gateway and says whether it is active\. If the user has several such connectors, one per computer, call status on them first and use only the one whose answer says active; never hand a request to an inactive one\.$/,
+  )
+  assert.doesNotMatch(voice.getInstructions(), /on standby by its settings/)
+  const { tools } = await voice.listTools()
+  for (const tool of tools) assert.match(tool.description, /This is the gateway Testbox \(e2e\)\.$/, tool.name)
+  assert.match(tools.find(t => t.name === 'status').description, /when the user has several such connectors, call status on them first and use only an active one\./)
+  // status gives it first, before the machine-readable line (voiceCall checks the line on every answer).
+  const raw = resultText(await voice.callTool({ name: 'status', arguments: {} }))
+  assert.match(raw, /^Gateway Testbox \(e2e\): active\n\[gateway=ok controller=/)
 })
 
 test('logs every voice call with client, method and tool, never the token', async () => {
@@ -306,7 +330,7 @@ test('in_reply_to with an unknown id hands nothing over', async () => {
   const before = channelEvents.length
   const result = await voice.callTool({ name: 'send', arguments: { message: 'Yes, do it.', in_reply_to: 'zzzz' } })
   assert.equal(result.isError, true)
-  assert.match(resultText(result), /^\[state=unknown in_reply_to=zzzz\] No request has this id, so nothing was handed over/)
+  assert.match(afterLine(resultText(result)), /^\[state=unknown in_reply_to=zzzz\] No request has this id, so nothing was handed over/)
   await new Promise(r => setTimeout(r, 200))
   assert.equal(channelEvents.length, before)
 })

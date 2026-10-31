@@ -14,6 +14,7 @@
 //   /oauth/register                                dynamic client registration, RFC 7591
 //   /oauth/authorize                               sign-in page, authorization code with PKCE (S256)
 //   /oauth/token                                   code exchange and refresh
+//   /oauth/revoke                                  token revocation, RFC 7009
 // A client may also identify itself with a client ID metadata document (an
 // HTTPS URL as client_id), but only on the allowed hosts.
 //
@@ -22,7 +23,10 @@
 // against timing attacks, so plain === is enough.
 //
 // Every step of a sign-in with a pairing code is also an event, 'pairing', for
-// the alerts on Telegram (ipguard.mjs).
+// the alerts on Telegram (ipguard.mjs). A new sign-in ('connected') and a
+// revocation, by the connector or at the computer ('revoked'), are events for
+// the standby (standby.mjs). When a grant was last used, by a call or a
+// refresh, is lastUse.
 
 import { createHash, randomBytes, randomInt } from 'node:crypto'
 import { EventEmitter } from 'node:events'
@@ -111,6 +115,9 @@ async function readParams(req) {
   }
   return new URLSearchParams(body)
 }
+
+// When a grant was last used: its last call, its last refresh, or its sign-in.
+export const lastUse = grant => Math.max(grant.createdAt ?? 0, grant.lastUsedAt ?? 0, grant.refreshedAt ?? 0)
 
 export class Auth extends EventEmitter {
   constructor({ stateFile, allowedHosts }) {
@@ -237,15 +244,33 @@ export class Auth extends EventEmitter {
     }))
   }
 
+  // At the computer (scripts/pair.mjs revoke): one grant by its id, or all.
   revoke(id) {
-    const before = this.state.grants.length
-    this.state.grants = this.state.grants.filter(g => id !== 'all' && g.id !== id)
-    const revoked = before - this.state.grants.length
-    if (revoked) {
+    const gone = this.state.grants.filter(g => id === 'all' || g.id === id)
+    this.state.grants = this.state.grants.filter(g => !gone.includes(g))
+    if (gone.length) {
       this.save()
       log('oauth revoked', id === 'all' ? 'all grants' : `grant=${id}`)
+      this.revoked(gone, 'computer')
     }
-    return revoked
+    return gone.length
+  }
+
+  // The grants of connectors, not of local tools (issueLocal), still valid.
+  connectorGrants() {
+    const t = now()
+    return this.state.grants.filter(g => g.clientId !== 'local' && (g.refreshExpiresAt ?? g.accessExpiresAt) > t)
+  }
+
+  // A listener's error must not fail the revocation: 'revoked' with the
+  // grants, who revoked them (client: the connector itself, RFC 7009;
+  // computer) and how many connector grants are left.
+  revoked(grants, by) {
+    try {
+      this.emit('revoked', { grants: grants.map(g => ({ id: g.id, client: g.clientName, local: g.clientId === 'local' })), by, left: this.connectorGrants().length })
+    } catch (error) {
+      log('oauth revocation event not handled:', error.message)
+    }
   }
 
   // A token for local tools such as fake-voice, without the sign-in page.
@@ -308,6 +333,31 @@ export class Auth extends EventEmitter {
   }
 
   // --- clients ------------------------------------------------------------
+
+  // The client of a token or revocation request, with its credentials in the
+  // form or as Basic authentication: { client } or { status, error,
+  // description }.
+  async authenticate(req, params) {
+    let clientId = params.get('client_id')
+    let secret = params.get('client_secret')
+    const basic = /^Basic\s+(\S+)$/i.exec(req.headers.authorization ?? '')
+    if (basic) {
+      const decoded = Buffer.from(basic[1], 'base64').toString('utf8')
+      const colon = decoded.indexOf(':')
+      try {
+        clientId = decodeURIComponent(decoded.slice(0, colon))
+        secret = decodeURIComponent(decoded.slice(colon + 1))
+      } catch {
+        return { status: 401, error: 'invalid_client', description: 'Malformed client credentials.' }
+      }
+    }
+    const client = await this.client(clientId)
+    if (!client) return { status: 401, error: 'invalid_client', description: 'Unknown client.' }
+    if (client.authMethod !== 'none' && !(secret && sha256(secret) === client.secretHash)) {
+      return { status: 401, error: 'invalid_client', description: 'Client authentication failed.' }
+    }
+    return { client }
+  }
 
   hostAllowed(url) {
     return this.allowedHosts.includes(url.host) || this.allowedHosts.includes(url.hostname)
@@ -519,24 +569,8 @@ export class Auth extends EventEmitter {
       sendJson(res, status, { error, error_description: description }, NO_STORE)
     }
 
-    let clientId = params.get('client_id')
-    let secret = params.get('client_secret')
-    const basic = /^Basic\s+(\S+)$/i.exec(req.headers.authorization ?? '')
-    if (basic) {
-      const decoded = Buffer.from(basic[1], 'base64').toString('utf8')
-      const colon = decoded.indexOf(':')
-      try {
-        clientId = decodeURIComponent(decoded.slice(0, colon))
-        secret = decodeURIComponent(decoded.slice(colon + 1))
-      } catch {
-        return fail(401, 'invalid_client', 'Malformed client credentials.')
-      }
-    }
-    const client = await this.client(clientId)
-    if (!client) return fail(401, 'invalid_client', 'Unknown client.')
-    if (client.authMethod !== 'none' && !(secret && sha256(secret) === client.secretHash)) {
-      return fail(401, 'invalid_client', 'Client authentication failed.')
-    }
+    const { client, status, error, description } = await this.authenticate(req, params)
+    if (!client) return fail(status, error, description)
     const resource = params.get('resource')
     if (resource && !sameResource(resource, origin)) return fail(400, 'invalid_target', 'Unknown resource.')
 
@@ -561,6 +595,12 @@ export class Auth extends EventEmitter {
       this.save()
       log('oauth connected', JSON.stringify(grant.clientName), `grant=${grant.id}`)
       sendJson(res, 200, tokens, NO_STORE)
+      // A new sign-in: the gateway leaves a standby (standby.mjs).
+      try {
+        this.emit('connected', { grant: { id: grant.id, client: grant.clientName } })
+      } catch (error) {
+        log('oauth sign-in event not handled:', error.message)
+      }
       return
     }
     if (grantType === 'refresh_token') {
@@ -570,12 +610,39 @@ export class Auth extends EventEmitter {
         return fail(400, 'invalid_grant', 'Unknown or expired refresh token.')
       }
       const tokens = this.issue(grant)
+      grant.refreshedAt = now() // a use, as a call is (lastUse)
       this.save()
       log('oauth token refreshed', `grant=${grant.id}`)
       sendJson(res, 200, tokens, NO_STORE)
       return
     }
     fail(400, 'unsupported_grant_type', 'Use authorization_code or refresh_token.')
+  }
+
+  // --- revocation endpoint (RFC 7009) -------------------------------------
+
+  // A connector that is disconnected may revoke its token: the grant goes,
+  // with every token of it, and the gateway hears of it ('revoked', which
+  // standby.mjs takes as a disconnect). The answer is 200 for an unknown
+  // token too, as the RFC asks, so that it tells nothing; a token of another
+  // client is left as it is.
+  async revokeToken(req, res) {
+    const params = await readParams(req)
+    const { client, status, error, description } = await this.authenticate(req, params)
+    if (!client) {
+      log('oauth revocation refused:', error, description)
+      sendJson(res, status, { error, error_description: description }, NO_STORE)
+      return
+    }
+    const hash = sha256(params.get('token') ?? '')
+    const grant = this.state.grants.find(g => [g.accessHash, g.previousAccessHash, g.refreshHash].includes(hash))
+    if (grant && grant.clientId === client.clientId) {
+      this.state.grants = this.state.grants.filter(g => g !== grant)
+      this.save()
+      log('oauth revoked by the client', JSON.stringify(grant.clientName), `grant=${grant.id}`)
+      this.revoked([grant], 'client')
+    }
+    res.writeHead(200, NO_STORE).end()
   }
 
   // --- routing ------------------------------------------------------------
@@ -607,6 +674,8 @@ export class Auth extends EventEmitter {
           authorization_endpoint: `${origin}/oauth/authorize`,
           token_endpoint: `${origin}/oauth/token`,
           registration_endpoint: `${origin}/oauth/register`,
+          revocation_endpoint: `${origin}/oauth/revoke`,
+          revocation_endpoint_auth_methods_supported: ['none', 'client_secret_post', 'client_secret_basic'],
           scopes_supported: [SCOPE],
           response_types_supported: ['code'],
           grant_types_supported: ['authorization_code', 'refresh_token'],
@@ -639,6 +708,10 @@ export class Auth extends EventEmitter {
       case '/oauth/token':
         if (!only('POST')) return true
         await this.token(req, res)
+        return true
+      case '/oauth/revoke':
+        if (!only('POST')) return true
+        await this.revokeToken(req, res)
         return true
       default:
         return false

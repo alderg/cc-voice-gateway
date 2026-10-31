@@ -560,6 +560,7 @@ export class Workers extends EventEmitter {
     sweepMs = SWEEP_MS,
     access = null,
     killswitch = null,
+    standby = null,
     ledger = null,
     stateDir,
     claudeBin = 'claude',
@@ -586,6 +587,7 @@ export class Workers extends EventEmitter {
     this.sweeping = null // old work folders being removed
     this.access = access // GitHubAccess in the container, null on this computer
     this.killswitch = killswitch // while it is locked, nothing starts
+    this.standby = standby // nor in a standby after the connector was disconnected (standby.mjs)
     this.ledger = ledger // open decisions: they hold a repository's queue
     this.stateDir = stateDir
     this.stateFile = join(stateDir, 'workers.json')
@@ -890,6 +892,7 @@ export class Workers extends EventEmitter {
     answered = null,
   }) {
     if (this.killswitch?.locked) return { status: 'locked', state: this.killswitch.state }
+    if (this.standby?.active) return { status: 'standby', why: this.standby.state.reason }
     const names = await this.known(worker)
     if (!names.includes(worker)) return { status: 'unknown', names }
     const job = { worker, task, words, fresh, allowDirty, direct, draft, request, answers }
@@ -920,6 +923,7 @@ export class Workers extends EventEmitter {
   // { status: 'locked' | 'gone', why }.
   reviewFix({ worker, slug, number, branch = null, task = null, round = 1, rounds = 1 }) {
     if (this.killswitch?.locked) return { status: 'locked', why: 'the kill switch is locked' }
+    if (this.standby?.active) return { status: 'standby', why: 'the gateway is in standby, as the connector was disconnected' }
     if (this.workspace(worker)?.kind !== 'repo') return { status: 'gone', why: `${worker} is no repository of the workers` }
     const waiting = this.queued(worker).find(entry => entry.review?.number === number && entry.review?.slug === slug)
     if (waiting) return { status: 'waiting', entry: waiting }
@@ -1118,6 +1122,7 @@ export class Workers extends EventEmitter {
   // "preparing", and counts as running.
   start(facts, { task, words, fresh, direct = false, draft = false, answers = null }, entry = null, place = 'main') {
     if (this.killswitch?.locked) return { status: 'locked', state: this.killswitch.state }
+    if (this.standby?.active) return { status: 'standby', why: this.standby.state.reason }
     if (entry && !this.state.queue.some(waiting => waiting.id === entry.id)) return { status: 'dropped' }
     const id = this.newTaskId()
     const kind = kindOf(facts)
@@ -1419,6 +1424,16 @@ export class Workers extends EventEmitter {
     return stopped
   }
 
+  // A standby after the connector was disconnected (standby.mjs): every run
+  // stops, and its result waits for the end of the standby; a run in a
+  // worktree goes back to the queue, which stays as it is, and nothing
+  // starts until then. Returns the runs.
+  stopForStandby(reason) {
+    const stopped = this.running()
+    for (const task of stopped) this.halt(task, { reason, report: true })
+    return stopped
+  }
+
   // --- the queue ----------------------------------------------------------
 
   // Queued tasks start in the order they came, once a run slot is free and
@@ -1593,9 +1608,10 @@ export class Workers extends EventEmitter {
   // Starts the next queued task that can start; poll() calls it every
   // second. With one run per repository only the first task of a repository
   // may start; with more, any whose repository and dependencies let it
-  // (blocked). Nothing starts while the kill switch is locked.
+  // (blocked). Nothing starts while the kill switch is locked, nor in a
+  // standby after the connector was disconnected (standby.mjs).
   async pump() {
-    if (this.pumping || !this.state.queue.length || this.killswitch?.locked || Date.now() < this.pausedUntil) return
+    if (this.pumping || !this.state.queue.length || this.killswitch?.locked || this.standby?.active || Date.now() < this.pausedUntil) return
     this.pumping = true
     try {
       for (const entry of [...this.state.queue]) {
@@ -1637,8 +1653,8 @@ export class Workers extends EventEmitter {
       log('queued task', entry.id, 'could not start:', error.message)
       return this.park(entry, 'it could not start; the gateway log says why')
     }
-    // locked and busy: it waits; dropped: the controller took it out meanwhile.
-    if (['started', 'locked', 'dropped', 'busy'].includes(result.status)) return
+    // locked, standby and busy: it waits; dropped: the controller took it out meanwhile.
+    if (['started', 'locked', 'standby', 'dropped', 'busy'].includes(result.status)) return
     const why = {
       origin: 'the origin of the repository changed in the container; it needs a look at the desk',
       refused: 'a direct push needs access level full, and the repository is not at full',

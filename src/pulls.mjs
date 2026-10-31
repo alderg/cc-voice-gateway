@@ -128,6 +128,7 @@ export class PullWatcher extends EventEmitter {
     this.log = log
     this.auth = null // { at, ok, me }
     this.busy = false
+    this.paused = false
     this.watches = this.load()
     this.timer = setInterval(() => this.tick(), Math.min(5000, Math.max(100, this.pollMs / 4)))
     this.timer.unref()
@@ -293,7 +294,8 @@ export class PullWatcher extends EventEmitter {
 
   async tick() {
     const due = this.active().filter(w => w.nextAt <= Date.now())
-    if (this.busy || !due.length) return
+    // paused: in a standby after the connector was disconnected (gateway.mjs).
+    if (this.busy || this.paused || !due.length) return
     this.busy = true
     try {
       if (!(await this.ready())) {
