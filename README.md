@@ -77,12 +77,15 @@ Linux or macOS ([install and test on a Mac](docs/macos.md)); on Windows, inside 
    tmux new -s voice scripts/start-controller.sh
    ```
 
-   Claude Code opens in `controller/` and asks at the terminal: trust and the MCP server on the
-   first start, and with the development flag the channel warning at every start
-   ([8.1](#81-starting-and-stopping)). Answer them with `tmux attach -t voice`, then detach with
-   Ctrl-b d. While the assistant runs, its own terminal is busy: attach from another one on this
-   computer, or over SSH. Section 10 of the page says so while the gateway is not up yet, and
-   notices by itself when it is.
+   Claude Code opens in `controller/` and asks at the terminal, and until you answer, the gateway
+   does not start: once whether you trust the folder (and the MCP server), and with the
+   development flag the channel warning at every start ([8.1](#81-starting-and-stopping)). Attach
+   with `tmux attach -t voice`. At "Is this a project you created or one you trust?" press the
+   down arrow once to "Yes, I trust this folder", then Enter: Enter alone picks "No, exit". Answer
+   any further question with Enter, then detach with Ctrl-b, then d. While the assistant runs, its
+   own terminal is busy: attach from another one on this computer, or over SSH. While the tmux
+   session runs and the gateway does not answer, section 10 of the page says how, names the
+   question when it sees it in the tmux session, and notices by itself when the gateway is up.
 
 5. **Start the funnel:** "Start the Funnel" in section 10 of the page, or at the computer:
 
@@ -1236,7 +1239,7 @@ the `localhost` link).
 | Watchdog | On Linux, writes and enables a systemd user service that starts the controller in tmux at boot, and turns on lingering for your user so that it keeps running without a login (if that is refused, it shows the `sudo` command); or starts it now in tmux. On macOS it writes a LaunchAgent that starts it in tmux at login, checks it with `plutil`, and with "start it now" loads it with `launchctl bootstrap`, which starts it (`kickstart` if it is loaded already); without, launchd loads it at the next login | Choices |
 | Plugin | Shows whether `voice@cc-voice-gateway` is on the organisation's channel allowlist; registers the marketplace if it is; otherwise shows the admin steps | The admin |
 | Finish | Writes `.secrets/` (5.10). Then it ends, or with "keep this page open" (the default) stays for the next step | Whether to stay |
-| Connect the Claude app | Shows whether the gateway runs; until it does, what to do (start the controller, or answer its questions with `tmux attach -t voice`), and it notices by itself. Then the Funnel's state, a button that starts it with `scripts/funnel.sh start` and its output, the connector URL while it is on, and a pairing code with a countdown, valid ten minutes and one sign-in, with "New code"; says when a client signed in with it, or why the code no longer works. Works before writing too, if a gateway runs already | Clicks |
+| Connect the Claude app | Shows whether the gateway runs; until it does, what to do: start the controller, or, while its tmux session runs, confirm what Claude Code waits for at the terminal, in a notice with the keys to press (`tmux attach -t voice`, the down arrow to "Yes, I trust this folder" and Enter, Enter for further questions, Ctrl-b d). It looks at the tmux pane (`tmux capture-pane`) for the folder trust question or the development channel's confirmation and names the one it sees; only which one reaches the page, never the pane's text. It notices by itself when the gateway runs. Then the Funnel's state, a button that starts it with `scripts/funnel.sh start` and its output, the connector URL while it is on, and a pairing code with a countdown, valid ten minutes and one sign-in, with "New code"; says when a client signed in with it, or why the code no longer works. Works before writing too, if a gateway runs already | Clicks |
 
 #### Claude in Chrome
 
@@ -2091,6 +2094,7 @@ gateway; do not set them.
 | The setup link says it is not valid or already used | The link works once, in one browser. Go on in that browser, or start `node scripts/setup.mjs` again for a new link. |
 | The setup page says "Too many wrong links" | Five wrong links from one address within ten minutes, or 30 in total, block every attempt for a while. Wait, or start the assistant again. |
 | The setup assistant does not start | `needs a terminal`: it shows its link only on a terminal, so run it directly, not with its output redirected. `cannot listen on …: EADDRINUSE`: choose another `--port`. |
+| Section 10 of the setup page says "not running yet" although the controller runs in tmux | Claude Code waits at the terminal, and the gateway starts only after the answer. `tmux attach -t voice`: at "Is this a project you created or one you trust?" (once for the folder) press the down arrow once to "Yes, I trust this folder", then Enter, since Enter alone picks "No, exit"; at the development channel's warning (every start without the allowlist) Enter. Leave with Ctrl-b, then d. |
 | The setup page cannot be reached from another computer | A firewall blocks the port, or `--host` names one address only. Or use the SSH tunnel the terminal shows. |
 | "Find my chat" finds nothing | Write to the bot after checking the token; Telegram keeps messages for 24 hours. A running gateway that polls the same bot takes them away: quit the controller first. |
 | No Telegram message | Questions and approvals go out only after `VOICE_GW_TELEGRAM_AFTER` seconds (600) without a voice call, and only if the voice assistant has not picked them up. Results never go to Telegram. `telegram fallback off` in the log: a file was missing or empty when the gateway started; fix it and restart the controller. `telegram send failed: 400 Bad Request: chat not found`: wrong chat ID, or you never wrote to the bot. `401 Unauthorized`: wrong token. |

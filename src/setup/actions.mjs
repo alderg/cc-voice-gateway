@@ -943,9 +943,25 @@ export function createSetup({
     return { state: pairing.expiresAt <= now ? 'expired' : 'gone' }
   }
 
+  // Which question the controller's terminal shows, from the tmux pane:
+  // 'trust' for Claude Code's folder trust question (once for the folder),
+  // 'channel' for the development channel's confirmation (at every start
+  // without the allowlist), or null. Whichever of them comes last on the
+  // screen, as an answered one can stay above the next. Only this word goes
+  // to the page, never the pane's text.
+  async function waitingFor() {
+    const pane = await output(bin.tmux, ['capture-pane', '-p', '-t', 'voice'])
+    if (pane.code !== 0) return null
+    const last = pattern => [...pane.text.matchAll(pattern)].at(-1)?.index ?? -1
+    const trust = last(/Quick safety check|Yes, I trust this folder/gi)
+    const channel = last(/Loading development channels|I am using this for local development/gi)
+    if (trust < 0 && channel < 0) return null
+    return trust > channel ? 'trust' : 'channel'
+  }
+
   // The page's poll: whether the gateway runs (else whether the tmux session
-  // does, where the controller may wait for its questions), the Funnel, the
-  // code, and the server's time left. Never the code itself.
+  // does, where the controller may wait for a confirmation, and which one),
+  // the Funnel, the code, and the server's time left. Never the code itself.
   async function connectState({ server }) {
     const answer = { gateway: await gatewayRuns(), written: Boolean(finishing), stay }
     if (answer.gateway) {
@@ -953,6 +969,7 @@ export function createSetup({
       answer.pairing = await pairingState()
     } else {
       answer.tmux = await tmuxSession()
+      answer.waiting = answer.tmux ? await waitingFor() : null
       answer.pairing = pairing ? { state: pairing.expiresAt > Date.now() ? 'unknown' : 'expired' } : null
     }
     answer.remaining = server?.remaining ?? null
@@ -962,7 +979,7 @@ export function createSetup({
 
   async function pairingCode() {
     if (!(await gatewayRuns())) {
-      throw fail('The gateway is not running yet. Start the controller, and at its first start answer its questions: tmux attach -t voice.', 409)
+      throw fail('The gateway is not running yet. Start the controller, and confirm what Claude Code asks at the terminal: tmux attach -t voice.', 409)
     }
     const askedAt = Date.now()
     let made

@@ -485,10 +485,32 @@ function showCode(text, expiresIn) {
   tickCode()
 }
 
-const WAIT_TMUX =
-  'The controller runs in the tmux session "voice", but its gateway does not answer yet. At its first start Claude Code ' +
-  'waits at the terminal for a few questions: in a terminal on this computer, or over SSH, run tmux attach -t voice, ' +
-  'answer them, then Ctrl-b d. This page notices by itself when the gateway runs.'
+// While the tmux session runs and the gateway does not answer, Claude Code
+// most likely waits for a confirmation at the terminal. The server looks at
+// the tmux pane and names the question it sees (status.waiting): the folder
+// trust question, once for the folder, whose default is "No, exit"; or the
+// development channel's, at every start without the allowlist (section 8),
+// whose default goes on. Otherwise both, in one text.
+const TRUST_STEP =
+  'press the down arrow once to "Yes, I trust this folder" (Enter alone picks "No, exit"), then Enter'
+const LEAVE = 'then leave tmux with Ctrl-b, then d. This page notices by itself when the gateway runs.'
+const WAIT_TMUX = {
+  trust:
+    'Action needed: Claude Code waits at the terminal for its one-time question whether you trust this folder, so the ' +
+    'gateway does not start. In a terminal on this computer, or over SSH: run tmux attach -t voice, ' +
+    `${TRUST_STEP}. Answer any further question with Enter, ${LEAVE}`,
+  channel:
+    'Action needed: Claude Code waits at the terminal for the development channel\'s confirmation, which it asks at ' +
+    'every start while the plugin is not on the allowlist (section 8), so the gateway does not start. In a terminal on ' +
+    'this computer, or over SSH: run tmux attach -t voice, press Enter for "I am using this for local development", ' +
+    LEAVE,
+  unknown:
+    'Action needed: the controller runs in the tmux session "voice", but its gateway does not answer yet. Most likely ' +
+    'Claude Code waits for a confirmation at the terminal. In a terminal on this computer, or over SSH: run tmux ' +
+    `attach -t voice. If it asks whether you trust this folder, which it does once, ${TRUST_STEP}. Answer any further ` +
+    'question with Enter, such as the development channel\'s confirmation, which comes at every start while the ' +
+    `plugin is not on the allowlist (section 8); ${LEAVE}`,
+}
 const WAIT_START =
   'The controller is not running. Start it: tick "Start it now" in section 7 and write the setup, or at the computer: ' +
   'tmux new -s voice scripts/start-controller.sh. This page notices by itself when the gateway runs.'
@@ -514,8 +536,11 @@ async function connect() {
     syncClock(status.remaining)
     const running = status.gateway === true
     show('#connect-gateway', running ? 'running' : 'not running yet', running ? 'ok' : '')
+    const question = Object.hasOwn(WAIT_TMUX, status.waiting ?? '') ? status.waiting : 'unknown'
+    const wait = running ? '' : status.tmux ? WAIT_TMUX[question] : WAIT_START
     $('#connect-wait').hidden = running
-    $('#connect-wait').textContent = running ? '' : status.tmux ? WAIT_TMUX : WAIT_START
+    // Only when it changes: it is an alert, which a screen reader reads out.
+    if ($('#connect-wait').textContent !== wait) $('#connect-wait').textContent = wait
     $('#connect-ready').hidden = !running
     if (running) {
       const funnel = status.funnel ?? {}

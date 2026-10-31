@@ -268,8 +268,9 @@
   <h2>7. Keeping the controller running</h2>
   <p class="guide">
     <code>scripts/start-controller.sh</code> runs the controller under a watchdog that starts it again after a
-    crash, in a tmux session. On its first start Claude Code asks a few questions at the terminal:
-    attach with <code>tmux attach -t voice</code> and answer them.
+    crash, in a tmux session. On its first start Claude Code asks at the terminal whether you trust the folder:
+    attach with <code>tmux attach -t voice</code>, press the down arrow once to "Yes, I trust this folder", then
+    Enter (Enter alone picks "No, exit"). Section 10 says when it waits for that.
   </p>
   <p class="guide" id="watchdog-linux">
     On Linux the autostart also turns on lingering for your user (<code>loginctl enable-linger</code>):
@@ -329,7 +330,8 @@
   <div id="next" hidden>
     <h3>What is left</h3>
     <ol class="guide">
-      <li>If the controller waits for its questions at the first start: <code>tmux attach -t voice</code>, answer them, then Ctrl-b d.</li>
+      <li>If section 10 says the gateway does not answer yet, Claude Code most likely waits for a confirmation at the
+        terminal: <code>tmux attach -t voice</code>, and confirm as section 10 says, then Ctrl-b, then d.</li>
       <li>Publish the endpoint at a public HTTPS address: "Start the Funnel" in section 10, or <code>scripts/funnel.sh start</code> with Tailscale Funnel.</li>
       <li>In the Claude app, add a custom connector with that address followed by <code>/mcp</code>, and sign in.</li>
       <li>Enter a pairing code on the sign-in page: "Show a pairing code" in section 10 while this page is open, or on this computer <code>node scripts/pair.mjs</code>.</li>
@@ -344,7 +346,7 @@
     the sign-in page. A code from here is valid for ten minutes and one sign-in; a new one replaces the one before, also
     one from <code>scripts/pair.mjs</code>. It is shown only on this page, never in the terminal or a log.</p>
   <p>Gateway: <span id="connect-gateway" class="state">checking…</span></p>
-  <p id="connect-wait" class="notice" hidden></p>
+  <p id="connect-wait" class="notice" role="alert" hidden></p>
   <div id="connect-ready" hidden>
     <h3>The endpoint</h3>
     <p>Tailscale Funnel: <span id="connect-funnel" class="state"></span></p>

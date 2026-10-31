@@ -28,6 +28,7 @@ const { adminRequest } = await import('../src/admin.mjs')
 const SECRETS = join(TMP, 'secrets') // the gateway's, and the setup's
 const BIN = join(TMP, 'bin')
 const SESSION = join(TMP, 'tmux-session') // the fake tmux: the session "voice" runs
+const PANE = join(TMP, 'tmux-pane') // the fake tmux: what its pane shows
 const FUNNEL_ON = join(TMP, 'funnel-on') // the fake tailscale: the Funnel publishes the endpoint
 const CALLBACK = 'https://claude.ai/api/mcp/auth_callback'
 const FORWARDED = { 'x-forwarded-proto': 'https', 'x-forwarded-host': 'voice-test.example.ts.net' }
@@ -35,9 +36,35 @@ const FORWARDED = { 'x-forwarded-proto': 'https', 'x-forwarded-host': 'voice-tes
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 
 const FAKE_TMUX = `#!/usr/bin/env node
-import { existsSync } from 'node:fs'
-if (process.argv[2] === 'has-session') process.exit(existsSync(${JSON.stringify(SESSION)}) ? 0 : 1)
+import { existsSync, readFileSync } from 'node:fs'
+const argv = process.argv.slice(2).join(' ')
+if (argv === 'has-session -t voice') process.exit(existsSync(${JSON.stringify(SESSION)}) ? 0 : 1)
+if (argv === 'capture-pane -p -t voice') {
+  if (!existsSync(${JSON.stringify(SESSION)})) process.exit(1)
+  process.stdout.write(existsSync(${JSON.stringify(PANE)}) ? readFileSync(${JSON.stringify(PANE)}, 'utf8') : '')
+}
 `
+// Claude Code's two questions at the start as the pane shows them, with a
+// line that must never reach the page.
+const SECRET_LINE = 'pane-text-never-on-the-page-7f3a'
+const TRUST_PANE = [
+  SECRET_LINE,
+  ' Accessing workspace:',
+  ' /Users/driver/cc-voice-gateway/controller',
+  ' Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open',
+  ' source project, or work from your team).',
+  ' ❯ 1. No, exit',
+  '   2. Yes, I trust this folder',
+  ' Enter to confirm · Esc to cancel',
+].join('\n')
+const CHANNEL_PANE = [
+  SECRET_LINE,
+  ' WARNING: Loading development channels',
+  ' --dangerously-load-development-channels is for local channel development only.',
+  ' Channels: server:voice',
+  ' ❯ 1. I am using this for local development',
+  '   2. Exit',
+].join('\n')
 // tailscale as funnel.sh asks it: its own name, the Funnel's state, and a
 // start that is refused as on Linux without the operator setting, so that no
 // check of the public relays runs.
@@ -224,14 +251,32 @@ test('while the gateway is down: no code, and the page says what to do', async (
   assert.equal(status, 200)
   assert.equal(data.gateway, false)
   assert.equal(data.tmux, false, 'nothing runs: start the controller')
+  assert.equal(data.waiting, null)
   assert.equal(data.pairing, null)
   assert.ok(data.remaining.overallMs > 0 && data.remaining.idleMs > 0)
   writeFileSync(SESSION, '')
   ;({ data } = await call('/api/connect'))
-  assert.equal(data.tmux, true, 'the controller may wait for its questions in tmux')
+  assert.equal(data.tmux, true, 'the controller may wait for a confirmation in tmux')
+  assert.equal(data.waiting, null, 'an empty pane: which one is not known')
   const refused = await call('/api/pairing', {})
   assert.equal(refused.status, 409)
   assert.match(refused.data.error, /The gateway is not running yet\..*tmux attach -t voice/)
+})
+
+test('while the gateway is down: which question the tmux pane shows, as one word, never the pane\'s text', async () => {
+  const { call, responses } = flow.page
+  const waiting = async pane => {
+    writeFileSync(PANE, pane)
+    return (await call('/api/connect')).data.waiting
+  }
+  assert.equal(await waiting(TRUST_PANE), 'trust')
+  assert.equal(await waiting(CHANNEL_PANE), 'channel')
+  // An answered question can stay on the screen above the next: the last one counts.
+  assert.equal(await waiting(`${TRUST_PANE}\n${CHANNEL_PANE}`), 'channel')
+  assert.equal(await waiting(`${CHANNEL_PANE}\n${TRUST_PANE}`), 'trust')
+  assert.equal(await waiting(`${SECRET_LINE}\n╭─ Claude Code ─╮\n> `), null, 'a session that runs, without either question')
+  assert.ok(!responses.some(r => r.text.includes(SECRET_LINE) || r.text.includes('Quick safety check')), 'only the word')
+  rmSync(PANE)
 })
 
 test('polling the gateway is no activity: a page left alone still ends by itself', async () => {
@@ -476,8 +521,32 @@ test('the page: what to do while the gateway is down, then a code with its time,
   const { $ } = ui
   assert.equal($('#connect-gateway').textContent, 'not running yet')
   assert.equal($('#connect-wait').hidden, false)
-  assert.match($('#connect-wait').textContent, /At its first start Claude Code waits at the terminal for a few questions: .* run tmux attach -t voice, answer them, then Ctrl-b d\. This page notices by itself when the gateway runs\./)
+  // Which question waits is not known: both, with the keys for each.
+  const unknown = $('#connect-wait').textContent
+  assert.match(unknown, /^Action needed: the controller runs in the tmux session "voice", but its gateway does not answer yet\. Most likely Claude Code waits for a confirmation at the terminal\./)
+  assert.match(unknown, /run tmux attach -t voice\. If it asks whether you trust this folder, which it does once, press the down arrow once to "Yes, I trust this folder" \(Enter alone picks "No, exit"\), then Enter\./)
+  assert.match(unknown, /Answer any further question with Enter, such as the development channel's confirmation, which comes at every start while the plugin is not on the allowlist \(section 8\); then leave tmux with Ctrl-b, then d\. This page notices by itself when the gateway runs\.$/)
   assert.equal($('#connect-ready').hidden, true)
+  const html = readFileSync(join(ROOT, 'src', 'setup', 'ui', 'index.html'), 'utf8')
+  assert.match(html, /<p id="connect-wait" class="notice" role="alert" hidden><\/p>/, 'a notice like the plugin warning')
+
+  connect = { gateway: false, tmux: true, waiting: 'trust', pairing: null, remaining }
+  await ui.poll()
+  assert.match(
+    $('#connect-wait').textContent,
+    /^Action needed: Claude Code waits at the terminal for its one-time question whether you trust this folder, so the gateway does not start\. In a terminal on this computer, or over SSH: run tmux attach -t voice, press the down arrow once to "Yes, I trust this folder" \(Enter alone picks "No, exit"\), then Enter\. Answer any further question with Enter, then leave tmux with Ctrl-b, then d\./,
+  )
+  connect = { gateway: false, tmux: true, waiting: 'channel', pairing: null, remaining }
+  await ui.poll()
+  assert.match(
+    $('#connect-wait').textContent,
+    /^Action needed: Claude Code waits at the terminal for the development channel's confirmation, which it asks at every start while the plugin is not on the allowlist \(section 8\), so the gateway does not start\. .*run tmux attach -t voice, press Enter for "I am using this for local development", then leave tmux with Ctrl-b, then d\./,
+  )
+  assert.doesNotMatch($('#connect-wait').textContent, /trust/, 'no step that is not needed')
+  connect = { gateway: false, tmux: true, waiting: 'something new', pairing: null, remaining }
+  await ui.poll()
+  assert.equal($('#connect-wait').textContent, unknown)
+
   connect = { gateway: false, tmux: false, pairing: null, remaining }
   await ui.poll()
   assert.match($('#connect-wait').textContent, /^The controller is not running\. Start it: tick "Start it now" in section 7/)
