@@ -14,6 +14,7 @@ import { connect } from 'node:net'
 import { dirname } from 'node:path'
 import { readBody, sendJson } from './http.mjs'
 import { log } from './log.mjs'
+import { socketPathMax } from './platform.mjs'
 
 function socketInUse(path) {
   return new Promise(resolve => {
@@ -27,6 +28,19 @@ function socketInUse(path) {
 }
 
 export async function startAdmin(auth, socketPath, { killswitch = null } = {}) {
+  // A longer path may be cut short (platform.mjs): the socket would listen
+  // under the shortened name, perhaps outside the secrets folder, until the
+  // gateway ended on the chmod below. So not at all: without the socket it
+  // runs, as when another gateway holds it, and the log says why.
+  const bytes = Buffer.byteLength(socketPath)
+  if (bytes > socketPathMax()) {
+    log(
+      `admin socket not started: its path has ${bytes} bytes, more than this system allows (${socketPathMax()}), so pairing, ` +
+        'local tokens and unlocking the kill switch do not work. Move the checkout, or set VOICE_GW_SECRETS_DIR to a shorter folder:',
+      socketPath,
+    )
+    return null
+  }
   mkdirSync(dirname(socketPath), { recursive: true, mode: 0o700 })
   if (existsSync(socketPath)) {
     if (await socketInUse(socketPath)) {

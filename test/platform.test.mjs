@@ -1,16 +1,22 @@
 // What differs between Linux and macOS (src/platform.mjs), for both platforms
 // on either: the temporary folders workers may write to, the PATH for the
-// autostart and the setup's checks, and finding a command on it.
+// autostart and the setup's checks, finding a command on it, and how long the
+// admin socket's path may be.
 
 import { test, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { LAUNCH_AGENT, SERVICE, findCommand, servicePath, tempFolders } from '../src/platform.mjs'
+import { LAUNCH_AGENT, SERVICE, findCommand, servicePath, socketPathMax, tempFolders } from '../src/platform.mjs'
 
 const TMP = mkdtempSync(join(tmpdir(), 'vgw-platform-'))
 after(() => rmSync(TMP, { recursive: true, force: true }))
+
+// What the admin socket logs goes to stderr, never the real log.
+process.env.VOICE_GW_LOG_FILE = ''
+process.env.VOICE_GW_SECRETS_DIR = join(TMP, 'no-secrets')
+const { startAdmin } = await import('../src/admin.mjs')
 
 test('the autostart\'s names', () => {
   assert.equal(SERVICE, 'cc-voice-gateway')
@@ -63,4 +69,21 @@ test('findCommand: the first executable file on the PATH; a path as it is; null 
   assert.equal(findCommand('nothing-like-this', `${a}:${b}`), null)
   assert.equal(findCommand('/opt/homebrew/bin/tmux', ''), '/opt/homebrew/bin/tmux')
   assert.equal(findCommand('node', dirname(process.execPath)), process.execPath.replace(/[^/]+$/, 'node'))
+})
+
+test("a socket's path: at most 103 bytes on macOS, 107 on Linux; the admin socket starts up to that, not beyond", async () => {
+  assert.equal(socketPathMax({ platform: 'darwin' }), 103)
+  assert.equal(socketPathMax({ platform: 'linux' }), 107)
+  // A folder that makes the socket's path just as long as this system allows.
+  const path = length => join(TMP, 'd'.repeat(length - Buffer.byteLength(join(TMP, '/admin.sock')) - 1), 'admin.sock')
+  const longest = path(socketPathMax())
+  assert.equal(Buffer.byteLength(longest), socketPathMax())
+  const admin = await startAdmin({}, longest)
+  assert.ok(admin, 'started')
+  assert.ok(existsSync(longest), 'where it was asked for')
+  await new Promise(resolve => admin.close(resolve))
+  // One byte more: not started, rather than made under a shortened path.
+  const tooLong = path(socketPathMax() + 1)
+  assert.equal(await startAdmin({}, tooLong), null)
+  assert.ok(!existsSync(dirname(tooLong)), 'nothing made')
 })

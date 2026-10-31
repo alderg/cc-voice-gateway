@@ -1,5 +1,6 @@
 // What differs between Linux and macOS, in one place: the temporary folders,
-// where commands live when a service starts them, and the autostart's name.
+// where commands live when a service starts them, the autostart's name, and
+// how long a socket's path may be.
 // Each function takes the platform as a parameter, so that the tests cover
 // both on either.
 
@@ -27,6 +28,15 @@ export function tempFolders({ platform = process.platform, tmp = tmpdir() } = {}
     }
   }
   return [...new Set(folders.map(folder => folder.replace(/(.)\/+$/, '$1')))]
+}
+
+// The longest path of a Unix socket, such as the gateway's admin socket, in
+// bytes: what sun_path holds with its closing zero, 108 bytes on Linux and
+// 104 on macOS. Node 22 does not refuse a longer one but cuts it short, so
+// that the socket is made under another name; Node 26 copes on macOS. The
+// gateway relies on neither.
+export function socketPathMax({ platform = process.platform } = {}) {
+  return platform === 'darwin' ? 103 : 107
 }
 
 // The PATH for the autostart and for the setup's checks. On Linux yours. On
