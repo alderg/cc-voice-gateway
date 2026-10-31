@@ -46,12 +46,13 @@ import { ACCESS_LEVELS, GitHubAccess } from './access.mjs'
 import { FolderTools, clonedText } from './folders.mjs'
 import { FunnelSwitch, staleText } from './funnel.mjs'
 import { Alerts, IpGuard } from './ipguard.mjs'
-import { Ledger, openItems, reminderText, startupText } from './ledger.mjs'
+import { Ledger, decisionLine, openItems, reminderText, startupText } from './ledger.mjs'
 import { ScratchFolders, scratchProblem } from './workspaces.mjs'
 import { Stats, shutdownText, telegramText } from './stats.mjs'
 import { Standby } from './standby.mjs'
 import { Presence } from './presence.mjs'
 import { Limits, TranscriptWatch, accountName, clock } from './limits.mjs'
+import { Night, morningText } from './night.mjs'
 
 // How long a shutdown waits at most for its message on Telegram.
 const FAREWELL_MS = 3000
@@ -114,6 +115,11 @@ const standby = new Standby({
 // a restart; its events are heard once everything is set up (below).
 const limits = new Limits({ file: config.limitsFile })
 const presence = new Presence({ name: config.gatewayName, standbySetting: config.standby, killswitch, standby, limits })
+// Night mode (night.mjs): by the quiet hours, or the driver's "good night";
+// its events too are heard once everything is set up (below).
+const night = new Night({ hours: config.quietHours, file: config.nightFile, pollMs: config.nightPollSeconds * 1000 })
+if (config.quietHours && !night.hours) log(`VOICE_GW_QUIET_HOURS=${config.quietHours} is no range such as 23:00-07:30; night mode only when the driver says good night`)
+else log(night.hours ? `night mode in the quiet hours ${config.quietHours}, and when the driver says good night` : 'night mode when the driver says good night (no quiet hours set)')
 log(
   `gateway ${presence.label}${config.standby ? ', on standby by its settings (VOICE_GW_STANDBY=1): the connector hands nothing over' : ''}; ` +
     `standby when the connector is disconnected: ${config.disconnectStandby ? 'on' : 'off (VOICE_GW_DISCONNECT_STANDBY=0)'}`,
@@ -207,6 +213,7 @@ const workers = new Workers({
   killswitch,
   standby,
   limits,
+  night,
   ledger,
   stateDir: config.stateDir,
   claudeBin: config.claudeBin,
@@ -272,6 +279,7 @@ let admin
 let funnel = null
 let settings = null // the watch on the settings file (live.mjs)
 let transcript = null // the watch on the controller's own transcript, for the usage limit (limits.mjs)
+let fallback = null // the Telegram fallback, with Telegram set up
 let farewell = null // without the watchdog: the message that the gateway shuts down (below)
 let shuttingDown = false
 // planned: false when the gateway ends by itself for an error (its port is
@@ -289,6 +297,7 @@ function shutdown(reason, code = process.exitCode ?? 0, { planned = true } = {})
   funnel?.close()
   standby.close()
   limits.close()
+  night.close()
   transcript?.close()
   pulls.close() // so do the watches on pull requests
   store.save() // the requests, with what the voice client has read
@@ -364,12 +373,16 @@ const channel = await startChannel(store, {
   hold: () => Boolean(limits.active('controller')),
   alive: () => limits.end('controller', 'it answered again'),
   notes: () => openNotes(),
+  night,
 })
 
+const capital = text => `${text[0].toUpperCase()}${text.slice(1)}`
+
 // What the gateway waits for or how it works now, for open_items and the
-// start-up summary: the usage limit waits.
+// start-up summary: night mode, the usage limit waits.
 function openNotes() {
-  return limits.list().map(item => `${item.text[0].toUpperCase()}${item.text.slice(1)}.`)
+  const notes = night.text() ? [`${capital(night.text())}.`] : []
+  return [...notes, ...limits.list().map(item => `${capital(item.text)}.`)]
 }
 
 // When a run ends, the gateway looks at its checkout (Workers.audit), and the
@@ -408,6 +421,8 @@ workers.on('finished', async task => {
     }
     await channel.push(request, request.meta)
     workers.markReported(task)
+    // In the night, for the morning summary (night.mjs).
+    night.record({ repo: task.repo, task: task.id, outcome: task.state, pulls: opened.map(pull => pull.number), result: task.result ?? '' })
   } catch (error) {
     log('worker result not delivered:', error.message)
   } finally {
@@ -478,7 +493,13 @@ if (config.funnelIdleMinutes) {
   log(`funnel auto-off: ${config.funnelIdleMinutes} minutes after the last voice call${telegram ? '' : '; without Telegram, only at the computer on again'}`)
 }
 if (telegram) {
-  new TelegramFallback(store, { send: text => telegram.send(text), afterSeconds: config.telegramAfterSeconds, paused: () => standby.active })
+  // Paused in a standby, and in night mode, where Telegram carries alarms
+  // only; what the night left, the morning summary names (night.mjs).
+  fallback = new TelegramFallback(store, {
+    send: text => telegram.send(text),
+    afterSeconds: config.telegramAfterSeconds,
+    paused: () => standby.active || night.active(),
+  })
   log(`telegram fallback ready: questions and approvals after ${config.telegramAfterSeconds} s without a voice call`)
   // Inbound, only the kill switch and the Funnel, only from the configured chat.
   telegramCommands = new TelegramCommands(telegram, { pollSeconds: config.telegramPollSeconds }).start()
@@ -487,6 +508,16 @@ if (telegram) {
     if (!state && !killswitch.locked) say(`cc-voice-gateway on ${hostname()}: "${text}" locked nothing. ${offText()}`)
   })
   telegramCommands.on('funnel', ({ action }) => funnel.command(action))
+  // Night mode on (/night, "good night") or off (/back, "I'm back"); off,
+  // the morning summary follows (night.mjs, below).
+  telegramCommands.on('away', ({ on }) => {
+    if (on) {
+      night.away('telegram')
+      say(`cc-voice-gateway on ${hostname()}: good night. ${capital(night.text())}. Send /back or "I'm back" to end it.`)
+    } else if (!night.back('telegram')) {
+      say(`cc-voice-gateway on ${hostname()}: night mode was not on.`)
+    }
+  })
   telegramCommands.on('stale', stale => say(staleText(stale)))
   // /stats: this running time in detail; /stats all: all time.
   telegramCommands.on('stats', ({ all }) => say(telegramText(stats.snapshot(), { host: hostname(), allTime: all })))
@@ -626,7 +657,7 @@ async function portBusy() {
 }
 
 admin = await startAdmin(auth, config.adminSocket, { killswitch })
-http = startVoiceHttp(store, channel, auth, config, { killswitch, onPortBusy: portBusy, guard: ipGuard, presence, standby, limits })
+http = startVoiceHttp(store, channel, auth, config, { killswitch, onPortBusy: portBusy, guard: ipGuard, presence, standby, limits, night })
 
 // Once the session is connected: first one event with everything open, so
 // that a restarted controller knows it without memory files; its answer is
@@ -849,7 +880,58 @@ function controllerLimited(hit) {
 }
 
 transcript = new TranscriptWatch({ onLimit: hit => controllerLimited(hit), pollMs: config.transcriptPollSeconds * 1000 }).start()
+// The night's summary names the waits too.
+limits.on('wait', (account, wait, first) => first && account !== 'controller' && night.note(`${accountName(account)} began to wait for the usage limit`))
+limits.on('resume', account => account !== 'controller' && night.note(`${accountName(account)} went on after the usage limit`))
 limits.start()
+
+// --- night mode (night.mjs) ---------------------------------------------------------
+//
+// When it begins, the controller hears it as an event of the gateway (the
+// driver does not); Telegram says nothing then, unless the driver switched it
+// on there. When it ends, by the clock or by "I'm back": one summary of the
+// night, on Telegram and as an event for the controller, whose answer the
+// driver hears as news. The night's news and its questions on Telegram count
+// as told then: the summary names them, instead of one message each.
+night.on('night', async ({ until, by }) => {
+  log(`night mode: the night began (${by})${until ? `, until ${new Date(until).toISOString()}` : ''}`)
+  try {
+    await channel.ready
+    const request = store.createRequest(
+      `Night mode is on${by === 'quiet hours' ? ', for the quiet hours' : `, as the driver said (${by})`}` +
+        `${until ? ` until ${clock(until)}` : ', until the driver says they are back'}. Workers decide what they can, ` +
+        'conservatively, note their assumptions and defer what needs the driver; questions and decisions wait for the ' +
+        'morning, and Telegram carries alarms only. Go on with what is queued. Reply "done"; the driver does not hear it.',
+      { origin: 'gateway' },
+    )
+    await channel.push(request, { kind: 'night', state: 'on' })
+  } catch (error) {
+    log('night event not delivered to the controller:', error.message)
+  }
+})
+
+night.on('morning', async summary => {
+  const text = morningText(summary, ledger.open().map(d => decisionLine(d)))
+  log(`night mode: the night is over (${summary.by}), ${summary.log.length} things noted`)
+  fallback?.settle()
+  store.settleNews(summary.since)
+  tell(`good morning. ${text}`)
+  try {
+    await channel.ready
+    const request = store.createRequest(
+      `${text}\nThe night is over (${summary.by}). Tell the driver as news, in at most three short sentences: what was ` +
+        'done, then the assumptions and deferred questions in a few words, then which decisions wait; details when they ' +
+        'ask. Reply "done". Ask about the waiting decisions afterwards, one at a time, as usual.',
+      { origin: 'worker' },
+    )
+    // trusted="no": it quotes what the workers wrote.
+    request.meta = { kind: 'morning', trusted: 'no' }
+    await channel.push(request, request.meta)
+  } catch (error) {
+    log('morning summary not delivered to the controller:', error.message)
+  }
+})
+night.start()
 
 // A decision never put to the driver, or a question they have not answered: a
 // reminder event after VOICE_GW_REMIND_MINUTES, at most three times; none
@@ -859,7 +941,8 @@ limits.start()
 // or from the kill switch) has one now. trusted="no", as for the summary.
 const reminders = setInterval(
   async () => {
-    if (!connected || killswitch.locked || standby.active) return
+    // None in night mode either: the decisions wait for the morning.
+    if (!connected || killswitch.locked || standby.active || night.active()) return
     for (const decision of ledger.due()) {
       try {
         const request = store.createRequest(reminderText(decision, ledger.maxReminders), { origin: 'worker' })

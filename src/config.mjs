@@ -264,6 +264,11 @@ export const config = {
   // How often the controller's own transcript is read for the usage limit
   // (limits.mjs), in seconds.
   transcriptPollSeconds: num(env.VOICE_GW_TRANSCRIPT_POLL, 5),
+  // Night mode by the clock (night.mjs): the quiet hours, as 23:00-07:30 in
+  // the computer's time zone; empty: only when the driver says good night.
+  quietHours: (env.VOICE_GW_QUIET_HOURS ?? '').trim(),
+  // How often the gateway looks whether the night began or ended, in seconds.
+  nightPollSeconds: num(env.VOICE_GW_NIGHT_POLL, 30),
 }
 
 config.oauthStateFile = join(config.secretsDir, 'oauth.json')
@@ -277,6 +282,8 @@ config.pullsStateFile = join(config.stateDir, 'pulls.json')
 config.standbyFile = join(config.stateDir, 'standby.json')
 // The waits for the Claude usage limit (limits.mjs), for the same reason.
 config.limitsFile = join(config.stateDir, 'limits.json')
+// Night mode and what its night noted (night.mjs).
+config.nightFile = join(config.stateDir, 'night.json')
 // The statistics of this running time and of all time (stats.mjs).
 config.statsFile = join(config.stateDir, 'stats.json')
 config.telegramTokenFile = join(config.secretsDir, 'telegram_token')

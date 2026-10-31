@@ -136,6 +136,27 @@ export function funnelCommand(text) {
   return FUNNEL_WORDS[words] ?? null
 }
 
+// Night mode (night.mjs): 'away' for /night, /goodnight, /away or "good night"
+// (and the same in German, French, Italian, Spanish); 'back' for /back,
+// /morning, "I'm back" or "good morning". null otherwise.
+const AWAY_WORDS = ['good night', 'goodnight', 'gute nacht', 'bonne nuit', 'buona notte', 'buonanotte', 'buenas noches']
+const BACK_WORDS = ["i'm back", 'im back', 'i am back', 'good morning', 'guten morgen', 'bin zurück', 'ich bin zurück', 'bonjour', 'buongiorno', 'buenos días']
+
+export function awayCommand(text) {
+  const slash = /^\/(night|goodnight|away|back|morning)(?:@\w+)?$/i.exec(String(text).trim())
+  if (slash) return ['back', 'morning'].includes(slash[1].toLowerCase()) ? 'back' : 'away'
+  const words = String(text)
+    .normalize('NFC')
+    .toLowerCase()
+    .replace(/[’`]/g, "'")
+    .replace(/[^\p{L}\s']+/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (AWAY_WORDS.includes(words)) return 'away'
+  if (BACK_WORDS.includes(words)) return 'back'
+  return null
+}
+
 // The statistics: /stats for this running time, /stats all for all time.
 export function statsCommand(text) {
   const match = /^\/stats(?:@\w+)?(?:\s+(all))?$/i.exec(String(text).trim())
@@ -147,8 +168,8 @@ export function statsCommand(text) {
 export const pause = (ms, signal) => delay(ms, undefined, { signal }).catch(() => {})
 
 // Inbound: polls the bot for messages from the configured private chat and
-// emits 'stop' for a stop command, 'funnel' for a Funnel command and 'stats'
-// for the statistics. Every
+// emits 'stop' for a stop command, 'funnel' for a Funnel command, 'away' for
+// night mode on or off and 'stats' for the statistics. Every
 // other chat, and every other message, is ignored. A command older than
 // maxAgeSeconds, sent while the gateway was not listening, does not count:
 // Telegram keeps messages for a day, and yesterday's /funnel on must not open
@@ -220,7 +241,8 @@ export class TelegramCommands extends EventEmitter {
     const stop = isStopCommand(message.text)
     const funnel = stop ? null : funnelCommand(message.text)
     const stats = stop || funnel ? null : statsCommand(message.text)
-    if (!stop && !funnel && !stats) return
+    const away = stop || funnel || stats ? null : awayCommand(message.text)
+    if (!stop && !funnel && !stats && !away) return
     const age = Math.round(Date.now() / 1000 - Number(message.date))
     if (age > this.maxAgeSeconds) {
       this.log(`telegram commands: ignored "${preview(message.text, 40)}", sent ${age} s ago`)
@@ -229,6 +251,7 @@ export class TelegramCommands extends EventEmitter {
     }
     if (stop) this.emit('stop', { text: message.text })
     else if (funnel) this.emit('funnel', { action: funnel, text: message.text })
+    else if (away) this.emit('away', { on: away === 'away', text: message.text })
     else this.emit('stats', { all: stats.all, text: message.text })
   }
 }
@@ -350,6 +373,16 @@ export class TelegramFallback {
     }
     // The marks go into the saved requests, so a restart sends nothing twice.
     if (marked) this.store.save?.()
+  }
+
+  // The questions and approvals open now count as told: the morning summary
+  // names what the night left (night.mjs), instead of one message each.
+  settle() {
+    for (const request of this.store.requests.values()) {
+      for (const update of request.updates.slice(request.cursor)) if (update.state === 'question') update.telegram = true
+    }
+    for (const permission of this.store.openPermissions()) permission.telegram = true
+    this.store.save?.()
   }
 
   deliver(text) {

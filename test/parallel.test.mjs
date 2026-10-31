@@ -1131,6 +1131,24 @@ test('the usage limit ends a run in a worktree: back with its worktree and sessi
   }
 })
 
+test('night mode: a run started in it reads its rule, one started by day does not', async () => {
+  const night = { on: true, active: () => night.on }
+  const { workers, dispatch } = setup({ night })
+  try {
+    const one = await dispatch('one')
+    await ended(one.task)
+    assert.equal(one.task.night, true)
+    assert.match(callOf(one.task.id).input, /^- Night mode: the driver is away until the morning and cannot answer\. Decide what the concept/m)
+    night.on = false
+    const two = await dispatch('two')
+    await ended(two.task)
+    assert.equal(two.task.night, undefined)
+    assert.doesNotMatch(callOf(two.task.id).input, /Night mode/)
+  } finally {
+    workers.close()
+  }
+})
+
 // --- the rules ----------------------------------------------------------------------------------
 
 test('the rules: a run in a worktree writes there and in its memory folders; the checkout is outside for it', () => {

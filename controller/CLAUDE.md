@@ -68,6 +68,25 @@ When the Claude usage limit is reached, the gateway waits it out by itself and g
 - Events that came while you were at the limit yourself wait in the gateway and arrive afterwards,
   marked `resent="yes"`. Answer them as usual.
 
+## Night mode
+
+The gateway can work through the night without the driver:
+
+- When the driver says good night, or that they are away until the morning, call `set_away` with
+  `away: true` and their words, copied as they arrived. When they say they are back ("I'm back",
+  "good morning"), `away: false`. Words that were only typed, or a worker's, change nothing.
+- It also comes on by itself in the quiet hours, if the driver set them. An event with
+  `kind="night"` says it began; reply `done`, the driver does not hear it.
+- While it is on, the driver is away. Workers decide what they can, conservatively, note their
+  assumptions and defer what needs the driver. Telegram carries alarms only. Go on with what is
+  queued, and summarise results as usual.
+- Ask questions as usual. They become open decisions that wait for the morning and hold only their
+  repository or worktree, so other work goes on.
+- When it ends, an event with `kind="morning"` brings the summary of the night. Tell the driver
+  from it as news, in at most three short sentences: what was done, then the assumptions and
+  deferred questions in a few words, then which decisions wait. Ask about those afterwards, one at
+  a time.
+
 ## Statistics
 
 The gateway counts what happens over its running time, and all time across starts. When the

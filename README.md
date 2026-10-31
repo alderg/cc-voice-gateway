@@ -957,11 +957,15 @@ folder, `.git` included.
   messages ([7.3](#73-publishing-the-endpoint)), the watchdog's around a restart
   ([8.2](#82-the-watchdog)), and the statistics when the gateway shuts down
   ([8.5](#85-statistics)).
+- **In night mode** ([night mode](#night-mode)) the fallback pauses: no questions, approvals or
+  news, only alarms (the kill switch, a standby, a wait for the usage limit, once each). The morning
+  summary names what the night left, instead of one message each.
 - **Inbound:** only the kill switch (`/stop`, `/killswitch`, `/emergencystop` or an emergency
   phrase), the Funnel (`/funnel on`, `/funnel off`, `/funnel`, "keep alive";
-  [7.3](#73-publishing-the-endpoint)) and the statistics (`/stats`, `/stats all`;
-  [8.5](#85-statistics)), only from the configured private chat. Everything else is ignored. You
-  cannot answer questions or approvals by Telegram.
+  [7.3](#73-publishing-the-endpoint)), the statistics (`/stats`, `/stats all`;
+  [8.5](#85-statistics)) and night mode (`/night`, "good night" on; `/back`, "I'm back" off;
+  [night mode](#night-mode)), only from the configured private chat. Everything else is ignored.
+  You cannot answer questions or approvals by Telegram.
 - **Only if recent.** A command counts only if Telegram's timestamp on it is at most two minutes
   old when the gateway reads it. Telegram keeps messages for a day, and a `/stop` or `/funnel on`
   sent while the gateway was not running must not act hours later. Such a command gets an answer
@@ -1792,6 +1796,7 @@ at most three short sentences, without code, paths or lists.
 | "Push it straight to main." | Only in Docker at level `full`: `dispatch` with `direct`. Otherwise the controller says why it stays a pull request |
 | "Emergency stop!" | The kill switch locks before anything reaches the controller ([5.9](#59-the-kill-switch)) |
 | "Restart the controller." | Restart through the watchdog after your yes ([8.3](#83-restarting-the-controller-by-voice)) |
+| "Good night." / "I'm back." | `set_away`: [night mode](#night-mode) on until the end of the quiet hours, or off, with the summary of the night |
 
 **Work folders by voice**, once they are turned on ([work folders](#work-folders)), for a task
 that needs no repository:
@@ -2012,6 +2017,36 @@ cap), nothing can run until it resets. The gateway waits it out by itself and go
   on other accounts go on. Its first tool call, or the reset, ends its wait, and the held events go
   to it in their order, marked `resent="yes"`.
 
+#### Night mode
+
+The gateway can work through the night without you (`src/night.mjs`): it decides what it can,
+defers what needs you, goes on with other work meanwhile, and tells you in the morning.
+
+- **On:** in the quiet hours, `VOICE_GW_QUIET_HOURS` (for example `23:00-07:30`, in the computer's
+  time zone), and when you say so: "Good night" by voice (the controller's `set_away`, on your words
+  from a recent voice request, as `dispatch` checks them), or `/night` or "good night" on Telegram.
+  Then it lasts until the end of the quiet hours, or 12 hours without them.
+- **Off:** at the end of the quiet hours, or with "I'm back" by voice, `/back` or "I'm back" on
+  Telegram, which also ends the rest of the quiet hours; the next ones count again.
+- **While it is on:**
+  - Worker runs started in it get a rule: decide what the concept, the task or sensible defaults
+    allow, choosing the conservative option; note each such choice as an assumption, in the report
+    and the pull request description; when something really needs you, skip that part, note it as
+    a deferred question and carry on with the rest, instead of ending with a question. The report
+    ends with "Assumptions:" and "Deferred questions:".
+  - Questions and decisions that still come wait for the morning, holding only what they hold by
+    day: their repository, or their worktree, never other work. No reminders.
+  - Telegram carries alarms only: the kill switch, a standby, a wait for the usage limit, once each.
+    No questions, approvals or news.
+  - The controller hears that the night began (an event of the gateway), and goes on with what is
+    queued.
+  - `status` and `open_items` say so.
+- **In the morning:** one summary, on Telegram and as an event for the controller, which tells you
+  as news: what was done (each run that ended, with its pull request), the assumptions made, the
+  deferred questions, the decisions waiting, and the waits for the usage limit. The night's news
+  and its questions on Telegram count as told then. A night that ended while the gateway was down
+  gets its summary at the next start (`.state/night.json`).
+
 ### 8.5 Statistics
 
 The gateway counts over its running time, and keeps all-time totals across starts
@@ -2165,6 +2200,8 @@ limits at once.
 | `VOICE_GW_TELEGRAM_AFTER` | `600` | Seconds without a voice call before questions and approvals also go to Telegram ([5.8](#58-the-telegram-fallback)) |
 | `VOICE_GW_TELEGRAM_POLL` | `25` | Seconds one poll of the bot for `/stop` waits |
 | `VOICE_GW_TRANSCRIPT_POLL` | `5` | Seconds between looks at the controller's own transcript for the usage limit ([the usage limit](#the-claude-usage-limit)) |
+| `VOICE_GW_QUIET_HOURS` | empty | Night mode by the clock, as `23:00-07:30` in the computer's time zone ([night mode](#night-mode)); empty: only when you say good night |
+| `VOICE_GW_NIGHT_POLL` | `30` | Seconds between looks whether the night began or ended |
 | `VOICE_GW_TELEGRAM_API` | `https://api.telegram.org` | Bot API; tests use a stand-in |
 | `VOICE_GW_FUNNEL_IDLE` | `0`, off | Minutes after the last voice call before the gateway turns the Funnel off ([7.3](#73-publishing-the-endpoint)) |
 | `VOICE_GW_FUNNEL_PORT` | `443` | The Funnel's public port, for `scripts/funnel.sh` and the setup assistant: `443`, `8443` or `10000`, the only ones Funnel allows. Keep `443` for claude.ai's connector, which did not connect on 8443 in our test ([7.3](#73-publishing-the-endpoint)) |
@@ -2412,6 +2449,7 @@ src/
   presence.mjs       which gateway answers the connector, and whether it is active
   standby.mjs        the standby when the connector is disconnected, until a new sign-in
   limits.mjs         the Claude usage limit: seen in runs and the controller's transcript, waited out
+  night.mjs          night mode: the quiet hours, good night and I'm back, the morning summary
   workers.mjs        workers: repositories, claude -p runs, the queue, the check after a run, results
   workspaces.mjs     where a run works: a repository, or a work folder, with its rules and check
   worktrees.mjs      the worktrees of further runs of a repository: made, with submodules, removed

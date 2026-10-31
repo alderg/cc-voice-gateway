@@ -220,6 +220,20 @@ export class Store extends EventEmitter {
     return this.newsSources(except).length > 0
   }
 
+  // The night's news, which the morning summary tells in one (night.mjs): the
+  // controller's answers to worker results since then, read. Questions stay,
+  // as their decisions do. Returns how many.
+  settleNews(since) {
+    let settled = 0
+    for (const request of this.requests.values()) {
+      if (request.origin !== 'worker' || request.createdAt < since || request.state !== 'done' || !this.hasUnread(request)) continue
+      request.cursor = request.updates.length
+      settled++
+    }
+    if (settled) this.saveSoon()
+    return settled
+  }
+
   takeNews(except) {
     return this.newsSources(except).flatMap(request =>
       this.takeUnread(request).map(update => ({ id: request.id, ...update })),

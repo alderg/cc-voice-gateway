@@ -230,6 +230,7 @@ function statusText(store, settings, killswitch) {
   if (permissions.length) {
     lines.push('Pending approvals: ' + permissions.map(p => `${p.code} (${p.toolName})`).join('; '))
   }
+  if (settings.night?.text()) lines.push(`Night mode: ${settings.night.text()}.`)
   for (const item of settings.limits?.list() ?? []) lines.push(`Waiting: ${item.text}.`)
   lines.push(...answeredElsewhereLines(store))
   const news = store.takeNews()
@@ -241,10 +242,10 @@ function statusText(store, settings, killswitch) {
 const alarmed = new Map() // lock id -> Set of grant ids
 
 // One MCP server instance per HTTP request; cheap, and keeps the endpoint stateless.
-function buildVoiceServer(store, channel, config, { killswitch = null, grant = null, presence = null, limits = null } = {}) {
-  // The waits for the Claude usage limit (limits.mjs) go with the settings
-  // into the reports.
-  const settings = limits ? { ...config, limits } : config
+function buildVoiceServer(store, channel, config, { killswitch = null, grant = null, presence = null, limits = null, night = null } = {}) {
+  // The waits for the Claude usage limit (limits.mjs) and night mode
+  // (night.mjs) go with the settings into the reports.
+  const settings = limits || night ? { ...config, limits, night } : config
   const mcp = new McpServer({ name: 'claude-code-voice', version: VERSION }, { instructions: voiceInstructions(presence) })
   // The gateway in a tool's description, for a user with several.
   const named = description =>
@@ -559,7 +560,7 @@ export function startVoiceHttp(
   channel,
   auth,
   settings,
-  { killswitch = null, onPortBusy = null, guard = new IpGuard(), presence = null, standby = null, limits = null } = {},
+  { killswitch = null, onPortBusy = null, guard = new IpGuard(), presence = null, standby = null, limits = null, night = null } = {},
 ) {
   const server = createServer(async (req, res) => {
     const caller = guard.caller(req)
@@ -627,7 +628,7 @@ export function startVoiceHttp(
       res.on('close', () => store.voiceCallEnded())
     }
 
-    const mcp = buildVoiceServer(store, channel, settings, { killswitch, grant, presence, limits })
+    const mcp = buildVoiceServer(store, channel, settings, { killswitch, grant, presence, limits, night })
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
       enableJsonResponse: true,

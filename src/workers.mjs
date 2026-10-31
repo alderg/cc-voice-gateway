@@ -65,6 +65,7 @@ import { chmodSync, closeSync, fstatSync, mkdirSync, openSync, readFileSync, rea
 import { dirname, join, posix, relative } from 'node:path'
 import { Limits, limitOf, waitText, worse } from './limits.mjs'
 import { log, preview } from './log.mjs'
+import { NIGHT_RULE } from './night.mjs'
 import { SUBAGENT_TOOLS, addResult } from './stats.mjs'
 import { DockerRunner, HostRunner, MARK, MAX_FILES, alive, startOf } from './runners.mjs'
 import {
@@ -588,6 +589,7 @@ export class Workers extends EventEmitter {
     killswitch = null,
     standby = null,
     limits = new Limits({ log: () => {} }),
+    night = null,
     ledger = null,
     stateDir,
     claudeBin = 'claude',
@@ -616,6 +618,7 @@ export class Workers extends EventEmitter {
     this.killswitch = killswitch // while it is locked, nothing starts
     this.standby = standby // nor in a standby after the connector was disconnected (standby.mjs)
     this.limits = limits // nor on an account that waits for the Claude usage limit (limits.mjs)
+    this.night = night // night mode (night.mjs): runs started in it get its rule
     this.ledger = ledger // open decisions: they hold a repository's queue
     this.stateDir = stateDir
     this.stateFile = join(stateDir, 'workers.json')
@@ -1218,6 +1221,7 @@ export class Workers extends EventEmitter {
       error: null,
       reported: false,
     }
+    if (this.night?.active()) record.night = true // started in night mode: its rule (runLines)
     if (wid) {
       record.worktree = wid // the worktree it runs in, by the task that made it
       record.checkout = facts.dir // the repository's checkout, whose git the worktree shares
@@ -2752,7 +2756,8 @@ const ACCESS_TEXT = {
 
 // What every run reads after its prompt, in a repository or a work folder:
 // that it resumes a run the usage limit ended, in the checkout or the work
-// folder (a worktree's lines say so themselves, worktrees.mjs).
+// folder (a worktree's lines say so themselves, worktrees.mjs); and in night
+// mode, how to work without the driver (night.mjs).
 export function runLines(record) {
   const lines = []
   if (record.requeued?.limit && !record.worktree) {
@@ -2762,6 +2767,7 @@ export function runLines(record) {
         'a repository, the files in a work folder), then finish it.',
     )
   }
+  if (record.night) lines.push(NIGHT_RULE)
   return lines.length ? lines.join('\n') + '\n' : ''
 }
 

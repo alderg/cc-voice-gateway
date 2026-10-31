@@ -178,6 +178,7 @@ test('declares the channel and permission capabilities and the reply tool', asyn
     'stats',
     'restart_controller',
     'raise_alarm',
+    'set_away',
   ])
   assert.match(claudeCode.getInstructions(), /request_id/)
 })
@@ -411,6 +412,33 @@ test('an approval answered at the computer: the next tool call of the session cl
   await controllerReply(id, 'done', 'The build is green.')
   assert.doesNotMatch(await voiceCall('status'), /Pending approvals/)
   assert.match(await voiceCall('approve', { code: 'cdpqr', decision: 'deny' }), /^\[approval=elsewhere code=cdpqr\]/)
+})
+
+test('night mode by voice: set_away on the driver\'s words, on and off; the controller hears the night begin and the summary', async () => {
+  const controller = async (name, args) => resultText(await claudeCode.callTool({ name, arguments: args }))
+  assert.match(await controller('set_away', { away: true, words: 'see you tomorrow' }), /^\[night=needs_driver\]/, 'no such voice request')
+  const id = idOf(await voiceCall('send', { message: 'Good night, see you tomorrow.' }))
+  await waitUntil(() => channelEvents.find(e => e.meta?.request_id === id))
+  const on = await controller('set_away', { away: true, words: 'Good night, see you tomorrow' })
+  assert.match(on, /^\[night=on until=\d\d:\d\d.*\] Night mode is on since \d\d:\d\d, as the driver said, until \d\d:\d\d.*Tell the driver good night/)
+  const night = await waitUntil(() => channelEvents.find(e => e.meta?.kind === 'night'))
+  assert.equal(night.meta.state, 'on')
+  await controllerReply(night.meta.request_id, 'done', 'ok')
+  await controllerReply(id, 'done', 'Good night.')
+  assert.match(await controller('open_items', {}), /\nThe gateway now:\n- Night mode is on since /)
+
+  const back = idOf(await voiceCall('send', { message: "I'm back, good morning." }))
+  await waitUntil(() => channelEvents.find(e => e.meta?.request_id === back))
+  assert.match(await controller('set_away', { away: false, words: "I'm back" }), /^\[night=off\] Night mode is off\. The summary of the night follows/)
+  const morning = await waitUntil(() => channelEvents.find(e => e.meta?.kind === 'morning'))
+  assert.match(morning.content, /^Night mode from \d\d:\d\d to \d\d:\d\d\.\nNo worker run ended in the night\./)
+  assert.equal(morning.meta.trusted, 'no')
+  await controllerReply(morning.meta.request_id, 'done', 'You were away; nothing happened.')
+  await controllerReply(back, 'done', 'Welcome back.')
+  assert.match(await controller('set_away', { away: false, words: "I'm back" }), /^\[night=off\] Night mode was not on/)
+  assert.doesNotMatch(await controller('open_items', {}), /Night mode/)
+  // The controller's answer to the summary is news for the voice assistant.
+  assert.match(await voiceCall('status'), /News from Claude Code \(id=\w+\): You were away; nothing happened\./)
 })
 
 test('approve rejects malformed codes', async () => {

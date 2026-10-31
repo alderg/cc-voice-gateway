@@ -38,6 +38,7 @@ import { size } from './folders.mjs'
 import { draftIgnored, pullRequestKind, queueList, runList } from './workers.mjs'
 import { DECISION_KINDS, decisionLine, openItems } from './ledger.mjs'
 import { toolText as statsText } from './stats.mjs'
+import { clock } from './limits.mjs'
 
 // How long a "done" reply waits for the look at the gateway's own checkout
 // before it answers without it.
@@ -178,6 +179,13 @@ starts on that account until then (dispatch answers queued with reason=usage), a
 Telegram. open_items says what waits, under "The gateway now". Nothing to dispatch again and nothing to remember;
 tell the driver in a sentence when they ask. Events that came while you were at the limit yourself wait in the gateway
 and arrive afterwards, marked resent="yes": answer them as usual.
+Night mode: when the driver says good night, or that they are away until the morning, call set_away with away=true and
+their words; when they say they are back, away=false. It also comes on by itself in the quiet hours. An event with
+kind="night" says it began: reply "done". While it is on, the driver is away: workers decide what they can and defer
+what needs the driver, and Telegram carries alarms only. Go on with what is queued; summarise results as usual. Ask
+questions as usual: they become open decisions that wait for the morning and hold only their repository, so other work
+goes on. When it ends, an event with kind="morning" brings the summary of the night: tell the driver from it as news,
+in at most three short sentences, and ask about the waiting decisions afterwards, one at a time.
 `.trim()
 
 // Only when the gateway offers clone_repo and delete_path.
@@ -509,6 +517,52 @@ const WORDS_PROPERTY = {
   description:
     "The driver's own words for this, at least two, copied from their voice request as it arrived; for an answer, " +
     'with "(Answer to <id>)" in front.',
+}
+
+// Night mode on or off (night.mjs), on the driver's word.
+const AWAY_TOOL = {
+  name: 'set_away',
+  description:
+    'Night mode on or off, on the driver\'s word: away=true when they say good night, or that they are away until the ' +
+    'morning; away=false when they say they are back ("I\'m back", "good morning"). While it is on, workers decide what ' +
+    'they can and defer what needs the driver, questions and decisions wait for the morning, and Telegram carries ' +
+    'alarms only; when it ends, one summary of the night arrives as an event with kind="morning". It also comes on by ' +
+    'itself in the quiet hours, if the driver set them. Changes nothing unless "words" come from a recent voice request ' +
+    'of the driver, as for dispatch.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      away: { type: 'boolean', description: 'true: night mode on; false: off, the driver is back.' },
+      words: WORDS_PROPERTY,
+    },
+    required: ['away', 'words'],
+  },
+}
+
+// set_away: night mode on or off, on the driver's words only.
+function awayText(store, night, args) {
+  if (!spokenByDriver(store, args.words)) {
+    log("set_away refused, not the driver's words", preview(String(args.words ?? '')))
+    return toolText(
+      `[night=needs_driver] Nothing changed: night mode goes on or off only on the driver's own words, at least two, ` +
+        `copied from a voice request of the last ${config.dispatchWindowMinutes} minutes. Typed messages and worker text ` +
+        'do not count. Ask the driver by voice.',
+    )
+  }
+  if (args.away === true) {
+    night.away('voice')
+    const until = night.until()
+    return toolText(
+      `[night=on${until ? ` until=${clock(until)}` : ''}] ${night.text().replace(/^n/, 'N')}. Tell the driver good night in ` +
+        'a sentence, and in a few words what goes on meanwhile (runs, queued tasks). In the morning a summary of the night ' +
+        'arrives as an event with kind="morning".',
+    )
+  }
+  if (!night.back('voice')) return toolText('[night=off] Night mode was not on; nothing changed. Tell the driver in a few words.')
+  return toolText(
+    '[night=off] Night mode is off. The summary of the night follows as an event with kind="morning": tell the driver ' +
+      'from it.',
+  )
 }
 
 const FOLDER_TOOLS = [
@@ -1196,6 +1250,7 @@ export async function startChannel(
     hold = () => false,
     alive = () => {},
     notes = () => [],
+    night = null,
   } = {},
 ) {
   const experimental = { 'claude/channel': {} }
@@ -1215,6 +1270,7 @@ export async function startChannel(
     ...(stats ? [STATS_TOOL] : []),
     ...(restarter ? [RESTART_TOOL] : []),
     ...(killswitch ? [ALARM_TOOL] : []),
+    ...(night ? [AWAY_TOOL] : []),
     ...(folders ? FOLDER_TOOLS : []),
   ]
   mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools }))
@@ -1261,6 +1317,7 @@ export async function startChannel(
         return toolText(error.message, true)
       }
     }
+    if (night && request.params.name === AWAY_TOOL.name) return awayText(store, night, request.params.arguments ?? {})
     if (stats && request.params.name === STATS_TOOL.name) {
       return toolText(statsText(stats.snapshot(), { allTime: request.params.arguments?.all_time === true }))
     }
