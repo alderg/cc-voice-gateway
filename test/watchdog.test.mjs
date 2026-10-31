@@ -341,9 +341,11 @@ test("--status shows the gateway: the session's child, how long it runs, whether
 // --- scripts/restart-everything.sh ------------------------------------------------
 
 // Stand-ins for tmux, systemctl, systemd-run, launchctl and uname, first on
-// the PATH: no test reaches the real service, LaunchAgent or tmux session.
-// They note how they were called; tmux, systemctl start and launchctl
-// kickstart start the start script in the background, as the real ones do.
+// the PATH: no test reaches the real service, LaunchAgent or tmux session,
+// also not on a Mac, where uname says Darwin and the real LaunchAgent's file
+// may exist: uname says Linux unless the case plays macOS. They note how they
+// were called; tmux, systemctl start and launchctl kickstart start the start
+// script in the background, as the real ones do.
 function restartBin(c, { service = false, mac = false } = {}) {
   const dir = join(c.dir, 'restart-bin')
   mkdirSync(dir, { recursive: true })
@@ -372,13 +374,11 @@ case "$*" in
 esac
 exit 0`
     : 'case "$*" in *LoadState*) echo not-found ;; esac\nexit 0')
-  if (mac) {
-    script('uname', 'echo Darwin')
-    script('launchctl', `case "$1" in
+  script('uname', `echo ${mac ? 'Darwin' : 'Linux'}`)
+  script('launchctl', `case "$1" in
   print) exit 0 ;;
   kickstart) ${background} ;;
 esac`)
-  }
   return { path: `${dir}:${c.env.PATH}`, calls: () => (existsSync(calls) ? readFileSync(calls, 'utf8') : '') }
 }
 
@@ -393,11 +393,10 @@ async function emergency(plan, { service = false, mac = false, wait = '20', gate
   const c = setup(plan, { env: { VOICE_GW_PORT: String(port), FAKE_ROOT: root, START: start, VOICE_GW_RESTART_WAIT: wait, VOICE_GW_RESTART_MOVED: '1' } })
   const bin = restartBin(c, { service, mac })
   c.env.PATH = bin.path
-  if (mac) {
-    c.env.HOME = join(c.dir, 'home')
-    mkdirSync(join(c.env.HOME, 'Library', 'LaunchAgents'), { recursive: true })
-    writeFileSync(join(c.env.HOME, 'Library', 'LaunchAgents', 'com.drawio.cc-voice-gateway.plist'), '<plist/>')
-  }
+  // A home of its own, with the LaunchAgent's file only where it plays macOS.
+  c.env.HOME = join(c.dir, 'home')
+  mkdirSync(join(c.env.HOME, 'Library', 'LaunchAgents'), { recursive: true })
+  if (mac) writeFileSync(join(c.env.HOME, 'Library', 'LaunchAgents', 'com.drawio.cc-voice-gateway.plist'), '<plist/>')
   if (service) writeFileSync(join(c.dir, 'service'), 'active\n')
   return { c, root, start, port, bin, script: join(root, 'scripts', 'restart-everything.sh'), gateway }
 }
