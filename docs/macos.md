@@ -38,9 +38,11 @@ versions, `bash -n` of every script with `/bin/bash`, the settings, the LaunchAg
 Here, before the setup, there is no `.secrets/gateway.env` yet: an INFO line says so, and the
 settings, the LaunchAgent and the gateway are INFO too, as only the setup brings them. Once the file
 is there, they are WARN when missing; `--before-setup` or `--after-setup` decides instead of the
-file. Without `--quick` it also runs the test suite, the same files as `npm test`: an INFO line
-says it starts, about 340 tests in about two minutes, then it prints a dot per test, X for a
-failure, and its PASS or FAIL. WARN is fine for what is optional.
+file. Without `--quick` it also runs the test suite, the same files as `npm test`, in about two
+minutes: an INFO line says it starts, then one line counts the tests as they run, written over
+each time, such as `42%  150 of 355 tests, 149 passed, 1 failed`, and the failed ones follow it by
+name. Into a file or a pipe it prints a dot per test instead, X for a failure. Then its PASS or
+FAIL. WARN is fine for what is optional.
 
 ## 3. The setup assistant
 

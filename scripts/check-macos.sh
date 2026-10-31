@@ -15,6 +15,11 @@
 # setup they are WARN when missing. --before-setup and --after-setup decide
 # instead of the file; --quick goes with either.
 #
+# The test suite, in a terminal: one line, written over after each test, with
+# how far it is and how many passed, failed and were skipped, then the failed
+# tests by name (scripts/test-progress.mjs). Into a file or a pipe: a dot per
+# test, X for a failure. On a failure, its FAIL line names the log.
+#
 # On purpose /bin/bash: on macOS that is bash 3.2, which every script here has
 # to run with. It runs on Linux as well, without the macOS checks.
 
@@ -211,19 +216,27 @@ if [ "$quick" = 0 ] && ! at_least 20.0.0 "$(node --version 2>/dev/null | sed 's/
 elif [ "$quick" = 0 ]; then
   results=${TMPDIR:-/tmp}
   results=${results%/}/cc-voice-gateway-tests.log
-  tests=$(cat test/*.test.mjs | grep -c '^test(')
-  info "the test suite runs now, as npm test: about $(((tests + 5) / 10 * 10)) tests, about two minutes; a dot per test, X for a failure"
+  # In a terminal one line, written over after each test (the reporter counts
+  # the tests itself); otherwise, as into a file, a dot per test.
+  if [ -t 1 ]; then
+    reporter=./scripts/test-progress.mjs
+    info "the test suite runs now, as npm test, about two minutes:"
+  else
+    reporter=dot
+    tests=$(cat test/*.test.mjs | grep -c '^test(')
+    info "the test suite runs now, as npm test: about $(((tests + 5) / 10 * 10)) tests, about two minutes; a dot per test, X for a failure"
+  fi
   # Without this session's settings, as a clean terminal would run it. The
   # files of npm test, with node itself: options given to npm test land after
   # the files, where node does not take them, and NODE_OPTIONS would reach the
   # gateways the tests start. TAP into the file, for the counts below (Node 23
   # and later write their default reporter, spec, into a file too), and the
-  # dots to the terminal.
+  # line or the dots to the terminal.
   (
     for name in $(compgen -e -X '!VOICE_GW_*'); do unset "$name"; done
     unset INVOCATION_ID XPC_SERVICE_NAME
     node --test --test-reporter=tap --test-reporter-destination="$results" \
-      --test-reporter=dot --test-reporter-destination=stdout test/*.test.mjs
+      --test-reporter="$reporter" --test-reporter-destination=stdout test/*.test.mjs
   )
   passed=$(sed -n 's/^# pass //p' "$results" | tail -n 1)
   failing=$(sed -n 's/^# fail //p' "$results" | tail -n 1)

@@ -2222,7 +2222,8 @@ scripts/
   telegram-notify.mjs          one Telegram message, for the watchdog
   stats.mjs                    the statistics at the desk, and the shutdown message for the watchdog
   fake-voice.mjs               play the voice AI at the desk
-  check-macos.sh               the checks on a Mac, PASS or FAIL each (docs/macos.md)
+  check-macos.sh               the checks on a Mac, PASS, WARN or FAIL each, and the tests (docs/macos.md)
+  test-progress.mjs            the tests as one line in a terminal, written over, for check-macos.sh
 test/                one file per area; npm test runs them all, with stand-ins for Claude Code,
                      gh, docker, the GitHub API and Telegram
 docs/
