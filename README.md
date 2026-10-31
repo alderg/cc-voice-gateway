@@ -557,8 +557,9 @@ What applies to every worker run (`src/workers.mjs`):
   left over in the session it resumes, write a result for it and go on with the task in the same
   process; a run can also leave a server or a test running. Every process of a run carries marks
   in its environment, which whatever it starts inherits (`VOICE_GW_RUN`, `VOICE_GW_TASK`,
-  `VOICE_GW_REPO`). The gateway finds them by these on Linux, besides the run's process group and
-  the tree below it, also those that left the group or whose parent ended. Until all of them are
+  `VOICE_GW_REPO`). The gateway finds them by these, on Linux in `/proc` and on macOS with
+  `ps -E`, besides the run's process group and the tree below it: also those that left the group
+  or whose parent ended. Until all of them are
   gone, the run counts as running (`state=ending` once it is being stopped): the rules watch it,
   the kill switch stops it, nothing else starts in its checkout, and its git check waits. When the
   run's own process ends while processes it started still run, the gateway ends those; a run that
@@ -568,7 +569,7 @@ What applies to every worker run (`src/workers.mjs`):
   process with the same id is never taken for it. Worker processes in a checkout that belong to no
   run the gateway follows (its state was lost, for example) are ended when the gateway starts,
   before a run there, and by the kill switch, and nothing starts in that checkout until they are
-  gone.
+  gone. These two, the start time and the processes of no run, need `/proc`: Linux only.
 - **The queue:** `dispatch` answers `dispatch=queued` with the task's id (`q…`), its position and
   why: `busy` (a run is going there), `queue` (tasks queued there go first) or `full` (no run
   slot); with several runs per repository also `limit` and `after`. Your words are checked when it
@@ -1068,8 +1069,8 @@ is guarded as follows:
   hook, `controller/CLAUDE.md`), which takes effect at the next restart; leaving this checkout out
   of the workers ([5.5](#55-workers-on-this-computer-or-in-docker)) only keeps runs from starting
   in it. A process that clears its environment and leaves both the run's process group and the
-  tree below it can survive a stop; on systems without `/proc`, such as macOS, so can one that
-  only leaves the group and the tree. **Only Docker isolates.** The same holds for
+  tree below it can survive a stop (the gateway reads the run's marks in the environment from
+  `/proc` on Linux and with `ps -E` on macOS). **Only Docker isolates.** The same holds for
   [work folders](#work-folders) on this computer: their rule on writes is stricter, but a run there
   can read and do everything your user can; in their container it reaches only the work folders.
 - **Several runs in one repository share its git.** Their worktrees share its objects and refs.

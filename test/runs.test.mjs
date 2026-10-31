@@ -28,6 +28,8 @@ const { RunGuard } = await import('../src/guard.mjs')
 const runners = await import('../src/runners.mjs')
 
 const LINUX = existsSync('/proc/self/stat')
+// Where the gateway reads a run's marks: /proc on Linux, ps -E on macOS.
+const MARKS = LINUX || process.platform === 'darwin'
 
 // The stand-in for claude. Words in the task:
 //   EARLY     first a turn of its own, as on a resume with a left-over
@@ -270,8 +272,8 @@ test('stop ends the whole process tree of a run, and the run ends only once all 
   const { workers, dispatch } = setup()
   try {
     const { task } = await dispatch('TREE: start the servers.')
-    // The orphan, whose parent is init or a subreaper now, only by its mark (Linux).
-    const names = LINUX ? ['claude', 'child', 'session', 'bare', 'orphan'] : ['claude', 'child', 'session', 'bare']
+    // The orphan, whose parent is init, launchd or a subreaper now, only by its mark.
+    const names = MARKS ? ['claude', 'child', 'session', 'bare', 'orphan'] : ['claude', 'child', 'session', 'bare']
     await until(() => names.every(name => pidOf(task, name)))
     const pids = pidsOf(task).filter(entry => names.includes(entry.name))
     for (const { name, pid } of pids) assert.ok(isAlive(pid), `${name} runs`)
@@ -291,7 +293,7 @@ test('the kill switch ends every process of every run, also one that gave an ear
   const { workers, dispatch } = setup()
   try {
     const { task } = await dispatch('EARLY TREE: start the servers.')
-    const names = LINUX ? ['claude', 'child', 'session', 'bare', 'orphan'] : ['claude', 'child', 'session', 'bare']
+    const names = MARKS ? ['claude', 'child', 'session', 'bare', 'orphan'] : ['claude', 'child', 'session', 'bare']
     await until(() => names.every(name => pidOf(task, name)))
     assert.equal(task.state, 'running')
     const stopped = workers.stopAll('kill switch (rule)')
@@ -319,6 +321,33 @@ test('what a run leaves running is part of it: the gateway ends it, then the run
   } finally {
     workers.close()
   }
+})
+
+test("a run's marks come from a process's environment, never from its arguments", { skip: !MARKS }, async () => {
+  // Not the marks of a run this test may itself run in.
+  const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith('VOICE_GW_')))
+  const marked = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)', 'VOICE_GW_RUN=in-the-arguments'], {
+    env: { ...env, VOICE_GW_RUN: 'in-the-environment', VOICE_GW_TASK: 'tenv', VOICE_GW_REPO: join(TMP, 'a b', 'alpha') },
+    stdio: 'ignore',
+  })
+  const named = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)', 'VOICE_GW_RUN=in-the-arguments'], { env, stdio: 'ignore' })
+  try {
+    // /proc/<pid>/environ and ps -E show a process's environment once it has started.
+    const marks = pid => runners.processList().find(p => p.pid === pid)?.marks
+    await until(() => marks(marked.pid)?.run)
+    assert.deepEqual(marks(marked.pid), { run: 'in-the-environment', task: 'tenv', repo: join(TMP, 'a b', 'alpha') })
+    assert.deepEqual(marks(named.pid), {})
+  } finally {
+    marked.kill('SIGKILL')
+    named.kill('SIGKILL')
+  }
+  // What ps -E adds to a command line, on macOS.
+  assert.deepEqual(runners.psMarks(' LANG=C VOICE_GW_REPO=/Users/me/My Projects/alpha VOICE_GW_RUN=r1 VOICE_GW_TASK=t1 _=/usr/bin/node'), {
+    repo: '/Users/me/My Projects/alpha',
+    run: 'r1',
+    task: 't1',
+  })
+  assert.deepEqual(runners.psMarks(' PATH=/usr/bin:/bin HOME=/Users/me'), {})
 })
 
 test('a run that gave its result and does not end is ended by the gateway after a while', async () => {

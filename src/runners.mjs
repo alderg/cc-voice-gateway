@@ -50,9 +50,9 @@ export function alive(pid) {
 // the shell that started them, their parent then being init or systemd. So
 // every run carries marks in its environment, which whatever it starts
 // inherits: VOICE_GW_RUN (unique per run), VOICE_GW_TASK (its task id) and
-// VOICE_GW_REPO (its checkout). On Linux the gateway finds a run's processes
-// by them in /proc, besides its process group and the tree below it; on other
-// systems only by the group and the tree (ps).
+// VOICE_GW_REPO (its checkout). The gateway finds a run's processes by them,
+// besides its process group and the tree below it: on Linux in /proc, on
+// macOS with ps -E, which shows the environment of this user's processes.
 
 export const MARK = { run: 'VOICE_GW_RUN', task: 'VOICE_GW_TASK', repo: 'VOICE_GW_REPO' }
 
@@ -116,6 +116,19 @@ export function running(pid, start = null) {
   return Boolean(stat) && !stat.ended && (!start || stat.start === start)
 }
 
+// The marks in what ps -E shows after a process's command line: its
+// variables, each " NAME=value". A value ends where the next variable begins,
+// so that a checkout's path with a space in it stays whole.
+export function psMarks(environment) {
+  const marks = {}
+  if (!environment.includes('VOICE_GW_')) return marks
+  for (const [key, name] of Object.entries(MARK)) {
+    const match = new RegExp(`(?:^| )${name}=(.*?)(?= [A-Za-z_][A-Za-z0-9_]*=|$)`).exec(environment)
+    if (match) marks[key] = match[1]
+  }
+  return marks
+}
+
 // Every process that has not ended: { pid, ppid, pgid, start, marks }.
 export function processList() {
   if (PROC) {
@@ -127,13 +140,28 @@ export function processList() {
     }
     return list
   }
+  // Elsewhere (macOS) from ps: once with the command lines, once with ps -E,
+  // which adds the environment of this user's processes to them. Only what
+  // follows the command line counts, so that a mark in a process's arguments
+  // is none; a process whose command line differs between the two is left
+  // without marks.
   try {
-    const out = execFileSync('ps', ['-axo', 'pid=,ppid=,pgid=,stat='], { encoding: 'utf8', timeout: 5000 })
-    return out
-      .split('\n')
-      .map(line => line.trim().split(/\s+/))
-      .filter(fields => fields.length >= 4 && !fields[3].startsWith('Z'))
-      .map(([pid, ppid, pgid]) => ({ pid: Number(pid), ppid: Number(ppid), pgid: Number(pgid), start: null, marks: {} }))
+    const ps = args => execFileSync('ps', args, { encoding: 'utf8', timeout: 5000, maxBuffer: 64 * 1024 * 1024 })
+    const list = []
+    for (const line of ps(['-axww', '-o', 'pid=,ppid=,pgid=,stat=,command=']).split('\n')) {
+      const fields = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/.exec(line)
+      if (!fields || fields[4].startsWith('Z')) continue
+      list.push({ pid: Number(fields[1]), ppid: Number(fields[2]), pgid: Number(fields[3]), start: null, marks: {}, command: fields[5] })
+    }
+    const withEnvironment = new Map()
+    for (const line of ps(['-axwwE', '-o', 'pid=,command=']).split('\n')) {
+      const fields = /^\s*(\d+)\s+(.*)$/.exec(line)
+      if (fields) withEnvironment.set(Number(fields[1]), fields[2])
+    }
+    return list.map(({ command, ...p }) => {
+      const line = withEnvironment.get(p.pid)
+      return line?.startsWith(command) ? { ...p, marks: psMarks(line.slice(command.length)) } : p
+    })
   } catch {
     return []
   }
