@@ -48,6 +48,7 @@ const { RunGuard } = await import('../src/guard.mjs')
 const { SettingsWatcher } = await import('../src/live.mjs')
 const { environmentWins } = await import('../src/settings.mjs')
 const { HostRunner } = await import('../src/runners.mjs')
+const { Limits } = await import('../src/limits.mjs')
 const { EXCLUDE_MARK, linkNodeModules, makeWorktree, removeWorktree } = await import('../src/worktrees.mjs')
 
 // The stand-in for claude. Words in the task:
@@ -57,6 +58,7 @@ const { EXCLUDE_MARK, linkNodeModules, makeWorktree, removeWorktree } = await im
 //   QUESTION     ends with a question
 //   CRASH        ends without a result, unless it resumes ("Resumed:")
 //   SLOWONCE     waits for good, unless it resumes
+//   LIMIT        meets the account's usage limit, resetting in a second, unless it resumes
 const FAKE_CLAUDE = `#!/usr/bin/env node
 const fs = require('fs')
 const path = require('path')
@@ -78,6 +80,17 @@ out({ type: 'system', subtype: 'init' })
   if (hold) while (!fs.existsSync(path.join(process.env.FAKE_HOLDS, hold))) await new Promise(r => setTimeout(r, 50))
   if (/SLOWONCE/.test(input) && !resumed) await new Promise(() => setInterval(() => {}, 1000))
   if (/CRASH/.test(input) && !resumed) process.exit(3)
+  if (/LIMIT/.test(input) && !resumed) {
+    // As Claude Code 2.1 at the account's limit (limits.mjs).
+    const resetsAt = Math.floor(Date.now() / 1000) + 2
+    const info = { status: 'rejected', resetsAt, rateLimitType: 'five_hour' }
+    const text = "You've hit your 5-hour limit · resets 3pm (Europe/Zurich)"
+    if (/LEAVE/.test(input)) fs.writeFileSync('half-done.txt', 'x')
+    out({ type: 'rate_limit_event', rate_limit_info: info })
+    out({ type: 'assistant', message: { content: [{ type: 'text', text }] }, error: 'rate_limit', is_api_error_message: true, api_error: 'usage_limit_reached', api_error_params: { rate_limit_info: info } })
+    out({ type: 'result', subtype: 'success', is_error: true, result: text })
+    process.exit(1)
+  }
   const name = /BRANCH:([\\w-]+)/.exec(input)?.[1] ?? 'b' + process.pid
   if (/COMMIT|PUSH/.test(input)) {
     try { git('checkout', '-q', '-b', 'voice/' + name) } catch { git('checkout', '-q', 'voice/' + name) }
@@ -1037,6 +1050,85 @@ test("only values set from outside win over the file: not those the start script
   assert.equal(maxWorkers({}), '5', 'no list, and not the same as the file: set outside')
   writeFileSync(mcp, JSON.stringify({ mcpServers: { voice: { env: { VOICE_GW_MAX_WORKERS: '5' } } } }))
   assert.equal(maxWorkers({ VOICE_GW_SETTINGS_FROM_FILE: 'VOICE_GW_MAX_WORKERS' }), '5', 'controller/.mcp.json wins')
+})
+
+// --- the Claude usage limit ------------------------------------------------------------------------
+
+test('the usage limit ends a run in the checkout: back in front, no result, no decision; nothing new starts on the account; after the reset it resumes in its session, and what it left is the task\'s', async () => {
+  const limits = new Limits({ minWaitMs: 0, log: () => {} })
+  const { dir, ledger, workers, dispatch } = setup({ repos: ['alpha', 'beta'], limits })
+  const finished = []
+  workers.on('finished', task => finished.push(task.id))
+  try {
+    const one = await dispatch('LIMIT LEAVE one')
+    assert.equal(one.status, 'started')
+    await until(() => one.task.state === 'limited')
+    assert.equal(one.task.reported, true, 'no result to report')
+    assert.match(one.task.error, /^the Claude usage limit was reached \(You've hit your 5-hour limit · resets 3pm/)
+    const back = workers.queued('alpha')[0]
+    assert.equal(back.id, one.task.requeuedAs)
+    assert.deepEqual(back.requeued, { task: one.task.id, why: one.task.error, limit: true })
+    assert.equal(back.continues, one.task.id)
+    assert.equal(back.resumes, 0)
+    assert.deepEqual(back.baseline, { startBranch: 'main', startDirty: [], unpushedBefore: [] })
+    assert.deepEqual(limits.active('host').tasks, [`alpha ${one.task.id}`])
+    assert.match(await workers.listText(), /usage=waiting\]\nWaiting: the workers on this computer wait for the Claude usage limit \(5-hour limit\) until \d\d:\d\d/)
+
+    // Nothing new starts on the account meanwhile.
+    const other = await workers.dispatch({ worker: 'beta', task: 'two', words: 'the words' })
+    assert.equal(other.status, 'queued')
+    assert.equal(other.reason, 'usage')
+    assert.match(other.wait, /^the workers on this computer wait for the Claude usage limit \(5-hour limit\) until \d\d:\d\d, when it resets$/)
+    assert.deepEqual(ledger.open(), [], 'no decision')
+
+    // The reset: it resumes in the checkout, in the same session, before anything else there.
+    const resumed = await until(() => workers.state.tasks.find(t => t.queued === back.id))
+    const call = await until(() => callOf(resumed.id))
+    assert.equal(call.cwd, dir)
+    assert.equal(call.resumed, true)
+    assert.equal(call.session, callOf(one.task.id).session)
+    assert.match(call.input, /^- Resumed: this task was interrupted \(the Claude usage limit was reached \(.*\)\) and continues here, in the same session\./m)
+    await ended(resumed)
+    assert.equal(resumed.state, 'done')
+    // half-done.txt from the run the limit ended, left-over.txt from this one (LEAVE).
+    assert.deepEqual(resumed.audit.dirty, ['half-done.txt', 'left-over.txt'], 'what the first run left counts as the task\'s')
+    assert.ok(resumed.decision, 'and the push decision names it')
+    const started = await until(() => workers.state.tasks.find(t => t.queued === other.entry.id))
+    await ended(started)
+    assert.ok(!finished.includes(one.task.id), 'the run the limit ended has no result event')
+    assert.equal(limits.active('host'), null)
+  } finally {
+    workers.close()
+  }
+})
+
+test('the usage limit ends a run in a worktree: back with its worktree and session, not counted as an interruption', async () => {
+  const limits = new Limits({ minWaitMs: 0, log: () => {} })
+  const { root, workers, dispatch } = setup({ maxPerRepo: 2, limits })
+  try {
+    const a = hold()
+    const one = await dispatch(`HOLD:${a} one`)
+    const two = await dispatch('LIMIT two', { parallel: true })
+    const wt = join(worktreesOf(root), two.task.id)
+    await until(() => two.task.state === 'limited')
+    const back = workers.queued('alpha').find(entry => entry.id === two.task.requeuedAs)
+    assert.equal(back.worktree, two.task.id)
+    assert.equal(back.resumes, 0, 'not one of the interruptions it may have')
+    assert.equal(back.baseline, undefined, 'a worktree is the task\'s own anyway')
+    assert.ok(existsSync(wt), 'kept')
+    assert.equal(one.task.state, 'running', 'a run going goes on')
+    const resumed = await until(() => workers.state.tasks.find(t => t.queued === back.id))
+    const call = await until(() => callOf(resumed.id))
+    assert.equal(call.cwd, wt)
+    assert.equal(call.session, callOf(two.task.id).session)
+    assert.match(call.input, /^- Resumed: this task was interrupted \(the Claude usage limit was reached/m)
+    await ended(resumed)
+    assert.equal(resumed.state, 'done')
+    release(a)
+    await ended(one.task)
+  } finally {
+    workers.close()
+  }
 })
 
 // --- the rules ----------------------------------------------------------------------------------

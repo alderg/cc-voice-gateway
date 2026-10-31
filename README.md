@@ -1970,6 +1970,48 @@ So the gateway notices the disconnect and switches itself off:
 A worker's checkout must not be used at the desk while it runs there: workers switch branches in
 your checkouts. A worker never commits, stashes or discards changes it did not make.
 
+#### The Claude usage limit
+
+When the account's usage limit is reached (the 5-hour or weekly limit, a per-model one, a spend
+cap), nothing can run until it resets. The gateway waits it out by itself and goes on afterwards
+(`src/limits.mjs`):
+
+- **How it sees it:** Claude Code ends such a turn with an API error, in a worker run's
+  stream-json (`claude -p`) and in the controller's transcript alike: `error: "rate_limit"`,
+  `api_error: "usage_limit_reached"` with `api_error_params.rate_limit_info` (`resetsAt` in Unix
+  seconds, `rateLimitType`), a `rate_limit_event` with `status: "rejected"`, and the text "You've
+  hit your 5-hour limit · resets 3pm (Europe/Zurich)". Older versions wrote "Claude AI usage limit
+  reached|<seconds>". An overloaded or throttled API (`error: "overloaded"`, or `"rate_limit"`
+  without `usage_limit_reached`, after Claude Code's own retries) counts as a shorter wait of the
+  same kind. Only API errors count, never what a worker writes about rate limits.
+- **A worker run that meets it** goes back to the queue, in front for its repository, with its
+  session, and its worktree if it had one, as a run interrupted by a restart does; in its checkout
+  too, where what it found at its start still counts for the look at the end, so what it left is
+  the task's. No result event, no push decision, nothing counted as failed (the statistics say
+  "held up by the usage limit"), and it does not count as one of the three interruptions a run in a
+  worktree may have. It resumes with a line that says so, once the wait is over.
+- **The wait:** until the reset time Claude Code gives (from `resetsAt`, else from the text, in the
+  computer's time), at least a minute; without one, 15, then 30, then 60 minutes, until a run gets
+  through again. Per account: the workers on this computer, those in a container (its own login),
+  and the controller session. Nothing new starts on an account that waits; `dispatch` answers
+  `queued` with `reason=usage`, and the queue goes on by itself afterwards. Kept across a restart
+  (`.state/limits.json`).
+- **What says so:** one Telegram message when the wait starts, one when it ends; `list_workers`
+  (`usage=waiting`), `worker_status`, `status` (`Waiting: …`), `open_items` and the start-up summary
+  ("The gateway now: …"), and the first line of every connector answer:
+  `Gateway sky (Mac): active; the workers on this computer wait for the Claude usage limit until
+  03:00, when it resets`. The gateway stays active.
+- **The controller session:** the workers on this computer use its login, so it counts as waiting
+  with them. The gateway also follows its own transcript (`CLAUDE_CODE_SESSION_ID`, which Claude
+  Code gives the gateway, in `<CLAUDE_CONFIG_DIR>/projects/*/<id>.jsonl`, every
+  `VOICE_GW_TRANSCRIPT_POLL` seconds). Before, an event that came while the controller was at the
+  limit started a turn that failed at once, and was never answered. Now, while it waits, events for
+  it are held in the gateway, and those it got since its last answer are marked to go again; the
+  voice assistant hears that a request waits and reaches Claude Code at the reset
+  (`[state=sent … held=usage]`), without the "has not picked up" hint. The queue and the worker runs
+  on other accounts go on. Its first tool call, or the reset, ends its wait, and the held events go
+  to it in their order, marked `resent="yes"`.
+
 ### 8.5 Statistics
 
 The gateway counts over its running time, and keeps all-time totals across starts
@@ -2082,7 +2124,7 @@ limits at once.
 | `VOICE_GW_PORT` | `8787` | Local HTTP port |
 | `VOICE_GW_HOST` | `127.0.0.1` | Bind address; keep loopback |
 | `VOICE_GW_SECRETS_DIR` | `.secrets` | Secrets, settings file, admin socket |
-| `VOICE_GW_STATE_DIR` | `.state` | Worker state and queue, run output, requests, open decisions, pull request watches |
+| `VOICE_GW_STATE_DIR` | `.state` | Worker state and queue, run output, requests, open decisions, pull request watches, usage limit waits |
 | `VOICE_GW_SELF_CHECKOUT` | This checkout | The checkout whose uncommitted changes and commits on no remote a "done" reply mentions ([5.5](#55-workers-on-this-computer-or-in-docker)); empty: none. Tests use a stand-in |
 | `VOICE_GW_REMIND_MINUTES` | `30` | Minutes before a decision you were never asked about, or a question you have not answered, comes back to the controller as a reminder, at most three times ([8.4](#84-voice-commands)) |
 | `VOICE_GW_LOG_FILE` | `.logs/gateway.log` | Empty: stderr only |
@@ -2122,6 +2164,7 @@ limits at once.
 | `VOICE_GW_DISCONNECT_UNUSED`, `VOICE_GW_DISCONNECT_GRACE` | `10`, `15` | Minutes: calls without a token count only after the connector's sign-in went unused this long, and the standby follows only if this many more pass without a use or a new sign-in |
 | `VOICE_GW_TELEGRAM_AFTER` | `600` | Seconds without a voice call before questions and approvals also go to Telegram ([5.8](#58-the-telegram-fallback)) |
 | `VOICE_GW_TELEGRAM_POLL` | `25` | Seconds one poll of the bot for `/stop` waits |
+| `VOICE_GW_TRANSCRIPT_POLL` | `5` | Seconds between looks at the controller's own transcript for the usage limit ([the usage limit](#the-claude-usage-limit)) |
 | `VOICE_GW_TELEGRAM_API` | `https://api.telegram.org` | Bot API; tests use a stand-in |
 | `VOICE_GW_FUNNEL_IDLE` | `0`, off | Minutes after the last voice call before the gateway turns the Funnel off ([7.3](#73-publishing-the-endpoint)) |
 | `VOICE_GW_FUNNEL_PORT` | `443` | The Funnel's public port, for `scripts/funnel.sh` and the setup assistant: `443`, `8443` or `10000`, the only ones Funnel allows. Keep `443` for claude.ai's connector, which did not connect on 8443 in our test ([7.3](#73-publishing-the-endpoint)) |
@@ -2368,6 +2411,7 @@ src/
   ipguard.mjs        the door: access log, /mcp only from Anthropic's addresses, alerts on Telegram
   presence.mjs       which gateway answers the connector, and whether it is active
   standby.mjs        the standby when the connector is disconnected, until a new sign-in
+  limits.mjs         the Claude usage limit: seen in runs and the controller's transcript, waited out
   workers.mjs        workers: repositories, claude -p runs, the queue, the check after a run, results
   workspaces.mjs     where a run works: a repository, or a work folder, with its rules and check
   worktrees.mjs      the worktrees of further runs of a repository: made, with submodules, removed

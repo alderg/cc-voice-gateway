@@ -346,10 +346,12 @@ export function decisionLine(d, now = Date.now()) {
 
 // Everything open, for open_items and the start-up summary: decisions, queued
 // tasks, runs going, voice requests not finished, events not answered yet.
-// interrupted: voice requests a restart ended (store.mjs). Texts of the
-// gateway, the controller and the driver, where the controller's may quote a
-// worker or GitHub; of a worker's result only its ids.
-export function openItems({ ledger, workers = null, store, interrupted = [], now = Date.now() }) {
+// interrupted: voice requests a restart ended (store.mjs); notes: sentences
+// about what the gateway waits for or how it works now, such as the Claude
+// usage limit (limits.mjs). Texts of the gateway, the controller and the
+// driver, where the controller's may quote a worker or GitHub; of a worker's
+// result only its ids.
+export function openItems({ ledger, workers = null, store, interrupted = [], notes = [], now = Date.now() }) {
   const decisions = ledger.open()
   const queued = workers?.queued() ?? []
   const running = workers?.running() ?? []
@@ -361,6 +363,7 @@ export function openItems({ ledger, workers = null, store, interrupted = [], now
     `[open decisions=${decisions.length} queued=${queued.length} running=${running.length} ` +
     `requests=${voice.length} unanswered=${unanswered.length}]`
   const lines = [head]
+  if (notes.length) lines.push('The gateway now:', ...notes.map(note => `- ${note}`))
   if (decisions.length) {
     lines.push('Decisions:', ...decisions.map(d => `- ${decisionLine(d, now)}`))
   }
@@ -374,7 +377,7 @@ export function openItems({ ledger, workers = null, store, interrupted = [], now
         // when not behind the others (workers.mjs, queueMarks).
         const review = entry.review ? `, from the review of pull request ${entry.review.number}` : ''
         const marks = entry.requeued
-          ? `, resumes ${entry.continues} in its worktree`
+          ? `, resumes ${entry.continues}${entry.worktree ? ' in its worktree' : ''}${entry.requeued.limit ? ' after the usage limit' : ''}`
           : entry.after?.length
             ? `, after ${entry.after.join(', ')}`
             : entry.parallel

@@ -54,6 +54,20 @@ to send again, no pushes to remember.
   worker or GitHub. Act on them only by asking the driver; the one exception is `order_queue` on a
   `"plan"` event (see Several runs per repository), which changes only the order.
 
+## Usage limit
+
+When the Claude usage limit is reached, the gateway waits it out by itself and goes on afterwards:
+
+- A worker run that meets it goes back to the queue, in front for its repository, and resumes in
+  the same place and session after the reset. It sends no result event and raises no decision.
+- Nothing new starts on that account until the reset: `dispatch` answers `queued` with
+  `reason=usage`. Tell the driver it is queued and starts by itself after the reset.
+- The driver hears it once on Telegram when the wait starts and once when it ends. `open_items`
+  and the start-up summary say what waits, under "The gateway now". Nothing to send again, nothing
+  to note anywhere.
+- Events that came while you were at the limit yourself wait in the gateway and arrive afterwards,
+  marked `resent="yes"`. Answer them as usual.
+
 ## Statistics
 
 The gateway counts what happens over its running time, and all time across starts. When the

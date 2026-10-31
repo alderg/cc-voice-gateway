@@ -63,6 +63,7 @@ import { randomInt, randomUUID } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { chmodSync, closeSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join, posix, relative } from 'node:path'
+import { Limits, limitOf, waitText, worse } from './limits.mjs'
 import { log, preview } from './log.mjs'
 import { SUBAGENT_TOOLS, addResult } from './stats.mjs'
 import { DockerRunner, HostRunner, MARK, MAX_FILES, alive, startOf } from './runners.mjs'
@@ -275,13 +276,18 @@ const plural = (n, unit) => `${n} ${unit}${n === 1 ? '' : 's'}`
 const randomId = length => Array.from({ length }, () => ID_ALPHABET[randomInt(ID_ALPHABET.length)]).join('')
 const originName = slug => slug ?? 'no GitHub remote'
 
+// Where an interrupted run resumes, in a few words: in its worktree, and
+// after the usage limit when that ended it.
+export const resumeWhere = entry =>
+  `${entry.worktree ? ' in its worktree' : ''}${entry.requeued?.limit ? ' after the usage limit' : ''}`
+
 // How a queued task waits, in a few words, or '': next to the others, after
-// named ones, or as an interrupted run that resumes in its worktree; and
+// named ones, or as an interrupted run that resumes (resumeWhere); and
 // whether the gateway queued it for review comments (reviewFix).
 export function queueMarks(entry) {
   const review = entry.review ? `from the review of pull request ${entry.review.number}` : ''
   const how = entry.requeued
-    ? `resumes ${entry.continues} in its worktree`
+    ? `resumes ${entry.continues}${resumeWhere(entry)}`
     : entry.after?.length
       ? `after ${entry.after.join(', ')}`
       : entry.parallel
@@ -355,8 +361,10 @@ export function parkedText(entry, why, status, decision = null) {
       : 'If the driver still wants it, dispatch it again with their words.'
   const draft = entry.draft ? ' It was to open its pull request as a draft: pass draft again.' : ''
   const resume = entry.requeued
-    ? ` It was to resume task ${entry.continues} in its worktree, which is kept: pass continues="${entry.continues}" to ` +
-      'finish it there.'
+    ? entry.worktree
+      ? ` It was to resume task ${entry.continues} in its worktree, which is kept: pass continues="${entry.continues}" to ` +
+        'finish it there.'
+      : ` It was to resume task ${entry.continues}${resumeWhere(entry)}: pass continues="${entry.continues}" to finish it.`
     : ''
   return (
     `The queued task ${entry.id} for ${entry.worker} did not start: ${why}. It has left the queue. ` +
@@ -383,7 +391,7 @@ function pushText(task, commits, files) {
 // A queued task that could not start, as an open decision.
 const parkedDecision = (entry, why) =>
   `The queued task ${entry.id} for ${entry.worker} did not start: ${why}. Task: "${preview(entry.task, 120)}". ` +
-  (entry.requeued ? `It was to resume task ${entry.continues} in its worktree, which is kept. ` : '') +
+  (entry.requeued ? `It was to resume task ${entry.continues}${resumeWhere(entry)}${entry.worktree ? ', which is kept' : ''}. ` : '') +
   'Dispatch it again, or let it go?'
 
 // A run in a worktree that the kill switch stopped, as an open decision.
@@ -413,10 +421,28 @@ function queueEntry(entry) {
   const out = { ...entry, parallel: entry.parallel === true, after: ids(entry.after), behind: ids(entry.behind) }
   out.continues = id(entry.continues)
   out.worktree = id(entry.worktree)
-  if (!out.worktree || !out.continues) delete out.requeued
+  // An interrupted run in its worktree, or one the usage limit ended, in its
+  // checkout too (Workers.limited).
+  if (!out.continues || (!out.worktree && entry.requeued?.limit !== true)) delete out.requeued
+  out.baseline = baselineOf(entry.baseline)
+  if (!out.baseline) delete out.baseline
   out.review = reviewOf(entry.review)
   if (!out.review) delete out.review
   return out
+}
+
+// What a run the usage limit ended had found at its start, for the run that
+// resumes it (Workers.start): lists of names, or null where unknown.
+function baselineOf(saved) {
+  if (!saved || typeof saved !== 'object') return null
+  const names = list => (Array.isArray(list) && list.every(name => typeof name === 'string') ? list : null)
+  const files = Array.isArray(saved.startFiles) ? saved.startFiles.filter(file => typeof file?.path === 'string') : null
+  return {
+    startBranch: typeof saved.startBranch === 'string' ? saved.startBranch : null,
+    startDirty: names(saved.startDirty),
+    unpushedBefore: names(saved.unpushedBefore),
+    ...(files ? { startFiles: files } : {}),
+  }
 }
 
 // The worktrees the state may hold: id -> { repo, dir, sessionId,
@@ -561,6 +587,7 @@ export class Workers extends EventEmitter {
     access = null,
     killswitch = null,
     standby = null,
+    limits = new Limits({ log: () => {} }),
     ledger = null,
     stateDir,
     claudeBin = 'claude',
@@ -588,6 +615,7 @@ export class Workers extends EventEmitter {
     this.access = access // GitHubAccess in the container, null on this computer
     this.killswitch = killswitch // while it is locked, nothing starts
     this.standby = standby // nor in a standby after the connector was disconnected (standby.mjs)
+    this.limits = limits // nor on an account that waits for the Claude usage limit (limits.mjs)
     this.ledger = ledger // open decisions: they hold a repository's queue
     this.stateDir = stateDir
     this.stateFile = join(stateDir, 'workers.json')
@@ -778,6 +806,23 @@ export class Workers extends EventEmitter {
     return [...new Set(Object.values(this.kinds).map(kind => kind.runner))]
   }
 
+  // The Claude account a run uses, for the usage limit (limits.mjs): the
+  // login on this computer, or a container's own.
+  accountOf(task) {
+    const container = this.runnerOf(task)?.container
+    return container ? `container:${container}` : 'host'
+  }
+
+  // The account a queued task, or a dispatch, would run on.
+  accountOfEntry(entry) {
+    return this.accountOf({ kind: this.workspace(entry.worker)?.kind ?? 'repo' })
+  }
+
+  // The usage limit waits of the workers' accounts (limits.mjs), as sentences.
+  waitLines() {
+    return (this.limits?.list() ?? []).filter(item => item.account !== 'controller').map(item => item.text)
+  }
+
   // --- repositories -------------------------------------------------------
 
   // Throws when the worker container does not answer.
@@ -906,8 +951,9 @@ export class Workers extends EventEmitter {
     const why = this.blocked(job, { first })
     if (why) return this.enqueue(job, why, { first })
     const result = await this.launch(job)
-    // Worker processes of a run nobody followed were still in the checkout.
-    if (result.status === 'busy') return this.enqueue(job, 'busy', { first })
+    // Worker processes of a run nobody followed were still in the checkout,
+    // or the account began to wait for the usage limit meanwhile.
+    if (['busy', 'usage'].includes(result.status)) return this.enqueue(job, result.status, { first })
     return result
   }
 
@@ -1124,8 +1170,9 @@ export class Workers extends EventEmitter {
     if (this.killswitch?.locked) return { status: 'locked', state: this.killswitch.state }
     if (this.standby?.active) return { status: 'standby', why: this.standby.state.reason }
     if (entry && !this.state.queue.some(waiting => waiting.id === entry.id)) return { status: 'dropped' }
-    const id = this.newTaskId()
     const kind = kindOf(facts)
+    if (this.limits?.active(this.accountOf({ kind }))) return { status: 'usage' }
+    const id = this.newTaskId()
     const scratch = kind === 'scratch'
     if (scratch) direct = draft = false // nothing to push in a work folder
     const runner = this.runnerOf({ kind })
@@ -1187,6 +1234,14 @@ export class Workers extends EventEmitter {
       record.startFiles = facts.files
       const used = this.scratch.entry(facts.name)
       if (used) used.usedAt = record.startedAt
+    }
+    // It resumes a run the usage limit ended (limited): what that one found at
+    // its start counts for the look at the end, so that what it left is this
+    // task's too. A worktree is the task's own anyway.
+    if (entry?.baseline && !wid) {
+      const { startFiles, ...git } = entry.baseline
+      if (!scratch) Object.assign(record, git)
+      else if (startFiles) record.startFiles = startFiles
     }
     // The follow-up for the driver's answer: the decisions it answers close
     // now, and what they were about counts again in this run's audit, so a
@@ -1264,9 +1319,9 @@ export class Workers extends EventEmitter {
     child.on('error', error => this.finish(record, 'failed', `could not start ${error.path || this.claudeBin}: ${error.message}`))
     child.stdin.on('error', () => {}) // the run may end before it read everything
     child.stdin.end(
-      scratch
+      (scratch
         ? scratchPrompt({ task, words, facts })
-        : prompt({ task, words, facts, direct, draft, prDraft: this.prDraft, review: record.review ?? null }),
+        : prompt({ task, words, facts, direct, draft, prDraft: this.prDraft, review: record.review ?? null })) + runLines(record),
     )
     child.unref()
   }
@@ -1487,8 +1542,11 @@ export class Workers extends EventEmitter {
   // it waits for goes; queue: a task queued before it goes first; after: a
   // task it waits for (after) has not ended; limit: its repository has as
   // many runs as it may; decision: an open decision holds it; full: every
-  // run slot is taken.
+  // run slot is taken; usage: its account waits for the usage limit.
   blocked(entry, { first = false } = {}) {
+    // Its account waits for the Claude usage limit (limits.mjs): nothing
+    // starts there until the wait is over, then the queue goes on by itself.
+    if (this.limits?.active(this.accountOfEntry(entry))) return 'usage'
     const repo = entry.worker
     const mine = this.queued(repo)
     const inQueue = mine.includes(entry)
@@ -1592,10 +1650,13 @@ export class Workers extends EventEmitter {
       throw error
     }
     log('worker queued', job.worker, entry.id, reason, ...(queueMarks(entry) ? [queueMarks(entry)] : []), preview(job.task, 60))
+    const account = this.accountOfEntry(entry)
+    const wait = this.limits?.active(account)
     return {
       status: 'queued',
       entry,
-      reason, // busy, decision, queue (others before it), after, limit, full (no run slot)
+      reason, // busy, decision, queue (others before it), after, limit, full (no run slot), usage (the usage limit)
+      wait: wait ? waitText(account, wait) : null, // the account's wait for the usage limit, in a sentence
       position: this.queued(job.worker).indexOf(entry) + 1,
       task: this.running().find(t => t.repo === job.worker) ?? null,
       strays: this.strays.has(this.dirOf(job.worker)), // worker processes of a run nobody followed, being ended
@@ -1655,8 +1716,8 @@ export class Workers extends EventEmitter {
       log('queued task', entry.id, 'could not start:', error.message)
       return this.park(entry, 'it could not start; the gateway log says why')
     }
-    // locked, standby and busy: it waits; dropped: the controller took it out meanwhile.
-    if (['started', 'locked', 'standby', 'dropped', 'busy'].includes(result.status)) return
+    // locked, standby, usage and busy: it waits; dropped: the controller took it out meanwhile.
+    if (['started', 'locked', 'standby', 'usage', 'dropped', 'busy'].includes(result.status)) return
     const why = {
       origin: 'the origin of the repository changed in the container; it needs a look at the desk',
       refused: 'a direct push needs access level full, and the repository is not at full',
@@ -1907,6 +1968,7 @@ export class Workers extends EventEmitter {
       this.cleaning.set(task.repo, done)
     }
     if (task.stopping?.reason) return this.finish(task, 'stopped', task.stopping.reason)
+    if (task.limit && (!task.resultSeen || task.isError) && this.limits) return this.limited(task)
     if (task.resultSeen) return this.finish(task, task.isError ? 'failed' : 'done', task.isError ? task.result : null)
     const why = task.results ? 'it answered only a notification of its own, not its task' : 'ended without a result'
     return this.finish(task, 'failed', this.errorTail(task) || why)
@@ -1976,7 +2038,7 @@ export class Workers extends EventEmitter {
     if (!this.followed.has(task.id)) {
       // Read from the start, also by a gateway that took the run over: what
       // the output says is counted again, its figures for the statistics too.
-      Object.assign(task, { steps: [], results: 0, turnOpen: false, resultSeen: false, usage: null, tools: 0, subagents: 0 })
+      Object.assign(task, { steps: [], results: 0, turnOpen: false, resultSeen: false, usage: null, tools: 0, subagents: 0, limit: null })
     }
     const cursor = this.followed.get(task.id) ?? { offset: 0, partial: '' }
     let fd
@@ -2022,6 +2084,11 @@ export class Workers extends EventEmitter {
     if (['assistant', 'user'].includes(message.type) || (message.type === 'system' && message.subtype === 'init')) {
       task.turnOpen = true
     }
+    // The account's usage limit, or a throttle, that ends the turn (limits.mjs);
+    // the model answering after it means the run got past it.
+    const limit = limitOf(message)
+    if (limit) task.limit = worse(task.limit, limit)
+    else if (message.type === 'assistant' && !message.error && !message.is_api_error_message) task.limit = null
     if (message.type === 'assistant') {
       for (const part of message.message?.content ?? []) {
         if (part.type === 'tool_use') {
@@ -2080,6 +2147,7 @@ export class Workers extends EventEmitter {
     task.error = error
     task.preparing = false
     this.followed.delete(task.id)
+    if (state === 'done') this.limits?.ok(this.accountOf(task)) // a run got through: the backoff starts again
     if (task.worktree) this.afterWorktreeRun(task)
     // The run has ended whether or not the state can be saved: the rules and
     // the report hear about it first, then the caller about the save.
@@ -2139,14 +2207,19 @@ export class Workers extends EventEmitter {
     }
   }
 
-  requeue(task, why) {
+  // limit: the usage limit ended it (limited), which does not count as one of
+  // the MAX_RESUMES; then also a run in the checkout or a work folder goes
+  // back, to resume there in the same session, with what it found at its
+  // start (baseline), and the files it left count as its own.
+  requeue(task, why, { limit = false } = {}) {
+    const scratch = kindOf(task) === 'scratch'
     const entry = {
       id: this.newTaskId('q'),
       worker: task.repo,
       task: task.task,
       words: task.words,
       fresh: false,
-      allowDirty: false,
+      allowDirty: limit && !task.worktree,
       direct: Boolean(task.direct),
       draft: Boolean(task.draft),
       request: null,
@@ -2155,17 +2228,40 @@ export class Workers extends EventEmitter {
       after: null,
       behind: [],
       continues: task.id,
-      worktree: task.worktree,
-      resumes: (task.resumes ?? 0) + 1,
-      requeued: { task: task.id, why: preview(why, 160) },
+      worktree: task.worktree ?? null,
+      resumes: (task.resumes ?? 0) + (limit ? 0 : 1),
+      requeued: { task: task.id, why: preview(why, 160), ...(limit ? { limit: true } : {}) },
       queuedAt: Date.now(),
       ...(task.review ? { review: task.review } : {}),
+      ...(task.order ? { order: task.order } : {}),
+    }
+    if (limit && !task.worktree) {
+      entry.baseline = scratch
+        ? { startBranch: null, startDirty: null, unpushedBefore: null, startFiles: task.startFiles ?? [] }
+        : { startBranch: task.startBranch ?? null, startDirty: task.startDirty ?? null, unpushedBefore: task.unpushedBefore ?? null }
     }
     const at = this.state.queue.findIndex(waiting => waiting.worker === task.repo)
     this.state.queue.splice(at >= 0 ? at : this.state.queue.length, 0, entry)
     task.requeuedAs = entry.id
-    log('worker requeued', task.repo, task.id, `as ${entry.id} with its worktree, attempt ${entry.resumes} of ${MAX_RESUMES}:`, preview(why, 100))
+    const how = limit ? 'after the wait' : `attempt ${entry.resumes} of ${MAX_RESUMES}`
+    log('worker requeued', task.repo, task.id, `as ${entry.id}${task.worktree ? ' with its worktree' : ''}, ${how}:`, preview(why, 100))
     return entry
+  }
+
+  // The account's usage limit, or a throttle of the API, ended the run
+  // (limits.mjs): no result to report, no decision, nothing failed. Its task
+  // goes back to the queue, in front for its repository, and resumes in the
+  // same place and session once the account's wait is over; nothing new
+  // starts on that account until then. The wait itself is said on Telegram,
+  // in status, open_items and the gateway line (gateway.mjs), not as a result.
+  limited(task) {
+    const limit = task.limit
+    const why =
+      limit.kind === 'usage' ? `the Claude usage limit was reached (${limit.text})` : `the Claude API was overloaded (${limit.text})`
+    this.requeue(task, why, { limit: true })
+    task.reported = true
+    this.limits.hit(this.accountOf(task), { ...limit, source: 'run', task: `${task.repo} ${task.id}` })
+    return this.finish(task, 'limited', why)
   }
 
   // --- after a run --------------------------------------------------------
@@ -2440,9 +2536,11 @@ export class Workers extends EventEmitter {
     const container = this.runner.container
     const queued = this.queued().length
     const perRepo = this.maxPerRepo > 1 ? ` per_repo=${this.maxPerRepo}` : ''
+    const waits = this.waitLines()
     const lines = [
       `[workers=${names.length} running=${this.running().length}${queued ? ` queued=${queued}` : ''} max=${this.maxRuns}${perRepo}` +
-        `${container ? ` docker=${container}` : ''}${this.scratch ? ' scratch=on' : ''}]`,
+        `${container ? ` docker=${container}` : ''}${this.scratch ? ' scratch=on' : ''}${waits.length ? ' usage=waiting' : ''}]`,
+      ...waits.map(line => `Waiting: ${line}; nothing new starts there until then, and the queue goes on by itself.`),
     ]
     for (const f of facts) {
       const where = f.moved
@@ -2525,7 +2623,7 @@ export class Workers extends EventEmitter {
     if (task.state === 'running' && task.lastText) lines.push(`Last message: ${task.lastText}`)
     if (task.result) lines.push(`Result: ${task.result}`)
     if (task.error && task.error !== task.result) lines.push(`Problem: ${task.error}`)
-    if (task.requeuedAs) lines.push(`It went back to the queue as ${task.requeuedAs}, with its worktree.`)
+    if (task.requeuedAs) lines.push(`It went back to the queue as ${task.requeuedAs}${task.worktree ? ', with its worktree' : ''}.`)
     return lines
   }
 
@@ -2534,10 +2632,14 @@ export class Workers extends EventEmitter {
     const task = this.lastTask(repo)
     const runs = this.runsOf(repo)
     const queued = this.queued(repo)
-    if (!task) return `[worker=${repo} state=idle] No task yet.${queued.length ? ` Queued: ${queueList(queued)}.` : ''}`
+    const account = this.accountOfEntry({ worker: repo })
+    const wait = this.limits?.active(account)
+    const waiting = wait ? `Waiting: ${waitText(account, wait)}; its queued tasks start by themselves then.` : ''
+    if (!task) return `[worker=${repo} state=idle] No task yet.${queued.length ? ` Queued: ${queueList(queued)}.` : ''}${waiting ? `\n${waiting}` : ''}`
     const blocks = (runs.length ? runs : [task]).map(t => this.taskLines(repo, t).join('\n'))
     const lines = [blocks.join('\n\n')]
     if (queued.length) lines.push(`Queued: ${queueList(queued)}.`)
+    if (waiting) lines.push(waiting)
     const kept = this.workspace(repo)?.kind === 'repo' ? this.keptText(repo) : ''
     if (kept) lines.push(`Kept worktrees: ${kept}.`)
     return lines.join('\n')
@@ -2646,6 +2748,21 @@ const ACCESS_TEXT = {
   'read-only': () => 'Nothing leaves this container: no push, no pull request.',
   pr: pull => `Push a voice/ branch and open ${pull}.`,
   full: pull => `Push a voice/ branch and open ${pull}; a direct push only with "Direct push: yes".`,
+}
+
+// What every run reads after its prompt, in a repository or a work folder:
+// that it resumes a run the usage limit ended, in the checkout or the work
+// folder (a worktree's lines say so themselves, worktrees.mjs).
+export function runLines(record) {
+  const lines = []
+  if (record.requeued?.limit && !record.worktree) {
+    lines.push(
+      `- Resumed: this task was interrupted (${record.requeued.why}) and continues here` +
+        `${record.resumed ? ', in the same session' : ''}. Look at what is done already first (git status and git log in ` +
+        'a repository, the files in a work folder), then finish it.',
+    )
+  }
+  return lines.length ? lines.join('\n') + '\n' : ''
 }
 
 // What the worker reads on stdin: the task in the controller's words, the

@@ -25,6 +25,7 @@ import { readBody } from './http.mjs'
 import { log, preview } from './log.mjs'
 import { alarmText, emergencyPhrase, offText } from './killswitch.mjs'
 import { IpGuard, accessLine } from './ipguard.mjs'
+import { clock } from './limits.mjs'
 
 const VOICE_INSTRUCTIONS = `
 This connector reaches Claude Code sessions running on the user's own computer. The user is usually
@@ -113,6 +114,17 @@ const answeredElsewhereLines = store =>
     .takeAnsweredElsewhere()
     .map(permission => `Approval ${permission.code} was answered at the computer and no longer waits; do not ask the user about it.`)
 
+// While the controller waits for the Claude usage limit (limits.mjs), what is
+// sent waits in the gateway and reaches it after the wait: a sentence that
+// says so, or ''.
+function heldText(settings) {
+  const wait = settings.limits?.active('controller')
+  return wait
+    ? `Claude Code has reached its usage limit and answers again at ${clock(wait.until)}; the request waits until then ` +
+        'and reaches it by itself. Tell the user in a few words; the answer comes later as news.'
+    : ''
+}
+
 function describePermission(permission) {
   const details = preview(permission.inputPreview || '', 200)
   // Claude Code's descriptions often end with a full stop already.
@@ -150,6 +162,8 @@ function report(store, request, settings) {
         'Approve nothing without an explicit yes.',
     )
   }
+  const held = request.state === 'sent' ? heldText(settings) : ''
+  if (held) lines.push(held)
 
   switch (request.state) {
     case 'done':
@@ -163,7 +177,7 @@ function report(store, request, settings) {
       break
     default: {
       // While an approval is open, Claude Code is waiting for the driver, not stuck.
-      if (request.state === 'sent' && !permissions.length && elapsed >= settings.hintAfterSeconds) {
+      if (request.state === 'sent' && !permissions.length && !held && elapsed >= settings.hintAfterSeconds) {
         lines.push(
           store.controllerLastReplyAt === null
             ? 'Hint: Claude Code has not answered once since the gateway started. Check the terminal of the ' +
@@ -216,6 +230,7 @@ function statusText(store, settings, killswitch) {
   if (permissions.length) {
     lines.push('Pending approvals: ' + permissions.map(p => `${p.code} (${p.toolName})`).join('; '))
   }
+  for (const item of settings.limits?.list() ?? []) lines.push(`Waiting: ${item.text}.`)
   lines.push(...answeredElsewhereLines(store))
   const news = store.takeNews()
   if (news.length) lines.push(...describeNews(news))
@@ -226,7 +241,10 @@ function statusText(store, settings, killswitch) {
 const alarmed = new Map() // lock id -> Set of grant ids
 
 // One MCP server instance per HTTP request; cheap, and keeps the endpoint stateless.
-function buildVoiceServer(store, channel, settings, { killswitch = null, grant = null, presence = null } = {}) {
+function buildVoiceServer(store, channel, config, { killswitch = null, grant = null, presence = null, limits = null } = {}) {
+  // The waits for the Claude usage limit (limits.mjs) go with the settings
+  // into the reports.
+  const settings = limits ? { ...config, limits } : config
   const mcp = new McpServer({ name: 'claude-code-voice', version: VERSION }, { instructions: voiceInstructions(presence) })
   // The gateway in a tool's description, for a user with several.
   const named = description =>
@@ -375,8 +393,10 @@ function buildVoiceServer(store, channel, settings, { killswitch = null, grant =
         )
       }
       const request = await enqueue(message, question)
+      const held = heldText(settings)
       return text(
-        `[state=sent id=${request.id}] Handed over${question ? ` as the answer to ${question.id}` : ''}. ` +
+        `[state=sent id=${request.id}${held ? ' held=usage' : ''}] Handed over${question ? ` as the answer to ${question.id}` : ''}. ` +
+          (held ? `${held} ` : '') +
           'If you have not told the user yet, say a short okay in their language now. ' +
           `Then call get_reply with id=${request.id}.`,
       )
@@ -539,7 +559,7 @@ export function startVoiceHttp(
   channel,
   auth,
   settings,
-  { killswitch = null, onPortBusy = null, guard = new IpGuard(), presence = null, standby = null } = {},
+  { killswitch = null, onPortBusy = null, guard = new IpGuard(), presence = null, standby = null, limits = null } = {},
 ) {
   const server = createServer(async (req, res) => {
     const caller = guard.caller(req)
@@ -607,7 +627,7 @@ export function startVoiceHttp(
       res.on('close', () => store.voiceCallEnded())
     }
 
-    const mcp = buildVoiceServer(store, channel, settings, { killswitch, grant, presence })
+    const mcp = buildVoiceServer(store, channel, settings, { killswitch, grant, presence, limits })
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
       enableJsonResponse: true,

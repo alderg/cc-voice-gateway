@@ -73,6 +73,7 @@ export function emptyPeriod(since = 0) {
       done: 0,
       failed: 0,
       stopped: 0,
+      limited: 0, // ended by the Claude usage limit, back in the queue to resume after the wait
       followups: 0, // continued the session of an earlier run
       worktrees: 0,
       scratch: 0, // in work folders
@@ -404,11 +405,11 @@ export class Stats {
     const name = Stats.nameOf(task)
     const ms = Math.max(0, (task.finishedAt ?? this.now()) - (task.startedAt ?? this.now()))
     runs.ended++
-    if (['done', 'failed', 'stopped'].includes(task.state)) runs[task.state]++
+    if (['done', 'failed', 'stopped', 'limited'].includes(task.state)) runs[task.state]++
     if (task.resumed) runs.followups++
     if (task.worktree) runs.worktrees++
     if (task.kind === 'scratch') runs.scratch++
-    if (task.requeuedAs) runs.requeued++
+    if (task.requeuedAs && task.state !== 'limited') runs.requeued++
     runs.ms += ms
     sample(runs.runMs, ms)
     if (ms > runs.longest.ms) runs.longest = { ms, repo: name }
@@ -604,6 +605,14 @@ const by = (counts, words = {}) =>
     .map(([name, n]) => `${n} ${words[name] ?? name}`)
     .join(', ')
 
+// How the runs ended: "3 done, 1 failed, 1 held up by the usage limit".
+const outcomesText = r =>
+  ['done', 'failed', 'stopped']
+    .filter(key => r[key])
+    .map(key => `${r[key]} ${key}`)
+    .concat(r.limited ? [`${r.limited} held up by the usage limit`] : [])
+    .join(', ')
+
 // Two or three sentences: the work, what came of it and what it cost, the
 // driver. you: for the driver themselves (Telegram), not for the controller.
 export function overviewText(p, { you = false, allTime = false } = {}) {
@@ -611,8 +620,7 @@ export function overviewText(p, { you = false, allTime = false } = {}) {
   const sentences = []
   const r = p.runs
   if (r.ended) {
-    const outcomes = ['done', 'failed', 'stopped'].filter(key => r[key]).map(key => `${r[key]} ${key}`)
-    let first = `${lead}: ${plural(r.ended, 'worker run')} (${outcomes.join(', ')}), ${span(r.ms)} of work`
+    let first = `${lead}: ${plural(r.ended, 'worker run')} (${outcomesText(r)}), ${span(r.ms)} of work`
     if (p.parallel.maxAtOnce >= 2) first += `, at most ${p.parallel.maxAtOnce} at once`
     sentences.push(`${first}.`)
     const made = []
@@ -706,7 +714,7 @@ export function detailsLines(p, { allTime = false, total = null } = {}) {
   if (!r.ended) {
     lines.push('Worker runs: none ended.')
   } else {
-    const outcomes = ['done', 'failed', 'stopped'].filter(key => r[key]).map(key => `${r[key]} ${key}`)
+    const outcomes = [outcomesText(r)]
     const kinds = []
     if (r.followups) kinds.push(`${plural(r.followups, 'follow-up')} in the same session`)
     if (r.worktrees) kinds.push(`${r.worktrees} in worktrees`)

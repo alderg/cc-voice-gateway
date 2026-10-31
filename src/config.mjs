@@ -261,6 +261,9 @@ export const config = {
   killCheckSeconds: num(env.VOICE_GW_KILL_CHECK, 30),
   // How long one poll of the Telegram bot for commands waits, in seconds.
   telegramPollSeconds: num(env.VOICE_GW_TELEGRAM_POLL, 25),
+  // How often the controller's own transcript is read for the usage limit
+  // (limits.mjs), in seconds.
+  transcriptPollSeconds: num(env.VOICE_GW_TRANSCRIPT_POLL, 5),
 }
 
 config.oauthStateFile = join(config.secretsDir, 'oauth.json')
@@ -272,6 +275,8 @@ config.adminSocket = join(config.secretsDir, 'admin.sock')
 config.pullsStateFile = join(config.stateDir, 'pulls.json')
 // The standby after the connector was disconnected, so that it holds across a restart.
 config.standbyFile = join(config.stateDir, 'standby.json')
+// The waits for the Claude usage limit (limits.mjs), for the same reason.
+config.limitsFile = join(config.stateDir, 'limits.json')
 // The statistics of this running time and of all time (stats.mjs).
 config.statsFile = join(config.stateDir, 'stats.json')
 config.telegramTokenFile = join(config.secretsDir, 'telegram_token')

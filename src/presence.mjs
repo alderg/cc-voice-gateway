@@ -13,7 +13,10 @@
 // switch is not locked. Inactive: on standby by its settings
 // (VOICE_GW_STANDBY=1, a test install for example), in standby after the
 // connector was disconnected (standby.mjs), the kill switch locked, or no
-// controller connected (not yet, or no longer).
+// controller connected (not yet, or no longer). An active one that waits for
+// the Claude usage limit (limits.mjs) stays active, and says so:
+//
+//   Gateway sky (Mac): active; the workers on this computer wait for the Claude usage limit until 03:00, when it resets
 
 import { readFileSync } from 'node:fs'
 import { hostname, platform } from 'node:os'
@@ -35,12 +38,13 @@ export const shortHost = (host = hostname()) => String(host).split('.')[0] || St
 
 export class Presence {
   // name: VOICE_GW_NAME, or empty; a name with its own brackets gets no kind.
-  constructor({ name = '', host = hostname(), kind = computerKind(), standbySetting = false, killswitch = null, standby = null } = {}) {
+  constructor({ name = '', host = hostname(), kind = computerKind(), standbySetting = false, killswitch = null, standby = null, limits = null } = {}) {
     const base = String(name).trim() || shortHost(host)
     this.label = /\(.*\)/.test(base) ? base : `${base} (${kind})`
     this.standbySetting = standbySetting
     this.killswitch = killswitch
     this.standby = standby // the standby after a disconnect, or null
+    this.limits = limits // the waits for the Claude usage limit, or null
     this.connected = false // a controller session on the channel (gateway.mjs)
   }
 
@@ -62,6 +66,8 @@ export class Presence {
 
   line() {
     const { active, why, next } = this.state()
-    return active ? `Gateway ${this.label}: active` : `Gateway ${this.label}: inactive, ${why}; ${next}`
+    if (!active) return `Gateway ${this.label}: inactive, ${why}; ${next}`
+    const waits = this.limits?.list().map(item => item.text) ?? []
+    return `Gateway ${this.label}: active${waits.length ? `; ${waits.join('; ')}` : ''}`
   }
 }

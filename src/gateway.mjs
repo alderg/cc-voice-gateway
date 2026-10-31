@@ -51,6 +51,7 @@ import { ScratchFolders, scratchProblem } from './workspaces.mjs'
 import { Stats, shutdownText, telegramText } from './stats.mjs'
 import { Standby } from './standby.mjs'
 import { Presence } from './presence.mjs'
+import { Limits, TranscriptWatch, accountName, clock } from './limits.mjs'
 
 // How long a shutdown waits at most for its message on Telegram.
 const FAREWELL_MS = 3000
@@ -109,7 +110,10 @@ const standby = new Standby({
   unusedMs: config.disconnectUnusedMinutes * 60000,
   graceMs: config.disconnectGraceMinutes * 60000,
 })
-const presence = new Presence({ name: config.gatewayName, standbySetting: config.standby, killswitch, standby })
+// The waits for the Claude usage limit (limits.mjs): per account, kept across
+// a restart; its events are heard once everything is set up (below).
+const limits = new Limits({ file: config.limitsFile })
+const presence = new Presence({ name: config.gatewayName, standbySetting: config.standby, killswitch, standby, limits })
 log(
   `gateway ${presence.label}${config.standby ? ', on standby by its settings (VOICE_GW_STANDBY=1): the connector hands nothing over' : ''}; ` +
     `standby when the connector is disconnected: ${config.disconnectStandby ? 'on' : 'off (VOICE_GW_DISCONNECT_STANDBY=0)'}`,
@@ -202,6 +206,7 @@ const workers = new Workers({
     : null,
   killswitch,
   standby,
+  limits,
   ledger,
   stateDir: config.stateDir,
   claudeBin: config.claudeBin,
@@ -266,6 +271,7 @@ let http
 let admin
 let funnel = null
 let settings = null // the watch on the settings file (live.mjs)
+let transcript = null // the watch on the controller's own transcript, for the usage limit (limits.mjs)
 let farewell = null // without the watchdog: the message that the gateway shuts down (below)
 let shuttingDown = false
 // planned: false when the gateway ends by itself for an error (its port is
@@ -282,6 +288,8 @@ function shutdown(reason, code = process.exitCode ?? 0, { planned = true } = {})
   telegramCommands?.close()
   funnel?.close()
   standby.close()
+  limits.close()
+  transcript?.close()
   pulls.close() // so do the watches on pull requests
   store.save() // the requests, with what the voice client has read
   // The last save of the statistics, with the end of this running time,
@@ -351,7 +359,18 @@ const channel = await startChannel(store, {
   stats,
   level: config.controllerLevel,
   onClose: () => shutdown('stdio closed'),
+  // While the controller waits for the usage limit, events for it are held;
+  // a tool call of it ends the wait (limits.mjs, below).
+  hold: () => Boolean(limits.active('controller')),
+  alive: () => limits.end('controller', 'it answered again'),
+  notes: () => openNotes(),
 })
+
+// What the gateway waits for or how it works now, for open_items and the
+// start-up summary: the usage limit waits.
+function openNotes() {
+  return limits.list().map(item => `${item.text[0].toUpperCase()}${item.text.slice(1)}.`)
+}
 
 // When a run ends, the gateway looks at its checkout (Workers.audit), and the
 // result goes to the controller as a channel event, with what the gateway saw
@@ -607,7 +626,7 @@ async function portBusy() {
 }
 
 admin = await startAdmin(auth, config.adminSocket, { killswitch })
-http = startVoiceHttp(store, channel, auth, config, { killswitch, onPortBusy: portBusy, guard: ipGuard, presence, standby })
+http = startVoiceHttp(store, channel, auth, config, { killswitch, onPortBusy: portBusy, guard: ipGuard, presence, standby, limits })
 
 // Once the session is connected: first one event with everything open, so
 // that a restarted controller knows it without memory files; its answer is
@@ -676,22 +695,37 @@ settings.on('change', ({ limits, changed, others }) => {
 // connector was disconnected, it waits until the standby ends (below).
 async function deliverStartup() {
   try {
-    const items = openItems({ ledger, workers, store, interrupted: store.interrupted })
+    const items = openItems({ ledger, workers, store, interrupted: store.interrupted, notes: openNotes() })
     const summary = store.createRequest(startupText(items), { origin: 'gateway' })
     await channel.push(summary, { kind: 'summary', trusted: 'no' })
   } catch (error) {
     log('start-up summary not delivered:', error.message)
   }
   await sendPlan('since the queue was planned, before this start')
-  for (const request of [...store.requests.values()].filter(r => r.resend)) {
-    try {
-      await channel.push(request, { ...request.meta, resent: 'yes' })
+  await resendHeld()
+}
+
+// The events to send again, in their order: worker results the previous
+// session never answered, and those held while the controller waited for
+// the usage limit, or that met it as failed turns. While it waits, they stay
+// (channel.mjs holds them again); a voice request a restart ended is not sent.
+let resending = Promise.resolve()
+function resendHeld() {
+  resending = resending.then(async () => {
+    for (const request of [...store.requests.values()].filter(r => r.resend)) {
+      if (limits.active('controller')) return
       delete request.resend
+      if (request.origin === 'voice' && request.state === 'done') continue
+      try {
+        await channel.push(request, { ...request.meta, resent: 'yes' })
+      } catch (error) {
+        request.resend = true
+        log('event not sent again:', error.message)
+      }
       store.changed()
-    } catch (error) {
-      log('worker result not sent again:', error.message)
     }
-  }
+  })
+  return resending
 }
 
 channel.ready.then(async () => {
@@ -763,6 +797,59 @@ standby.on('leave', async ({ why }) => {
   }
   await deliverStartup()
 })
+
+// --- the Claude usage limit (limits.mjs) ---------------------------------------
+//
+// A worker run that meets it goes back to the queue (Workers.limited), and
+// its account waits: one Telegram message when the wait starts, one when it
+// ends, and the queue goes on by itself. The workers on this computer share
+// the controller session's login, so the controller counts as waiting too:
+// its events are held (channel.mjs) instead of ending as failed turns. Its
+// own transcript says when it meets the limit itself; then the events it
+// got since its last answer go again too. A tool call of it ends its wait,
+// and so does the reset; then the held events go to it.
+limits.on('wait', (account, wait, first) => {
+  if (!first) return
+  const until = wait.reset ? `at ${clock(wait.until)}, when it resets` : `at ${clock(wait.until)}`
+  if (account === 'controller') {
+    if (wait.source === 'transcript' && !limits.active('host')) {
+      tell(`the controller session reached the Claude usage limit (${wait.text}). What comes for it waits, and reaches it ${until}.`)
+    }
+    return
+  }
+  const tasks = wait.tasks.length ? `${wait.tasks.join(', ')} went back to the queue and resume${wait.tasks.length === 1 ? 's' : ''} ` : 'The queue goes on '
+  const what = wait.kind === 'usage' ? `reached the Claude usage limit (${wait.text})` : `met an overloaded Claude API (${wait.text})`
+  tell(`${accountName(account)} ${what}. ${tasks}${until}; nothing new starts there until then, and I go on by myself.`)
+  if (account === 'host') limits.hit('controller', { kind: wait.kind, resetsAt: wait.until, limit: wait.limit, text: wait.text, source: 'account' })
+})
+
+limits.on('resume', (account, wait, why) => {
+  if (account === 'controller') {
+    if (wait.source === 'transcript') tell(`the controller session goes on (${why}); what waited reaches it now.`)
+    resendHeld()
+    return
+  }
+  tell(`the usage limit wait is over for ${accountName(account)} (${why}): the queue goes on.`)
+})
+
+// The controller met the limit itself: it waits, and what it got since its
+// last answer goes again, as those turns failed.
+function controllerLimited(hit) {
+  limits.hit('controller', { ...hit, source: 'transcript' })
+  let marked = 0
+  for (const request of store.requests.values()) {
+    if (!request.pushedAt || request.resend || !['sent', 'working'].includes(request.state)) continue
+    request.resend = true
+    marked++
+  }
+  if (marked) {
+    store.changed()
+    log(`usage limit: ${marked} event${marked === 1 ? '' : 's'} the controller did not answer go to it again after the wait`)
+  }
+}
+
+transcript = new TranscriptWatch({ onLimit: hit => controllerLimited(hit), pollMs: config.transcriptPollSeconds * 1000 }).start()
+limits.start()
 
 // A decision never put to the driver, or a question they have not answered: a
 // reminder event after VOICE_GW_REMIND_MINUTES, at most three times; none

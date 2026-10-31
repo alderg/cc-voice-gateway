@@ -172,6 +172,12 @@ Standby: an event with kind="standby" state="on" says the driver disconnected th
 gateway stopped the worker runs, starts nothing and sends no reminders until the connector signs in again, which
 an event with state="off" says. Reply "done" to either; the driver does not hear it. Meanwhile dispatch answers
 "standby": nothing starts.
+Usage limit: when the Claude usage limit is reached, the gateway waits it out by itself. A worker run that meets it
+goes back to the queue and resumes in its place and session after the reset, without a result event; nothing new
+starts on that account until then (dispatch answers queued with reason=usage), and the driver hears it once on
+Telegram. open_items says what waits, under "The gateway now". Nothing to dispatch again and nothing to remember;
+tell the driver in a sentence when they ask. Events that came while you were at the limit yourself wait in the gateway
+and arrive afterwards, marked resent="yes": answer them as usual.
 `.trim()
 
 // Only when the gateway offers clone_repo and delete_path.
@@ -659,6 +665,7 @@ function dispatchText(worker, result) {
         after: `it waits for ${(entry.after ?? []).join(', ')}`,
         limit: `${worker} has as many runs as one repository may have (${result.perRepo}): ${runList(runs)}`,
         full: `every run slot is taken (${result.running.map(t => t.repo).join(', ')})`,
+        usage: result.wait ?? 'the workers wait for the Claude usage limit',
       }[reason]
       const ask =
         reason === 'decision'
@@ -780,8 +787,8 @@ function orderText(workers, worker, args) {
   }
   if (result.status === 'requeued') {
     return toolText(
-      `[order=unchanged worker=${worker} queued=${result.entry.id}] It resumes an interrupted run in its worktree and ` +
-        'goes first; there is nothing to order.',
+      `[order=unchanged worker=${worker} queued=${result.entry.id}] It resumes an interrupted run` +
+        `${result.entry.worktree ? ' in its worktree' : ''} and goes first; there is nothing to order.`,
       true,
     )
   }
@@ -1139,8 +1146,8 @@ const OPEN_ITEMS_HINT =
   'decisions="<id>"; once the driver decided, the follow-up dispatch, your "done" to their answer or ' +
   'resolve_decision closes it.'
 
-async function ledgerTool({ ledger, workers, store }, name, args, spoken) {
-  if (name === 'open_items') return toolText(`${openItems({ ledger, workers, store })}\n${OPEN_ITEMS_HINT}`)
+async function ledgerTool({ ledger, workers, store, notes = () => [] }, name, args, spoken) {
+  if (name === 'open_items') return toolText(`${openItems({ ledger, workers, store, notes: notes() })}\n${OPEN_ITEMS_HINT}`)
   // resolve_decision
   const decision = ledger.get(args.id)
   if (!decision || decision.state === 'closed') {
@@ -1169,9 +1176,27 @@ async function ledgerTool({ ledger, workers, store }, name, args, spoken) {
   return toolText(parts.join(' '))
 }
 
+// hold: whether the controller waits for the Claude usage limit (limits.mjs),
+// so that an event would only end as a failed turn: it is kept to be sent
+// again (resend) instead. alive: a tool call of the session, a sign that it
+// answers. notes: lines for open_items about what the gateway waits for.
 export async function startChannel(
   store,
-  { permissionRelay, workers, restarter, killswitch, folders, ledger = null, selfCheck = null, stats = null, level = 'confined', onClose } = {},
+  {
+    permissionRelay,
+    workers,
+    restarter,
+    killswitch,
+    folders,
+    ledger = null,
+    selfCheck = null,
+    stats = null,
+    level = 'confined',
+    onClose,
+    hold = () => false,
+    alive = () => {},
+    notes = () => [],
+  } = {},
 ) {
   const experimental = { 'claude/channel': {} }
   if (permissionRelay) experimental['claude/channel/permission'] = {}
@@ -1211,6 +1236,7 @@ export async function startChannel(
 
   mcp.setRequestHandler(CallToolRequestSchema, async request => {
     if (permissionRelay) answeredElsewhere(`${request.params.name} called`)
+    alive(request.params.name)
     if (killswitch && request.params.name === ALARM_TOOL.name) {
       const reason = String(request.params.arguments?.reason ?? '').trim() || 'no reason given'
       const state = killswitch.trip({ trigger: 'controller', reason }) ?? killswitch.state
@@ -1245,7 +1271,7 @@ export async function startChannel(
     if (ledger && LEDGER_TOOLS.some(tool => tool.name === request.params.name)) {
       const spoken = words => spokenByDriver(store, words)
       try {
-        return await ledgerTool({ ledger, workers, store }, request.params.name, request.params.arguments ?? {}, spoken)
+        return await ledgerTool({ ledger, workers, store, notes }, request.params.name, request.params.arguments ?? {}, spoken)
       } catch (error) {
         return toolText(error.message, true)
       }
@@ -1291,11 +1317,21 @@ export async function startChannel(
     // Pushes a request into the controller session. Claude Code drops the
     // event silently if the session was not started with the channel flag.
     // Extra meta keys become attributes of the <channel> tag.
+    // While the controller waits for the usage limit, the event is kept with
+    // its attributes and goes again once it answers (gateway.mjs).
     async push(request, meta = {}) {
+      if (hold()) {
+        request.meta = { ...request.meta, ...meta }
+        request.resend = true
+        store.changed()
+        log('push held: the controller waits for the usage limit', `id=${request.id}`, preview(request.text))
+        return
+      }
       await mcp.notification({
         method: 'notifications/claude/channel',
         params: { content: request.text, meta: { request_id: request.id, ...meta } },
       })
+      request.pushedAt = Date.now()
       log('push', `id=${request.id}`, preview(request.text))
     },
 
