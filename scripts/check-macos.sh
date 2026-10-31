@@ -170,14 +170,24 @@ fi
 
 # --- the test suite -------------------------------------------------------------------
 
-if [ "$quick" = 0 ]; then
+if [ "$quick" = 0 ] && ! at_least 20.0.0 "$(node --version 2>/dev/null | sed 's/^v//')"; then
+  fail "npm test: the test suite needs Node.js 20 or later"
+elif [ "$quick" = 0 ]; then
   results=${TMPDIR:-/tmp}
   results=${results%/}/cc-voice-gateway-tests.log
-  # Without this session's settings, as a clean terminal would run it.
+  tests=$(cat test/*.test.mjs | grep -c '^test(')
+  info "the test suite runs now, as npm test: about $(((tests + 5) / 10 * 10)) tests, about two minutes; a dot per test, X for a failure"
+  # Without this session's settings, as a clean terminal would run it. The
+  # files of npm test, with node itself: options given to npm test land after
+  # the files, where node does not take them, and NODE_OPTIONS would reach the
+  # gateways the tests start. TAP into the file, for the counts below (Node 23
+  # and later write their default reporter, spec, into a file too), and the
+  # dots to the terminal.
   (
     for name in $(compgen -e -X '!VOICE_GW_*'); do unset "$name"; done
     unset INVOCATION_ID XPC_SERVICE_NAME
-    npm test >"$results" 2>&1
+    node --test --test-reporter=tap --test-reporter-destination="$results" \
+      --test-reporter=dot --test-reporter-destination=stdout test/*.test.mjs
   )
   passed=$(sed -n 's/^# pass //p' "$results" | tail -n 1)
   failing=$(sed -n 's/^# fail //p' "$results" | tail -n 1)

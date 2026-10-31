@@ -35,7 +35,9 @@ scripts/check-macos.sh --quick
 
 `check-macos.sh` prints PASS, WARN or FAIL per check: tools and versions, `bash -n` of every script
 with `/bin/bash`, the settings, the LaunchAgent, what runs. Without `--quick` it also runs the test
-suite (about two minutes). WARN is fine for what is optional or not set up yet.
+suite, the same files as `npm test`: an INFO line says it starts, about 340 tests in about two
+minutes, then it prints a dot per test, X for a failure, and its PASS or FAIL. WARN is fine for
+what is optional or not set up yet.
 
 ## 3. The setup assistant
 
