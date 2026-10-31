@@ -539,6 +539,7 @@ export class RunGuard extends EventEmitter {
     run.memories = [run.dir, task.checkout].filter(Boolean).map(dir => memoryFolder(claudeConfig, dir))
     run.worktree = Boolean(task.worktree)
     run.checkout = task.checkout ?? null
+    run.cwd = run.dir // the shell's folder after its last Bash call (see shell)
     this.runs.set(task.id, run)
     run.ready = this.baseline(run)
   }
@@ -574,7 +575,12 @@ export class RunGuard extends EventEmitter {
         this.violation(run, 'many changes', `more than ${this.maxEdits} file edits in one run`)
       }
     } else if (part.name === 'Bash' && typeof part.input?.command === 'string') {
-      this.shell(run, part.input.command)
+      // Claude Code keeps the shell's folder from one Bash call to the next
+      // while it stays in the workspace, and goes back to the workspace when
+      // a call leaves it. After a cd it cannot follow, the workspace, as
+      // before: a relative path is checked rather than let through.
+      const cwd = this.shell(run, part.input.command, run.cwd)
+      run.cwd = cwd && (cwd === run.dir || cwd.startsWith(run.dir.replace(/\/$/, '') + '/')) ? cwd : run.dir
     }
   }
 
@@ -674,6 +680,8 @@ export class RunGuard extends EventEmitter {
   // only absolute targets count. sh -c, bash -c and eval run their text, and
   // a script that cat or tee wrote from a heredoc is checked as shell
   // commands when the same call runs it, with a shell or by its path.
+  // Returns the folder the call leaves its shell in, null where it cannot
+  // tell.
   shell(run, command, cwd = run.dir) {
     const outer = []
     const scripts = new Map() // path -> script written from a heredoc in this call
@@ -731,6 +739,7 @@ export class RunGuard extends EventEmitter {
         }
       }
     }
+    return outer.length ? outer[0] : cwd
   }
 
   // --- writes -------------------------------------------------------------------

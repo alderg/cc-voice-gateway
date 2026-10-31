@@ -276,6 +276,11 @@ const OUTSIDE = [
 
 // What the rule makes of one Bash call: the reasons it trips with.
 function trips(command, tool = 'Bash') {
+  return tripsAll([command], tool)
+}
+
+// The same for several calls of one run, one after the other.
+function tripsAll(commands, tool = 'Bash') {
   const workers = new EventEmitter()
   const tripped = []
   const guard = new RunGuard({
@@ -288,8 +293,10 @@ function trips(command, tool = 'Bash') {
   })
   const task = { id: 'tabc', repo: 'alpha', dir: '/work/alpha', slug: null, defaultBranch: 'main', startedAt: Date.now() }
   workers.emit('started', task)
-  const input = tool === 'Bash' ? { command } : { file_path: command, content: 'x' }
-  workers.emit('tool', task, { type: 'tool_use', name: tool, input })
+  for (const command of commands) {
+    const input = tool === 'Bash' ? { command } : { file_path: command, content: 'x' }
+    workers.emit('tool', task, { type: 'tool_use', name: tool, input })
+  }
   guard.close()
   return tripped
 }
@@ -306,6 +313,21 @@ test('the sweep: real writes outside the repository and the temporary folders st
     assert.match(reasons[0], /^write outside the allowed folders: /, command)
     assert.ok(reasons[0].includes(path.replace(/^~/, homedir())), `${command}: ${reasons[0]}`)
   }
+})
+
+test("a cd carries over to the next Bash call, as Claude Code keeps the shell's folder, but only within the workspace", () => {
+  // The kill switch of 2026-10-31: the log went to the worktree's own .voice-scratch.
+  assert.deepEqual(tripsAll(['cd test/simple-modern', 'timeout 590 node run.js > ../../.voice-scratch/full-format.log 2>&1']), [])
+  assert.deepEqual(tripsAll(['cd src', 'cd ..', 'echo x > a.txt']), [])
+  assert.deepEqual(tripsAll(['cd sub && make', 'echo x > ../a.txt']), [])
+  // From the folder it carried over, a write above the workspace still trips.
+  assert.match(tripsAll(['cd sub', 'rm -rf ../../other'])[0], /writes \/work\/other \(/)
+  // A folder outside the workspace does not stay: Claude Code goes back to it.
+  assert.match(tripsAll(['cd /tmp/work', 'echo x > ../x'])[0], /writes \/work\/x \(/)
+  assert.match(tripsAll(['cd', 'echo x > ../x'])[0], /writes \/work\/x \(/)
+  // Neither does a subshell's cd, nor one it cannot follow.
+  assert.match(tripsAll(['(cd sub/dir)', 'echo x > ../x'])[0], /writes \/work\/x \(/)
+  assert.match(tripsAll(['cd "$UNKNOWN"', 'echo x > ../x'])[0], /writes \/work\/x \(/)
 })
 
 test("the run's own Claude Code memory folder is allowed, another project's is not", () => {
