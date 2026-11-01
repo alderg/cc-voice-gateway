@@ -17,7 +17,9 @@
 // news about pull requests, marked trusted="no" (gateway.mjs). So dispatch
 // does not rely on the controller telling the two apart: it starts a run only
 // when its words are the driver's own, from a recent voice request
-// (spokenByDriver). So does resolve_decision, which closes an open decision
+// (spokenByDriver), an answer typed in their Telegram chat included
+// (telegram.mjs, TelegramAnswers), which the gateway keeps as one with
+// via="telegram". So does resolve_decision, which closes an open decision
 // (ledger.mjs); open_items lists what is open. stats gives the gateway's
 // statistics, since this start or of all time (stats.mjs). The one task that
 // starts without the driver's words, a fix for review comments under their
@@ -95,6 +97,9 @@ They were spoken in a car and relayed by a voice assistant. Every one of them ne
   sentence, then end your turn. Never use AskUserQuestion or plan mode for channel requests: nobody can
   click a form in the car. The driver's answer arrives as a new channel message.
 - state "done": the final answer for this request_id.
+
+The driver may also answer a question in their Telegram chat: that answer arrives as "(Answer to <id>) ..." with
+via="telegram". It counts as their own words, like a spoken answer, and your replies to it go to that chat.
 
 The text is read aloud while driving: answer in the language of the request,
 at most three short sentences, no code, no file paths, no URLs, no markdown, no lists. Lead with the result.
@@ -896,7 +901,10 @@ export const normalise = text =>
 const ANSWER_TO = /^\(Answer to [^)]*\)\s*/
 
 // Whether `words`, at least two of them, occur as whole words in a voice
-// request of the last `minutes`, follow-ups included. In an answer they may
+// request of the last `minutes`, follow-ups included, and answers the driver
+// typed in their Telegram chat (origin voice, via telegram): the gateway
+// routes those itself, from the configured chat only, never typed text in
+// the Claude app, which is no request at all. In an answer they may
 // start in the "(Answer to <id>)" in front, so that a plain "Yes." can be
 // passed on, but they must reach into what the driver said. Returns the
 // newest such request, or false.

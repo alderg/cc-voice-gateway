@@ -135,7 +135,9 @@ export class Store extends EventEmitter {
 
   // answers: for the driver's answer to a question, the id of the question's
   // request; the 'answer' event tells the open decisions (gateway.mjs).
-  createRequest(text, { origin = 'voice', worker = null, answers = null } = {}) {
+  // via: 'telegram' for the driver's answer typed in their Telegram chat
+  // (telegram.mjs, TelegramAnswers), still origin voice, as their own words.
+  createRequest(text, { origin = 'voice', worker = null, answers = null, via = null } = {}) {
     const request = {
       id: this.newId(),
       text,
@@ -148,6 +150,7 @@ export class Store extends EventEmitter {
       closed: false, // the voice client has received state done
     }
     if (answers) request.answers = answers
+    if (via) request.via = via
     this.requests.set(request.id, request)
     this.prune()
     if (answers) this.emit('answer', request)

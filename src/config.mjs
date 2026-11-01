@@ -30,6 +30,14 @@ export const CONTROLLER_LEVELS = ['confined', 'clone-delete', 'unrestricted']
 // the rules.
 export const KILLSWITCH_MODES = ['off', 'manual', 'auto']
 
+// Answers by Telegram (VOICE_GW_TELEGRAM_ANSWERS, telegram.mjs): on, the
+// default and for any value it does not know; other, which leaves push,
+// merge, restart and delete decisions to the driver's voice; off with 0.
+export function telegramAnswersMode(value) {
+  const text = String(value ?? '').trim().toLowerCase()
+  return text === '0' ? 'off' : text === 'other' ? 'other' : 'on'
+}
+
 // Where Claude voice mode calls from: Anthropic's published outbound range.
 export const ANTHROPIC_RANGES = ['160.79.104.0/21']
 
@@ -226,6 +234,13 @@ export const config = {
   // calls are normal while the driver talks.
   telegramAfterSeconds: num(env.VOICE_GW_TELEGRAM_AFTER, 600),
   telegramApi: env.VOICE_GW_TELEGRAM_API || 'https://api.telegram.org',
+  // Answers by Telegram (telegram.mjs, TelegramAnswers): a Reply to a
+  // question there, or a message with its code, reaches the controller as
+  // the driver's answer, as one by voice does. on, the default and for any
+  // value but these two; other: not for push, merge, restart and delete
+  // decisions, which then take the driver's voice; 0: off.
+  telegramAnswers: telegramAnswersMode(env.VOICE_GW_TELEGRAM_ANSWERS),
+  telegramAnswersSetting: env.VOICE_GW_TELEGRAM_ANSWERS ?? '',
 
   // The Tailscale Funnel (funnel.mjs): off by itself this many minutes after
   // the last voice call; 0 or empty, the default, leaves it on. On again with

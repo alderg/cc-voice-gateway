@@ -182,6 +182,10 @@
     <p class="guide">Unticked, a saved bot token and chat ID are deleted when you write the setup.</p>
     <label>Silence before Telegram (seconds) <input data-setting="VOICE_GW_TELEGRAM_AFTER" inputmode="numeric"></label>
     <p class="guide">After this long without a voice call, voice mode counts as ended, and questions and approvals also go to Telegram. Results wait for the next voice call. Default 600: gaps of a few minutes are normal while you talk.</p>
+    <label>Answers in Telegram
+      <select data-setting="VOICE_GW_TELEGRAM_ANSWERS"><option value="1">to every question (default)</option><option value="other">not to push, merge, restart and delete questions</option><option value="0">off, only by voice</option></select>
+    </label>
+    <p class="guide">A Reply to a question there, or a message that starts with its code, such as "8cep yes", reaches the controller as your answer, as one by voice does; its replies come back to the chat. Approvals stay with your voice and the terminal.</p>
   </div>
 </section>
 

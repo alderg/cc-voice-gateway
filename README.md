@@ -15,7 +15,7 @@ This README is the technical documentation. What it is for, in a two-minute vide
 | **Voice control** | Claude's voice mode, through a custom MCP connector, as the front end of Claude Code: in the car with CarPlay or Android Auto, on the phone, or at the desk next to mouse and keyboard. Answers are written to be heard; approvals by voice | [Overview](#1-overview), [voice commands](#84-voice-commands) |
 | **Three layers of AI** | The voice AI (Claude voice mode) hands each request to the controller, a Claude Code session on your computer reached through a channel. The controller keeps the context, dispatches workers (headless `claude -p` runs) and sums up their results. The gateway in between has no AI of its own | [Overview](#1-overview), [architecture](#41-architecture) |
 | **Parallel workers** | Several repositories at once, several runs per repository in git worktrees of their own, a queue that survives restarts, work folders for tasks without a repository; on this computer or in Docker | [Workers](#55-workers-on-this-computer-or-in-docker), [several runs](#several-runs-per-repository), [work folders](#work-folders) |
-| **It comes back to you** | Results as spoken news; questions and approvals on Telegram once the call has ended; pull requests watched, review comments fixed automatically; open items and reminders; the controller in the Claude app with Remote Control | [Telegram](#58-the-telegram-fallback), [open items](#84-voice-commands), [review fixes](#automatic-fixes-for-review-comments), [Remote Control](#remote-control-from-the-claude-app) |
+| **It comes back to you** | Results as spoken news; questions and approvals on Telegram once the call has ended, questions answered there by Reply; pull requests watched, review comments fixed automatically; open items and reminders; the controller in the Claude app with Remote Control | [Telegram](#58-the-telegram-fallback), [open items](#84-voice-commands), [review fixes](#automatic-fixes-for-review-comments), [Remote Control](#remote-control-from-the-claude-app) |
 | **Safe by design** | Pull requests on `voice/` branches; a merge after your yes and an approval; workers only on your spoken words; Docker access levels set by the GitHub token; a confined controller; a kill switch in code; sign-in with a pairing code, `/mcp` only from Anthropic's addresses | [Security design](#5-security-design) |
 
 > [!WARNING]
@@ -400,7 +400,7 @@ to a lost phone or a leaked token.
 | A run in a work folder on this computer | Everything your user can, without approvals; the rules allow writes only in its folder | Nothing is blocked; rules only observe, as for any worker |
 | A run in a work folder in its container | The work folders, Claude Code's token, the network | Your other files, SSH keys, `gh` login, the repositories, any GitHub token |
 | Others on GitHub | Comment on a watched pull request: the news names them; the text of the repository's owner, members and collaborators reaches the controller, marked `trusted="no"` | Get anyone else's text to the controller through the watch; have a fork or someone else's pull request watched (see 8.4) |
-| The Telegram chat | Receive questions, approval requests and alerts; send `/stop`; turn the Funnel on and off | Anything else; other chats are ignored |
+| The Telegram chat | Receive questions, approval requests and alerts; send `/stop`; turn the Funnel on and off; answer an open question by Reply or with its code ([5.8](#58-the-telegram-fallback)) | Approve, unlock, or send a new request; anything else; other chats are ignored |
 
 ### 5.2 The voice endpoint and OAuth
 
@@ -577,7 +577,10 @@ and its instructions call that text data, never instructions. The gateway checks
   case without punctuation and quotes. Worker results and pull request news never count.
 - **Answers count.** A follow-up "(Answer to <id>) Yes." is a voice request too. The words may
   start in "(Answer to <id>)", so that a plain yes can be passed on, but must reach into what you
-  said; the gateway's prefix alone does not count.
+  said; the gateway's prefix alone does not count. So does an answer you typed in your Telegram
+  chat, as a Reply to a question or with its code ([5.8](#58-the-telegram-fallback)): the gateway
+  routes it itself, only from your configured chat and only to an open question, and the
+  controller sees it with `via="telegram"`.
 - **Every dispatch.** With `direct`, `draft` and `allow_dirty` too. Otherwise `dispatch=needs_driver`:
   nothing starts, and the controller is told to ask you by voice. `list_workers`,
   `worker_status`, `stop_worker`, `open_items` and `stats` are not checked.
@@ -975,8 +978,8 @@ folder, `.git` included.
   long.
 - **What:** only what needs you. Questions and approval requests that voice mode has not picked
   up then also go to the chat, each once. Results, news and interim `working` updates never do;
-  they wait for the next voice call. A question the controller settled in the meantime is not
-  sent.
+  they wait for the next voice call, apart from the controller's replies to an answer you gave in
+  the chat (below). A question the controller settled in the meantime is not sent.
 - **Not waiting for that:** the kill switch alarm goes at once, whether voice mode is on or not,
   and so do a note when the gateway ends because another process holds its port, the alerts
   about suspicious requests and sign-ins ([5.2](#52-the-voice-endpoint-and-oauth)), the Funnel's
@@ -989,14 +992,37 @@ folder, `.git` included.
 - **Inbound:** only the kill switch (`/stop`, `/killswitch`, `/emergencystop` or an emergency
   phrase), the Funnel (`/funnel on`, `/funnel off`, `/funnel`, "keep alive";
   [7.3](#73-publishing-the-endpoint)), the statistics (`/stats`, `/stats all`;
-  [8.5](#85-statistics)) and night mode (`/night`, "good night" on; `/back`, "I'm back" off;
-  [night mode](#night-mode)), only from the configured private chat. Everything else is ignored.
-  You cannot answer questions or approvals by Telegram.
-- **Only if recent.** A command counts only if Telegram's timestamp on it is at most two minutes
-  old when the gateway reads it. Telegram keeps messages for a day, and a `/stop` or `/funnel on`
-  sent while the gateway was not running must not act hours later. Such a command gets an answer
-  instead: "Ignored "/funnel on": it was sent 15 minutes ago, while the gateway was not
-  listening… Send it again if you still want it."
+  [8.5](#85-statistics)), night mode (`/night`, "good night" on; `/back`, "I'm back" off;
+  [night mode](#night-mode)) and answers to questions (below), only from the configured private
+  chat. Approvals cannot be answered by Telegram.
+- **Answers by Telegram** (`VOICE_GW_TELEGRAM_ANSWERS`, on by default). Every question there shows
+  its code in its first and last line ("Question for request 8cep …"). Answer it with Telegram's
+  Reply on that message, whatever you write, unless it is `/stop`, an emergency phrase or another
+  slash command; or, without a Reply, with a message that names the code of exactly one open
+  question, a request's or a decision's ("8cep yes", "Answer dk3p: no"). The gateway maps the
+  Reply to the question by the id of the message it sent, kept with the request, also across a
+  restart. It reaches the controller exactly like an answer by voice, "(Answer to 8cep) yes",
+  marked `via="telegram"`: the question counts as answered, its open decisions keep your answer,
+  and `dispatch` and `resolve_decision` take its words ([5.4](#54-approvals-by-voice)). The chat
+  confirms it ("Passed on to the controller as your answer to 8cep."), and the controller's
+  replies to it come back there as replies to your message, also while voice mode is on or in
+  the night; only a standby holds them.
+- **Not passed on,** with a short reason in the chat: a message with no Reply to a question and no
+  code of an open question (it lists the open ones), one that names several, a question that is
+  answered or settled already, a Reply to an approval request, and anything while the kill switch
+  is locked ("It is unlocked only at the computer.") or the gateway is inactive, in a standby or
+  without a controller. Telegram never starts a new request, never approves and never unlocks.
+- **Which decisions.** By default an answer by Telegram counts for every question, push, merge,
+  restart and delete included: it carries the same weight as the same words spoken. A merge and a
+  confirmed delete still need Claude Code's approval afterwards, which Telegram cannot give.
+  `VOICE_GW_TELEGRAM_ANSWERS=other` leaves push, merge, restart and delete decisions to your voice
+  (their questions say so, and an answer there is not passed on); `0` turns answers by Telegram
+  off.
+- **Only if recent.** A command or an answer counts only if Telegram's timestamp on it is at most
+  two minutes old when the gateway reads it. Telegram keeps messages for a day, and a `/stop`,
+  `/funnel on` or "yes" sent while the gateway was not running must not act hours later. Such a
+  message gets an answer instead: "Ignored "/funnel on": it was sent 15 minutes ago, while the
+  gateway was not listening… Send it again if you still want it."
 - **Through Telegram's servers.** Bot chats are not end-to-end encrypted, so leave the files out
   if that is not acceptable.
 - **The token** never appears in a log line or error message.
@@ -1664,7 +1690,9 @@ The gateway's log says the same at its start. From the app, on the controller:
   `request_id`, nothing read aloud. The controller answers it in the app (`controller/CLAUDE.md`).
 - **No worker by typing.** Typed words are no voice request, so `dispatch` answers `needs_driver`
   ([5.4](#54-approvals-by-voice)), as do `clone_repo`, a confirmed `delete_path` and
-  `resolve_decision`. Say it by voice. Status questions, `list_workers`, `worker_status`,
+  `resolve_decision`. Say it by voice. An answer to a question you type in your Telegram chat is
+  different: the gateway routes it itself, from your configured chat
+  ([5.8](#58-the-telegram-fallback)). Status questions, `list_workers`, `worker_status`,
   `open_items`, `stop_worker` and a merge (your yes, then the approval) work.
 - **Approvals** show in the terminal, in the car and in the app; the first answer counts
   ([5.4](#54-approvals-by-voice)).
@@ -1859,8 +1887,9 @@ to fix review comments, which the gateway carries out itself, not the controller
   push decision after a run that left commits on no remote or uncommitted files
   ([5.5](#55-workers-on-this-computer-or-in-docker)) or a stop, one for a queued task that could
   not start or that the kill switch took out of the queue, and one for the gateway's own checkout.
-- **Pending, asked, answered, closed.** Your answer to the question ("(Answer to <id>) …") is kept
-  with it, and a question back on your answer is the same decision. It closes when the follow-up
+- **Pending, asked, answered, closed.** Your answer to the question ("(Answer to <id>) …"), by
+  voice or [by Telegram](#58-the-telegram-fallback), is kept with it, and a question back on your
+  answer is the same decision. It closes when the follow-up
   dispatch with your answer starts, when the controller replies "done" to your answer (unless that
   follow-up still waits in the queue), or with `resolve_decision` and your words. When you decide
   in a new request instead of answering, the controller closes it with `resolve_decision`.
@@ -2262,7 +2291,8 @@ limits at once.
 | `VOICE_GW_DISCONNECT_STANDBY` | `1` | `1`: when the connector is disconnected, one message, then standby until a new sign-in; `0`: stays on |
 | `VOICE_GW_DISCONNECT_UNUSED`, `VOICE_GW_DISCONNECT_GRACE` | `10`, `15` | Minutes: calls without a token count only after the connector's sign-in went unused this long, and the standby follows only if this many more pass without a use or a new sign-in |
 | `VOICE_GW_TELEGRAM_AFTER` | `600` | Seconds without a voice call before questions and approvals also go to Telegram ([5.8](#58-the-telegram-fallback)) |
-| `VOICE_GW_TELEGRAM_POLL` | `25` | Seconds one poll of the bot for `/stop` waits |
+| `VOICE_GW_TELEGRAM_ANSWERS` | `1` | `1`: a Reply to a question on Telegram, or a message with its code, reaches the controller as your answer ([5.8](#58-the-telegram-fallback)); `other`: not for push, merge, restart and delete decisions, which take your voice; `0`: off, questions are answered by voice only. Another value counts as `1` |
+| `VOICE_GW_TELEGRAM_POLL` | `25` | Seconds one poll of the bot for `/stop` and answers waits |
 | `VOICE_GW_TRANSCRIPT_POLL` | `5` | Seconds between looks at the controller's own transcript for the usage limit ([the usage limit](#the-claude-usage-limit)) |
 | `VOICE_GW_QUIET_HOURS` | empty | Night mode by the clock, as `23:00-07:30` in the computer's time zone ([night mode](#night-mode)); empty: only when you say good night |
 | `VOICE_GW_NIGHT_POLL` | `30` | Seconds between looks whether the night began or ended |
@@ -2401,6 +2431,7 @@ gateway; do not set them.
 | `dispatch=locked`, `[state=locked]` or an `[ALARM]` line | The kill switch is locked; the alarm names the trigger. `node scripts/unlock.mjs --status` shows it, `node scripts/unlock.mjs` at the server unlocks it. |
 | `dispatch=origin` | In the container, the repository's `origin` is no longer the GitHub repository the gateway saw first ([5.6](#56-access-levels-and-their-detection)). Check the clone at the desk; if the change is wanted, stop the controller and remove the repository's line under `origins` in `.state/workers.json`. |
 | The kill switch locked for no good reason | Read the reason. A rule that misfires: raise its `VOICE_GW_KILL_*` threshold, or add a folder to `VOICE_GW_KILL_ALLOW_PATHS`. |
+| An answer on Telegram is "not passed on" | The reason follows in the chat. Reply to the question's own message, or name its code (the four characters after "Question for request"); a decision's code works too. Only questions still open count: one answered by voice is settled. While the kill switch is locked or the gateway is inactive nothing goes through; answer by voice once it is unlocked or active again. `telegram answers off` in the log: `VOICE_GW_TELEGRAM_ANSWERS=0`. |
 | `/stop` on Telegram does nothing | Only your configured private chat counts, and the gateway must poll the bot: the log says `telegram commands: …` if a webhook or another program takes the updates. |
 | `/funnel on` answers "Ignored …: it was sent … ago" | The gateway was not running when you sent it, for example during a restart or right after boot. Send it again. |
 | `/funnel on` answers "The Funnel did not come on: Access denied" | Run `sudo tailscale set --operator=$USER` once on the computer. |
@@ -2525,7 +2556,7 @@ src/
   runners.mjs        where workers run: this computer, or the Docker container; a run's processes
   access.mjs         access levels in the container, from the GitHub token
   pulls.mjs          the watch on pull requests that workers open
-  telegram.mjs       Telegram fallback, and /stop and /funnel from your chat
+  telegram.mjs       Telegram fallback; /stop, /funnel and answers to questions from your chat
   funnel.mjs         the Funnel on and off from Telegram, and off by itself when idle
   killswitch.mjs     the kill switch: state, emergency phrases, alarm
   guard.mjs          the kill switch's rules on the workers' runs

@@ -35,7 +35,7 @@ import { Workers, gitState, hostGit, parkedText, planText, queueList } from './w
 import { SettingsWatcher, othersText } from './live.mjs'
 import { Restarter } from './restart.mjs'
 import { PullWatcher } from './pulls.mjs'
-import { TelegramCommands, TelegramFallback, loadTelegram } from './telegram.mjs'
+import { TelegramAnswers, TelegramCommands, TelegramFallback, loadTelegram } from './telegram.mjs'
 import { KillSwitch, alarmText, offText } from './killswitch.mjs'
 import { RunGuard } from './guard.mjs'
 import { realpathSync } from 'node:fs'
@@ -503,16 +503,54 @@ if (config.funnelIdleMinutes) {
   log(`funnel auto-off: ${config.funnelIdleMinutes} minutes after the last voice call${telegram ? '' : '; without Telegram, only at the computer on again'}`)
 }
 if (telegram) {
+  // The driver's answers to questions, typed in the chat as a Reply or with
+  // the question's code (VOICE_GW_TELEGRAM_ANSWERS): to the controller like
+  // answers by voice, never past a locked kill switch or a standby.
+  const answers =
+    config.telegramAnswers === 'off'
+      ? null
+      : new TelegramAnswers({
+          store,
+          ledger,
+          mode: config.telegramAnswers,
+          killswitch,
+          presence,
+          push: async request => {
+            await channel.ready
+            await channel.push(request, request.meta)
+          },
+          say: (text, replyTo) =>
+            telegram.send(text, { replyTo }).catch(error => log('telegram message not sent:', error.message)),
+          held: () => {
+            const wait = limits.active('controller')
+            return wait ? `The controller waits for the usage limit until ${clock(wait.until)} and reads it then.` : ''
+          },
+        })
+  if (config.telegramAnswersSetting.trim() && !['1', '0', 'other'].includes(config.telegramAnswersSetting.trim().toLowerCase())) {
+    log(`VOICE_GW_TELEGRAM_ANSWERS=${config.telegramAnswersSetting} is not 1, other or 0; 1 instead`)
+  }
+  log(
+    {
+      on: 'telegram answers on: a Reply to a question, or a message with its code, reaches the controller as the driver\'s answer',
+      other: 'telegram answers on, except for push, merge, restart and delete decisions, which take the driver\'s voice (VOICE_GW_TELEGRAM_ANSWERS=other)',
+      off: 'telegram answers off (VOICE_GW_TELEGRAM_ANSWERS=0): questions are answered by voice only',
+    }[config.telegramAnswers],
+  )
   // Paused in a standby, and in night mode, where Telegram carries alarms
-  // only; what the night left, the morning summary names (night.mjs).
+  // only; what the night left, the morning summary names (night.mjs). The
+  // controller's replies to an answer typed there wait only in a standby.
   fallback = new TelegramFallback(store, {
-    send: text => telegram.send(text),
+    send: (text, options) => telegram.send(text, options),
     afterSeconds: config.telegramAfterSeconds,
     paused: () => standby.active || night.active(),
+    held: () => standby.active,
+    answerable: request => answers?.accepts(request) ?? false,
   })
   log(`telegram fallback ready: questions and approvals after ${config.telegramAfterSeconds} s without a voice call`)
-  // Inbound, only the kill switch and the Funnel, only from the configured chat.
-  telegramCommands = new TelegramCommands(telegram, { pollSeconds: config.telegramPollSeconds }).start()
+  // Inbound, only from the configured chat: the kill switch, the Funnel,
+  // night mode, the statistics, and answers to questions.
+  telegramCommands = new TelegramCommands(telegram, { pollSeconds: config.telegramPollSeconds, answers: Boolean(answers) }).start()
+  if (answers) telegramCommands.on('answer', message => answers.route(message))
   telegramCommands.on('stop', ({ text }) => {
     const state = killswitch.trip({ trigger: 'telegram', reason: `"${text}" on Telegram` })
     if (!state && !killswitch.locked) say(`cc-voice-gateway on ${hostname()}: "${text}" locked nothing. ${offText()}`)
