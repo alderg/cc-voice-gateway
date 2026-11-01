@@ -54,17 +54,18 @@ support; not an Anthropic product.
 
 ## The video, scene by scene
 
-About 100 seconds, voice Kokoro `af_heart`, captions in the frame. The spoken text is in
-`script.json`; the frames are animated in `slides.html`.
+About two minutes, voice Kokoro `af_heart`, captions in the frame. The spoken text is in
+`script.json`; the frames are animated in `slides.html`, in the product page's look: a drive past
+the signs of a motorway, with each message's green sign at the top right, as on the page.
 
 | Scene | Message | Picture | Voiceover (short) |
 |---|---|---|---|
-| `intro` | – | The name, a live voice waveform, "Claude Code, by voice." | This is cc-voice-gateway: Claude Code, by voice. |
-| `gap` | Problem | Voice mode and Claude Code, a broken link between them | Voice mode can talk, but it cannot reach Claude Code. The gateway connects them. |
-| `anywhere` | 1 | Three scenes: car, desk, on the go | In the car, at your desk while you keep working with mouse and keyboard, or on the go. |
-| `dialog` | 1 | A conversation, a worker's terminal next to it | Ask why the build failed; ask for a fix; a pull request is open. |
-| `layers` | 2 | Voice AI → controller → workers, pulses flowing | Three layers of AI: listen and pass on; keep context, steer and sum up; do the work. |
-| `parallel` | 3 | Lanes of runs filling up, a queue, Docker | Several workers in parallel, in worktrees, in work folders, in containers. |
-| `back` | 4 | A phone: spoken news, a Telegram push, a review fixed | Results come back as short news; questions follow you to Telegram; reviews get fixed. |
-| `safe` | 5 | A checklist builds up, then "Emergency stop" | Pull requests; a merge needs your yes twice; your words only; emergency stop. |
-| `end` | – | Name, tagline, GitHub URL, the notice | Open source, on GitHub. A prototype, provided as-is. |
+| `intro` | – | The page's green direction sign on its posts: the name, then "Claude Code, by voice." with the car, the desk, the phone and any language | This is cc-voice-gateway: Claude Code, by voice. |
+| `gap` | Problem | The route from voice mode to Claude Code, closed by a road barrier, then bridged by the gateway's sign | Voice mode can talk, but it cannot reach Claude Code. The gateway connects them. |
+| `anywhere` | 1 | Three blue information signs: car, desk, on the go, each with the driver's words | In the car, at your desk while you keep working with mouse and keyboard, or on the go. |
+| `dialog` | 1 | A transcript of the conversation, a worker's terminal on a dark display next to it | Ask why the build failed; ask for a fix; a pull request is open. |
+| `layers` | 2 | Voice AI, controller, workers as numbered cards, a short stretch of road between them | Three layers of AI: listen and pass on; keep context, steer and sum up; do the work. |
+| `parallel` | 3 | The page's board of workers on a dark display, filling up to four running and one queued | Several workers in parallel, in worktrees, in work folders, in containers. |
+| `back` | 4 | A phone in voice mode, and what reaches you: spoken news, a Telegram question, checks, a review fixed | Results come back as short news; questions follow you to Telegram; reviews get fixed. |
+| `safe` | 5 | The rules build up, then the red STOP sign and "Emergency stop." | Pull requests; a merge needs your yes twice; your words only; emergency stop. |
+| `end` | – | The direction sign again, the GitHub address on a blue plate beneath it, the notice on a plain plate on its posts | Open source, on GitHub. A prototype, provided as-is. |

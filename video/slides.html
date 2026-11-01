@@ -4,329 +4,270 @@
   setup({ total, fps, scenes: [{ id, start, end, lines: [{ start, voice, end, caption }] }], levels }),
   then calls render(t) for every frame and takes a screenshot.
   Elements with data-in="<line>" appear when that line of their scene starts, data-d adds a delay
-  (seconds, or "40%" of the line's spoken length), data-fx picks the motion (up, fade, pop, left,
-  right, type, wipe), data-out="<line>" hides or dims them again (data-outfx="dim").
-  Opened on its own, it plays with a guessed timeline: slides.html#t=12 shows second 12, #play plays.
-  Colors follow the diagrams: orange the voice AI, purple the gateway and controller, blue Claude Code.
+  (seconds, or "40%" of the line's spoken length), data-fx picks the motion (up, fade, pop, near,
+  left, right, type, wipe, wipel), data-out="<line>" hides or dims them again (data-outfx="dim").
+  Opened on its own, it plays with a guessed timeline: slides.html#play plays, slides.html#t=12
+  shows second 12.
+  The look follows the product page (docs/index.html): a drive past the signs of a motorway, asphalt
+  ink on overcast concrete grey, green direction signs, blue information signs, a red STOP, set in
+  Barlow and Barlow Semi Condensed from docs/assets/fonts. The page's daylight colours: a video
+  cannot follow the system's setting, and it plays in the page's dark dashboard frame either way.
 -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <title>cc-voice-gateway video</title>
 <style>
+  /* Barlow and Barlow Semi Condensed by Jeremy Tribby, SIL Open Font License 1.1 (docs/assets/fonts/OFL.txt). */
+  @font-face { font-family: "Barlow"; font-weight: 400; src: url(../docs/assets/fonts/barlow-latin-400-normal.woff2) format("woff2"); }
+  @font-face { font-family: "Barlow"; font-weight: 600; src: url(../docs/assets/fonts/barlow-latin-600-normal.woff2) format("woff2"); }
+  @font-face { font-family: "Barlow Semi Condensed"; font-weight: 600; src: url(../docs/assets/fonts/barlow-semi-condensed-latin-600-normal.woff2) format("woff2"); }
+  @font-face { font-family: "Barlow Semi Condensed"; font-style: italic; font-weight: 500; src: url(../docs/assets/fonts/barlow-semi-condensed-latin-500-italic.woff2) format("woff2"); }
+
   :root {
-    --bg: #060a17;
-    --ink: #f8fafc;
-    --text: #cbd5e1;
-    --muted: #8b9ab3;
-    --line: #243052;
-    --card: #0f1730;
-    --card2: #131d3b;
-    --orange: #fb923c;
-    --purple: #a78bfa;
-    --blue: #60a5fa;
-    --green: #4ade80;
-    --red: #f87171;
-    --amber: #fbbf24;
-    --tg: #38bdf8;
-    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    --page: #e9ece7;
+    --paper: #f6f7f4;
+    --ink: #25292c;
+    --muted: #4f565b;
+    --rule: #c6ccc5;
+    --steel: #8d9499;
+    --green: #0b6b3c;
+    --green-ink: #0a5c34;
+    --blue: #1e4f8f;
+    --yellow: #f4b400;
+    --red: #c8102e;
+    --screen: #1b2023;
+    --road: #3b4145;
+    --on-screen: #e4e8e2;
+    --on-screen-muted: #b9c1bb;
+    --ok: #7fd6a1;
+    --text: "Barlow", sans-serif;
+    --display: "Barlow Semi Condensed", "Barlow", sans-serif;
+    --mono: ui-monospace, "SF Mono", Menlo, "DejaVu Sans Mono", Consolas, monospace;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  html, body { width: 1920px; height: 1080px; overflow: hidden; background: var(--bg); }
-  body { color: var(--ink); font-family: system-ui, -apple-system, "Helvetica Neue", Helvetica, sans-serif; -webkit-font-smoothing: antialiased; }
-  svg.i { display: block; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
-
-  /* background: slow blobs over a dotted grid */
-  #bg { position: absolute; inset: 0; overflow: hidden; }
-  .blob { position: absolute; width: 1400px; height: 1400px; border-radius: 50%; }
-  .b1 { background: radial-gradient(closest-side, rgba(167, 139, 250, .20), transparent); }
-  .b2 { background: radial-gradient(closest-side, rgba(96, 165, 250, .16), transparent); }
-  .b3 { background: radial-gradient(closest-side, rgba(251, 146, 60, .12), transparent); }
-  .dots { position: absolute; inset: -40px; background-image: radial-gradient(rgba(148, 163, 184, .16) 1.4px, transparent 1.6px); background-size: 36px 36px;
-    -webkit-mask-image: radial-gradient(ellipse 75% 70% at 50% 45%, #000 30%, transparent 85%); }
+  html, body { width: 1920px; height: 1080px; overflow: hidden; background: var(--page); }
+  body { color: var(--ink); font: 400 30px/1.4 var(--text); -webkit-font-smoothing: antialiased; font-kerning: normal; }
+  svg.i { display: block; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; flex: none; }
+  ul { list-style: none; }
 
   section { position: absolute; inset: 0; display: none; }
   .stage { position: absolute; inset: 0; transform-origin: 50% 46%; }
   .abs { position: absolute; }
-  .center { text-align: center; }
-  .grad { background: linear-gradient(90deg, var(--amber), var(--orange) 30%, var(--purple) 65%, var(--blue)); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .row-center { position: absolute; left: 0; right: 0; display: flex; justify-content: center; }
 
-  .brand { position: absolute; left: 112px; top: 64px; font: 600 28px system-ui; color: var(--muted); display: flex; align-items: center; gap: 14px; }
-  .brand i { width: 14px; height: 14px; border-radius: 50%; background: var(--purple); box-shadow: 0 0 18px var(--purple); }
-  .chapter { position: absolute; right: 112px; top: 56px; display: flex; align-items: center; gap: 14px; padding: 10px 22px 10px 12px; border-radius: 999px;
-    background: rgba(15, 23, 48, .8); border: 1.5px solid var(--line); font: 600 26px system-ui; color: var(--text); }
-  .chapter b { display: grid; place-items: center; height: 38px; min-width: 38px; padding: 0 10px; border-radius: 999px; font: 700 21px var(--mono); color: #0b1020; }
+  /* A road sign: a coloured plate with a white line run in from its edge, as on the page. */
+  .sign { --plate: var(--green); --line: #fff; --edge: 6px; --stroke: 3px; background: var(--plate); color: #fff; border-radius: 12px;
+    box-shadow: inset 0 0 0 var(--edge) var(--plate), inset 0 0 0 calc(var(--edge) + var(--stroke)) var(--line); }
+  .sign.blue { --plate: var(--blue); }
+  .sign.plain { --plate: var(--paper); --line: var(--ink); color: var(--ink); }
+  .pict { display: grid; place-items: center; }
+  .posts { position: absolute; display: flex; justify-content: space-between; }
+  .posts i { width: 22px; height: 100%; background: linear-gradient(90deg, var(--steel), #c9cdc8 60%, var(--steel)); }
 
-  h2.title { position: absolute; left: 0; right: 0; top: 150px; text-align: center; font: 760 70px/1.1 system-ui; letter-spacing: -.025em; }
-  .sub { font: 450 34px/1.4 system-ui; color: var(--text); }
+  .brand { position: absolute; left: 112px; top: 58px; padding: 13px 20px 12px; --edge: 4px; --stroke: 2px; border-radius: 9px; font: 600 28px/1 var(--display); letter-spacing: .01em; }
+  .chapter { position: absolute; right: 112px; top: 58px; padding: 13px 20px 12px; --edge: 4px; --stroke: 2px; border-radius: 9px; font: 600 28px/1 var(--display); letter-spacing: .01em; }
+  h2.title { position: absolute; left: 112px; right: 112px; top: 150px; font: 600 76px/1.04 var(--display); letter-spacing: -.012em; }
+  .say { font: italic 500 40px/1.22 var(--display); color: var(--green-ink); }
 
-  .caption { position: absolute; left: 50%; bottom: 64px; transform: translateX(-50%); max-width: 1560px; padding: 16px 34px; border-radius: 18px;
-    background: rgba(3, 7, 18, .78); border: 1px solid rgba(148, 163, 184, .16); font: 500 36px/1.32 system-ui; color: #e2e8f0; text-align: center; text-wrap: balance; }
-  .progress { position: absolute; left: 0; right: 0; bottom: 0; height: 6px; background: rgba(148, 163, 184, .08); }
-  .progress i { display: block; height: 100%; width: 0; background: linear-gradient(90deg, var(--orange), var(--purple), var(--blue)); }
+  .caption { position: absolute; left: 50%; bottom: 56px; transform: translateX(-50%); max-width: 1500px; padding: 15px 34px 14px; border-radius: 10px;
+    background: rgba(37, 41, 44, .95); color: #f2f3ef; font: 400 36px/1.32 var(--text); text-align: center; text-wrap: balance; }
+  .progress { position: absolute; left: 0; right: 0; bottom: 0; height: 6px; background: rgba(37, 41, 44, .1); }
+  .progress i { display: block; height: 100%; width: 0; background: var(--green); }
 
-  .card { position: absolute; border-radius: 30px; background: linear-gradient(180deg, var(--card2), var(--card)); border: 2px solid var(--line); }
-  .card.orange { border-color: rgba(251, 146, 60, .55); }
-  .card.blue { border-color: rgba(96, 165, 250, .55); }
-  .card.purple { border-color: rgba(167, 139, 250, .8); box-shadow: 0 0 90px rgba(167, 139, 250, .22); }
-  .icon { display: grid; place-items: center; border-radius: 22px; }
-  .icon.orange { background: rgba(251, 146, 60, .14); color: var(--orange); }
-  .icon.purple { background: rgba(167, 139, 250, .16); color: var(--purple); }
-  .icon.blue { background: rgba(96, 165, 250, .14); color: var(--blue); }
-  .icon.green { background: rgba(74, 222, 128, .14); color: var(--green); }
-  .icon.red { background: rgba(248, 113, 113, .16); color: var(--red); }
-  .icon.amber { background: rgba(251, 191, 36, .14); color: var(--amber); }
-  .icon.tg { background: rgba(56, 189, 248, .16); color: var(--tg); }
+  /* intro and end: the direction sign on its posts */
+  .hero { display: grid; grid-template-columns: 128px minmax(0, 1fr); column-gap: 52px; padding: 50px 76px 54px 66px; border-radius: 22px; --edge: 11px; --stroke: 5px; }
+  .hero .shield { grid-column: 2; justify-self: start; padding: 10px 20px 9px; border-radius: 8px; background: #fff; color: var(--green); font: 600 44px/1 var(--display); letter-spacing: .01em; transform-origin: 50% 50%; }
+  .hero .arrow { grid-column: 1; grid-row: 2; width: 128px; height: auto; fill: #fff; margin-top: 22px; }
+  .hero h1 { grid-column: 2; grid-row: 2; margin-top: 26px; font: 600 150px/.94 var(--display); letter-spacing: -.01em; }
+  .hero .dest { grid-column: 2; display: grid; grid-template-columns: auto auto; justify-content: start; gap: 18px 60px; margin-top: 40px; padding-top: 30px;
+    border-top: 4px solid rgba(255, 255, 255, .92); font: 600 36px/1.2 var(--display); }
+  .hero .dest li { display: flex; align-items: center; gap: 16px; }
+  #intro .hero { left: 330px; top: 104px; width: 1260px; }
+  #intro .posts { left: 330px; width: 1260px; top: 700px; height: 400px; padding: 0 410px; }
+  .playsign { position: absolute; left: 875px; top: 830px; width: 170px; height: 170px; border-radius: 50%; display: none; place-items: center; background: var(--blue);
+    box-shadow: inset 0 0 0 8px var(--blue), inset 0 0 0 14px #fff, 0 10px 40px rgba(37, 41, 44, .25); }
+  .playsign svg { margin-left: 12px; }
 
+  #end .hero { left: 410px; top: 92px; width: 1100px; grid-template-columns: 104px minmax(0, 1fr); column-gap: 44px; padding: 44px 64px 50px 56px; }
+  #end .hero .arrow { width: 104px; margin-top: 16px; }
+  #end .hero h1 { font-size: 124px; margin-top: 22px; }
+  #end .hero .shield { font-size: 40px; }
+  #end .ghplate { position: absolute; left: 410px; top: 548px; width: 1100px; height: 108px; display: flex; align-items: center; justify-content: center; gap: 22px;
+    border-radius: 14px; --edge: 8px; --stroke: 4px; font: 600 50px/1 var(--display); letter-spacing: .005em; }
+  #end .posts { left: 410px; width: 1100px; top: 500px; height: 600px; padding: 0 300px; }
+  #end .notice { position: absolute; left: 410px; top: 742px; width: 1100px; padding: 32px 40px 30px; border-radius: 12px; --edge: 6px; --stroke: 3px;
+    text-align: center; font: 400 31px/1.42 var(--text); }
+
+  /* gap: the route, closed, then bridged */
+  .route { position: absolute; top: 595px; height: 12px; background: var(--ink); }
+  .stopdot { position: absolute; top: 583px; width: 36px; height: 36px; margin-left: -18px; border-radius: 50%; background: var(--page); border: 8px solid var(--ink); }
+  .stopdot.via { border-color: var(--green); background: #fff; }
+  .stoplabel { position: absolute; top: 650px; width: 560px; margin-left: -280px; text-align: center; }
+  .stoplabel b { display: block; font: 600 54px/1.1 var(--display); }
+  .stoplabel small { display: block; margin-top: 6px; font: 400 30px/1.35 var(--text); color: var(--muted); }
+  #gap .barrier { left: 810px; top: 520px; }
+  #gap .via-sign { top: 380px; }
+  #gap .via-sign .sign { padding: 26px 40px 24px; border-radius: 14px; --edge: 7px; --stroke: 4px; text-align: center; }
+  #gap .via-sign b { display: block; font: 600 56px/1.05 var(--display); }
+  #gap .via-sign small { display: block; margin-top: 6px; font: 400 28px/1.3 var(--text); color: rgba(255, 255, 255, .9); }
+
+  /* anywhere: three information signs */
+  .case { position: absolute; top: 290px; width: 520px; }
+  .case .pict { width: 150px; height: 150px; border-radius: 14px; --edge: 7px; --stroke: 4px; }
+  .case h3 { margin-top: 32px; font: 600 54px/1.05 var(--display); }
+  .case p { margin-top: 12px; font: 400 30px/1.4 var(--text); color: var(--muted); }
+  .case p.say { margin-top: 26px; font: italic 500 40px/1.22 var(--display); color: var(--green-ink); }
+
+  /* dialog: a transcript, and the worker's display */
+  .talk { position: absolute; left: 112px; top: 214px; width: 880px; border-bottom: 2px solid var(--rule); }
+  .talk > div { display: grid; grid-template-columns: 150px minmax(0, 1fr); align-items: baseline; padding: 26px 0 24px; border-top: 2px solid var(--rule); }
+  .talk .who { font: 600 28px/1 var(--text); color: var(--muted); }
+  .talk .say { font-size: 48px; line-height: 1.15; }
+  .talk .ans { font: 400 40px/1.3 var(--text); }
+  .screen { background: var(--screen); color: var(--on-screen); border-radius: 16px; }
+  .term { left: 1060px; top: 214px; width: 748px; height: 412px; overflow: hidden; }
+  .term .head { display: flex; align-items: center; gap: 16px; padding: 24px 30px 22px; border-bottom: 1px solid #343c41; font: 600 34px/1 var(--display); }
+  .term .state { margin-left: auto; padding: 8px 16px 7px; border-radius: 6px; font: 600 22px/1 var(--text); }
+  .term .body { padding: 24px 30px; font: 400 26px/1.85 var(--mono); }
+  .term .p { color: #8f9893; }
+  .ok { color: var(--ok); }
+  .hl { color: #fff; }
+
+  /* layers: three cards, a short stretch of road between them */
+  .layer { position: absolute; top: 284px; width: 440px; height: 560px; padding: 36px 38px; border-radius: 10px; background: var(--paper); }
+  .layer .n { font: 600 112px/.82 var(--display); color: var(--green-ink); }
+  .layer h3 { margin-top: 24px; font: 600 56px/1.05 var(--display); }
+  .layer .where { margin-top: 8px; font: 400 26px/1.35 var(--text); color: var(--muted); }
+  .dashes { display: grid; gap: 14px; }
+  .dashes li { position: relative; padding-left: 36px; }
+  .dashes li::before { content: ""; position: absolute; left: 0; top: .62em; width: 22px; height: 5px; background: var(--ink); }
+  .layer .dashes { margin-top: 28px; font: 400 28px/1.3 var(--text); }
+  .hop { position: absolute; top: 470px; width: 188px; height: 160px; }
+  .hop .road { position: absolute; left: 0; right: 0; top: 58px; height: 44px; background-color: var(--road);
+    background-image: linear-gradient(90deg, #f2f3ef 55%, transparent 55%); background-size: 30px 5px; background-repeat: repeat-x; background-position: 6px center; }
+  .hop .lbl { position: absolute; left: 0; right: 0; display: flex; align-items: center; justify-content: center; gap: 8px; font: 600 24px/1 var(--text); color: var(--ink); }
+
+  /* parallel: the workers, on a dark dashboard display */
+  .board { left: 112px; top: 270px; width: 1696px; padding: 6px 0 12px; }
+  .board .bhead { display: flex; align-items: baseline; justify-content: space-between; padding: 20px 34px 18px; border-bottom: 1px solid #343c41; font: 600 38px/1 var(--display); }
+  .board .bhead span { font: 400 28px/1 var(--text); color: var(--on-screen-muted); }
+  .lane { display: grid; grid-template-columns: 58px 420px minmax(0, 1fr) 360px 250px; align-items: center; column-gap: 28px; height: 82px; padding: 0 34px; border-bottom: 1px solid #2c3337; }
+  .lane:last-child { border-bottom: 0; }
+  .lane .pict { width: 58px; height: 58px; border-radius: 8px; --edge: 3px; --stroke: 2px; }
+  .lane .who { font: 600 32px/1.1 var(--text); }
+  .lane .who small { display: block; margin-top: 3px; font: 400 22px/1.2 var(--text); color: var(--on-screen-muted); }
+  .lane .task { font: 400 29px/1.2 var(--text); }
+  .lane .track { height: 12px; border-radius: 6px; background: #2c3337; overflow: hidden; }
+  .lane .fill { height: 100%; width: 0; border-radius: 6px; background: var(--yellow); }
+  .lane .fill.done { background: #3fae6a; }
+  .lane .status { text-align: right; white-space: nowrap; font: 400 27px/1 var(--text); color: var(--on-screen-muted); }
+  .lane .status.done { color: var(--ok); }
+  .lane.wait .who, .lane.wait .task, .lane.wait .status { color: #8f9893; }
+
+  /* back: voice mode on the phone, and what reaches you */
+  .phone { left: 112px; top: 168px; width: 380px; height: 712px; padding: 14px; border-radius: 58px; }
+  .phone .inner { position: relative; height: 100%; border-radius: 46px; background: #121618; }
+  .phone .notch { position: absolute; left: 50%; top: 18px; width: 108px; height: 28px; margin-left: -54px; border-radius: 99px; background: var(--screen); }
+  .phone .mode { position: absolute; left: 0; right: 0; top: 84px; text-align: center; font: 600 26px/1 var(--display); color: var(--on-screen-muted); letter-spacing: .02em; }
+  .phone .said { position: absolute; left: 34px; right: 34px; top: 460px; text-align: center; font: italic 500 34px/1.25 var(--display); color: #fff; }
   .wave { position: absolute; display: flex; align-items: center; justify-content: center; }
-  .wave i { display: block; border-radius: 99px; flex: none; }
+  .wave i { display: block; flex: none; border-radius: 3px; }
+  #back h2.title { left: 600px; top: 166px; }
+  .feed { position: absolute; left: 600px; display: flex; align-items: center; gap: 26px; padding: 24px 30px 24px 24px; border-radius: 10px; background: var(--paper); }
+  .feed .pict { width: 76px; height: 76px; border-radius: 9px; --edge: 4px; --stroke: 2.5px; }
+  .feed b { display: block; font: 600 25px/1.2 var(--text); color: var(--muted); }
+  .feed span { display: block; margin-top: 4px; font: 400 35px/1.25 var(--text); }
 
-  /* intro and end */
-  .mark { position: absolute; left: 0; right: 0; text-align: center; font: 800 124px/1 system-ui; letter-spacing: -.04em; }
-  .mark i { display: inline-block; width: 40px; height: 40px; border-radius: 50%; background: var(--purple); margin-right: 34px; vertical-align: 14px; box-shadow: 0 0 50px var(--purple); }
-  .tagline { position: absolute; left: 0; right: 0; text-align: center; font: 700 76px/1.1 system-ui; letter-spacing: -.03em; }
-  #intro .mark { top: 470px; }
-  #intro .tagline { top: 640px; }
-  #end .mark { top: 330px; }
-  #end .tagline { top: 488px; font-size: 64px; }
-  #end .url { position: absolute; top: 630px; left: 50%; transform: translateX(-50%); padding: 20px 44px; border-radius: 999px; white-space: nowrap;
-    border: 2px solid rgba(167, 139, 250, .6); background: rgba(15, 23, 48, .7); font: 600 38px var(--mono); color: var(--ink); }
-  #end .notice { position: absolute; left: 0; right: 0; top: 790px; font: 450 30px/1.5 system-ui; color: var(--muted); }
-
-  /* gap */
-  .node { top: 380px; width: 520px; height: 320px; padding: 44px 46px; }
-  .node .icon { width: 88px; height: 88px; margin-bottom: 30px; }
-  .node .name { font: 720 46px/1.15 system-ui; }
-  .node .desc { font: 450 31px/1.35 system-ui; color: var(--muted); margin-top: 12px; }
-  #gap .left { left: 190px; }
-  #gap .right { left: 1210px; }
-  #gap .broken { left: 730px; top: 500px; }
-  #gap .bridge { left: 710px; top: 450px; width: 500px; height: 200px; }
-  .rail { position: absolute; height: 8px; border-radius: 4px; }
-  .pulses { position: absolute; height: 20px; }
-  .pulses i { position: absolute; top: 0; width: 20px; height: 20px; margin-left: -10px; border-radius: 50%; }
-  #gap .hub { position: absolute; left: 175px; top: 25px; width: 150px; height: 150px; border-radius: 50%; display: grid; place-items: center;
-    background: radial-gradient(circle at 50% 40%, #2a2050, #151032); border: 3px solid var(--purple); box-shadow: 0 0 90px rgba(167, 139, 250, .5); color: var(--purple); }
-  #gap .hublabel { position: absolute; left: -40px; right: -40px; top: 196px; text-align: center; font: 700 34px system-ui; color: var(--purple); }
-
-  /* anywhere */
-  .panel { top: 270px; width: 520px; height: 560px; padding: 30px; }
-  #anywhere .p1 { left: 140px; } #anywhere .p2 { left: 700px; } #anywhere .p3 { left: 1260px; }
-  .scene-art { position: relative; height: 300px; border-radius: 22px; background: #0a1128; border: 1.5px solid #1c2747; overflow: hidden; }
-  .panel .label { display: flex; align-items: center; gap: 16px; margin-top: 30px; font: 720 42px/1.1 system-ui; }
-  .panel .label .icon { width: 58px; height: 58px; border-radius: 16px; }
-  .panel .desc { font: 450 29px/1.38 system-ui; color: var(--muted); margin-top: 14px; }
-  .chips { display: flex; gap: 10px; }
-  .chip { padding: 6px 16px; border-radius: 999px; font: 600 21px system-ui; color: var(--text); background: rgba(148, 163, 184, .1); border: 1px solid rgba(148, 163, 184, .2); }
-  /* car display */
-  .dash { position: absolute; left: 24px; right: 24px; top: 26px; height: 196px; border-radius: 22px; background: #050914; border: 3px solid #26314f; display: flex; }
-  .dash .side { width: 70px; border-right: 1.5px solid #1c2747; display: grid; align-content: center; gap: 14px; justify-items: center; }
-  .dash .side i { width: 34px; height: 34px; border-radius: 10px; background: #1b2546; }
-  .dash .side i:nth-child(2) { background: rgba(251, 146, 60, .35); }
-  .dash .main { flex: 1; position: relative; }
-  .dash .orb { position: absolute; left: 34px; top: 50px; width: 92px; height: 92px; border-radius: 50%; background: radial-gradient(circle at 40% 35%, #fdba74, #ea580c 70%); box-shadow: 0 0 40px rgba(251, 146, 60, .55); }
-  .wheel { position: absolute; left: 50%; top: 236px; width: 380px; height: 380px; margin-left: -190px; border-radius: 50%; border: 18px solid #1c2747; }
-  /* desk */
-  .monitor { position: absolute; left: 34px; right: 34px; top: 22px; height: 200px; border-radius: 16px; background: #050914; border: 3px solid #26314f; overflow: hidden; }
-  .monitor .bar { height: 26px; background: #111a33; display: flex; gap: 8px; align-items: center; padding-left: 12px; }
-  .monitor .bar i { width: 10px; height: 10px; border-radius: 50%; background: #334155; }
-  .code { padding: 14px 18px; display: grid; gap: 10px; }
-  .code i { display: block; height: 10px; border-radius: 5px; }
-  .voicepill { position: absolute; right: 14px; bottom: 14px; display: flex; align-items: center; gap: 12px; padding: 10px 16px; border-radius: 999px;
-    background: rgba(251, 146, 60, .14); border: 1.5px solid rgba(251, 146, 60, .6); font: 600 18px system-ui; color: #fed7aa; }
-  .stand { position: absolute; left: 50%; top: 222px; width: 70px; height: 22px; margin-left: -35px; background: #1c2747; }
-  .keyboard { position: absolute; left: 70px; top: 248px; width: 270px; height: 40px; border-radius: 8px; background: #141d38; border: 1.5px solid #26314f;
-    background-image: radial-gradient(#334155 3px, transparent 3.5px); background-size: 18px 13px; background-position: 6px 6px; }
-  .mouse { position: absolute; left: 372px; top: 244px; width: 30px; height: 46px; border-radius: 15px; background: #141d38; border: 1.5px solid #3b4a6b; }
-  .cursor { position: absolute; width: 28px; height: 34px; }
-  /* phone */
-  .phone { position: absolute; left: 50%; top: 22px; width: 170px; height: 330px; margin-left: -85px; border-radius: 30px; background: #050914; border: 4px solid #2b3858; }
-  .phone .notch { position: absolute; left: 50%; top: 10px; width: 54px; height: 14px; margin-left: -27px; border-radius: 99px; background: #1b2546; }
-  .phone .orb { position: absolute; left: 50%; top: 62px; width: 74px; height: 74px; margin-left: -37px; border-radius: 50%; background: radial-gradient(circle at 40% 35%, #fdba74, #ea580c 70%); box-shadow: 0 0 36px rgba(251, 146, 60, .55); }
-  .bubble-sm { position: absolute; left: 14px; right: 14px; top: 196px; padding: 10px 12px; border-radius: 14px; background: rgba(251, 146, 60, .12); border: 1px solid rgba(251, 146, 60, .4); font: 500 15px/1.3 system-ui; color: #fed7aa; text-align: center; }
-  .trees { position: absolute; bottom: 0; left: 0; right: 0; height: 90px; }
-
-  /* dialog */
-  #dialog .talk { position: absolute; left: 112px; top: 200px; width: 900px; }
-  .bubble { display: flex; gap: 22px; align-items: flex-start; margin-bottom: 30px; }
-  .bubble .who { flex: none; width: 96px; height: 76px; border-radius: 38px; display: grid; place-items: center; font: 700 22px system-ui; }
-  .bubble .says { padding: 22px 30px; border-radius: 26px; font: 500 36px/1.35 system-ui; background: #18223f; border: 1px solid #26314f; }
-  .bubble.you .who { background: #2b3650; color: #e2e8f0; }
-  .bubble.claude .who { background: rgba(251, 146, 60, .16); color: var(--orange); border: 2px solid rgba(251, 146, 60, .6); }
-  .bubble.claude .says { background: rgba(251, 146, 60, .09); border-color: rgba(251, 146, 60, .38); }
-  #dialog .term { left: 1070px; top: 210px; width: 740px; height: 440px; padding: 0; border-color: rgba(96, 165, 250, .5); background: #070d1f; overflow: hidden; }
-  .term .head { display: flex; align-items: center; gap: 16px; padding: 22px 30px; border-bottom: 1.5px solid #1c2747; font: 700 28px system-ui; color: var(--blue); }
-  .term .head .state { margin-left: auto; font: 600 22px system-ui; padding: 6px 16px; border-radius: 999px; }
-  .term .body { padding: 26px 30px; font: 500 27px/1.85 var(--mono); color: #cbd5e1; }
-  .term .p { color: #64748b; }
-  .ok { color: var(--green); }
-  .hl { color: var(--ink); }
-
-  /* layers */
-  .layer { top: 290px; width: 440px; height: 480px; padding: 38px 40px; }
-  #layers .c1 { left: 130px; } #layers .c2 { left: 740px; } #layers .c3 { left: 1350px; }
-  .layer .top { display: flex; align-items: center; gap: 20px; }
-  .layer .icon { width: 84px; height: 84px; }
-  .layer .kicker { font: 700 20px var(--mono); letter-spacing: .08em; text-transform: uppercase; }
-  .layer .name { font: 740 42px/1.1 system-ui; margin-top: 4px; }
-  .layer .where { font: 500 25px system-ui; color: var(--muted); margin-top: 22px; }
-  .layer ul { list-style: none; margin-top: 22px; display: grid; gap: 16px; }
-  .layer li { display: flex; gap: 14px; font: 500 28px/1.3 system-ui; color: var(--text); }
-  .layer li::before { content: ""; flex: none; width: 10px; height: 10px; border-radius: 50%; margin-top: 13px; background: currentColor; opacity: .9; }
-  .layer.orange li::before { background: var(--orange); }
-  .layer.purple li::before { background: var(--purple); }
-  .layer.blue li::before { background: var(--blue); }
-  .layer .workers { display: flex; gap: 10px; margin-top: 28px; }
-  .layer .workers span { padding: 6px 14px; border-radius: 10px; font: 600 20px var(--mono); color: #bfdbfe; background: rgba(96, 165, 250, .12); border: 1px solid rgba(96, 165, 250, .35); }
-  .link { position: absolute; top: 340px; width: 170px; height: 80px; }
-  .link .rail { left: 0; right: 0; height: 4px; opacity: .55; }
-  .link .lbl { position: absolute; left: 0; right: 0; text-align: center; font: 600 18px var(--mono); color: var(--muted); }
-  #layers .l1 { left: 570px; } #layers .l2 { left: 1180px; }
-
-  /* parallel */
-  #parallel .board { left: 150px; top: 270px; width: 1620px; height: 560px; padding: 26px 40px; }
-  .board .bhead { display: flex; align-items: center; gap: 18px; padding-bottom: 18px; border-bottom: 1.5px solid #1c2747; font: 700 28px system-ui; color: var(--text); }
-  .board .bhead .stat { margin-left: auto; display: flex; gap: 14px; }
-  .board .bhead .stat span { padding: 6px 16px; border-radius: 999px; font: 600 22px system-ui; background: rgba(148, 163, 184, .1); }
-  .lane { display: grid; grid-template-columns: 70px 380px 400px 1fr 200px; align-items: center; gap: 22px; height: 92px; border-bottom: 1px solid #172142; }
-  .lane .icon { width: 60px; height: 60px; border-radius: 16px; }
-  .lane .who { font: 700 30px system-ui; }
-  .lane .who small { display: block; font: 500 21px system-ui; color: var(--muted); margin-top: 3px; }
-  .lane .task { font: 500 27px system-ui; color: var(--text); }
-  .lane .track { height: 14px; border-radius: 7px; background: #172142; overflow: hidden; }
-  .lane .fill { height: 100%; width: 0; border-radius: 7px; }
-  .lane .status { font: 600 23px system-ui; color: var(--muted); text-align: right; white-space: nowrap; }
-  .lane .status.done { color: var(--green); }
-
-  /* back */
-  #back .phonebig { left: 220px; top: 160px; width: 380px; height: 690px; border-radius: 56px; background: #050914; border: 6px solid #2b3858; box-shadow: 0 40px 120px rgba(0, 0, 0, .5); }
-  #back .phonebig .notch { position: absolute; left: 50%; top: 18px; width: 110px; height: 30px; margin-left: -55px; border-radius: 99px; background: #141d38; }
-  #back .phonebig .orb { position: absolute; left: 50%; top: 150px; width: 170px; height: 170px; margin-left: -85px; border-radius: 50%; background: radial-gradient(circle at 40% 35%, #fdba74, #ea580c 70%); box-shadow: 0 0 80px rgba(251, 146, 60, .5); }
-  #back .phonebig .said { position: absolute; left: 30px; right: 30px; top: 470px; font: 500 27px/1.4 system-ui; color: #fed7aa; text-align: center; }
-  #back .phonebig .mode { position: absolute; left: 0; right: 0; top: 80px; text-align: center; font: 600 20px system-ui; color: var(--muted); letter-spacing: .06em; text-transform: uppercase; }
-  #back h2.title { left: 700px; right: 120px; text-align: left; top: 175px; font-size: 64px; }
-  .note { position: absolute; left: 700px; width: 1100px; display: flex; gap: 26px; align-items: flex-start; padding: 26px 32px; border-radius: 26px;
-    background: linear-gradient(180deg, var(--card2), var(--card)); border: 2px solid var(--line); }
-  .note .icon { flex: none; width: 70px; height: 70px; border-radius: 18px; }
-  .note .src { font: 600 23px system-ui; color: var(--muted); }
-  .note .msg { font: 600 32px/1.3 system-ui; margin-top: 6px; }
-  .note.orange { border-color: rgba(251, 146, 60, .5); }
-  .note.tg { border-color: rgba(56, 189, 248, .5); }
-  .note.green { border-color: rgba(74, 222, 128, .45); }
-  .note.purple { border-color: rgba(167, 139, 250, .55); }
-
-  /* safe */
-  #safe h2.title { left: 150px; right: auto; text-align: left; top: 160px; }
-  .rule { position: absolute; left: 150px; width: 960px; display: flex; gap: 26px; align-items: center; font: 600 34px/1.25 system-ui; }
-  .rule .icon { flex: none; width: 70px; height: 70px; border-radius: 18px; }
-  #safe .stop { left: 1210px; top: 250px; width: 560px; height: 560px; padding: 0; border-color: rgba(248, 113, 113, .55); box-shadow: 0 0 120px rgba(248, 113, 113, .16); }
-  .stop .btn { position: absolute; left: 50%; top: 70px; width: 250px; height: 250px; margin-left: -125px; border-radius: 50%; display: grid; place-items: center;
-    background: radial-gradient(circle at 45% 38%, #fca5a5, #dc2626 62%, #991b1b); border: 8px solid #3f1d2b; box-shadow: 0 18px 60px rgba(220, 38, 38, .45); font: 800 52px system-ui; letter-spacing: .04em; color: #fff; }
-  .stop .ring { position: absolute; left: 50%; top: 195px; width: 250px; height: 250px; margin: -125px 0 0 -125px; border-radius: 50%; border: 4px solid var(--red); }
-  .stop .t { position: absolute; left: 0; right: 0; top: 360px; text-align: center; font: 740 46px system-ui; }
-  .stop .d { position: absolute; left: 40px; right: 40px; top: 430px; text-align: center; font: 450 29px/1.4 system-ui; color: var(--muted); }
-
-  .play { position: absolute; left: 50%; top: 890px; width: 150px; height: 150px; margin: -75px 0 0 -75px; border-radius: 50%; display: none; place-items: center;
-    background: rgba(2, 6, 23, .6); border: 4px solid rgba(248, 250, 252, .85); box-shadow: 0 0 120px rgba(167, 139, 250, .45); }
-  .play svg { margin-left: 12px; }
+  /* safe: the rules, and the STOP sign */
+  .rule { position: absolute; left: 112px; width: 1060px; display: flex; gap: 28px; align-items: center; font: 600 38px/1.2 var(--text); }
+  .rule .pict { width: 76px; height: 76px; border-radius: 9px; --edge: 4px; --stroke: 2.5px; }
+  .stopcol { position: absolute; left: 1250px; top: 270px; width: 560px; text-align: center; }
+  .stopcol svg { width: 330px; height: 330px; margin: 0 auto; display: block; }
+  .stopcol .say { margin-top: 36px; font-size: 64px; color: var(--red); }
+  .stopcol p:not(.say) { margin-top: 14px; font: 400 31px/1.4 var(--text); color: var(--muted); }
 </style>
 </head>
 <body>
 
-<div id="bg">
-  <div class="blob b1" id="b1"></div><div class="blob b2" id="b2"></div><div class="blob b3" id="b3"></div>
-  <div class="dots"></div>
-</div>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-ahead" viewBox="0 0 80 100"><path d="M40 0l38 42H54v58H26V42H2z"/></symbol>
+  <symbol id="i-exit" viewBox="0 0 100 100"><path d="M30 6h64v64L72 48 26 94 6 74l46-46z"/></symbol>
+</svg>
 
 <section id="intro"><div class="stage">
-  <div class="wave" data-n="56" data-gap="10" data-bw="12" style="left:360px;top:200px;width:1200px;height:230px"></div>
-  <div class="mark" data-in="0" data-fx="up"><i></i>cc-voice-gateway</div>
-  <div class="tagline" data-in="1" data-fx="up">Claude Code, <span class="grad">by voice.</span></div>
+  <div class="posts" data-in="0" data-fx="fade"><i></i><i></i></div>
+  <div class="sign hero abs" data-in="0" data-fx="near">
+    <div class="shield" id="shield">cc-voice-gateway</div>
+    <svg class="arrow" data-in="1" data-fx="fade" viewBox="0 0 80 100"><use href="#i-ahead"/></svg>
+    <h1 data-in="1" data-d=".2" data-fx="up">Claude Code,<br>by voice.</h1>
+    <ul class="dest" data-in="1" data-d="40%" data-fx="fade">
+      <li><span data-icon="car" data-size="44" data-stroke="2.1"></span>CarPlay or Android Auto</li>
+      <li><span data-icon="monitor" data-size="44" data-stroke="2.1"></span>At the desk</li>
+      <li><span data-icon="phone" data-size="44" data-stroke="2.1"></span>On the phone</li>
+      <li><span data-icon="globe" data-size="44" data-stroke="2.1"></span>Any language</li>
+    </ul>
+  </div>
 </div></section>
 
 <section id="gap"><div class="stage">
-  <div class="brand"><i></i>cc-voice-gateway</div>
+  <div class="sign brand">cc-voice-gateway</div>
   <h2 class="title" data-in="0" data-out="2">Voice mode can talk. Claude Code can work.</h2>
-  <h2 class="title" data-in="2" data-d=".25">The gateway <span class="grad">connects the two.</span></h2>
-  <div class="card node orange left" data-in="0" data-fx="left">
-    <div class="icon orange" data-icon="wave" data-size="46"></div>
-    <div class="name">Claude voice mode</div>
-    <div class="desc">Talks with you, in any language, in the Claude app</div>
-  </div>
-  <svg class="abs broken" data-in="1" data-d="40%" data-out="2" width="460" height="120" viewBox="0 0 460 120">
-    <line x1="10" y1="60" x2="175" y2="60" stroke="#475569" stroke-width="6" stroke-dasharray="16 14" stroke-linecap="round"/>
-    <line x1="285" y1="60" x2="450" y2="60" stroke="#475569" stroke-width="6" stroke-dasharray="16 14" stroke-linecap="round"/>
-    <circle cx="230" cy="60" r="44" fill="rgba(248,113,113,.14)" stroke="#f87171" stroke-width="4"/>
-    <path d="M212 42 L248 78 M248 42 L212 78" stroke="#f87171" stroke-width="8" stroke-linecap="round"/>
+  <h2 class="title" data-in="2" data-d=".25">The gateway connects the two.</h2>
+  <div class="route" data-in="0" data-d=".2" data-fx="wipe" data-dur=".8" style="left:330px;width:470px"></div>
+  <div class="route" data-in="1" data-fx="wipel" data-dur=".8" style="left:1120px;width:470px"></div>
+  <div class="route" data-in="2" data-fx="wipe" data-dur=".7" style="left:780px;width:360px"></div>
+  <div class="stopdot" data-in="0" data-fx="pop" style="left:330px"></div>
+  <div class="stoplabel" data-in="0" data-d=".3" style="left:330px"><b>Claude voice mode</b><small>talks with you, in any language</small></div>
+  <div class="stopdot" data-in="1" data-fx="pop" style="left:1590px"></div>
+  <div class="stoplabel" data-in="1" data-d=".2" style="left:1590px"><b>Claude Code</b><small>does the work, on your computer</small></div>
+  <svg class="abs barrier" data-in="1" data-d="40%" data-fx="pop" data-out="2" width="300" height="170" viewBox="0 0 300 170">
+    <defs><pattern id="stripes" width="44" height="44" patternUnits="userSpaceOnUse" patternTransform="rotate(40)"><rect width="22" height="44" fill="#c8102e"/><rect x="22" width="22" height="44" fill="#fff"/></pattern></defs>
+    <rect x="34" y="40" width="14" height="130" fill="#8d9499"/><rect x="252" y="40" width="14" height="130" fill="#8d9499"/>
+    <rect x="145" y="30" width="10" height="24" fill="#25292c"/>
+    <rect x="6" y="52" width="288" height="62" rx="5" fill="url(#stripes)" stroke="#25292c" stroke-width="4"/>
+    <circle id="lamp" cx="150" cy="22" r="17" fill="#f4b400" stroke="#25292c" stroke-width="4"/>
   </svg>
-  <div class="bridge abs" data-in="2" data-fx="fade">
-    <div class="rail" data-in="2" data-fx="wipe" data-dur=".8" style="left:0;width:500px;top:96px;background:linear-gradient(90deg,var(--orange),var(--purple),var(--blue))"></div>
-    <div class="pulses" data-speed=".45" data-n="3" data-color="#fde68a" style="left:0;width:500px;top:90px"></div>
-    <div class="hub" data-in="2" data-d=".3" data-fx="pop"><span data-icon="gateway" data-size="70" data-stroke="2.4"></span></div>
-    <div class="hublabel" data-in="2" data-d=".6">cc-voice-gateway</div>
-  </div>
-  <div class="card node blue right" data-in="1" data-fx="right">
-    <div class="icon blue" data-icon="terminal" data-size="46"></div>
-    <div class="name">Claude Code</div>
-    <div class="desc">Works in your repositories, on your own computer</div>
-  </div>
+  <div class="stopdot via" data-in="2" data-d=".3" data-fx="pop" style="left:960px"></div>
+  <div class="row-center via-sign"><div class="sign" data-in="2" data-d=".35" data-fx="pop"><b>cc-voice-gateway</b><small>the bridge, a custom connector</small></div></div>
 </div></section>
 
 <section id="anywhere"><div class="stage">
-  <div class="brand"><i></i>cc-voice-gateway</div>
-  <div class="chapter"><b style="background:var(--orange)">01</b>Voice control</div>
-  <h2 class="title" data-in="0" style="top:140px">Talk to Claude Code, <span class="grad">wherever you are.</span></h2>
-  <div class="card panel p1" data-in="0" data-d=".2">
-    <div class="scene-art">
-      <div class="wheel"></div>
-      <div class="dash"><div class="side"><i></i><i></i><i></i></div>
-        <div class="main"><div class="orb" data-orb="1"></div>
-          <div class="wave" data-n="14" data-gap="6" data-bw="8" data-color="#fb923c" style="left:146px;top:46px;width:190px;height:100px"></div></div></div>
-    </div>
-    <div class="label"><span class="icon orange" data-icon="car" data-size="32"></span>In the car</div>
-    <div class="desc">With CarPlay or Android Auto.<br>Your eyes stay on the road.</div>
+  <div class="sign brand">cc-voice-gateway</div>
+  <div class="sign chapter">Voice control</div>
+  <h2 class="title" data-in="0">Talk instead of type. Wherever you are.</h2>
+  <div class="case" data-in="0" data-d=".3" style="left:112px">
+    <span class="sign blue pict"><span data-icon="car" data-size="86" data-stroke="1.9"></span></span>
+    <h3>In the car</h3>
+    <p>With CarPlay or Android Auto.<br>Your eyes stay on the road.</p>
+    <p class="say" data-in="0" data-d="55%" data-fx="fade">“Why did the build fail on main? Fix it and open a pull request.”</p>
   </div>
-  <div class="card panel p2" data-in="1" data-d=".1">
-    <div class="scene-art">
-      <div class="monitor"><div class="bar"><i></i><i></i><i></i></div>
-        <div class="code">
-          <i style="width:62%;background:#3b4a6b"></i><i style="width:44%;margin-left:28px;background:#60a5fa;opacity:.55"></i>
-          <i style="width:70%;margin-left:28px;background:#3b4a6b"></i><i style="width:38%;margin-left:56px;background:#a78bfa;opacity:.55"></i>
-          <i style="width:52%;margin-left:28px;background:#3b4a6b"></i><i style="width:30%;background:#4ade80;opacity:.45"></i>
-        </div>
-        <div class="voicepill"><span data-icon="mic" data-size="20"></span>Voice
-          <div class="wave" data-n="9" data-gap="4" data-bw="5" data-color="#fb923c" style="position:relative;width:80px;height:28px"></div></div>
-      </div>
-      <div class="stand"></div><div class="keyboard"></div><div class="mouse"></div>
-      <svg class="cursor" id="cursor" viewBox="0 0 28 34"><path d="M3 2 L3 27 L9.5 21 L14 31 L18.5 29 L14 19.5 L23 19.5 Z" fill="#f8fafc" stroke="#0b1020" stroke-width="2" stroke-linejoin="round"/></svg>
-    </div>
-    <div class="label"><span class="icon purple" data-icon="monitor" data-size="32"></span>At your desk</div>
-    <div class="desc">Voice runs alongside.<br>Mouse and keyboard stay yours.</div>
+  <div class="case" data-in="1" data-d=".1" style="left:700px">
+    <span class="sign blue pict"><span data-icon="monitor" data-size="86" data-stroke="1.9"></span></span>
+    <h3>At your desk</h3>
+    <p>Voice runs alongside.<br>Mouse and keyboard stay yours.</p>
+    <p class="say" data-in="1" data-d="50%" data-fx="fade">“Tell the alpha worker to update the changelog.”</p>
   </div>
-  <div class="card panel p3" data-in="2" data-d=".1">
-    <div class="scene-art">
-      <svg class="trees" viewBox="0 0 460 90" preserveAspectRatio="none"><path d="M0 70 Q 115 40 230 62 T 460 55 V90 H0Z" fill="#101a35"/><path d="M0 82 Q 140 62 260 78 T 460 74 V90 H0Z" fill="#141f3f"/></svg>
-      <div class="phone"><div class="notch"></div><div class="orb" data-orb="1"></div>
-        <div class="wave" data-n="12" data-gap="4" data-bw="6" data-color="#fb923c" style="left:20px;top:146px;width:122px;height:40px"></div>
-        <div class="bubble-sm">Pull request 12 is open.</div></div>
-    </div>
-    <div class="label"><span class="icon blue" data-icon="phone" data-size="32"></span>On the go</div>
-    <div class="desc">On a walk, at the gym,<br>between two meetings.</div>
+  <div class="case" data-in="2" data-d=".1" style="left:1288px">
+    <span class="sign blue pict"><span data-icon="phone" data-size="86" data-stroke="1.9"></span></span>
+    <h3>On the go</h3>
+    <p>On a walk, at the gym,<br>between two meetings.</p>
+    <p class="say" data-in="2" data-d="45%" data-fx="fade">“In a new work folder: compare the three phone plans.”</p>
   </div>
 </div></section>
 
 <section id="dialog"><div class="stage">
-  <div class="brand"><i></i>cc-voice-gateway</div>
-  <div class="chapter"><b style="background:var(--orange)">01</b>Voice control</div>
+  <div class="sign brand">cc-voice-gateway</div>
+  <div class="sign chapter">Voice control</div>
   <div class="talk">
-    <div class="bubble you" data-in="0" data-fx="left"><div class="who">You</div><div class="says">Why did the build fail on main?</div></div>
-    <div class="bubble claude" data-in="0" data-d="62%" data-fx="left"><div class="who">Claude</div><div class="says">A date test assumes UTC.<br>Shall I fix it?</div></div>
-    <div class="bubble you" data-in="1" data-fx="left"><div class="who">You</div><div class="says">Yes. Fix it and run the tests.</div></div>
-    <div class="bubble claude" data-in="2" data-d="55%" data-fx="left"><div class="who">Claude</div><div class="says">Pull request 12 is open.<br>All 128 tests pass.</div></div>
+    <div data-in="0" data-fx="left"><span class="who">You</span><p class="say">“Why did the build fail on main?”</p></div>
+    <div data-in="0" data-d="62%" data-fx="left"><span class="who">Claude</span><p class="ans">A date test assumes UTC.<br>Shall I fix it?</p></div>
+    <div data-in="1" data-fx="left"><span class="who">You</span><p class="say">“Yes. Fix it and run the tests.”</p></div>
+    <div data-in="2" data-d="55%" data-fx="left"><span class="who">Claude</span><p class="ans">Pull request 12 is open.<br>All 128 tests pass.</p></div>
   </div>
-  <div class="card term" data-in="1" data-d="20%" data-fx="right">
-    <div class="head"><span data-icon="terminal" data-size="30"></span>Worker · alpha
-      <span class="state" id="termstate" style="background:rgba(96,165,250,.14);color:#93c5fd">running</span></div>
+  <div class="screen term abs" data-in="1" data-d="20%" data-fx="right">
+    <div class="head"><span data-icon="terminal" data-size="32"></span>Worker, alpha
+      <span class="state" id="termstate">running</span></div>
     <div class="body">
       <div data-in="1" data-d="35%" data-fx="fade" data-dur=".15"><span class="p">$ </span><span data-in="1" data-d="35%" data-fx="type">git switch -c voice/fix-date-test</span></div>
       <div data-in="1" data-d="58%" data-fx="fade"><span class="p">✎ </span>test/dates.test.mjs</div>
@@ -338,149 +279,157 @@
 </div></section>
 
 <section id="layers"><div class="stage">
-  <div class="brand"><i></i>cc-voice-gateway</div>
-  <div class="chapter"><b style="background:var(--purple)">02</b>Orchestration</div>
-  <h2 class="title" data-in="0" style="top:140px">Three layers of AI. <span class="grad">One conversation.</span></h2>
-  <div class="card layer orange c1" data-in="1" data-fx="up">
-    <div class="top"><span class="icon orange" data-icon="wave" data-size="42"></span><div><div class="kicker" style="color:var(--orange)">Layer 1</div><div class="name">Voice AI</div></div></div>
-    <div class="where">Claude voice mode, in the Claude app</div>
-    <ul><li>Listens, in any language</li><li>Passes on your request</li><li>Reads the answer aloud</li></ul>
+  <div class="sign brand">cc-voice-gateway</div>
+  <div class="sign chapter">Three layers of AI</div>
+  <h2 class="title" data-in="0">Three layers of AI. One conversation.</h2>
+  <article class="layer" data-in="1" data-fx="up" style="left:112px">
+    <div class="n">1</div>
+    <h3>Voice AI</h3>
+    <p class="where">Claude voice mode, in the Claude app</p>
+    <ul class="dashes"><li>Listens, in any language</li><li>Passes on your request</li><li>Reads the answer aloud</li></ul>
+  </article>
+  <div class="hop" data-in="2" data-fx="fade" style="left:552px">
+    <div class="lbl" style="top:14px">request <span data-icon="right" data-size="26" data-stroke="2.6"></span></div>
+    <div class="road" data-in="2" data-fx="wipe" data-dur=".6"></div>
+    <div class="lbl" style="top:122px"><span data-icon="left" data-size="26" data-stroke="2.6"></span> answer</div>
   </div>
-  <div class="link l1" data-in="2" data-fx="fade">
-    <div class="lbl" style="top:-6px">request</div>
-    <div class="rail" style="top:30px;background:var(--orange)"></div>
-    <div class="pulses" data-speed=".55" data-n="2" data-color="#fdba74" style="left:0;width:170px;top:22px"></div>
-    <div class="rail" style="top:58px;background:var(--purple)"></div>
-    <div class="pulses" data-speed=".42" data-n="2" data-dir="-1" data-color="#c4b5fd" style="left:0;width:170px;top:50px"></div>
-    <div class="lbl" style="top:78px">answer</div>
+  <article class="layer" data-in="2" data-d=".15" data-fx="up" style="left:740px">
+    <div class="n">2</div>
+    <h3>Controller</h3>
+    <p class="where">Claude Code, on your computer</p>
+    <ul class="dashes"><li>Keeps the context</li><li>Dispatches and steers the workers</li><li>Sums up their results</li></ul>
+  </article>
+  <div class="hop" data-in="3" data-fx="fade" style="left:1180px">
+    <div class="lbl" style="top:14px">task <span data-icon="right" data-size="26" data-stroke="2.6"></span></div>
+    <div class="road" data-in="3" data-fx="wipe" data-dur=".6"></div>
+    <div class="lbl" style="top:122px"><span data-icon="left" data-size="26" data-stroke="2.6"></span> result</div>
   </div>
-  <div class="card layer purple c2" data-in="2" data-fx="up">
-    <div class="top"><span class="icon purple" data-icon="cpu" data-size="42"></span><div><div class="kicker" style="color:var(--purple)">Layer 2</div><div class="name">Controller</div></div></div>
-    <div class="where">Claude Code, on your computer</div>
-    <ul><li>Keeps the context</li><li>Dispatches and steers the workers</li><li>Sums up their results</li></ul>
-  </div>
-  <div class="link l2" data-in="3" data-fx="fade">
-    <div class="lbl" style="top:-6px">task</div>
-    <div class="rail" style="top:30px;background:var(--purple)"></div>
-    <div class="pulses" data-speed=".55" data-n="2" data-color="#c4b5fd" style="left:0;width:170px;top:22px"></div>
-    <div class="rail" style="top:58px;background:var(--blue)"></div>
-    <div class="pulses" data-speed=".42" data-n="2" data-dir="-1" data-color="#93c5fd" style="left:0;width:170px;top:50px"></div>
-    <div class="lbl" style="top:78px">result</div>
-  </div>
-  <div class="card layer blue c3" data-in="3" data-fx="up">
-    <div class="top"><span class="icon blue" data-icon="terminal" data-size="42"></span><div><div class="kicker" style="color:var(--blue)">Layer 3</div><div class="name">Workers</div></div></div>
-    <div class="where">Claude Code runs, in your repositories</div>
-    <ul><li>Change code, run the tests</li><li>Commit and open pull requests</li><li>Report back when done</li></ul>
-    <div class="workers"><span>alpha</span><span>beta</span><span>work folder</span></div>
-  </div>
+  <article class="layer" data-in="3" data-d=".15" data-fx="up" style="left:1368px">
+    <div class="n">3</div>
+    <h3>Workers</h3>
+    <p class="where">Claude Code runs, in your repositories</p>
+    <ul class="dashes"><li>Change code, run the tests</li><li>Commit and open pull requests</li><li>Report back when done</li></ul>
+  </article>
 </div></section>
 
 <section id="parallel"><div class="stage">
-  <div class="brand"><i></i>cc-voice-gateway</div>
-  <div class="chapter"><b style="background:var(--blue)">03</b>Parallel workers</div>
-  <h2 class="title" data-in="0" style="top:140px">Several workers. <span class="grad">At the same time.</span></h2>
-  <div class="card board" data-in="0" data-d=".3">
-    <div class="bhead"><span data-icon="terminal" data-size="30" style="color:var(--blue)"></span>Workers
-      <div class="stat"><span id="runs" style="color:#93c5fd">1 running</span><span id="queued" style="color:#fcd34d">0 queued</span></div></div>
-    <div class="lane" data-lane="0" data-in="0" data-d=".6" data-len="7.5">
-      <span class="icon blue" data-icon="branch" data-size="30"></span>
-      <div class="who">alpha<small>repository · this computer</small></div>
+  <div class="sign brand">cc-voice-gateway</div>
+  <div class="sign chapter">Parallel workers</div>
+  <h2 class="title" data-in="0">Several workers. At the same time.</h2>
+  <div class="screen board abs" data-in="0" data-d=".3">
+    <div class="bhead">Workers <span id="count">1 running</span></div>
+    <div class="lane" data-in="0" data-d=".6" data-len="10">
+      <span class="sign blue pict"><span data-icon="branch" data-size="32"></span></span>
+      <div class="who">alpha<small>a repository</small></div>
       <div class="task">Fix the date test</div>
-      <div class="track"><div class="fill" style="background:var(--blue)"></div></div>
-      <div class="status" data-done="PR #12 ✓">running</div>
+      <div class="track"><div class="fill"></div></div>
+      <div class="status" data-done="PR #12 open">running</div>
     </div>
-    <div class="lane" data-lane="1" data-in="1" data-d="15%" data-len="8">
-      <span class="icon purple" data-icon="branch" data-size="30"></span>
-      <div class="who">alpha · 2<small>its own git worktree</small></div>
+    <div class="lane" data-in="1" data-d="15%" data-len="24">
+      <span class="sign blue pict"><span data-icon="branch" data-size="32"></span></span>
+      <div class="who">alpha, worktree 2<small>its own git worktree</small></div>
       <div class="task">Update the changelog</div>
-      <div class="track"><div class="fill" style="background:var(--purple)"></div></div>
-      <div class="status" data-done="PR #13 ✓">running</div>
+      <div class="track"><div class="fill"></div></div>
+      <div class="status" data-done="PR #13 open">running</div>
     </div>
-    <div class="lane" data-lane="2" data-in="1" data-d="55%" data-len="9">
-      <span class="icon blue" data-icon="branch" data-size="30"></span>
-      <div class="who">beta<small>repository · this computer</small></div>
+    <div class="lane" data-in="1" data-d="55%" data-len="34">
+      <span class="sign blue pict"><span data-icon="branch" data-size="32"></span></span>
+      <div class="who">beta<small>another repository</small></div>
       <div class="task">Add the API docs</div>
-      <div class="track"><div class="fill" style="background:var(--blue)"></div></div>
-      <div class="status" data-done="PR #4 ✓">running</div>
+      <div class="track"><div class="fill"></div></div>
+      <div class="status" data-done="PR #4 open">running</div>
     </div>
-    <div class="lane" data-lane="3" data-in="2" data-d="10%" data-len="6.5">
-      <span class="icon amber" data-icon="folder" data-size="30"></span>
+    <div class="lane" data-in="2" data-d="10%" data-len="13">
+      <span class="sign blue pict"><span data-icon="folder" data-size="32"></span></span>
       <div class="who">work folder<small>no repository</small></div>
       <div class="task">Compare three phone plans</div>
-      <div class="track"><div class="fill" style="background:var(--amber)"></div></div>
-      <div class="status" data-done="table ready ✓">running</div>
+      <div class="track"><div class="fill"></div></div>
+      <div class="status" data-done="table ready">running</div>
     </div>
-    <div class="lane" data-lane="4" data-in="3" data-d="5%" data-len="20" style="border-bottom:0">
-      <span class="icon green" data-icon="box" data-size="30"></span>
-      <div class="who">gamma<small>Docker container · level pr</small></div>
+    <div class="lane" data-in="3" data-d="5%" data-len="22">
+      <span class="sign blue pict"><span data-icon="box" data-size="32"></span></span>
+      <div class="who">gamma, in Docker<small>a container of its own</small></div>
       <div class="task">Upgrade the dependencies</div>
-      <div class="track"><div class="fill" style="background:var(--green)"></div></div>
-      <div class="status" data-done="PR #31 ✓">running</div>
+      <div class="track"><div class="fill"></div></div>
+      <div class="status" data-done="PR #31 open">running</div>
+    </div>
+    <div class="lane wait" data-in="3" data-d="50%" data-queued="1">
+      <span class="sign plain pict" style="--plate:#2c3337;--line:#8f9893;color:#b9c1bb"><span data-icon="clock" data-size="32"></span></span>
+      <div class="who">queued<small>after the changelog</small></div>
+      <div class="task">Write the release notes</div>
+      <div></div>
+      <div class="status">waiting</div>
     </div>
   </div>
 </div></section>
 
 <section id="back"><div class="stage">
-  <div class="brand"><i></i>cc-voice-gateway</div>
-  <div class="chapter"><b style="background:var(--green)">04</b>It comes back to you</div>
-  <div class="card phonebig" data-in="0" data-fx="left">
-    <div class="notch"></div><div class="mode">Voice mode</div>
-    <div class="orb" data-orb="1"></div>
-    <div class="wave" data-n="20" data-gap="6" data-bw="8" data-color="#fb923c" style="left:40px;top:350px;width:288px;height:80px"></div>
-    <div class="said" data-in="0" data-d="30%" data-fx="fade">“News from alpha: pull request 12 passed all checks.”</div>
+  <div class="sign brand">cc-voice-gateway</div>
+  <div class="sign chapter">It comes back to you</div>
+  <div class="screen phone abs" data-in="0" data-fx="left">
+    <div class="inner">
+      <div class="notch"></div>
+      <div class="mode">Voice mode</div>
+      <div class="wave" data-n="13" data-gap="12" data-bw="12" data-color="#f2f3ef" style="left:40px;right:40px;top:200px;height:190px"></div>
+      <div class="said" data-in="0" data-d="30%" data-fx="fade">“News from alpha: pull request 12 passed all checks.”</div>
+    </div>
   </div>
-  <h2 class="title" data-in="0">Nothing gets lost <span class="grad">after you hang up.</span></h2>
-  <div class="note orange" style="top:320px" data-in="0" data-d="45%" data-fx="right">
-    <span class="icon orange" data-icon="speaker" data-size="36"></span>
-    <div><div class="src">Spoken news · in your next answer</div><div class="msg">alpha: pull request 12 is open. All checks passed.</div></div>
+  <h2 class="title" data-in="0">Nothing gets lost after you hang up.</h2>
+  <div class="feed" style="top:304px;width:1208px" data-in="0" data-d="45%" data-fx="right">
+    <span class="sign blue pict"><span data-icon="speaker" data-size="40"></span></span>
+    <div><b>Spoken news, in your next answer</b><span>alpha: pull request 12 is open. All checks passed.</span></div>
   </div>
-  <div class="note tg" style="top:480px" data-in="1" data-d="25%" data-fx="right">
-    <span class="icon tg" data-icon="send" data-size="34"></span>
-    <div><div class="src">Telegram · after the call</div><div class="msg">beta asks: open the pull request as a draft?</div></div>
+  <div class="feed" style="top:464px;width:1208px" data-in="1" data-d="25%" data-fx="right">
+    <span class="sign blue pict"><span data-icon="send" data-size="38"></span></span>
+    <div><b>Telegram, after the call</b><span>beta asks: open the pull request as a draft?</span></div>
   </div>
-  <div class="note green" style="top:640px;width:530px" data-in="2" data-d="10%" data-fx="right">
-    <span class="icon green" data-icon="check" data-size="36"></span>
-    <div><div class="src">Pull request #12</div><div class="msg">All checks passed</div></div>
+  <div class="feed" style="top:624px;width:590px" data-in="2" data-d="10%" data-fx="right">
+    <span class="sign pict"><span data-icon="check" data-size="40" data-stroke="2.6"></span></span>
+    <div><b>Pull request 12</b><span>All checks passed</span></div>
   </div>
-  <div class="note purple" style="top:640px;left:1270px;width:530px" data-in="2" data-d="45%" data-fx="right">
-    <span class="icon purple" data-icon="review" data-size="36"></span>
-    <div><div class="src">2 review comments</div><div class="msg">Fixed and pushed</div></div>
+  <div class="feed" style="top:624px;left:1218px;width:590px" data-in="2" data-d="45%" data-fx="right">
+    <span class="sign pict"><span data-icon="review" data-size="40"></span></span>
+    <div><b>2 review comments</b><span>Fixed and pushed</span></div>
   </div>
 </div></section>
 
 <section id="safe"><div class="stage">
-  <div class="brand"><i></i>cc-voice-gateway</div>
-  <div class="chapter"><b style="background:var(--red)">05</b>Safe by design</div>
-  <h2 class="title" data-in="0">Safe <span class="grad">by design.</span></h2>
-  <div class="rule" style="top:300px" data-in="1" data-fx="left"><span class="icon purple" data-icon="pr" data-size="36"></span>Every change on a branch, as a pull request</div>
-  <div class="rule" style="top:400px" data-in="1" data-d="55%" data-fx="left"><span class="icon amber" data-icon="check" data-size="36"></span>A merge needs your yes, twice</div>
-  <div class="rule" style="top:500px" data-in="2" data-fx="left"><span class="icon orange" data-icon="mic" data-size="36"></span>Workers start only on your spoken words</div>
-  <div class="rule" style="top:600px" data-in="2" data-d="50%" data-fx="left"><span class="icon green" data-icon="box" data-size="36"></span>Docker containers with scoped GitHub tokens</div>
-  <div class="rule" style="top:700px" data-in="2" data-d="85%" data-fx="left"><span class="icon blue" data-icon="key" data-size="36"></span>Sign-in only with a code from your computer</div>
-  <div class="card stop" data-in="3" data-fx="pop">
-    <div class="ring" data-ring="0"></div><div class="ring" data-ring="1"></div>
-    <div class="btn">STOP</div>
-    <div class="t">“Emergency stop”</div>
-    <div class="d">Every worker stops at once.<br>Unlocked only at your computer.</div>
+  <div class="sign brand">cc-voice-gateway</div>
+  <div class="sign chapter">Safe by design</div>
+  <h2 class="title" data-in="0">You stay in control of what lands.</h2>
+  <div class="rule" style="top:296px" data-in="1" data-fx="left"><span class="sign blue pict"><span data-icon="pr" data-size="40"></span></span>Every change on a branch, as a pull request</div>
+  <div class="rule" style="top:402px" data-in="1" data-d="55%" data-fx="left"><span class="sign blue pict"><span data-icon="check" data-size="40" data-stroke="2.6"></span></span>A merge needs your yes, twice</div>
+  <div class="rule" style="top:508px" data-in="2" data-fx="left"><span class="sign blue pict"><span data-icon="mic" data-size="40"></span></span>Workers start only on your spoken words</div>
+  <div class="rule" style="top:614px" data-in="2" data-d="50%" data-fx="left"><span class="sign blue pict"><span data-icon="box" data-size="40"></span></span>Docker containers with scoped GitHub tokens</div>
+  <div class="rule" style="top:720px" data-in="2" data-d="85%" data-fx="left"><span class="sign blue pict"><span data-icon="key" data-size="40"></span></span>Sign-in only with a code from your computer</div>
+  <div class="stopcol" data-in="3" data-fx="pop">
+    <svg viewBox="0 0 100 100">
+      <path d="M29.3 0h41.4L100 29.3v41.4L70.7 100H29.3L0 70.7V29.3z" fill="#c8102e"/>
+      <path d="M30.7 4.5h38.6l26.2 26.2v38.6L69.3 95.5H30.7L4.5 69.3V30.7z" fill="none" stroke="#fff" stroke-width="3"/>
+      <text x="50" y="59.5" text-anchor="middle" fill="#fff" font-family="Barlow Semi Condensed, Barlow, sans-serif" font-weight="600" font-size="27" letter-spacing="1">STOP</text>
+    </svg>
+    <p class="say">“Emergency stop.”</p>
+    <p>Every worker stops at once.<br>Unlocked only at your computer.</p>
   </div>
 </div></section>
 
 <section id="end"><div class="stage">
-  <div class="wave" data-n="40" data-gap="9" data-bw="10" style="left:560px;top:150px;width:800px;height:140px"></div>
-  <div class="mark" data-in="0" data-fx="up"><i></i>cc-voice-gateway</div>
-  <div class="tagline" data-in="0" data-d=".3" data-fx="up">Claude Code, <span class="grad">by voice.</span></div>
-  <div class="url" data-in="0" data-d=".8" data-fx="fade">github.com/alderg/cc-voice-gateway</div>
-  <div class="notice center" data-in="0" data-d="1.4" data-fx="fade">Open source · Apache 2.0 · A prototype, provided as-is, without support.<br>Not an Anthropic product.</div>
+  <div class="posts" data-in="0" data-fx="fade"><i></i><i></i></div>
+  <div class="sign hero abs" data-in="0" data-fx="near">
+    <div class="shield">cc-voice-gateway</div>
+    <svg class="arrow" viewBox="0 0 80 100"><use href="#i-ahead"/></svg>
+    <h1>Claude Code,<br>by voice.</h1>
+  </div>
+  <div class="sign blue ghplate" data-in="0" data-d=".5" data-fx="up"><span data-icon="github" data-size="52" data-stroke="2"></span>github.com/alderg/cc-voice-gateway</div>
+  <div class="sign plain notice" data-in="0" data-d="1.3" data-fx="up">Open source, Apache 2.0. A prototype, provided as-is, without support.<br>Not an Anthropic product.</div>
 </div></section>
 
-<div class="play" id="play"><svg width="56" height="64" viewBox="0 0 72 84"><path d="M4 6 L68 42 L4 78 Z" fill="#f8fafc" stroke="#f8fafc" stroke-width="6" stroke-linejoin="round"/></svg></div>
+<div class="playsign" id="play"><svg width="62" height="70" viewBox="0 0 72 84"><path d="M6 6 L68 42 L6 78 Z" fill="#fff" stroke="#fff" stroke-width="8" stroke-linejoin="round"/></svg></div>
 <div class="caption" id="caption"></div>
 <div class="progress"><i id="progress"></i></div>
 
 <script>
   const ICONS = {
-    wave: '<g fill="currentColor" stroke="none"><rect x="2" y="9" width="2.6" height="6" rx="1.3"/><rect x="6.4" y="5.5" width="2.6" height="13" rx="1.3"/><rect x="10.7" y="2" width="2.6" height="20" rx="1.3"/><rect x="15" y="6" width="2.6" height="12" rx="1.3"/><rect x="19.4" y="9.5" width="2.6" height="5" rx="1.3"/></g>',
-    gateway: '<circle cx="5" cy="12" r="2.8"/><circle cx="19" cy="12" r="2.8"/><path d="M7.8 12h8.4"/><path d="M12 4v4M12 16v4" opacity=".5"/>',
     terminal: '<path d="M4 6.5l5.5 5.5L4 17.5"/><path d="M12 18h8"/>',
     check: '<path d="M4.5 12.5l5 5L19.5 7"/>',
     key: '<circle cx="8" cy="15" r="4"/><path d="M11 12l8.5-8.5M16.5 6.5l3 3M14 9l2 2"/>',
@@ -489,13 +438,17 @@
     send: '<path d="M21 3L10.5 13.5"/><path d="M21 3l-6.5 18-4-7.5L3 9.5z"/>',
     folder: '<path d="M3 7.5A2.5 2.5 0 0 1 5.5 5h3.7l2.3 2.3h7A2.5 2.5 0 0 1 21 9.8v7.7a2.5 2.5 0 0 1-2.5 2.5h-13A2.5 2.5 0 0 1 3 17.5z"/>',
     box: '<path d="M12 2.8l8 4.4v9.6l-8 4.4-8-4.4V7.2z"/><path d="M4 7.2l8 4.4 8-4.4"/><path d="M12 11.6v9.6"/>',
-    car: '<path d="M3.5 13.5l1.8-5.2A2.5 2.5 0 0 1 7.7 6.6h8.6a2.5 2.5 0 0 1 2.4 1.7l1.8 5.2v4.5a1 1 0 0 1-1 1h-1.8a1 1 0 0 1-1-1V17H7.3v1a1 1 0 0 1-1 1H4.5a1 1 0 0 1-1-1z"/><path d="M3.5 13.5h17"/><circle cx="7.5" cy="15.2" r=".6"/><circle cx="16.5" cy="15.2" r=".6"/>',
+    car: '<path d="M3.5 13.5l1.8-5.2A2.5 2.5 0 0 1 7.7 6.6h8.6a2.5 2.5 0 0 1 2.4 1.7l1.8 5.2v4.5a1 1 0 0 1-1 1h-1.8a1 1 0 0 1-1-1V17H7.3v1a1 1 0 0 1-1 1H4.5a1 1 0 0 1-1-1z"/><path d="M3.5 13.5h17"/>',
     monitor: '<rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8.5 20h7M12 16v4"/>',
     phone: '<rect x="7" y="2.5" width="10" height="19" rx="2.5"/><path d="M11 18.5h2"/>',
+    globe: '<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/>',
     speaker: '<path d="M4 9.5h3.5L13 5v14l-5.5-4.5H4z"/><path d="M16.5 9a4.5 4.5 0 0 1 0 6M19 6.5a8 8 0 0 1 0 11"/>',
     mic: '<rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21"/>',
     review: '<path d="M4 5h16v11H9.5L5 20z" /><path d="M8.5 10.5l2 2 4.5-4.5"/>',
-    cpu: '<rect x="6" y="6" width="12" height="12" rx="2.5"/><path d="M9.5 2.5V6M14.5 2.5V6M9.5 18v3.5M14.5 18v3.5M2.5 9.5H6M2.5 14.5H6M18 9.5h3.5M18 14.5h3.5"/><circle cx="12" cy="12" r="2" fill="currentColor" stroke="none"/>',
+    clock: '<circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/>',
+    right: '<path d="M4 12h15M13.5 6.5L19 12l-5.5 5.5"/>',
+    left: '<path d="M20 12H5M10.5 6.5L5 12l5.5 5.5"/>',
+    github: '<path d="M9 19c-4.3 1.4-4.3-2.5-6-3m12 5v-3.5c0-1 .1-1.4-.5-2 2.8-.3 5.5-1.4 5.5-6a4.6 4.6 0 0 0-1.3-3.2 4.2 4.2 0 0 0-.1-3.2s-1.1-.3-3.5 1.3a12.3 12.3 0 0 0-6.2 0C6.5 2.8 5.4 3.1 5.4 3.1a4.2 4.2 0 0 0-.1 3.2A4.6 4.6 0 0 0 4 9.5c0 4.6 2.7 5.7 5.5 6-.6.6-.6 1.2-.5 2V21"/>',
   }
   for (const el of document.querySelectorAll('[data-icon]')) {
     const s = el.dataset.size || 24
@@ -505,10 +458,6 @@
   const clamp = x => Math.max(0, Math.min(1, x))
   const easeOut = p => 1 - Math.pow(1 - clamp(p), 3)
   const smooth = p => { p = clamp(p); return p * p * (3 - 2 * p) }
-  const hex = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16))
-  const mix = (a, b, p) => a.map((v, i) => Math.round(v + (b[i] - v) * p))
-  const STOPS = ['#fb923c', '#a78bfa', '#60a5fa'].map(hex)
-  const gradAt = p => (p < .5 ? mix(STOPS[0], STOPS[1], p * 2) : mix(STOPS[1], STOPS[2], p * 2 - 1))
 
   const TL = { total: 0, fps: 30, scenes: [], levels: null }
   const scenes = {}
@@ -529,24 +478,13 @@
         for (let i = 0; i < n; i++) {
           const b = document.createElement('i')
           b.style.width = bw + 'px'
-          b.style.background = el.dataset.color || `rgb(${gradAt(n === 1 ? 0 : i / (n - 1)).join(',')})`
+          b.style.background = el.dataset.color || '#fff'
           el.appendChild(b)
           bars.push(b)
         }
         return { el, bars, n, bw, h: el.offsetHeight || parseFloat(el.style.height) }
       })
-      const pulses = [...section.querySelectorAll('.pulses')].map(el => {
-        const dots = []
-        for (let i = 0; i < Number(el.dataset.n || 3); i++) {
-          const d = document.createElement('i')
-          d.style.background = el.dataset.color || '#fff'
-          d.style.boxShadow = `0 0 18px ${el.dataset.color || '#fff'}`
-          el.appendChild(d)
-          dots.push(d)
-        }
-        return { el, dots, speed: Number(el.dataset.speed || .5), dir: Number(el.dataset.dir || 1) }
-      })
-      scenes[section.id] = { section, stage: section.querySelector('.stage'), anims, waves, pulses }
+      scenes[section.id] = { section, stage: section.querySelector('.stage'), anims, waves }
     }
   }
 
@@ -570,7 +508,7 @@
   function animate(el, s, t) {
     const at = lineTime(s, Number(el.dataset.in), el.dataset.d)
     const fx = el.dataset.fx || 'up'
-    const dur = Number(el.dataset.dur || (fx === 'type' ? Math.max(.35, el.dataset.text.length * .035) : .6))
+    const dur = Number(el.dataset.dur || (fx === 'type' ? Math.max(.35, el.dataset.text.length * .035) : fx === 'near' ? .9 : .6))
     let p = (t - at) / dur
     if (el.dataset.out !== undefined) {
       const out = lineTime(s, Number(el.dataset.out), el.dataset.od)
@@ -589,68 +527,68 @@
     }
     const e = easeOut(p)
     el.style.opacity = clamp(p * 1.6)
-    if (fx === 'up') el.style.transform = `translateY(${(1 - e) * 46}px)`
-    else if (fx === 'left') el.style.transform = `translateX(${-(1 - e) * 70}px)`
-    else if (fx === 'right') el.style.transform = `translateX(${(1 - e) * 70}px)`
-    else if (fx === 'pop') el.style.transform = `scale(${.82 + .18 * e})`
+    if (fx === 'up') el.style.transform = `translateY(${(1 - e) * 40}px)`
+    else if (fx === 'left') el.style.transform = `translateX(${-(1 - e) * 60}px)`
+    else if (fx === 'right') el.style.transform = `translateX(${(1 - e) * 60}px)`
+    else if (fx === 'pop') el.style.transform = `scale(${.86 + .14 * e})`
+    else if (fx === 'near') el.style.transform = `scale(${.93 + .07 * e})`
     else if (fx === 'wipe') { el.style.opacity = p > 0 ? 1 : 0; el.style.clipPath = `inset(0 ${(1 - e) * 100}% 0 0)` }
+    else if (fx === 'wipel') { el.style.opacity = p > 0 ? 1 : 0; el.style.clipPath = `inset(0 0 0 ${(1 - e) * 100}%)` }
   }
 
+  // A level meter for voice mode: flat bars, highest in the middle, moving with the voice.
   function wave(w, t, lv, seed) {
     const c = (w.n - 1) / 2
     for (let i = 0; i < w.n; i++) {
-      const shape = Math.exp(-Math.pow((i - c) / (w.n * .34), 2))
+      const shape = Math.exp(-Math.pow((i - c) / (w.n * .38), 2))
       const n1 = .55 + .45 * Math.sin(t * 9.1 + i * 1.37 + seed) * Math.sin(t * 5.3 + i * .71 + seed * 2)
-      const n2 = .5 + .5 * Math.sin(t * 13.7 + i * 2.3)
-      const amp = .16 + .84 * lv
-      const h = Math.max(w.bw, w.h * shape * amp * (.35 + .65 * Math.abs(n1)) * (.8 + .2 * n2))
+      const amp = .1 + .9 * lv
+      const h = Math.max(w.bw, w.h * shape * amp * (.4 + .6 * Math.abs(n1)))
       w.bars[i].style.height = h.toFixed(1) + 'px'
     }
   }
 
   const ticks = {
-    anywhere(lt, s, t) {
-      const c = document.getElementById('cursor')
-      c.style.left = (300 + 60 * Math.sin(t * .8) + 20 * Math.sin(t * 2.1)) + 'px'
-      c.style.top = (110 + 34 * Math.sin(t * 1.1 + 1)) + 'px'
+    intro(lt, s, t) {
+      // the gateway's name appears large in the middle of the sign, then moves up into its panel
+      const sh = document.getElementById('shield'), sign = sh.offsetParent
+      const dx = sign.offsetWidth / 2 - (sh.offsetLeft + sh.offsetWidth / 2)
+      const dy = sign.offsetHeight / 2 - (sh.offsetTop + sh.offsetHeight / 2)
+      const shown = easeOut((t - lineTime(s, 0, '.3')) / .6)
+      const big = 1 - smooth((t - lineTime(s, 1)) / .8)
+      sh.style.opacity = clamp((t - lineTime(s, 0, '.3')) / .4)
+      sh.style.transform = `translate(${(dx * big).toFixed(1)}px, ${(dy * big).toFixed(1)}px) scale(${((.9 + .1 * shown) * (1 + 1.1 * big)).toFixed(4)})`
+    },
+    gap(lt, s, t) {
+      // the barrier's warning lamp blinks
+      document.getElementById('lamp').setAttribute('fill', Math.floor(t * 1.6) % 2 ? '#7a5c00' : '#f4b400')
     },
     dialog(lt, s, t) {
       const done = t > lineTime(s, 2, '45%')
       const st = document.getElementById('termstate')
       st.textContent = done ? 'done' : 'running'
-      st.style.background = done ? 'rgba(74,222,128,.14)' : 'rgba(96,165,250,.14)'
-      st.style.color = done ? '#86efac' : '#93c5fd'
+      st.style.background = done ? 'rgba(63,174,106,.22)' : 'rgba(244,180,0,.2)'
+      st.style.color = done ? '#7fd6a1' : '#f4c542'
     },
     parallel(lt, s, t) {
       let running = 0, queued = 0
       for (const lane of s.el.querySelectorAll('.lane')) {
         const start = lineTime(s, Number(lane.dataset.in), lane.dataset.d) + .3
-        const len = Number(lane.dataset.len)
-        const p = clamp((t - start) / len)
+        if (lane.dataset.queued) { if (t >= start) queued++; continue }
+        const p = clamp((t - start) / Number(lane.dataset.len))
         const fill = lane.querySelector('.fill'), status = lane.querySelector('.status')
         fill.style.width = (p * 100).toFixed(2) + '%'
         if (t >= start && p < 1) running++
-        if (Number(lane.dataset.lane) === 4 && t < start && t > lineTime(s, 2, '60%')) queued++
         const done = p >= 1
+        fill.classList.toggle('done', done)
         status.textContent = done ? status.dataset.done : t >= start ? 'running' : ''
         status.classList.toggle('done', done)
       }
-      document.getElementById('runs').textContent = `${Math.max(running, 0)} running`
-      document.getElementById('queued').textContent = `${queued} queued`
-    },
-    safe(lt, s, t) {
-      const at = lineTime(s, 3, '10%')
-      for (const r of s.el.querySelectorAll('[data-ring]')) {
-        const ph = ((t - at) / 1.8 + Number(r.dataset.ring) * .5) % 1
-        r.style.opacity = t < at ? 0 : (1 - ph) * .7
-        r.style.transform = `scale(${1 + ph * .55})`
-      }
+      document.getElementById('count').textContent = `${running} running` + (queued ? `, ${queued} queued` : '')
     },
   }
 
-  let opts = {}
   function render(t, o = {}) {
-    opts = o
     const F = .7
     TL.scenes.forEach((s, si) => {
       const sc = scenes[s.id]
@@ -661,28 +599,14 @@
       if (op <= 0.001) return
       sc.section.style.opacity = op
       const lt = t - s.start, dur = s.end - s.start
-      sc.stage.style.transform = `scale(${1 + .028 * clamp(lt / dur)})`
+      // driving on: the scene comes slowly closer, and grows a little more as it passes
+      sc.stage.style.transform = `scale(${1 + .028 * clamp(lt / dur) + .05 * (1 - b)})`
       s.el = sc.section
       for (const el of sc.anims) animate(el, s, t)
       const lv = level(t)
       sc.waves.forEach((w, i) => wave(w, t, lv, i * 1.9))
-      for (const orb of sc.section.querySelectorAll('[data-orb]')) orb.style.transform = `scale(${1 + .1 * lv})`
-      for (const p of sc.pulses) {
-        const W = p.el.offsetWidth
-        p.dots.forEach((d, k) => {
-          const f = ((t * p.speed + k / p.dots.length) % 1 + 1) % 1
-          const x = p.dir > 0 ? f : 1 - f
-          d.style.left = (x * W).toFixed(1) + 'px'
-          d.style.opacity = Math.sin(Math.PI * f).toFixed(3)
-        })
-      }
       if (ticks[s.id]) ticks[s.id](lt, s, t)
     })
-    // the background drifts slowly
-    const bx = Math.sin(t * .05), by = Math.cos(t * .043)
-    Object.assign(document.getElementById('b1').style, { left: `${700 + 260 * bx}px`, top: `${-520 + 120 * by}px` })
-    Object.assign(document.getElementById('b2').style, { left: `${-420 + 200 * by}px`, top: `${80 + 140 * bx}px` })
-    Object.assign(document.getElementById('b3').style, { left: `${1100 - 180 * by}px`, top: `${300 - 160 * bx}px` })
     // the caption of the line being spoken
     const box = document.getElementById('caption')
     let text = '', cop = 0
@@ -707,6 +631,9 @@
 
   window.setup = timeline => { Object.assign(TL, timeline) }
   window.render = render
+  // Every face loads now, so that document.fonts.ready (which build.mjs awaits) covers them all,
+  // also those of scenes still hidden.
+  for (const face of document.fonts) face.load()
   prepare()
 
   // Opened on its own: a guessed timeline, #t=<seconds> for a still, #play to play it.

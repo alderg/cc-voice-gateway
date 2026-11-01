@@ -3,8 +3,8 @@
 //   node video/build.mjs [output.mp4]
 // One voiceover clip per line (Kokoro, voice af_heart, through tts.py), then the animated frames:
 // headless Chrome renders slides.html at every frame's time, and ffmpeg encodes them with the
-// voice. The waveforms in the frames follow the voiceover's loudness. Needs Google Chrome, ffmpeg
-// and Kokoro (see video/README.md). VOICE overrides the voice in script.json. TTS=say speaks with
+// voice. The voice-mode level meters in the frames follow the voiceover's loudness. Needs Google
+// Chrome (CHROME points elsewhere), ffmpeg and Kokoro (see video/README.md). VOICE overrides the voice in script.json. TTS=say speaks with
 // macOS `say` instead, for a quick draft. STILLS=<folder> writes one frame per line there instead
 // of the video, to look at the layout.
 
@@ -19,7 +19,15 @@ const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = resolve(HERE, '..')
 const OUT = resolve(process.argv[2] ?? join(ROOT, 'docs', 'assets', 'cc-voice-gateway.mp4'))
 const STILLS = process.env.STILLS ? resolve(process.env.STILLS) : null
-const CHROME = process.env.CHROME ?? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+const CHROME = process.env.CHROME ?? findChrome()
+function findChrome() {
+  if (process.platform === 'darwin') return '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+  for (const name of ['google-chrome', 'google-chrome-stable', 'chromium', 'chromium-browser']) {
+    const found = spawnSync('which', [name], { encoding: 'utf8' })
+    if (found.status === 0 && found.stdout.trim()) return found.stdout.trim()
+  }
+  return 'google-chrome'
+}
 const script = JSON.parse(readFileSync(join(HERE, 'script.json'), 'utf8'))
 const TTS = process.env.TTS ?? 'kokoro'
 const VOICE = process.env.VOICE ?? (TTS === 'say' ? 'Samantha' : script.voice)
@@ -184,7 +192,15 @@ try {
     const encoder = spawn('ffmpeg', [
       '-v', 'error', '-y', '-f', 'image2pipe', '-c:v', 'png', '-framerate', String(FPS), '-i', '-', '-i', voiceTrack,
       '-map', '0:v', '-map', '1:a',
-      '-c:v', 'libx264', '-preset', 'slow', '-crf', '21', '-tune', 'animation', '-pix_fmt', 'yuv420p', '-r', String(FPS),
+      // Converted with the BT.709 matrix and tagged BT.709 throughout, so that browsers show the
+      // page's own colours (untagged, ffmpeg's default BT.601 matrix turns the signs' green darker);
+      // the tags go on the frames, which win over the encoder's options. Square pixels said
+      // explicitly (SAR 1:1, so 16:9), and High profile at level 4.1 with at most 4 reference
+      // frames, which every phone decodes (tune animation alone asks for 10 and level 5.0).
+      '-vf', 'scale=out_color_matrix=bt709:out_range=tv,format=yuv420p,setsar=1,' +
+        'setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv',
+      '-c:v', 'libx264', '-preset', 'slow', '-crf', '21', '-tune', 'animation',
+      '-profile:v', 'high', '-level:v', '4.1', '-refs', '4', '-r', String(FPS),
       '-c:a', 'aac', '-b:a', '160k', '-ar', '48000', '-movflags', '+faststart', '-t', total.toFixed(3), OUT,
     ], { stdio: ['pipe', 'inherit', 'inherit'] })
     const finished = new Promise((res, rej) => encoder.on('close', code => (code === 0 ? res() : rej(new Error(`ffmpeg exit ${code}`)))))
