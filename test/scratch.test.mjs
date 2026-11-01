@@ -634,6 +634,7 @@ test('the gateway with VOICE_GW_SCRATCH=1: scratch/new in the tools, the instruc
     assert.match(instructions, /^Work folders: the driver turned them on\. A task that needs no repository/m)
     assert.match(instructions, /goes to dispatch with worker "scratch\/new": a run in a new empty folder, on this computer\./)
     assert.match(instructions, /It is removed 3 days after its last\s+run\./)
+    assert.match(instructions, /Hand research and lookups there at once rather than doing them yourself/)
     const tools = await gw.tools()
     const dispatchTool = tools.find(tool => tool.name === 'dispatch')
     assert.match(dispatchTool.description, /worker "scratch\/new": a run in a new empty work folder, on this computer, with no git/)

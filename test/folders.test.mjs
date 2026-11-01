@@ -299,6 +299,7 @@ test('the gateway offers clone_repo and delete_path only above the level confine
     assert.ok((await open.tools()).includes('delete_path'))
     assert.match(open.claudeCode.getInstructions(), /Cloning and deleting: the driver turned on clone_repo/)
     assert.match(open.claudeCode.getInstructions(), /Level unrestricted: the driver turned the confinement off/)
+    assert.match(open.claudeCode.getInstructions(), /to a subagent in the background with the Agent tool\./)
   } finally {
     await open.close()
   }

@@ -454,6 +454,7 @@ test('start-controller.sh passes the level: deny rules up to clone-delete, allow
   const open = runWithStub([], () => {}, { level: 'unrestricted' })
   assert.deepEqual(JSON.parse(valueOf(open.argv, '--settings')).permissions, { allow: UNRESTRICTED_ALLOW })
   assert.match(valueOf(open.argv, '--append-system-prompt'), /^Controller level unrestricted: .*The limits of the working area in CLAUDE\.md do not apply/)
+  assert.match(valueOf(open.argv, '--append-system-prompt'), /Hand longer work off all the same, as "Hand longer work off" in CLAUDE\.md says/)
   // Never past Claude Code's own prompts: manual mode, no bypass.
   assert.equal(valueOf(open.argv, '--permission-mode'), 'manual')
   assert.ok(!open.argv.includes('--dangerously-skip-permissions'))

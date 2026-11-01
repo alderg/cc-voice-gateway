@@ -183,6 +183,9 @@ test('declares the channel and permission capabilities and the reply tool', asyn
     'end_order',
   ])
   assert.match(claudeCode.getInstructions(), /request_id/)
+  // The controller stays free for new requests: longer work goes out at once.
+  assert.match(claudeCode.getInstructions(), /^Stay free for the driver: do yourself only what takes a few quick tool calls/m)
+  assert.match(claudeCode.getInstructions(), /Never block on a long job yourself\./)
 })
 
 test('voice endpoint exposes the voice tools', async () => {

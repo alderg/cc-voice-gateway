@@ -164,7 +164,9 @@ Claude app, and Claude Code on your computer. It is one Node.js process with two
   a running Claude Code session, the **controller**. The controller answers through the channel's
   `reply` tool. By default it may read its own folder and the status of pull requests, and does no
   repository work itself; two higher [levels](#53-the-controllers-confinement) let it also clone
-  and delete, or do everything.
+  and delete, or do everything. At every level it does only quick lookups itself and hands anything
+  longer off at once, several jobs side by side, to a worker, a work folder, or at `unrestricted` a
+  subagent in the background, so that it stays free for your next request.
 
 Work in a repository goes to a **worker**: a headless `claude -p` run in that repository, started
 by the gateway when the controller calls `dispatch`. One run per repository, two at a time by
@@ -1791,7 +1793,7 @@ at most three short sentences, without code, paths or lists.
 | "Leave the commits in alpha as they are." | `resolve_decision` with your words closes the push decision; alpha's queued tasks go on |
 | "Clone drawio-mcp from alderg." | Above `confined`: `clone_repo`; you hear when it is there |
 | "Delete the folder old-experiment." | Above `confined`: `delete_path` says what would be lost, the controller asks; you say yes, then confirm the approval |
-| "Look up the release notes of the latest Claude Code." | Only at `unrestricted`: the controller uses the web itself. With [work folders](#work-folders) on, at every level: a run in a new work folder looks it up |
+| "Look up the release notes of the latest Claude Code." | With [work folders](#work-folders) on, at every level: a run in a new work folder looks it up. Without them, only at `unrestricted`: the controller hands it to a subagent in the background and stays free; you hear the result as news |
 | "Rechne mir die Fahrtkosten nach Basel aus." / "Draft a reply to the landlord." | With work folders on: `dispatch` with `scratch/new`; you hear the result, and the files are in that folder at the desk. "Make it shorter." goes to the same folder |
 | "Is anyone reviewing pull request 12 in alpha?" / "Did the last CI run on main pass?" | The controller answers itself with read-only `gh` |
 | "Request a review for pull request 12 in alpha." | Only on your word: the worker reviews the diff and posts a review, or adds the person you name as reviewer |
