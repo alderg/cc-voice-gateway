@@ -305,16 +305,19 @@ everything blue is Claude Code.
 
 ![Flow of a request](docs/request-flow.drawio.svg)
 
-The voice AI calls `send` and then `get_reply` until the state is `done`. `send` returns at once,
-so the voice AI calls it with no lead-in and says its result straight away, in your language: the
-request is passed on ("Ist weitergegeben"). Before `ask`, `approve` and `status`, and between polls,
-it says only a short phrase that fits, such as "Bin dran", "Läuft" or "Moment bitte". The
-instructions and the descriptions of these five tools forbid a "let me check" in any form and
-language ("Moment, ich schau mal nach", "ich sehe mal nach", "lass mich nachsehen"): the voice AI
-looks nothing up, it only passes the request on. It never stays silent: in a car silence sounds as
-if you were not heard, so the instructions ask for an answer at once to everything you say, the
-result of `send` says what to say before the first `get_reply`, and that of a poll without news asks
-for a short phrase. A beep would not do, since it sounds like an error. Every result starts with a
+The voice AI calls `send` and then `get_reply` until the state is `done`. When you ask for
+something, it calls the tool straight away and speaks once it returns. `send` returns at once, and
+right after it the voice AI confirms in a few words of your language what it passed on, fitting the
+request and worded differently each time, such as "Der Abgleich der Branches ist unterwegs", "Die
+Frage zu den Tests ist bei Claude Code" or "Neustart ist angefragt". After `ask` it reads the answer,
+or confirms the same way while it still runs; after `approve` it confirms your decision in a short
+phrase ("Erlaubt", "Abgelehnt"); between polls it says in a short phrase that it is still running
+("Läuft noch"). The instructions and the tool descriptions are short and say only what to do, with
+examples of what fits, and name no sentences to avoid: a list of those made the voice AI say them more
+often. It never stays silent: in a car silence sounds as if you were not heard, so the instructions
+ask for an answer at once to everything you say, the results of `send` and of a running `ask` ask for
+the confirmation, and that of a poll without news for a short phrase. A beep would not do, since it
+sounds like an error. Every result starts with a
 machine-readable line, for example `[state=working id=k7f3 elapsed=34s]`. Requests and approvals
 have these states:
 
@@ -1961,9 +1964,9 @@ all look alike to the voice assistant (`src/presence.mjs`):
   work in every state.
 - **The connector's instructions and every tool description** name the gateway, and a standby by the
   settings; the instructions and `status` tell the voice assistant to call `status` on its
-  connectors first, to use an active one, and to switch connectors only when an answer says so,
-  never because a kill switch is locked. They are fetched when the connector connects, so the live
-  state is only in the answers.
+  connectors first and to use an active one, and the instructions to switch connectors only when an
+  answer says so, and that a locked kill switch is unlocked only at the computer. They are fetched
+  when the connector connects, so the live state is only in the answers.
 
 **The standby after a disconnect** (`src/standby.mjs`, `VOICE_GW_DISCONNECT_STANDBY`, on by
 default). A connector removed in claude.ai goes on calling the address without a token when a

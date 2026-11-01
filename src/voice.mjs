@@ -27,25 +27,29 @@ import { alarmText, emergencyPhrase, offText } from './killswitch.mjs'
 import { IpGuard, accessLine } from './ipguard.mjs'
 import { clock } from './limits.mjs'
 
+// What the voice AI says, asked for in the car: nothing before a call, then,
+// right after a request went on, a few words that name what went on, worded
+// differently each time, not one phrase for every request. Only positive
+// rules and examples, in the instructions and in every description: a list of
+// sentences not to say made the voice AI say them more often. The rules for
+// speaking stand in the tool descriptions too, next to each tool.
 const VOICE_INSTRUCTIONS = `
-This connector reaches Claude Code sessions running on the user's own computer. The user is usually
-driving, so keep everything you say short.
-Never leave the user in silence: they cannot look at the screen, and silence sounds as if they were not
-heard. Whenever they have said something, answer at once, in their language. If you did not understand,
-ask back instead of staying quiet.
-Workflow: send (or ask) -> get_reply, repeated while state is "sent" or "working" (each call waits up
-to about 40 seconds) -> read the answer. send returns at once: call it with no lead-in, and its result
-is your answer, said straight away: the request is passed on ("Passed on", in German "Ist weitergegeben").
-Before ask, approve and status, and between polls, say only a short phrase that fits, such as "On it",
-"Still running" or "One moment" (in German "Bin dran", "Läuft", "Moment bitte").
-Never say that you will look or check yourself, no "Moment, ich schau mal nach", "ich schaue nach",
-"ich sehe mal nach", "lass mich nachsehen", "let me check" or the like in any language: you look nothing
-up, Claude Code does the work and you pass it on. Relay Claude Code's answers faithfully; you may shorten
-them but never invent results.
-Approvals: read them out and call approve only after the user explicitly said yes or no to that action.
-News: results of work Claude Code finished in the background arrive with any call. Read them out too.
-Emergency: when the user says "emergency stop" or "kill switch", or the same in another language, call
-emergency_stop at once, without asking back. An [ALARM] line in any result is read out first.
+This connector reaches Claude Code on the user's own computer. The user is usually driving: keep
+everything short and in their language, and answer at once whenever they have said something, since
+silence sounds as if they were not heard. If you did not understand, ask back.
+When the user asks for something, call the tool straight away and speak once it returns. Requests go
+on with send, which returns at once, or ask, which waits up to about 40 seconds for a short answer.
+Right after send, and after ask while it still runs, confirm in a few words what you passed on, fitting
+the request and worded differently each time, such as "The branch sync is on its way" or "Restart
+requested" (in German "Der Abgleich der Branches ist unterwegs", "Neustart ist angefragt"). Then call
+get_reply while the state is "sent" or "working"; between calls, say in a short phrase that it is
+still running.
+Claude Code does the work: relay its answers and questions faithfully, shortened if you like.
+Approvals: read them out, and call approve only after the user explicitly said yes or no to that
+action; then confirm it in a short phrase, such as "Allowed" (in German "Erlaubt").
+News: results of work Claude Code finished in the background come with any call; read them out too.
+Emergency: when the user says "emergency stop" or "kill switch", in any language, call emergency_stop
+at once, without asking back. An [ALARM] line in any result is read out first.
 `.trim()
 
 // Which gateway this connector reaches, for a user with several: the name,
@@ -54,11 +58,11 @@ function voiceInstructions(presence) {
   if (!presence) return VOICE_INSTRUCTIONS
   const lines = [
     VOICE_INSTRUCTIONS,
-    `This connector is the gateway ${presence.label}. Every answer starts with a line that names the gateway and says ` +
-      'whether it is active. If the user has several such connectors, one per computer, call status on them first and ' +
-      'use the one whose answer says active. Switch to another connector only when an answer says "use another ' +
-      'connector" (a gateway on standby); never because a kill switch is locked: tell the user it can only be ' +
-      'unlocked at the computer.',
+    `This connector is the gateway ${presence.label}. Every answer starts with a line that names it and says whether ` +
+      'it is active; an inactive gateway hands nothing over. With several such connectors, one per computer, call ' +
+      'status on each first and use the active one. Switch to another connector only when an answer says "use ' +
+      'another connector" (a gateway on standby). A locked kill switch is unlocked only at the computer: tell the ' +
+      'user so.',
   ]
   if (presence.standbySetting) {
     lines.push('This gateway is on standby by its settings: it hands nothing over. Use another connector.')
@@ -67,32 +71,22 @@ function voiceInstructions(presence) {
 }
 
 const RELAY_RULE =
-  "Use it for anything about the user's projects, code, computer or running Claude Code sessions: " +
-  'you cannot see their machine, Claude Code can. Pass the request on instead of answering from your ' +
-  'own knowledge or searching the web.'
+  "Use it, rather than your own knowledge or the web, for anything about the user's projects, code, computer " +
+  'or Claude Code sessions: Claude Code sees their machine.'
 
-// What the voice AI never says, in any language: it looks nothing up itself.
-// Heard in the car before send: "Einen Moment, ich schau mal nach".
-const NO_LOOKING =
-  ' Never say that you will look or check yourself, no "Moment, ich schau mal nach", "ich schaue nach", ' +
-  '"ich sehe mal nach", "lass mich nachsehen", "let me check" or the like in any language: you look nothing ' +
-  'up, Claude Code does the work.'
+// Right after a request went on: what went on, in a few words.
+const CONFIRM =
+  'confirm in a few words of their language what you passed on, fitting the request and worded differently ' +
+  'each time, such as "The branch sync is on its way", "Your question about the tests is with Claude Code" or ' +
+  '"Restart requested" (in German "Der Abgleich der Branches ist unterwegs", "Die Frage zu den Tests ist bei ' +
+  'Claude Code", "Neustart ist angefragt").'
 
-// send returns at once, so its result is the acknowledgement: nothing before
-// the call, the result right after it. A lead-in before it only delays.
-const SEND_RULE =
-  ' Call it with no lead-in: say nothing before the call. Right after it, say its result in a few words of ' +
-  'their language: for a request handed over, that it is passed on ("Passed on", in German "Ist weitergegeben").' +
-  NO_LOOKING
+// In the results of send and of ask while it still runs: the same, short.
+const CONFIRM_NOW =
+  'Now confirm to the user in a few words of their language what you passed on, fitting this request and ' +
+  'worded differently each time.'
 
-// Before the other calls, which may take a while: a short phrase that fits,
-// in the user's language, never a sentence about looking. In a car, silence
-// sounds as if the request was not heard.
-const shortPhrase = examples =>
-  ` Before the call say only a short phrase in their language that fits, such as ${examples}.` + NO_LOOKING
-
-const MESSAGE_DESCRIPTION =
-  "The user's request word for word, in their language. Do not summarise, translate or add your own framing."
+const MESSAGE_DESCRIPTION = "The user's request word for word, in their language, as they said it."
 
 const text = (body, isError = false) => ({ content: [{ type: 'text', text: body }], isError })
 
@@ -125,7 +119,7 @@ function describeNews(news) {
 const answeredElsewhereLines = store =>
   store
     .takeAnsweredElsewhere()
-    .map(permission => `Approval ${permission.code} was answered at the computer and no longer waits; do not ask the user about it.`)
+    .map(permission => `Approval ${permission.code} was answered at the computer and is settled; it needs nothing from the user.`)
 
 // While the controller waits for the Claude usage limit (limits.mjs), what is
 // sent waits in the gateway and reaches it after the wait: a sentence that
@@ -150,8 +144,9 @@ function describePermission(permission) {
 
 // Builds the text a voice client receives for one request.
 // The first line is machine-readable so the decision to poll again never
-// depends on reading prose.
-function report(store, request, settings) {
+// depends on reading prose. first: the result of ask, before which the voice
+// AI said nothing, so while it still runs it confirms what went on.
+function report(store, request, settings, { first = false } = {}) {
   const fresh = store.takeUnread(request)
   const permissions = store.openPermissions()
   for (const permission of permissions) permission.announced = true
@@ -203,15 +198,17 @@ function report(store, request, settings) {
       lines.push(
         fresh.length
           ? `Still working. Tell the user briefly and call get_reply again with id=${request.id}.`
-          : 'Still working. Tell the user in a short phrase that it is still running, nothing more, and call ' +
-              `get_reply again with id=${request.id}.`,
+          : first && !held
+            ? `Still working. ${CONFIRM_NOW} Then call get_reply with id=${request.id}.`
+            : 'Still working. Tell the user in a short phrase that it is still running, fitting the request, and ' +
+                `call get_reply again with id=${request.id}.`,
       )
     }
   }
   return lines.join('\n')
 }
 
-async function waitAndReport(store, request, waitSeconds, signal, settings) {
+async function waitAndReport(store, request, waitSeconds, signal, settings, options) {
   await store.waitFor(
     () =>
       store.hasUnread(request) ||
@@ -222,7 +219,7 @@ async function waitAndReport(store, request, waitSeconds, signal, settings) {
     waitSeconds * 1000,
     signal,
   )
-  return text(report(store, request, settings))
+  return text(report(store, request, settings, options))
 }
 
 function statusText(store, settings, killswitch) {
@@ -346,12 +343,9 @@ function buildVoiceServer(store, channel, config, { killswitch = null, grant = n
     {
       title: 'Status',
       description: named(
-        'Check that the voice gateway is reachable and whether Claude Code is answering; lists open requests ' +
-          'and pending approvals. Use when the user asks if the connection works or what is going on. Its first ' +
-          'line says which gateway this is and whether it is active: when the user has several such connectors, ' +
-          'call status on them first and use an active one. Switch connectors only when the line says "use another ' +
-          'connector", never because the kill switch is locked.' +
-          shortPhrase('"One moment" (in German "Moment bitte")'),
+        'Whether this gateway is reachable and Claude Code answers, with open requests and pending approvals. Use ' +
+          'it when the user asks whether the connection works or what is going on, and, with several such ' +
+          'connectors, on each first to find the active one.',
       ),
       annotations: { readOnlyHint: true },
     },
@@ -364,9 +358,9 @@ function buildVoiceServer(store, channel, config, { killswitch = null, grant = n
       {
         title: 'Emergency stop',
         description: named(
-          'Emergency stop (kill switch). Call it at once, with no lead-in and without asking back, when the user ' +
-            'says "emergency stop" or "kill switch", or the same in another language. Locks the gateway: no new tasks, ' +
-            "all work on the user's computer stops. Only someone at the computer can unlock it.",
+          'Emergency stop (kill switch). Call it at once, without asking back, when the user says "emergency stop" ' +
+            "or \"kill switch\", in any language. Locks the gateway: all work on the user's computer stops and " +
+            'nothing new starts, until someone unlocks it at the computer.',
         ),
         inputSchema: {
           words: z.string().max(400).optional().describe("The user's words, if any."),
@@ -382,22 +376,18 @@ function buildVoiceServer(store, channel, config, { killswitch = null, grant = n
     {
       title: 'Send to Claude Code',
       description: named(
-        'Send the user\'s request to Claude Code on their computer. ' +
+        "Pass the user's request on to Claude Code on their computer. " +
           RELAY_RULE +
-          ' Returns immediately with an id; then call get_reply with that id until state is done or question. ' +
-          'Prefer this over ask for anything that may take longer than half a minute. While the gateway is ' +
-          'inactive it hands nothing over and says so (state=inactive).' +
-          SEND_RULE,
+          ' Returns at once with an id: follow it with get_reply until the state is done or question. Use send for ' +
+          'anything that may take longer than half a minute. Call it straight away, and right after it ' +
+          CONFIRM,
       ),
       inputSchema: {
         message: z.string().min(1).max(4000).describe(MESSAGE_DESCRIPTION),
         in_reply_to: z
           .string()
           .optional()
-          .describe(
-            'If this answers a question from Claude Code (state=question), the id of that request. The question ' +
-              'then counts as answered; follow the answer with get_reply and the new id.',
-          ),
+          .describe('For an answer to a question from Claude Code (state=question): the id of that request.'),
       },
     },
     withLine(withAlarm(async ({ message, in_reply_to }) => {
@@ -416,10 +406,7 @@ function buildVoiceServer(store, channel, config, { killswitch = null, grant = n
       const held = heldText(settings)
       return text(
         `[state=sent id=${request.id}${held ? ' held=usage' : ''}] Handed over${question ? ` as the answer to ${question.id}` : ''}. ` +
-          (held
-            ? `${held} `
-            : 'Say now, in a few words of their language, only that it is passed on (in German "Ist weitergegeben"). ') +
-          `Then call get_reply with id=${request.id}.`,
+          `${held || CONFIRM_NOW} Then call get_reply with id=${request.id}.`,
       )
     })),
   )
@@ -429,12 +416,11 @@ function buildVoiceServer(store, channel, config, { killswitch = null, grant = n
     {
       title: 'Ask Claude Code',
       description: named(
-        'Send a short question to Claude Code and wait up to about 40 seconds for the answer in one call. ' +
-          RELAY_RULE +
-          ' If the result says state=working, continue with get_reply and the returned id; never call ask again ' +
-          'for the same request, that would send it twice. While the gateway is inactive it hands nothing over ' +
-          'and says so (state=inactive).' +
-          shortPhrase('"One moment" or "On it" (in German "Moment bitte", "Bin dran")'),
+        'Pass a short question on to Claude Code and wait up to about 40 seconds for its answer, in one call; ' +
+          "like send, for anything about the user's projects, code, computer or Claude Code sessions. Call it " +
+          'straight away, then read the answer. While it still runs (state=sent or working), the question is sent ' +
+          'already: first confirm in a few words what you passed on, as after send, then follow the returned id ' +
+          'with get_reply.',
       ),
       inputSchema: {
         message: z.string().min(1).max(4000).describe(MESSAGE_DESCRIPTION),
@@ -444,7 +430,7 @@ function buildVoiceServer(store, channel, config, { killswitch = null, grant = n
       const refused = refuse(message)
       if (refused) return refused
       const request = await enqueue(message)
-      return waitAndReport(store, request, settings.maxWaitSeconds, extra.signal, settings)
+      return waitAndReport(store, request, settings.maxWaitSeconds, extra.signal, settings, { first: true })
     })),
   )
 
@@ -453,15 +439,12 @@ function buildVoiceServer(store, channel, config, { killswitch = null, grant = n
     {
       title: 'Get reply',
       description: named(
-        'Wait for news on a request sent with send or ask, then return what Claude Code said since the last call. ' +
-          'After the line about the gateway, a machine-readable line follows: [state=... id=...]. state=sent or ' +
-          'working: read out briefly what Claude Code said, if anything; otherwise say only a short phrase in their ' +
-          'language that it is still running, such as "Still running" or "On it" ' +
-          '(in German "Läuft noch", "Bin dran"); then call get_reply again with the same id. Right after send, its ' +
-          '"passed on" is enough before the first call. state=question: read the question and send the answer with ' +
-          'send (in_reply_to=id), then follow the new id. state=done: read the answer. If an approval is listed, ask ' +
-          'the user before calling approve.' +
-          NO_LOOKING,
+        'Wait for news on a request from send or ask; returns what Claude Code said since the last call, with a ' +
+          'line [state=... id=...]. state=sent or working: read out briefly what Claude Code said, or else say in a ' +
+          'short phrase that it is still running, varied and fitting the request, such as "Still running" or "The ' +
+          'sync is still going" (in German "Läuft noch", "Der Abgleich läuft noch"); then call get_reply again with ' +
+          "the same id. state=question: read the question, then send the user's answer with send (in_reply_to=id). " +
+          'state=done: read the answer. A listed approval: read it to the user and ask, allow or deny.',
       ),
       inputSchema: {
         id: z.string().min(1).describe('The id returned by send or ask.'),
@@ -471,7 +454,7 @@ function buildVoiceServer(store, channel, config, { killswitch = null, grant = n
           .min(1)
           .max(60)
           .optional()
-          .describe('How long to wait for news before returning. Leave it out; the default is right for voice.'),
+          .describe('Seconds to wait for news; best left out, the default suits voice.'),
       },
       annotations: { readOnlyHint: true },
     },
@@ -491,11 +474,10 @@ function buildVoiceServer(store, channel, config, { killswitch = null, grant = n
       {
         title: 'Answer approval',
         description: named(
-          'Answer a permission prompt from Claude Code, for example running a shell command or writing a file. ' +
-            'Only call this after you read the request to the user and they explicitly said yes (allow) or no ' +
-            '(deny) to this specific action. Never approve on your own. Before the call, confirm their decision in ' +
-            'a short phrase of their language, such as "Allowed" or "Denied" (in German "Erlaubt", "Abgelehnt").' +
-            NO_LOOKING,
+          'Answer a permission prompt from Claude Code, such as running a shell command or writing a file. Call it ' +
+            'only after you read the request to the user and they explicitly said yes (allow) or no (deny) to this ' +
+            'action, then straight away; right after it, confirm their decision in a short phrase of their language, ' +
+            'such as "Allowed" or "Denied" (in German "Erlaubt", "Abgelehnt").',
         ),
         inputSchema: {
           code: z
