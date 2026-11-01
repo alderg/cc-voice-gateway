@@ -31,14 +31,17 @@ const VOICE_INSTRUCTIONS = `
 This connector reaches Claude Code sessions running on the user's own computer. The user is usually
 driving, so keep everything you say short.
 Never leave the user in silence: they cannot look at the screen, and silence sounds as if they were not
-heard. Whenever they have said something, say something back at once, at least a short okay in their
-language, and before every tool call. If you did not understand, ask back instead of staying quiet.
+heard. Whenever they have said something, answer at once, in their language. If you did not understand,
+ask back instead of staying quiet.
 Workflow: send (or ask) -> get_reply, repeated while state is "sent" or "working" (each call waits up
-to about 40 seconds) -> read the answer. Before send or ask, acknowledge in one short line in the
-user's language that fits the request: a task is on its way, a question gets its answer in a moment.
-Word it freshly each time. Never say you will look or check yourself: Claude Code does the work, you
-pass it on. Between polls tell the user in a few words that it is still running. Relay Claude Code's
-answers faithfully; you may shorten them but never invent results.
+to about 40 seconds) -> read the answer. send returns at once: call it with no lead-in, and its result
+is your answer, said straight away: the request is passed on ("Passed on", in German "Ist weitergegeben").
+Before ask, approve and status, and between polls, say only a short phrase that fits, such as "On it",
+"Still running" or "One moment" (in German "Bin dran", "Läuft", "Moment bitte").
+Never say that you will look or check yourself, no "Moment, ich schau mal nach", "ich schaue nach",
+"ich sehe mal nach", "lass mich nachsehen", "let me check" or the like in any language: you look nothing
+up, Claude Code does the work and you pass it on. Relay Claude Code's answers faithfully; you may shorten
+them but never invent results.
 Approvals: read them out and call approve only after the user explicitly said yes or no to that action.
 News: results of work Claude Code finished in the background arrive with any call. Read them out too.
 Emergency: when the user says "emergency stop" or "kill switch", or the same in another language, call
@@ -68,15 +71,25 @@ const RELAY_RULE =
   'you cannot see their machine, Claude Code can. Pass the request on instead of answering from your ' +
   'own knowledge or searching the web.'
 
-// What the voice AI says before it hands a request over. No fixed phrases:
-// the user may speak any language. Never skipped: in a car, silence sounds
-// as if the request was not heard.
-const ACK_RULE =
-  ' Before the call, always, say one short line to the user in their language that fits this request: for a task, ' +
-  'that it is on its way (in the sense of "will do"); for a plain question, that the answer comes in a moment. ' +
-  'Word it freshly each time, in your own words, not as a fixed phrase. Never say or imply that you will look ' +
-  'it up or check it yourself ("let me check", "I\'ll have a look" or the like in any language): you only pass ' +
-  'the request on, Claude Code does the work.'
+// What the voice AI never says, in any language: it looks nothing up itself.
+// Heard in the car before send: "Einen Moment, ich schau mal nach".
+const NO_LOOKING =
+  ' Never say that you will look or check yourself, no "Moment, ich schau mal nach", "ich schaue nach", ' +
+  '"ich sehe mal nach", "lass mich nachsehen", "let me check" or the like in any language: you look nothing ' +
+  'up, Claude Code does the work.'
+
+// send returns at once, so its result is the acknowledgement: nothing before
+// the call, the result right after it. A lead-in before it only delays.
+const SEND_RULE =
+  ' Call it with no lead-in: say nothing before the call. Right after it, say its result in a few words of ' +
+  'their language: for a request handed over, that it is passed on ("Passed on", in German "Ist weitergegeben").' +
+  NO_LOOKING
+
+// Before the other calls, which may take a while: a short phrase that fits,
+// in the user's language, never a sentence about looking. In a car, silence
+// sounds as if the request was not heard.
+const shortPhrase = examples =>
+  ` Before the call say only a short phrase in their language that fits, such as ${examples}.` + NO_LOOKING
 
 const MESSAGE_DESCRIPTION =
   "The user's request word for word, in their language. Do not summarise, translate or add your own framing."
@@ -187,7 +200,12 @@ function report(store, request, settings) {
                 'turn failed with an error, for example because the login expired.',
         )
       }
-      lines.push(`Still working. Tell the user briefly and call get_reply again with id=${request.id}.`)
+      lines.push(
+        fresh.length
+          ? `Still working. Tell the user briefly and call get_reply again with id=${request.id}.`
+          : 'Still working. Tell the user in a short phrase that it is still running, nothing more, and call ' +
+              `get_reply again with id=${request.id}.`,
+      )
     }
   }
   return lines.join('\n')
@@ -332,7 +350,8 @@ function buildVoiceServer(store, channel, config, { killswitch = null, grant = n
           'and pending approvals. Use when the user asks if the connection works or what is going on. Its first ' +
           'line says which gateway this is and whether it is active: when the user has several such connectors, ' +
           'call status on them first and use an active one. Switch connectors only when the line says "use another ' +
-          'connector", never because the kill switch is locked.',
+          'connector", never because the kill switch is locked.' +
+          shortPhrase('"One moment" (in German "Moment bitte")'),
       ),
       annotations: { readOnlyHint: true },
     },
@@ -345,9 +364,9 @@ function buildVoiceServer(store, channel, config, { killswitch = null, grant = n
       {
         title: 'Emergency stop',
         description: named(
-          'Emergency stop (kill switch). Call it at once, without asking back, when the user says "emergency ' +
-            'stop" or "kill switch", or the same in another language. Locks the gateway: no new tasks, all work on the ' +
-            "user's computer stops. Only someone at the computer can unlock it.",
+          'Emergency stop (kill switch). Call it at once, with no lead-in and without asking back, when the user ' +
+            'says "emergency stop" or "kill switch", or the same in another language. Locks the gateway: no new tasks, ' +
+            "all work on the user's computer stops. Only someone at the computer can unlock it.",
         ),
         inputSchema: {
           words: z.string().max(400).optional().describe("The user's words, if any."),
@@ -368,7 +387,7 @@ function buildVoiceServer(store, channel, config, { killswitch = null, grant = n
           ' Returns immediately with an id; then call get_reply with that id until state is done or question. ' +
           'Prefer this over ask for anything that may take longer than half a minute. While the gateway is ' +
           'inactive it hands nothing over and says so (state=inactive).' +
-          ACK_RULE,
+          SEND_RULE,
       ),
       inputSchema: {
         message: z.string().min(1).max(4000).describe(MESSAGE_DESCRIPTION),
@@ -397,8 +416,9 @@ function buildVoiceServer(store, channel, config, { killswitch = null, grant = n
       const held = heldText(settings)
       return text(
         `[state=sent id=${request.id}${held ? ' held=usage' : ''}] Handed over${question ? ` as the answer to ${question.id}` : ''}. ` +
-          (held ? `${held} ` : '') +
-          'If you have not told the user yet, say a short okay in their language now. ' +
+          (held
+            ? `${held} `
+            : 'Say now, in a few words of their language, only that it is passed on (in German "Ist weitergegeben"). ') +
           `Then call get_reply with id=${request.id}.`,
       )
     })),
@@ -414,7 +434,7 @@ function buildVoiceServer(store, channel, config, { killswitch = null, grant = n
           ' If the result says state=working, continue with get_reply and the returned id; never call ask again ' +
           'for the same request, that would send it twice. While the gateway is inactive it hands nothing over ' +
           'and says so (state=inactive).' +
-          ACK_RULE,
+          shortPhrase('"One moment" or "On it" (in German "Moment bitte", "Bin dran")'),
       ),
       inputSchema: {
         message: z.string().min(1).max(4000).describe(MESSAGE_DESCRIPTION),
@@ -435,10 +455,13 @@ function buildVoiceServer(store, channel, config, { killswitch = null, grant = n
       description: named(
         'Wait for news on a request sent with send or ask, then return what Claude Code said since the last call. ' +
           'After the line about the gateway, a machine-readable line follows: [state=... id=...]. state=sent or ' +
-          'working: tell the user briefly, in a few varied words of their language, that Claude Code is still on it ' +
-          '(never that you are looking yourself) and call get_reply again with the same id. state=question: read the ' +
-          'question and send the answer with send (in_reply_to=id), then follow the new id. state=done: read the ' +
-          'answer. If an approval is listed, ask the user before calling approve.',
+          'working: read out briefly what Claude Code said, if anything; otherwise say only a short phrase in their ' +
+          'language that it is still running, such as "Still running" or "On it" ' +
+          '(in German "Läuft noch", "Bin dran"); then call get_reply again with the same id. Right after send, its ' +
+          '"passed on" is enough before the first call. state=question: read the question and send the answer with ' +
+          'send (in_reply_to=id), then follow the new id. state=done: read the answer. If an approval is listed, ask ' +
+          'the user before calling approve.' +
+          NO_LOOKING,
       ),
       inputSchema: {
         id: z.string().min(1).describe('The id returned by send or ask.'),
@@ -471,7 +494,8 @@ function buildVoiceServer(store, channel, config, { killswitch = null, grant = n
           'Answer a permission prompt from Claude Code, for example running a shell command or writing a file. ' +
             'Only call this after you read the request to the user and they explicitly said yes (allow) or no ' +
             '(deny) to this specific action. Never approve on your own. Before the call, confirm their decision in ' +
-            'a few words of their language.',
+            'a short phrase of their language, such as "Allowed" or "Denied" (in German "Erlaubt", "Abgelehnt").' +
+            NO_LOOKING,
         ),
         inputSchema: {
           code: z

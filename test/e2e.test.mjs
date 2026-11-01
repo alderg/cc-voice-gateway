@@ -211,6 +211,56 @@ test('the connector names its gateway, for a driver with several: in the instruc
   assert.match(raw, /^Gateway Testbox \(e2e\): active\n\[gateway=ok controller=/)
 })
 
+// Heard in the car: "Einen Moment, ich schau mal nach" before send, then "Ist
+// weitergegeben". send returns at once: its result is the answer, nothing
+// before it; the other calls get a short phrase; never a "let me check".
+test('what the voice assistant says around a call: nothing before send, its result after; a short phrase before the others; never a "let me check"', async () => {
+  const noLooking =
+    /Never say that you will look or check yourself, no "Moment, ich schau mal nach", "ich schaue nach", "ich sehe mal nach", "lass mich nachsehen", "let me check" or the like in any language: you look nothing up, Claude Code does the work\./
+  const instructions = voice.getInstructions()
+  assert.match(instructions, /^heard\. Whenever they have said something, answer at once, in their language\./m)
+  assert.match(
+    instructions,
+    /send returns at once: call it with no lead-in, and its result\nis your answer, said straight away: the request is passed on \("Passed on", in German "Ist weitergegeben"\)\./,
+  )
+  assert.match(
+    instructions,
+    /^Before ask, approve and status, and between polls, say only a short phrase that fits, such as "On it",\n"Still running" or "One moment" \(in German "Bin dran", "Läuft", "Moment bitte"\)\.$/m,
+  )
+  assert.match(
+    instructions.replace(/\n/g, ' '),
+    /Never say that you will look or check yourself, no "Moment, ich schau mal nach", "ich schaue nach", "ich sehe mal nach", "lass mich nachsehen", "let me check" or the like in any language: you look nothing up, Claude Code does the work and you pass it on\./,
+  )
+  assert.doesNotMatch(instructions, /short okay|before every tool call|Word it freshly/)
+
+  const { tools } = await voice.listTools()
+  const description = name => tools.find(t => t.name === name).description
+  assert.match(
+    description('send'),
+    /\(state=inactive\)\. Call it with no lead-in: say nothing before the call\. Right after it, say its result in a few words of their language: for a request handed over, that it is passed on \("Passed on", in German "Ist weitergegeben"\)\. Never say/,
+  )
+  assert.doesNotMatch(description('send'), /Before the call/)
+  assert.match(
+    description('ask'),
+    /\(state=inactive\)\. Before the call say only a short phrase in their language that fits, such as "One moment" or "On it" \(in German "Moment bitte", "Bin dran"\)\. Never say/,
+  )
+  assert.match(
+    description('status'),
+    /never because the kill switch is locked\. Before the call say only a short phrase in their language that fits, such as "One moment" \(in German "Moment bitte"\)\. Never say/,
+  )
+  assert.match(
+    description('get_reply'),
+    /state=sent or working: read out briefly what Claude Code said, if anything; otherwise say only a short phrase in their language that it is still running, such as "Still running" or "On it" \(in German "Läuft noch", "Bin dran"\); then call get_reply again with the same id\. Right after send, its "passed on" is enough before the first call\./,
+  )
+  assert.match(
+    description('approve'),
+    /Before the call, confirm their decision in a short phrase of their language, such as "Allowed" or "Denied" \(in German "Erlaubt", "Abgelehnt"\)\. Never say/,
+  )
+  for (const name of ['send', 'ask', 'status', 'get_reply', 'approve']) assert.match(description(name), noLooking, name)
+  assert.match(description('emergency_stop'), /^Emergency stop \(kill switch\)\. Call it at once, with no lead-in and without asking back, when/)
+  for (const tool of tools) assert.doesNotMatch(tool.description, /freshly|in your own words|a few varied words/, tool.name)
+})
+
 test('logs every voice call with client, method and tool, never the token', async () => {
   // In the car the question is whether the assistant called the connector at
   // all; these lines answer it even when no request reaches the controller.
@@ -277,12 +327,19 @@ test('status and the hint work before the controller ever answered', async () =>
   assert.match(hint, /has not answered once/)
   assert.match(hint, /--dangerously-load-development-channels server:voice/)
   assert.match(hint, /login expired/)
+  // A poll without news: a short phrase, nothing more.
+  assert.match(hint, new RegExp(`\\nStill working\\. Tell the user in a short phrase that it is still running, nothing more, and call get_reply again with id=${id}\\.$`))
 })
 
 test('send -> channel event -> reply(working, done) -> get_reply', async () => {
   const sent = await voiceCall('send', { message: 'How many files are in the playground?' })
   const id = idOf(sent)
   assert.match(sent, /^\[state=sent id=[a-z0-9]{4}\]/)
+  // Its result is the answer to the driver: that it is passed on, and only that.
+  assert.match(
+    sent,
+    new RegExp(`\\] Handed over\\. Say now, in a few words of their language, only that it is passed on \\(in German "Ist weitergegeben"\\)\\. Then call get_reply with id=${id}\\.$`),
+  )
 
   const event = await waitUntil(() => channelEvents.find(e => e.meta?.request_id === id))
   assert.equal(event.content, 'How many files are in the playground?')
@@ -291,7 +348,8 @@ test('send -> channel event -> reply(working, done) -> get_reply', async () => {
   const first = await voiceCall('get_reply', { id })
   assert.match(first, new RegExp(`^\\[state=working id=${id} `))
   assert.match(first, /Claude Code: Looking\./)
-  assert.match(first, /call get_reply again/)
+  // With news from Claude Code, its words, briefly; not just a short phrase.
+  assert.match(first, /\nStill working\. Tell the user briefly and call get_reply again/)
 
   // The long poll returns as soon as the answer arrives, not after the full wait.
   const started = Date.now()

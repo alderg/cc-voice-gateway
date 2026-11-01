@@ -305,15 +305,18 @@ everything blue is Claude Code.
 
 ![Flow of a request](docs/request-flow.drawio.svg)
 
-The voice AI calls `send` and then `get_reply` until the state is `done`. Before `send` or `ask`
-it says one short line in your language that fits the request, in its own words each time: a task
-is on its way, a question gets its answer in a moment. The tool descriptions ask for no fixed phrase,
-since you may speak any language, and never for a "let me check": the voice AI only passes the
-request on. It never stays silent: in a car silence sounds as if you were not heard, so the
-instructions ask for at least a short okay after everything you say, and the result of `send` reminds
-it once more, before the first `get_reply`. A beep would not do, since it sounds like an error.
-Every result starts with a machine-readable line, for example
-`[state=working id=k7f3 elapsed=34s]`. Requests and approvals have these states:
+The voice AI calls `send` and then `get_reply` until the state is `done`. `send` returns at once,
+so the voice AI calls it with no lead-in and says its result straight away, in your language: the
+request is passed on ("Ist weitergegeben"). Before `ask`, `approve` and `status`, and between polls,
+it says only a short phrase that fits, such as "Bin dran", "Läuft" or "Moment bitte". The
+instructions and the descriptions of these five tools forbid a "let me check" in any form and
+language ("Moment, ich schau mal nach", "ich sehe mal nach", "lass mich nachsehen"): the voice AI
+looks nothing up, it only passes the request on. It never stays silent: in a car silence sounds as
+if you were not heard, so the instructions ask for an answer at once to everything you say, the
+result of `send` says what to say before the first `get_reply`, and that of a poll without news asks
+for a short phrase. A beep would not do, since it sounds like an error. Every result starts with a
+machine-readable line, for example `[state=working id=k7f3 elapsed=34s]`. Requests and approvals
+have these states:
 
 ![States](docs/states.drawio.svg)
 
