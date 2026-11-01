@@ -13,7 +13,8 @@
 // work folders for tasks without a repository, a watch on the pull requests they
 // open, for checks and reviews, with fixes for review comments queued without
 // asking (VOICE_GW_AUTO_FIX_REVIEWS), and optionally Telegram, for questions and
-// approvals after the voice mode ended, and for alarms. At the controller
+// approvals after the voice mode ended, for alarms, and for the driver's
+// answers and requests typed there (telegram.mjs). At the controller
 // levels clone-delete and unrestricted, also cloning and deleting in the
 // worker root (folders.mjs). Over all of it, the kill switch (killswitch.mjs).
 // And what is open, so that nothing is forgotten: decisions for the driver
@@ -504,15 +505,18 @@ if (config.funnelIdleMinutes) {
 }
 if (telegram) {
   // The driver's answers to questions, typed in the chat as a Reply or with
-  // the question's code (VOICE_GW_TELEGRAM_ANSWERS): to the controller like
-  // answers by voice, never past a locked kill switch or a standby.
+  // the question's code (VOICE_GW_TELEGRAM_ANSWERS), and their other
+  // messages as requests (VOICE_GW_TELEGRAM_REQUESTS): to the controller
+  // like answers and requests by voice, never past a locked kill switch or a
+  // standby.
   const answers =
-    config.telegramAnswers === 'off'
+    config.telegramAnswers === 'off' && !config.telegramRequests
       ? null
       : new TelegramAnswers({
           store,
           ledger,
           mode: config.telegramAnswers,
+          requests: config.telegramRequests,
           killswitch,
           presence,
           push: async request => {
@@ -536,9 +540,18 @@ if (telegram) {
       off: 'telegram answers off (VOICE_GW_TELEGRAM_ANSWERS=0): questions are answered by voice only',
     }[config.telegramAnswers],
   )
+  if (config.telegramRequestsSetting.trim() && !['1', '0'].includes(config.telegramRequestsSetting.trim())) {
+    log(`VOICE_GW_TELEGRAM_REQUESTS=${config.telegramRequestsSetting} is not 1 or 0; 1 instead`)
+  }
+  log(
+    config.telegramRequests
+      ? 'telegram requests on: any other message from the chat reaches the controller as a request of the driver\'s, and its replies come back there'
+      : 'telegram requests off (VOICE_GW_TELEGRAM_REQUESTS=0): a message that is no command and no answer is not passed on',
+  )
   // Paused in a standby, and in night mode, where Telegram carries alarms
   // only; what the night left, the morning summary names (night.mjs). The
-  // controller's replies to an answer typed there wait only in a standby.
+  // controller's replies to an answer or a request typed there wait only in
+  // a standby.
   fallback = new TelegramFallback(store, {
     send: (text, options) => telegram.send(text, options),
     afterSeconds: config.telegramAfterSeconds,
@@ -548,8 +561,14 @@ if (telegram) {
   })
   log(`telegram fallback ready: questions and approvals after ${config.telegramAfterSeconds} s without a voice call`)
   // Inbound, only from the configured chat: the kill switch, the Funnel,
-  // night mode, the statistics, and answers to questions.
-  telegramCommands = new TelegramCommands(telegram, { pollSeconds: config.telegramPollSeconds, answers: Boolean(answers) }).start()
+  // night mode, the statistics, answers to questions and requests. With
+  // requests, a Reply to a message that asks nothing, news or an alarm, is
+  // read like any message: a command is a command there too.
+  telegramCommands = new TelegramCommands(telegram, {
+    pollSeconds: config.telegramPollSeconds,
+    answers: Boolean(answers),
+    ...(config.telegramRequests ? { asks: id => answers.asks(id) } : {}),
+  }).start()
   if (answers) telegramCommands.on('answer', message => answers.route(message))
   telegramCommands.on('stop', ({ text }) => {
     const state = killswitch.trip({ trigger: 'telegram', reason: `"${text}" on Telegram` })

@@ -422,6 +422,8 @@ test('the start: checks, current settings, repositories and the plugin, without 
   assert.match(html, /<input data-setting="VOICE_GW_AUTO_FIX_ROUNDS" inputmode="numeric">/)
   assert.equal(data.settings.VOICE_GW_TELEGRAM_ANSWERS, '1', 'answers by Telegram to every question, by default')
   assert.match(html, /<select data-setting="VOICE_GW_TELEGRAM_ANSWERS"><option value="1">to every question \(default\)<\/option><option value="other">not to push, merge, restart and delete questions<\/option><option value="0">off, only by voice<\/option><\/select>/)
+  assert.equal(data.settings.VOICE_GW_TELEGRAM_REQUESTS, '1', 'requests by Telegram on, by default')
+  assert.match(html, /<select data-setting="VOICE_GW_TELEGRAM_REQUESTS"><option value="1">on, like a voice request \(default\)<\/option><option value="0">off, only commands and answers<\/option><\/select>/)
   assert.equal(data.settings.VOICE_GW_SCRATCH, '0', 'work folders off, by default')
   assert.equal(data.settings.VOICE_GW_SCRATCH_DOCKER, '', 'and on this computer when turned on')
   assert.equal(data.settings.VOICE_GW_SCRATCH_DAYS, '60')
@@ -513,11 +515,12 @@ test('finishing: invalid input is refused before anything is written', async () 
       VOICE_GW_STANDBY: 'yes',
       VOICE_GW_DISCONNECT_STANDBY: 'no',
       VOICE_GW_TELEGRAM_ANSWERS: 'yes',
+      VOICE_GW_TELEGRAM_REQUESTS: 'other',
       NOPE: '1',
     },
   })
   assert.equal(refused.status, 400)
-  for (const name of ['VOICE_GW_AUTO_FIX_REVIEWS', 'VOICE_GW_AUTO_FIX_ROUNDS', 'VOICE_GW_NAME', 'VOICE_GW_STANDBY', 'VOICE_GW_DISCONNECT_STANDBY', 'VOICE_GW_TELEGRAM_ANSWERS']) {
+  for (const name of ['VOICE_GW_AUTO_FIX_REVIEWS', 'VOICE_GW_AUTO_FIX_ROUNDS', 'VOICE_GW_NAME', 'VOICE_GW_STANDBY', 'VOICE_GW_DISCONNECT_STANDBY', 'VOICE_GW_TELEGRAM_ANSWERS', 'VOICE_GW_TELEGRAM_REQUESTS']) {
     assert.match(refused.data.error, new RegExp(`${name}: not a valid value`))
   }
   assert.match(refused.data.error, /VOICE_GW_REMOTE_CONTROL: not a valid value/)

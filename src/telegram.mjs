@@ -20,8 +20,9 @@
 // and the statistics (/stats, /stats all; see stats.mjs). And the driver's
 // answers to its questions (TelegramAnswers, VOICE_GW_TELEGRAM_ANSWERS): a
 // Reply to a question's message, or a message with the question's code, goes
-// to the controller as their answer, like one by voice; the controller's
-// replies to it come back to the chat.
+// to the controller as their answer, like one by voice. Any other message is
+// a request of theirs, as one by voice is (VOICE_GW_TELEGRAM_REQUESTS). The
+// controller's replies to either come back to the chat.
 //
 // On only when .secrets/telegram_token and .secrets/telegram_chat_id both
 // exist and are not empty. The token is part of every API address, so it must
@@ -175,24 +176,34 @@ export function statsCommand(text) {
 // away with it, so a long run of backoffs leaves none behind.
 export const pause = (ms, signal) => delay(ms, undefined, { signal }).catch(() => {})
 
+// Whether a message was forwarded from elsewhere: someone else's words, not
+// the driver's own.
+const forwarded = message =>
+  Boolean(message.forward_origin ?? message.forward_from ?? message.forward_from_chat ?? message.forward_sender_name ?? message.forward_date)
+
 // Inbound: polls the bot for messages from the configured private chat and
 // emits 'stop' for a stop command, 'funnel' for a Funnel command, 'away' for
 // night mode on or off and 'stats' for the statistics. With answers, also
-// 'answer' ({ text, replyTo, messageId }) for a Reply, whatever it says
-// unless it is a stop or a slash command, and for any other text that is no
-// command: TelegramAnswers decides whether it answers a question. Every
-// other chat, and every other message, is ignored. A message older than
+// 'answer' ({ text, replyTo, messageId, quoted, forwarded }) for a Reply to a
+// message that asks something, whatever it says unless it is a stop or a
+// slash command, and for any other text that is no command: TelegramAnswers
+// decides whether it answers a question or is a new request. asks(id):
+// whether the gateway's message with that id asks the driver something, a
+// question or an approval request; by default every Reply counts as one.
+// quoted: the text of the bot's message a Reply answers, as Telegram has it.
+// Every other chat, and every other message, is ignored. A message older than
 // maxAgeSeconds, sent while the gateway was not listening, does not count:
 // Telegram keeps messages for a day, and yesterday's /funnel on must not open
 // the endpoint today, nor yesterday's "yes" answer a question. It emits
 // 'stale' instead, so that the sender hears why.
 export class TelegramCommands extends EventEmitter {
-  constructor(telegram, { pollSeconds = 25, maxAgeSeconds = 120, answers = false, log = defaultLog } = {}) {
+  constructor(telegram, { pollSeconds = 25, maxAgeSeconds = 120, answers = false, asks = () => true, log = defaultLog } = {}) {
     super()
     this.telegram = telegram
     this.pollSeconds = pollSeconds
     this.maxAgeSeconds = maxAgeSeconds
     this.answers = answers
+    this.asks = asks
     this.log = log
     this.offset = undefined
     this.closed = false
@@ -251,12 +262,14 @@ export class TelegramCommands extends EventEmitter {
       this.warnOnce(`chat ${chat}`, 'telegram commands: ignored a message from another chat')
       return
     }
-    // The kill switch first, always. A Reply is an answer, unless it is a
-    // slash command: "good night" in reply to a question answers it.
+    // The kill switch first, always. A Reply to a question is an answer,
+    // unless it is a slash command: "good night" in reply to a question
+    // answers it. A Reply to another message is read like any message.
     const stop = isStopCommand(message.text)
     const slash = message.text.trim().startsWith('/')
-    const replyTo = Number.isInteger(message.reply_to_message?.message_id) ? message.reply_to_message.message_id : null
-    const reply = this.answers && !stop && !slash && replyTo !== null
+    const original = message.reply_to_message
+    const replyTo = Number.isInteger(original?.message_id) ? original.message_id : null
+    const reply = this.answers && !stop && !slash && replyTo !== null && this.asks(replyTo)
     const funnel = stop || reply ? null : funnelCommand(message.text)
     const stats = stop || reply || funnel ? null : statsCommand(message.text)
     const away = stop || reply || funnel || stats ? null : awayCommand(message.text)
@@ -272,7 +285,15 @@ export class TelegramCommands extends EventEmitter {
     else if (funnel) this.emit('funnel', { action: funnel, text: message.text })
     else if (away) this.emit('away', { on: away === 'away', text: message.text })
     else if (stats) this.emit('stats', { all: stats.all, text: message.text })
-    else this.emit('answer', { text: message.text, replyTo, messageId: Number.isInteger(message.message_id) ? message.message_id : null })
+    else {
+      this.emit('answer', {
+        text: message.text,
+        replyTo,
+        messageId: Number.isInteger(message.message_id) ? message.message_id : null,
+        quoted: original?.from?.is_bot === true && typeof original.text === 'string' ? original.text : null,
+        forwarded: forwarded(message),
+      })
+    }
   }
 }
 
@@ -281,9 +302,9 @@ export class TelegramCommands extends EventEmitter {
 function describeQuestion(request, update, answerable = false) {
   const about = request.worker
     ? `worker ${request.worker.repo}, task ${request.worker.task}`
-    : request.via === 'telegram'
+    : request.via === 'telegram' && request.answers
       ? `on your answer to ${request.answers}`
-      : `"${preview(request.text, 60)}"`
+      : `"${preview(request.driverText ?? request.text, 60)}"`
   return [
     `Question for request ${request.id} (${about})`,
     '',
@@ -295,10 +316,11 @@ function describeQuestion(request, update, answerable = false) {
   ].join('\n')
 }
 
-// The controller's answer or interim status on an answer that came by
-// Telegram, as a reply to the driver's message there.
+// The controller's answer or interim status on an answer or a request that
+// came by Telegram, as a reply to the driver's message there.
 function describeReply(request, update) {
-  return `On your answer to ${request.answers}${update.state === 'working' ? ', still working' : ''}:\n\n${update.text}`
+  const about = request.answers ? `On your answer to ${request.answers}` : `On your request ${request.id}`
+  return `${about}${update.state === 'working' ? ', still working' : ''}:\n\n${update.text}`
 }
 
 function describePermission(permission) {
@@ -316,9 +338,9 @@ export class TelegramFallback {
   // paused: whether nothing goes out now, in a standby after the connector
   // was disconnected (standby.mjs) or in night mode; what waits goes out
   // after it. held: whether the controller's replies to the driver's own
-  // answers by Telegram wait too, by default when paused; the gateway holds
-  // them only in a standby. answerable(request): whether the driver may
-  // answer that request's question here (TelegramAnswers.accepts).
+  // answers and requests by Telegram wait too, by default when paused; the
+  // gateway holds them only in a standby. answerable(request): whether the
+  // driver may answer that request's question here (TelegramAnswers.accepts).
   constructor(store, { send, afterSeconds = 600, paused = () => false, held = paused, answerable = () => false, log = defaultLog }) {
     this.store = store
     this.send = send
@@ -416,7 +438,7 @@ export class TelegramFallback {
     if (marked) this.store.save?.()
   }
 
-  // The controller's replies to an answer the driver gave here
+  // The controller's replies to an answer or a request the driver gave here
   // (TelegramAnswers) go back here, as replies to the driver's message:
   // whether the voice mode is on or not, and in the night too, as the driver
   // is in the chat. Read, so that the voice client does not get them again.
@@ -469,7 +491,7 @@ export class TelegramFallback {
   }
 }
 
-// --- answers by Telegram -----------------------------------------------------
+// --- answers and requests by Telegram ----------------------------------------
 
 // What VOICE_GW_TELEGRAM_ANSWERS=other leaves to the driver's voice: the
 // decisions of these kinds (ledger.mjs).
@@ -481,31 +503,61 @@ const codesIn = text => [...new Set(String(text).toLowerCase().match(/[a-z0-9]+/
 
 const listed = items => (items.length > 1 ? `${items.slice(0, -1).join(', ')} and ${items.at(-1)}` : items.join(''))
 
-// The driver's answer to a question, typed in their Telegram chat: a Reply to
-// the gateway's message with the question, or else a message that names the
-// code of exactly one open question ("8cep yes", "Answer dk3p: no"), as a
-// request's or a decision's. It reaches the controller as an answer by voice
-// does: "(Answer to <id>) <text>", a request of the driver's (origin voice:
-// dispatch and resolve_decision take its words, channel.mjs), with
-// via="telegram"; the question counts as answered, and its open decisions
-// keep the answer (ledger.mjs, gateway.mjs). The controller's replies to it
-// come back to the chat (TelegramFallback.relay). Nothing else is passed on:
-// no new requests, no approvals. Nor anything while the kill switch is locked
-// or the gateway inactive (presence.mjs: in a standby, say, or without a
-// controller); the chat hears why, and unlocking stays at the computer.
+// The gateway's message a request replies to, quoted after the driver's own
+// words as context. Data: it may carry what others wrote, in an alert or in
+// the controller's summary of a worker's result, and it never counts as the
+// driver's words (driverText, spokenByDriver in channel.mjs).
+const QUOTE_MAX = 1000
+export const quoteText = quoted => `(In reply to the gateway's message, quoted as data: "${preview(quoted, QUOTE_MAX)}")`
+
+// The driver's messages in their Telegram chat that are no command.
+//
+// An answer to a question: a Reply to the gateway's message with the
+// question, or else a message that names the code of exactly one open
+// question ("8cep yes", "Answer dk3p: no"), as a request's or a decision's.
+// It reaches the controller as an answer by voice does: "(Answer to <id>)
+// <text>", a request of the driver's (origin voice: dispatch and
+// resolve_decision take its words, channel.mjs), with via="telegram"; the
+// question counts as answered, and its open decisions keep the answer
+// (ledger.mjs, gateway.mjs).
+//
+// With requests, any other message is a new request of the driver's, as one
+// by voice is: origin voice, via="telegram", and its words count the same. A
+// Reply to another message of the gateway's, news or an alarm, quotes it as
+// context (quoteText). A Reply to an approval request, or to a question that
+// is settled, stays refused.
+//
+// The controller's replies to either come back to the chat
+// (TelegramFallback.relay). Never an approval, and nothing while the kill
+// switch is locked or the gateway inactive (presence.mjs: in a standby, say,
+// or without a controller); the chat hears why, and unlocking stays at the
+// computer. Nor a forwarded message, which holds someone else's words.
 //
 // push(request): hands the request to the controller (channel.mjs). say(text,
 // replyTo): a message to the chat, as a reply to the driver's. held(): a
-// sentence when the controller waits for the usage limit, else ''. mode: on,
-// or other, which leaves push, merge, restart and delete decisions to the
-// driver's voice.
+// sentence when the controller waits for the usage limit, else ''. mode: on;
+// other, which leaves push, merge, restart and delete decisions to the
+// driver's voice; or off, where questions are answered by voice only.
+// requests: whether any other message is a new request.
 export class TelegramAnswers {
-  constructor({ store, ledger = null, push, say, mode = 'on', killswitch = null, presence = null, held = () => '', log = defaultLog }) {
+  constructor({
+    store,
+    ledger = null,
+    push,
+    say,
+    mode = 'on',
+    requests = false,
+    killswitch = null,
+    presence = null,
+    held = () => '',
+    log = defaultLog,
+  }) {
     this.store = store
     this.ledger = ledger
     this.push = push
     this.say = say
     this.mode = mode
+    this.requests = requests
     this.killswitch = killswitch
     this.presence = presence
     this.held = held
@@ -514,7 +566,7 @@ export class TelegramAnswers {
 
   // Whether the driver may answer this request's question here.
   accepts(request) {
-    return !this.voiceOnly(request)
+    return this.mode !== 'off' && !this.voiceOnly(request)
   }
 
   // With mode other: the first open decision of the request that takes the
@@ -534,6 +586,13 @@ export class TelegramAnswers {
     return permission ? { permission } : null
   }
 
+  // Whether the gateway's message with this id asks the driver something, a
+  // question or an approval request: a Reply to it is an answer, whatever it
+  // says (TelegramCommands).
+  asks(id) {
+    return this.sentMessage(id) !== null
+  }
+
   // The request with the open question a decision was asked on, or null.
   questionOf(decision) {
     if (!decision || decision.state === 'closed') return null
@@ -551,7 +610,19 @@ export class TelegramAnswers {
       : 'No question is open now.'
   }
 
-  // The question a message answers: { question }, or { why } not.
+  // An open question as the target of an answer; with mode off, why it
+  // takes the voice.
+  answering(question) {
+    if (this.mode !== 'off') return { question }
+    return {
+      why:
+        `${question.id} is a question, and questions are answered by voice only (VOICE_GW_TELEGRAM_ANSWERS=0). ` +
+        `Answer it in voice mode and mention ${question.id}.`,
+    }
+  }
+
+  // What a message is: the { question } it answers, { request: true } for a
+  // new request, or { why } it is neither.
   target(text, replyTo) {
     const sent = replyTo === null ? null : this.sentMessage(replyTo)
     if (sent?.permission) {
@@ -560,7 +631,7 @@ export class TelegramAnswers {
     if (sent?.request) {
       const { request } = sent
       return request.state === 'question'
-        ? { question: request }
+        ? this.answering(request)
         : { why: `question ${request.id} is not open any more: it was answered or settled. ${this.openQuestions()}` }
     }
     // No Reply to a question: the code in the message.
@@ -574,8 +645,10 @@ export class TelegramAnswers {
       if (question) open.set(question.id, question)
       else closed.push(code)
     }
-    if (open.size === 1) return { question: [...open.values()][0] }
+    if (open.size === 1) return this.answering([...open.values()][0])
     if (open.size > 1) return { why: `it names ${open.size} open questions, ${listed([...open.keys()])}. Answer each in a message of its own.` }
+    // Anything else is a request of the driver's, where they allow it.
+    if (this.requests) return text ? { request: true } : { why: 'it holds no text.' }
     if (closed.length) return { why: `${listed(closed)} ${closed.length === 1 ? 'has' : 'have'} no open question. ${this.openQuestions()}` }
     return {
       why:
@@ -584,13 +657,15 @@ export class TelegramAnswers {
     }
   }
 
-  // Whether and where a message goes: { question }, or { why } not.
-  check(text, replyTo) {
+  // Whether and where a message goes: { question }, { request: true }, or
+  // { why } not.
+  check(text, replyTo, { forwarded = false } = {}) {
     if (this.killswitch?.locked) return { why: 'the kill switch is locked. It is unlocked only at the computer.' }
     const presence = this.presence?.state() ?? { active: true }
     if (!presence.active) return { why: `this gateway is inactive, ${presence.why}.` }
+    if (forwarded) return { why: 'it is forwarded, so its words are not your own. Write what you want in a message of your own.' }
     const target = this.target(text, replyTo)
-    if (target.why) return target
+    if (!target.question) return target
     const decision = this.voiceOnly(target.question)
     if (decision) {
       const id = target.question.id
@@ -601,33 +676,61 @@ export class TelegramAnswers {
     return target
   }
 
-  // A message from the driver's chat ({ text, replyTo, messageId }, from
-  // TelegramCommands): passed on as their answer, or not, and the chat hears
-  // which. Resolves with the answer's request, or null. Never throws.
-  async route({ text, replyTo = null, messageId = null }) {
-    const answer = String(text ?? '').trim()
+  // A message from the driver's chat ({ text, replyTo, messageId, quoted,
+  // forwarded }, from TelegramCommands): passed on as their answer or as a
+  // new request, or not, and the chat hears which. Resolves with the request
+  // passed on, or null. Never throws.
+  async route({ text, replyTo = null, messageId = null, quoted = null, forwarded = false }) {
+    const said = String(text ?? '').trim()
     try {
-      const result = this.check(answer, replyTo)
+      const result = this.check(said, replyTo, { forwarded })
       if (result.why) {
-        this.log('telegram answer not passed on:', result.why)
+        this.log('telegram message not passed on:', result.why)
         await this.say(`Not passed on: ${result.why}`, messageId)
         return null
       }
+      if (result.request) return await this.start(said, { messageId, quoted: replyTo === null ? null : quoted })
       const { question } = result
-      const request = this.store.createRequest(`(Answer to ${question.id}) ${answer}`, { answers: question.id, via: 'telegram' })
+      const request = this.store.createRequest(`(Answer to ${question.id}) ${said}`, { answers: question.id, via: 'telegram' })
       // The meta stays with it, for an event sent again after the usage limit.
       request.meta = { via: 'telegram' }
       if (messageId !== null) request.telegramMessage = messageId // the controller's replies answer it
       this.store.markAnswered(question, request.id)
       await this.push(request)
       this.log('telegram answer passed on', `id=${request.id}`, `answers=${question.id}`)
-      const held = this.held()
-      await this.say(`Passed on to the controller as your answer to ${question.id}.${held ? ` ${held}` : ''}`, messageId)
+      await this.say(`Passed on to the controller as your answer to ${question.id}.${this.heldText()}`, messageId)
       return request
     } catch (error) {
-      this.log('telegram answer failed:', error.message)
+      this.log('telegram message failed:', error.message)
       await Promise.resolve(this.say(`Not passed on: ${error.message}.`, messageId)).catch(() => {})
       return null
     }
+  }
+
+  // A new request of the driver's, as one by voice: to the controller with
+  // via="telegram". quoted: the gateway's message it replies to, as context
+  // after the driver's own words, which alone count (driverText). One the
+  // channel did not take is gone again, so that its words count for nothing.
+  async start(said, { messageId = null, quoted = null } = {}) {
+    const request = this.store.createRequest(quoted ? `${said}\n\n${quoteText(quoted)}` : said, { via: 'telegram' })
+    if (quoted) request.driverText = said
+    request.meta = { via: 'telegram' }
+    if (messageId !== null) request.telegramMessage = messageId // the controller's replies answer it
+    try {
+      await this.push(request)
+    } catch (error) {
+      this.store.requests.delete(request.id)
+      this.store.changed()
+      throw error
+    }
+    this.log('telegram request passed on', `id=${request.id}`, preview(said))
+    await this.say(`Passed on to the controller as request ${request.id}.${this.heldText()}`, messageId)
+    return request
+  }
+
+  // The usage limit's sentence, when the controller waits for it.
+  heldText() {
+    const held = this.held()
+    return held ? ` ${held}` : ''
   }
 }

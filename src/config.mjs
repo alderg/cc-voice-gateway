@@ -38,6 +38,10 @@ export function telegramAnswersMode(value) {
   return text === '0' ? 'off' : text === 'other' ? 'other' : 'on'
 }
 
+// Requests by Telegram (VOICE_GW_TELEGRAM_REQUESTS, telegram.mjs): on, the
+// default and for any value it does not know; off with 0.
+export const telegramRequestsOn = value => String(value ?? '').trim() !== '0'
+
 // Where Claude voice mode calls from: Anthropic's published outbound range.
 export const ANTHROPIC_RANGES = ['160.79.104.0/21']
 
@@ -241,6 +245,12 @@ export const config = {
   // decisions, which then take the driver's voice; 0: off.
   telegramAnswers: telegramAnswersMode(env.VOICE_GW_TELEGRAM_ANSWERS),
   telegramAnswersSetting: env.VOICE_GW_TELEGRAM_ANSWERS ?? '',
+  // Requests by Telegram (telegram.mjs, TelegramAnswers): any other message
+  // from the driver's chat, no command and no answer, reaches the controller
+  // as a request of theirs, as one by voice does, and its replies come back
+  // there. On, the default; 0: off, such a message is not passed on.
+  telegramRequests: telegramRequestsOn(env.VOICE_GW_TELEGRAM_REQUESTS),
+  telegramRequestsSetting: env.VOICE_GW_TELEGRAM_REQUESTS ?? '',
 
   // The Tailscale Funnel (funnel.mjs): off by itself this many minutes after
   // the last voice call; 0 or empty, the default, leaves it on. On again with

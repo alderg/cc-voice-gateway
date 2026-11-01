@@ -186,6 +186,10 @@
       <select data-setting="VOICE_GW_TELEGRAM_ANSWERS"><option value="1">to every question (default)</option><option value="other">not to push, merge, restart and delete questions</option><option value="0">off, only by voice</option></select>
     </label>
     <p class="guide">A Reply to a question there, or a message that starts with its code, such as "8cep yes", reaches the controller as your answer, as one by voice does; its replies come back to the chat. Approvals stay with your voice and the terminal.</p>
+    <label>Requests in Telegram
+      <select data-setting="VOICE_GW_TELEGRAM_REQUESTS"><option value="1">on, like a voice request (default)</option><option value="0">off, only commands and answers</option></select>
+    </label>
+    <p class="guide">Any other message you write to the bot reaches the controller as a request of yours, as one by voice does, and its replies come back as replies to your message. Your Telegram account then starts work as your voice does.</p>
   </div>
 </section>
 

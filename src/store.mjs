@@ -135,8 +135,9 @@ export class Store extends EventEmitter {
 
   // answers: for the driver's answer to a question, the id of the question's
   // request; the 'answer' event tells the open decisions (gateway.mjs).
-  // via: 'telegram' for the driver's answer typed in their Telegram chat
-  // (telegram.mjs, TelegramAnswers), still origin voice, as their own words.
+  // via: 'telegram' for the driver's answer or request typed in their
+  // Telegram chat (telegram.mjs, TelegramAnswers), still origin voice, as
+  // their own words.
   createRequest(text, { origin = 'voice', worker = null, answers = null, via = null } = {}) {
     const request = {
       id: this.newId(),
