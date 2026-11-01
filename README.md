@@ -2016,10 +2016,40 @@ it). The watch above does it, in code (`src/pulls.mjs`, `Workers.reviewFix`):
   up, and the controller tells you. A further fix takes your word, and a run you dispatch that
   works on the pull request gives it its rounds again.
 - **What you hear:** the news about the review, which says that a fix was queued (with
-  `fix="q…"` for the controller, which dispatches nothing for it), and later the fix's result.
+  `fix="q…"` for the controller, which dispatches nothing for it), and later the fix's result,
+  both gathered into the digest below while they are routine.
   `open_items`, `list_workers` and `worker_status` show such a task as "from the review of pull
   request 12"; its runs count in the statistics like any other.
 - **Off,** with `VOICE_GW_AUTO_FIX_REVIEWS=0`: news only, and a fix only when you ask for it.
+
+#### The digest of routine review news
+
+Within a few hours of automatic rounds, one event each made dozens of near-identical news items:
+"checks passed", "Claude commented, round 2 queued", "nothing needed fixing". So the gateway
+gathers the routine ones and tells the controller once, in one short summary
+(`VOICE_GW_REVIEW_DIGEST`, `src/digest.mjs`), by fixed rules in its code:
+
+- **Routine:** checks that all finished without a failure; with automatic fixes on, reviews and
+  comments that ask for nothing (approvals, others' text, which is not forwarded) or that a fix
+  was queued for, or that a fix waiting already takes; and an automatic fix that ended done, pushed
+  nothing to its pull request (its head did not move during the run, as `gh` shows it right after),
+  left nothing on no remote or uncommitted, and does not end with a question. With automatic
+  fixes off, only passed checks.
+- **Still one by one:** failed checks, comments that ask for changes with no fix queued (the
+  automatic rounds used up, the kill switch locked), a fix that pushed changes, failed, asks or
+  left something, and every run you or a standing order dispatched. Such an event takes along the
+  routine items of its own pull request that were not told yet, so the order stays.
+- **When:** once the news has been quiet for `VOICE_GW_REVIEW_DIGEST` minutes (10), at the latest
+  `VOICE_GW_REVIEW_DIGEST_MAX` minutes (30) after its first item; not before the controller is
+  connected, nor in a standby. It reaches the controller as one event, `kind="digest"`,
+  `trusted="no"`, with `items`, `pull_requests` (owner/name#number), `fix` (the fixes queued) and
+  `tasks` (the fix runs) as attributes and one line per item with its time; the controller answers
+  it once, in two or three sentences, and you hear that as news.
+- **Nothing lost:** the items wait in `.state/digest.json`, and leave it only once their digest is
+  a request, which goes to the controller again after a restart if it was never answered.
+  `open_items` and the start-up summary say how many wait, and when they go.
+- **Off,** with `VOICE_GW_REVIEW_DIGEST=0`: one event each, as before; items gathered before go
+  once as one digest at the next start.
 
 #### Several gateways, and the standby after a disconnect
 
@@ -2339,6 +2369,8 @@ limits at once.
 | `VOICE_GW_PR_WATCH_HOURS` | `24` | Hours before a watch ends |
 | `VOICE_GW_AUTO_FIX_REVIEWS` | `1` | `1`: new review comments that ask for changes, from collaborators and review bots, get a fix the gateway queues itself ([automatic fixes](#automatic-fixes-for-review-comments)); `0`: only on the driver's word |
 | `VOICE_GW_AUTO_FIX_ROUNDS` | `3` | Automatic fixes per pull request, until the driver dispatches something for it again |
+| `VOICE_GW_REVIEW_DIGEST` | `10` | Minutes of quiet before routine news about the workers' pull requests goes to the controller as one [digest](#the-digest-of-routine-review-news); `0`: one event each, as before |
+| `VOICE_GW_REVIEW_DIGEST_MAX` | `30` | Minutes after its first item at the latest before the digest goes, however busy the news is |
 | `VOICE_GW_REVIEW_BOTS` | `claude,copilot-pull-request-reviewer,copilot` | Review bots whose reviews and comments start a fix, by GitHub login without `[bot]` |
 | `VOICE_GW_NAME` | the computer's name | The gateway's name in the first line of every connector answer, in its instructions and tool descriptions, with the kind of computer unless it has brackets of its own ([several gateways](#several-gateways-and-the-standby-after-a-disconnect)) |
 | `VOICE_GW_STANDBY` | `0` | `1`: inactive on purpose, a standby install: the connector answers, says it is inactive, and hands nothing over |
@@ -2462,6 +2494,7 @@ gateway; do not set them.
 | A result says `git="1 commit on no remote"` although the worker pushed | The check counts commits that no remote-tracking branch (`refs/remotes/…`) has. A push to a URL instead of a named remote does not update them; `git fetch` in the checkout does. Without any remote, commits never count. |
 | What did a worker do? | `.state/tasks/<task>.jsonl` holds the whole run. `claude --resume <session>` in the repository opens the session; `.state/workers.json` lists the session ids. |
 | A private repository is handled like a public one | `gh` is not logged in or not on the `PATH`, so the visibility is unknown, and the worker asks before pushing to be safe. |
+| Passed checks or a queued review fix are not told at once | They are routine and wait for the [digest](#the-digest-of-routine-review-news): `VOICE_GW_REVIEW_DIGEST` minutes after the news went quiet, at the latest `VOICE_GW_REVIEW_DIGEST_MAX` after the first. `open_items` says how many wait; the log has `digest: routine news kept …`; `.state/digest.json` holds them. `VOICE_GW_REVIEW_DIGEST=0` brings back one event each. |
 | No news about checks or reviews on a worker's pull request | The log says why: `gh is not logged in`, or `stopped watching pull request … : nothing automatic runs` (often a draft that bot reviewers skip, with `VOICE_GW_PR_DRAFT=1` or `draft`; marking it ready in a later run watches it again), `merged`, `closed` or `time limit`. Only pull requests on `voice/` branches that a run linked to, or pushed to after that, are watched. `.state/pulls.json` lists the watches. |
 | The controller cannot merge a pull request | A draft must be marked ready first (a task for the worker). Required reviews or checks, conflicts and other branch protection apply; `--admin` is blocked on purpose. With `VOICE_GW_PERMISSION_RELAY=0` the approval only appears at the terminal. |
 | The controller says a `gh` command was blocked | Only the commands in [The controller's confinement](#53-the-controllers-confinement) pass, each with `--repo owner/name` and flags as separate words. If it does not know about `gh` at all, restart the controller so that it reads the current `controller/CLAUDE.md`. |
@@ -2607,7 +2640,7 @@ src/
   night.mjs          night mode: the quiet hours, good night and I'm back, the morning summary
   orders.mjs         standing orders: what the controller may dispatch without fresh words, at night
   workers.mjs        workers: repositories, claude -p runs, the queue, the check after a run, results
-  workspaces.mjs     where a run works: a repository, or a work folder, with its rules and check
+  workspaces.mjs     where a run works: a repository, or a work folder, with its rules and check; run folders
   worktrees.mjs      the worktrees of further runs of a repository: made, with submodules, removed
   live.mjs           the worker limits from the settings file while the gateway runs
   ledger.mjs         open decisions for the driver, and the open items
@@ -2615,6 +2648,7 @@ src/
   runners.mjs        where workers run: this computer, or the Docker container; a run's processes
   access.mjs         access levels in the container, from the GitHub token
   pulls.mjs          the watch on pull requests that workers open
+  digest.mjs         routine news about them, gathered into one event for the controller
   telegram.mjs       Telegram fallback; /stop, /funnel, answers and requests from your chat
   funnel.mjs         the Funnel on and off from Telegram, and off by itself when idle
   killswitch.mjs     the kill switch: state, emergency phrases, alarm

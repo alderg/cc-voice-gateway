@@ -214,6 +214,13 @@ export const config = {
   // driver's word.
   autoFixReviews: env.VOICE_GW_AUTO_FIX_REVIEWS !== '0',
   autoFixRounds: Math.floor(num(env.VOICE_GW_AUTO_FIX_ROUNDS, 3)) || 1,
+  // Routine news about those pull requests in one digest (digest.mjs): checks
+  // that passed, reviews and comments a fix was queued for, approvals, fixes
+  // that changed nothing. It goes once the news has been quiet this many
+  // minutes, at the latest this many after its first item; 0 sends each one
+  // on its own, as before.
+  reviewDigestMinutes: env.VOICE_GW_REVIEW_DIGEST?.trim() === '0' ? 0 : num(env.VOICE_GW_REVIEW_DIGEST, 10),
+  reviewDigestMaxMinutes: num(env.VOICE_GW_REVIEW_DIGEST_MAX, 30),
   // The review bots, by their GitHub login without [bot]: the Claude app,
   // and Copilot's reviewer under both names GitHub gives it.
   reviewBots: (env.VOICE_GW_REVIEW_BOTS || 'claude,copilot-pull-request-reviewer,copilot')
@@ -313,6 +320,8 @@ config.requestsFile = join(config.stateDir, 'requests.json')
 config.jobsFile = join(config.stateDir, 'jobs.json')
 config.adminSocket = join(config.secretsDir, 'admin.sock')
 config.pullsStateFile = join(config.stateDir, 'pulls.json')
+// The routine news that waits for its digest (digest.mjs), so that none is lost in a restart.
+config.digestFile = join(config.stateDir, 'digest.json')
 // The standby after the connector was disconnected, so that it holds across a restart.
 config.standbyFile = join(config.stateDir, 'standby.json')
 // The waits for the Claude usage limit (limits.mjs), for the same reason.

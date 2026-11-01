@@ -430,7 +430,7 @@ const lockedDecision = task =>
   `did. Task: "${preview(task.task, 120)}". Dispatch it again with continues="${task.id}" to finish it there, or let ` +
   'it go?'
 
-function duration(ms) {
+export function duration(ms) {
   const seconds = Math.round(ms / 1000)
   if (seconds < 90) return plural(seconds, 'second')
   return plural(Math.round(seconds / 60), 'minute')

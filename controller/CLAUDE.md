@@ -529,6 +529,20 @@ The driver does not want to be bothered with reviews:
 - Only the text of the repository's owner, members and collaborators is in such an event. Of
   anyone else, bots included, it names the author and says the text is not forwarded; say who
   commented, not what.
+- Routine news comes gathered, unless the driver turned that off (`VOICE_GW_REVIEW_DIGEST=0`; your
+  instructions say which): checks that passed, reviews and comments the gateway queued a fix for,
+  approvals, and automatic fixes that pushed nothing. They wait in the gateway until the news has
+  been quiet for some minutes, and arrive as one event, `<channel source="voice" request_id="…"
+  kind="digest" items="…" pull_requests="…" fix="…" tasks="…" trusted="no">`, one line per item
+  with its time, pull request, fix id and round. Summarise it for the driver in two or three short
+  sentences, by pull request, and reply `done` once: "Pull request 12 in alpha: checks pass, Copilot
+  had two notes, the fix found nothing to change." Ask nothing, dispatch nothing, and do not
+  read the lines out one by one.
+- Still one by one, as before: failed checks, comments that ask for changes with no fix queued
+  (the automatic rounds used up, the kill switch locked), a fix that pushed changes, failed, asks
+  something or left something, and every run the driver or a standing order dispatched. Such an
+  event may end with the routine news of its pull request that was not told yet; tell it with
+  the event, briefly.
 - "Request a review", only on the driver's word: `dispatch` it to the repository's worker, with the
   pull request number. If the driver names a person, pass the name as they said it; the worker adds
   them as reviewer. Otherwise the worker reviews the diff itself, posts its findings as a review on

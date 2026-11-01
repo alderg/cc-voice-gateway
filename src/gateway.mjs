@@ -25,14 +25,15 @@
 
 import { CONTROLLER_LEVELS, EFFORTS, KILLSWITCH_MODES, ROOT, VERSION, WORKER_LIMITS, config, environmentWinsOver, limitValue } from './config.mjs'
 import { FROM_FILE } from './settings.mjs'
-import { log } from './log.mjs'
+import { log, preview } from './log.mjs'
 import { execFileSync } from 'node:child_process'
 import { Store } from './store.mjs'
 import { Auth } from './oauth.mjs'
 import { startAdmin } from './admin.mjs'
 import { startChannel } from './channel.mjs'
 import { startVoiceHttp } from './voice.mjs'
-import { Workers, gitState, hostGit, parkedText, planText, queueList } from './workers.mjs'
+import { Workers, auditSummary, duration, gitState, hostGit, parkedText, planText, queueList } from './workers.mjs'
+import { Digest, digestMeta, digestText, fixLine, foldedText, pullKey, routineFix, routineNews } from './digest.mjs'
 import { SettingsWatcher, othersText } from './live.mjs'
 import { Restarter } from './restart.mjs'
 import { PullWatcher } from './pulls.mjs'
@@ -282,6 +283,17 @@ const pulls = new PullWatcher({
   bots: config.reviewBots,
 })
 pulls.paused = standby.active // no news, no fixes in a standby
+// Routine news about them gathered into one digest (digest.mjs), which goes
+// once it has been quiet for a while; 0 keeps one event each.
+const digest = new Digest({ file: config.digestFile, quietMinutes: config.reviewDigestMinutes, maxMinutes: config.reviewDigestMaxMinutes })
+log(
+  digest.enabled
+    ? `routine news about workers' pull requests: one digest after ${config.reviewDigestMinutes} quiet minutes, at most ` +
+        `${Math.max(config.reviewDigestMinutes, config.reviewDigestMaxMinutes)} after its first item (VOICE_GW_REVIEW_DIGEST)` +
+        (digest.items.length ? `; ${digest.items.length} waiting from before` : '')
+    : "routine news about workers' pull requests: one event each (VOICE_GW_REVIEW_DIGEST=0)" +
+        (digest.items.length ? `; ${digest.items.length} gathered before go as one digest` : ''),
+)
 log(
   config.autoFixReviews
     ? `review comments on workers' pull requests: fixed without asking, at most ${config.autoFixRounds} automatic ` +
@@ -315,6 +327,7 @@ function shutdown(reason, code = process.exitCode ?? 0, { planned = true } = {})
   night.close()
   transcript?.close()
   pulls.close() // so do the watches on pull requests
+  digest.close() // its items are in its file already
   store.save() // the requests, with what the voice client has read
   // The last save of the statistics, with the end of this running time,
   // which the watchdog's message waits for (scripts/stats.mjs).
@@ -398,13 +411,17 @@ const capital = text => `${text[0].toUpperCase()}${text.slice(1)}`
 // start-up summary: night mode, the standing orders, the usage limit waits.
 function openNotes() {
   const notes = night.text() ? [`${capital(night.text())}.`] : []
-  return [...notes, ...orders.lines(), ...limits.list().map(item => `${capital(item.text)}.`)]
+  const digested = digest.note() ? [`${capital(digest.note())}.`] : []
+  return [...notes, ...orders.lines(), ...limits.list().map(item => `${capital(item.text)}.`), ...digested]
 }
 
 // When a run ends, the gateway looks at its checkout (Workers.audit), and the
 // result goes to the controller as a channel event, with what the gateway saw
 // and the pull requests the run opened or worked on. The controller's reply
-// to it reaches the driver as news.
+// to it reaches the driver as news. A fix the gateway queued for review
+// comments that changed nothing is routine: it waits for the digest
+// (digest.mjs). Any other result takes along the routine items of its pull
+// requests that wait there.
 const reporting = new Set()
 workers.on('finished', async task => {
   // In a standby the result waits; the poll offers it again after it.
@@ -418,7 +435,28 @@ workers.on('finished', async task => {
       return []
     })
     stats.reported(task, opened)
-    const request = store.createRequest(workers.resultText(task, opened), {
+    const record = () =>
+      night.record({ repo: task.repo, task: task.id, outcome: task.state, pulls: opened.map(pull => pull.number), result: task.result ?? '' })
+    if (digest.enabled && task.review) {
+      // Whether it pushed to its pull request: its head moved during the run.
+      const pushed = pulls.changedSince(task.review.slug, task.review.number, task.startedAt, task.finishedAt)
+      if (routineFix(task, { pushed, clean: auditSummary(task.audit) === 'clean' })) {
+        digest.add({
+          key: `task:${task.id}`,
+          pull: pullKey(task.review.slug, task.review.number),
+          worker: task.repo,
+          line: fixLine(task, duration(task.finishedAt - task.startedAt)),
+          fix: task.queued ?? null,
+          task: task.id,
+        })
+        workers.markReported(task)
+        record()
+        return
+      }
+    }
+    const own = [...opened.map(pull => pullKey(task.slug, pull.number)), ...(task.review ? [pullKey(task.review.slug, task.review.number)] : [])]
+    const folded = task.slug && own.length ? digest.take({ pulls: own }) : []
+    const request = store.createRequest(workers.resultText(task, opened) + foldedText(folded), {
       origin: 'worker',
       worker: { repo: task.repo, task: task.id },
     })
@@ -438,7 +476,7 @@ workers.on('finished', async task => {
     await channel.push(request, request.meta)
     workers.markReported(task)
     // In the night, for the morning summary (night.mjs).
-    night.record({ repo: task.repo, task: task.id, outcome: task.state, pulls: opened.map(pull => pull.number), result: task.result ?? '' })
+    record()
   } catch (error) {
     log('worker result not delivered:', error.message)
   } finally {
@@ -480,11 +518,24 @@ folders?.on('cloned', async event => {
 
 // Checks and reviews on those pull requests reach the controller as events
 // too, and the driver as news; with fix, the fix the gateway queued for
-// review comments.
+// review comments. Routine news waits for the digest (digest.mjs); other news
+// takes along what of its pull request waits there.
+let newsCount = 0
 pulls.on('news', async news => {
   try {
+    const pull = pullKey(news.slug, news.number)
+    if (digest.enabled && routineNews(news)) {
+      digest.add({
+        key: `news:${pull}:${Date.now()}:${++newsCount}`,
+        pull,
+        worker: news.worker,
+        line: `"${preview(news.title ?? '', 60)}": ${news.brief}`,
+        fix: news.fix ?? null,
+      })
+      return
+    }
     await channel.ready
-    const request = store.createRequest(news.text, { origin: 'worker' })
+    const request = store.createRequest(news.text + foldedText(digest.take({ pulls: [pull] })), { origin: 'worker' })
     // trusted="no": it quotes what others wrote on GitHub.
     request.meta = { worker: news.worker, repo: news.slug, pull_request: String(news.number), kind: news.kind, trusted: 'no' }
     if (news.fix) request.meta.fix = news.fix
@@ -808,7 +859,35 @@ async function deliverStartup() {
   }
   await sendPlan('since the queue was planned, before this start')
   await resendHeld()
+  // Routine news gathered before the digest was turned off goes now, as one.
+  if (!digest.enabled) await sendDigest({ force: true })
 }
+
+// The digest of routine news about the workers' pull requests (digest.mjs):
+// one event once the news has been quiet for a while, kind="digest" and
+// trusted="no", as it quotes what workers and GitHub said. Its answer is news
+// for the driver (origin "worker"). The request is kept before its items go
+// from the digest's file, and a request the controller never answered goes
+// again after a restart (store.mjs), so no item is lost. Not before the
+// session is connected, nor in a standby: then later. One at a time.
+let digesting = Promise.resolve()
+function sendDigest({ force = false } = {}) {
+  digesting = digesting.then(() => deliverDigest(force)).catch(error => log('digest not delivered:', error.message))
+  return digesting
+}
+
+async function deliverDigest(force) {
+  if (!connected || standby.active || !digest.items.length || (!force && !digest.due())) return
+  const items = [...digest.items]
+  const request = store.createRequest(digestText(items), { origin: 'worker' })
+  request.meta = { kind: 'digest', ...digestMeta(items), trusted: 'no' }
+  store.save()
+  digest.take({ items })
+  log(`digest: ${items.length} routine item${items.length === 1 ? '' : 's'} about pull requests to the controller as one event`)
+  await channel.push(request, request.meta)
+}
+
+digest.on('due', () => sendDigest())
 
 // The events to send again, in their order: worker results the previous
 // session never answered, and those held while the controller waited for

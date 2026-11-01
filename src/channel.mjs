@@ -96,6 +96,19 @@ request that replies to a message of the gateway's quotes that message after the
   : `The driver may also answer a question in their Telegram chat: that answer arrives as "(Answer to <id>) ..." with
 via="telegram". It counts as their own words, like a spoken answer, and your replies to it go to that chat.`
 
+// Routine news about those pull requests in one digest (VOICE_GW_REVIEW_DIGEST,
+// digest.mjs), or one event each with it off.
+const DIGEST_INSTRUCTIONS = config.reviewDigestMinutes
+  ? `
+Routine news about the workers' pull requests is gathered into one event, kind="digest" trusted="no", once it has been quiet for
+${config.reviewDigestMinutes} minutes, at the latest ${Math.max(config.reviewDigestMinutes, config.reviewDigestMaxMinutes)} minutes after its first item: checks that passed, reviews and comments
+the gateway queued a fix for, approvals, and automatic fixes that changed nothing, one line each with its pull
+request, fix id and round. Summarise a digest for the driver in two or three short sentences, by pull request, and
+reply "done" to it once; ask nothing and dispatch nothing for it. Failed checks, comments that ask for changes with no
+fix queued, automatic rounds used up, fixes that pushed changes or ask something, and every run the driver ordered
+still arrive one by one; such an event may also bring the routine news of its pull request that was not told yet.`
+  : ''
+
 const INSTRUCTIONS = `
 Messages from the driver arrive as <channel source="${CHANNEL_SOURCE}" request_id="...">TEXT</channel>.
 They were spoken in a car and relayed by a voice assistant. Every one of them needs an answer through the
@@ -169,7 +182,7 @@ When the run opened or updated a pull request, the tag also has pull_request="<n
 that it is out, and which one. Never offer or suggest a review; details only when the driver asks.${DRAFT_INSTRUCTIONS}
 Checks and reviews that run on such a pull request by themselves arrive later as <channel source="${CHANNEL_SOURCE}"
 request_id="..." worker="..." repo="owner/name" pull_request="..." kind="checks|review|comment" trusted="no">:
-summarise them in one or two sentences and reply "done", without asking anything. The driver hears it as news.${REVIEW_INSTRUCTIONS}
+summarise them in one or two sentences and reply "done", without asking anything. The driver hears it as news.${REVIEW_INSTRUCTIONS}${DIGEST_INSTRUCTIONS}
 Open items: the gateway keeps what is open, so keep nothing of it in memory files. Every question you ask (state
 "question") becomes an open decision: name its kind in "kind" (push, merge, restart, delete, else other), and
 when you ask about decisions that are open already, their ids in "decisions". The gateway raises decisions itself

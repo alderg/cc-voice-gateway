@@ -90,7 +90,7 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 
 async function until(predicate, ms = 8000) {
   for (const started = Date.now(); Date.now() - started < ms; await sleep(25)) {
-    const value = predicate()
+    const value = await predicate()
     if (value) return value
   }
   throw new Error('timed out waiting')
@@ -206,6 +206,37 @@ test('a fix is queued for new comments of a collaborator or a review bot, as the
     assert.equal(asked.length, 3)
     assert.match(news[4].text, /from claude ask for changes: .* as q003, automatic round 3 of 3/)
     assert.equal(w.watches[0].fixes, 3)
+  } finally {
+    w.close()
+  }
+})
+
+test("changedSince: whether a fix pushed to its pull request, as seen after it ended; its pull request is looked at even unnamed, and counts as updated only when it moved", async () => {
+  setGitHub(g => {
+    g.prs['acme/alpha#41'] = pr(41)
+    g.inline['acme/alpha#41'] = []
+  })
+  // No poll of its own in between: only the runs' looks count here.
+  const w = new PullWatcher({ ghBin: GH, stateFile: join(TMP, 'changed.json'), pollSeconds: 3600, watchHours: 1, log: () => {} })
+  try {
+    await w.fromRun(task([41]))
+    const review = { slug: 'acme/alpha', number: 41, round: 1, rounds: 3 }
+    const fix = task([], { id: 'tfix', review, startedAt: Date.now() })
+    await sleep(5)
+    fix.finishedAt = Date.now()
+    assert.equal(w.changedSince('acme/alpha', 41, fix.startedAt, fix.finishedAt), null, 'not seen since it ended')
+    assert.deepEqual(await w.fromRun(fix), [], 'it named nothing and pushed nothing: no pull request of its own')
+    assert.equal(w.changedSince('acme/alpha', 41, fix.startedAt, fix.finishedAt), false)
+
+    const pushed = task([], { id: 'tfx2', review, startedAt: Date.now() })
+    setGitHub(g => {
+      g.prs['acme/alpha#41'].headRefOid = 'ccc333'
+    })
+    await sleep(5)
+    pushed.finishedAt = Date.now()
+    assert.deepEqual((await w.fromRun(pushed)).map(p => p.number), [41], 'it pushed: updated')
+    assert.equal(w.changedSince('Acme/Alpha', 41, pushed.startedAt, pushed.finishedAt), true)
+    assert.equal(w.changedSince('acme/alpha', 99, 0), null, 'not watched')
   } finally {
     w.close()
   }
@@ -627,8 +658,11 @@ test('gateway: on by default, a bot\'s review queues the fix itself, the event s
     g.inline['acme/alpha#7'] = []
   })
 
-  let gw = await startGateway(root)
+  // One event each, as with the digest off (VOICE_GW_REVIEW_DIGEST=0); the
+  // digest has a test of its own below.
+  let gw = await startGateway(root, { VOICE_GW_REVIEW_DIGEST: '0' })
   try {
+    assert.doesNotMatch(gw.claudeCode.getInstructions(), /kind="digest"/)
     assert.match(gw.claudeCode.getInstructions(), /Review comments are fixed without asking, as the driver's standing instruction \(VOICE_GW_AUTO_FIX_REVIEWS\)/)
     assert.match(gw.claudeCode.getInstructions(), /After 3 automatic rounds for a pull\nrequest the event says they are used up/)
     await gw.voice.callTool({ name: 'send', arguments: { message: 'Fix the typo.' } })
@@ -664,7 +698,7 @@ test('gateway: on by default, a bot\'s review queues the fix itself, the event s
   }
 
   // Off: news only, nothing queued.
-  gw = await startGateway(root, { VOICE_GW_AUTO_FIX_REVIEWS: '0' })
+  gw = await startGateway(root, { VOICE_GW_AUTO_FIX_REVIEWS: '0', VOICE_GW_REVIEW_DIGEST: '0' })
   try {
     assert.match(gw.claudeCode.getInstructions(), /Review comments are fixed only on the driver's word: dispatch it to the repository's worker/)
     assert.doesNotMatch(gw.claudeCode.getInstructions(), /fixed without asking/)
@@ -678,6 +712,132 @@ test('gateway: on by default, a bot\'s review queues the fix itself, the event s
     assert.doesNotMatch(news.content, /Automatic fixing/)
     await sleep(1500)
     assert.equal(claudeCalls().length, calls, 'no run')
+  } finally {
+    await gw.close()
+  }
+})
+
+test('gateway: the digest gathers routine news, checks passed, a review with its fix queued and the fix that changed nothing, into one event; other news comes alone and takes its own along; nothing is lost in a restart', async () => {
+  const root = join(TMP, 'digest', 'Developer')
+  const dir = join(root, 'alpha')
+  mkdirSync(dir, { recursive: true })
+  const git = (...args) => execFileSync('git', args, { cwd: dir, stdio: 'ignore' })
+  git('init', '-q', '-b', 'main')
+  writeFileSync(join(dir, 'README.md'), '# alpha\n')
+  git('add', '.')
+  git('-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-q', '-m', 'init')
+  git('remote', 'add', 'origin', 'git@github.com:acme/alpha.git')
+  writeFileSync(join(BIN, 'gateway-claude'), FAKE_GATEWAY_CLAUDE)
+  chmodSync(join(BIN, 'gateway-claude'), 0o755)
+  setGitHub(g => {
+    g.prs['acme/alpha#7'] = pr(7)
+    g.inline['acme/alpha#7'] = []
+    g.restReviews = {}
+  })
+  const state = join(TMP, 'digest-state')
+  // Three seconds of quiet, twelve at most.
+  const env = { VOICE_GW_STATE_DIR: state, VOICE_GW_REVIEW_DIGEST: '0.05', VOICE_GW_REVIEW_DIGEST_MAX: '0.2' }
+  const routine = async (gw, n) => {
+    const open = await until(async () => {
+      const text = (await gw.claudeCode.callTool({ name: 'open_items', arguments: {} })).content[0].text
+      return new RegExp(`^- ${n} routine items? about pull requests wait for the next digest, which goes at about \\d\\d:\\d\\d\\.$`, 'm').test(text) && text
+    })
+    return open
+  }
+
+  let gw = await startGateway(root, env)
+  try {
+    const instructions = gw.claudeCode.getInstructions()
+    assert.match(instructions, /^Routine news about the workers' pull requests is gathered into one event, kind="digest" trusted="no", once it has been quiet for\n0\.05 minutes, at the latest 0\.2 minutes after its first item/m)
+    assert.match(instructions, /Summarise a digest for the driver in two or three short sentences, by pull request, and\nreply "done" to it once; ask nothing and dispatch nothing for it\./)
+
+    // The driver's own run is no routine: its result comes alone, as always.
+    await gw.voice.callTool({ name: 'send', arguments: { message: 'Fix the typo.' } })
+    const started = await gw.claudeCode.callTool({ name: 'dispatch', arguments: { worker: 'alpha', task: 'Fix the typo.', words: 'Fix the typo.' } })
+    const first = /task=(t[a-z0-9]{3})/.exec(started.content[0].text)[1]
+    const result = await until(() => gw.events.find(e => e.meta?.task === first))
+    assert.equal(result.meta.pull_request, '7')
+
+    // Checks that passed, then a bot's review with the fix it queued, then
+    // the fix's result, which pushed nothing: one digest, after the quiet.
+    setGitHub(g => {
+      g.prs['acme/alpha#7'].statusCheckRollup = [{ __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }]
+    })
+    await routine(gw, 1)
+    setGitHub(g => {
+      g.restReviews['acme/alpha#7'] = [restItem('R1', 'copilot-pull-request-reviewer[bot]', 'Bot')]
+      g.prs['acme/alpha#7'].reviews = [
+        { id: 'R1', author: { login: 'copilot-pull-request-reviewer' }, authorAssociation: 'NONE', state: 'COMMENTED', body: 'One finding.', submittedAt: now() },
+      ]
+    })
+    const digest = await until(() => gw.events.find(e => e.meta?.kind === 'digest'), 20000)
+    assert.deepEqual(gw.events.filter(e => ['checks', 'review', 'comment', 'checks,review'].includes(e.meta?.kind)), [], 'no single event for routine news')
+    const fix = digest.meta.fix
+    assert.match(fix, /^q[a-z0-9]{3}$/)
+    const fixTask = digest.meta.tasks
+    assert.match(fixTask, /^t[a-z0-9]{3}$/)
+    assert.deepEqual(
+      { items: digest.meta.items, pull_requests: digest.meta.pull_requests, trusted: digest.meta.trusted },
+      { items: '3', pull_requests: 'acme/alpha#7', trusted: 'no' },
+    )
+    assert.match(digest.content, /^Digest of routine news about the workers' pull requests: 3 items about 1 pull request since \d\d:\d\d, gathered by the gateway instead of one event each\./)
+    assert.match(digest.content, /^- \d\d:\d\d acme\/alpha#7 \(worker alpha\): "Fix the typo in the README": checks finished: 1 passed$/m)
+    assert.match(digest.content, new RegExp(`^- \\d\\d:\\d\\d acme/alpha#7 \\(worker alpha\\): "Fix the typo in the README": review from copilot-pull-request-reviewer: commented; copilot-pull-request-reviewer asked for changes: fix ${fix} queued, automatic round 1 of 3$`, 'm'))
+    assert.match(digest.content, new RegExp(`^- \\d\\d:\\d\\d acme/alpha#7 \\(worker alpha\\): the automatic fix ${fixTask} \\(round 1 of 3, queued as ${fix}\\) ended done after \\d+ seconds?, pushed nothing and left nothing: "Done; pull request 7 is open\\."$`, 'm'))
+    assert.doesNotMatch(digest.content, /One finding/, 'what reviews say is for the worker')
+    assert.match(digest.content, /Tell the driver as news in two or three short sentences, by pull request/)
+    assert.ok(claudeCalls().some(c => /Fix the review comments on pull request 7/.test(c.input)), 'the fix ran')
+    assert.equal(gw.events.filter(e => e.meta?.queued === fix).length, 0, "the fix's result came in the digest")
+    // Its answer is news for the driver, as for any worker result.
+    await gw.claudeCode.callTool({ name: 'reply', arguments: { request_id: digest.meta.request_id, state: 'done', text: 'Pull request 7 in alpha: checks pass, Copilot had one finding, nothing to fix.' } })
+    assert.match((await gw.voice.callTool({ name: 'status', arguments: {} })).content[0].text, /Pull request 7 in alpha: checks pass/)
+
+    // A routine approval waits; failed checks on a new push come alone, and
+    // take it along.
+    setGitHub(g => {
+      g.prs['acme/alpha#7'].reviews.push({ id: 'R2', author: { login: 'octo' }, authorAssociation: 'MEMBER', state: 'APPROVED', body: '', submittedAt: now() })
+    })
+    await routine(gw, 1)
+    setGitHub(g => {
+      Object.assign(g.prs['acme/alpha#7'], { headRefOid: 'bbb222', statusCheckRollup: [{ __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' }] })
+    })
+    const failed = await until(() => gw.events.find(e => e.meta?.kind === 'checks'))
+    assert.match(failed.content, /^Checks finished on the latest push: 0 passed, 1 failed \(test\)\.$/m)
+    assert.match(failed.content, /\nRoutine news about this pull request since what was told last, gathered for the digest and told with this event instead:\n- \d\d:\d\d acme\/alpha#7 \(worker alpha\): "Fix the typo in the README": review from octo: approved$/)
+    await sleep(3500)
+    assert.equal(gw.events.filter(e => e.meta?.kind === 'digest').length, 1, 'the approval went with the failed checks')
+
+    // A routine item when the gateway stops: kept in its file, it comes
+    // after the restart.
+    setGitHub(g => {
+      g.prs['acme/alpha#7'].reviews.push({ id: 'R3', author: { login: 'mona' }, authorAssociation: 'COLLABORATOR', state: 'APPROVED', body: '', submittedAt: now() })
+    })
+    await routine(gw, 1)
+  } finally {
+    await gw.close()
+  }
+  const saved = JSON.parse(readFileSync(join(state, 'digest.json'), 'utf8')).items
+  assert.equal(saved.length, 1)
+  assert.match(saved[0].line, /review from mona: approved/)
+  gw = await startGateway(root, env)
+  try {
+    const after = await until(() => gw.events.find(e => e.meta?.kind === 'digest' && !e.meta.resent), 20000)
+    assert.equal(after.meta.items, '1')
+    assert.match(after.content, /review from mona: approved$/m)
+    assert.deepEqual(JSON.parse(readFileSync(join(state, 'digest.json'), 'utf8')).items, [], 'gone from the file once it is a request')
+  } finally {
+    await gw.close()
+  }
+
+  // Turned off with items left: they go once, as one digest, after the start-up summary.
+  const left = { key: 'news:left', pull: 'acme/alpha#7', worker: 'alpha', line: '"Fix the typo in the README": review from hubot: approved', at: Date.now(), fix: null, task: null }
+  writeFileSync(join(state, 'digest.json'), JSON.stringify({ items: [left] }))
+  gw = await startGateway(root, { ...env, VOICE_GW_REVIEW_DIGEST: '0' })
+  try {
+    assert.doesNotMatch(gw.claudeCode.getInstructions(), /kind="digest"/)
+    const last = await until(() => gw.events.find(e => e.meta?.kind === 'digest' && !e.meta.resent))
+    assert.match(last.content, /review from hubot: approved$/m)
+    assert.ok(gw.events.findIndex(e => e.meta?.kind === 'summary') < gw.events.indexOf(last))
   } finally {
     await gw.close()
   }
