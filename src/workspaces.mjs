@@ -8,7 +8,8 @@
 //            or in the worker container, named by its folder. One run at a
 //            time. Before a run the gateway looks at uncommitted files, the
 //            origin and the access level; after it, at git (Workers.audit),
-//            and what is left becomes a push decision.
+//            and what is left becomes a push decision, apart from its
+//            helper folder (HELPER_FOLDER).
 //   scratch  a work folder, only with VOICE_GW_SCRATCH=1: a new empty folder
 //            per task under VOICE_GW_SCRATCH_ROOT, for what needs no
 //            repository, such as a question to look up, research, a
@@ -31,6 +32,23 @@ import { preview } from './log.mjs'
 
 // The kind of a task record, or of a queue entry.
 export const kindOf = record => record?.kind ?? 'repo'
+
+// The helper folder of a run in a repository, at the top of its checkout or
+// worktree: where the worker puts test reports, screenshots, logs, temporary
+// files and other scratch output, never committed (WORKER_RULES). What is
+// untracked in it is no change of the run's: the look for uncommitted files
+// before and after a run passes over it (Workers.inspect, gitState), so it
+// raises no push decision, and the kill switch counts it apart, against a
+// limit of its own (guard.mjs). By path, in the gateway's own code: never
+// in an ignore file of the driver's repository. A worktree takes it along
+// when the gateway removes it; in the checkout it stays, for a follow-up in
+// the same session and a look at the desk, and the worker deletes what it no
+// longer needs.
+export const HELPER_FOLDER = '.voice-scratch'
+
+// Whether a path relative to the top of the checkout, as git prints it
+// (in quotes where it has unusual characters), is inside the helper folder.
+export const inHelperFolder = path => String(path).replace(/^"/, '').startsWith(`${HELPER_FOLDER}/`)
 
 // The repositories in the worker root, as the runner lists them.
 export class Repositories {

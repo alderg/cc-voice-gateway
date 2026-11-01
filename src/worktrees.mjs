@@ -315,6 +315,9 @@ export function worktreeLines(facts, wt, { direct = false } = {}) {
       'them; where a test folder lacks its dependencies or needs others, remove its link (rm on the link, no ' +
       'trailing slash) and install them inside the worktree.',
   )
-  lines.push('- The gateway removes this worktree after the run once nothing is left uncommitted or unpushed in it.')
+  lines.push(
+    '- The gateway removes this worktree after the run once nothing is left uncommitted or unpushed in it, and ' +
+      'your helper folder with it.',
+  )
   return lines
 }

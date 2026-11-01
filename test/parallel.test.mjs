@@ -40,7 +40,7 @@ process.env.VOICE_GW_SECRETS_DIR = join(TMP, 'no-secrets')
 // The submodules here come from file:// URLs, which git refuses for
 // submodules unless told; real ones come from GitHub.
 Object.assign(process.env, { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'protocol.file.allow', GIT_CONFIG_VALUE_0: 'always' })
-const { Workers, planText, prompt } = await import('../src/workers.mjs')
+const { Workers, auditSummary, gitState, planText, prompt, workerRules } = await import('../src/workers.mjs')
 const { Ledger } = await import('../src/ledger.mjs')
 const { Store } = await import('../src/store.mjs')
 const { answeredTask } = await import('../src/channel.mjs')
@@ -55,6 +55,7 @@ const { EXCLUDE_MARK, linkNodeModules, makeWorktree, removeWorktree } = await im
 //   HOLD:<name>  waits until the file holds/<name> is there
 //   COMMIT       commits on voice/<BRANCH or pid>; PUSH: and pushes it
 //   LEAVE        leaves a new file uncommitted
+//   HELPERS      leaves a report, a screenshot and a clone in its helper folder
 //   QUESTION     ends with a question
 //   CRASH        ends without a result, unless it resumes ("Resumed:")
 //   SLOWONCE     waits for good, unless it resumes
@@ -100,6 +101,12 @@ out({ type: 'system', subtype: 'init' })
     if (/PUSH/.test(input)) git('push', '-q', 'origin', 'voice/' + name)
   }
   if (/LEAVE/.test(input)) fs.writeFileSync('left-over.txt', 'x')
+  if (/HELPERS/.test(input)) {
+    fs.mkdirSync('.voice-scratch/shots', { recursive: true })
+    fs.writeFileSync('.voice-scratch/a11y-report.json', '{}')
+    fs.writeFileSync('.voice-scratch/shots/page.png', 'png')
+    if (!fs.existsSync('.voice-scratch/clone-1')) execFileSync('git', ['init', '-q', '.voice-scratch/clone-1'])
+  }
   out({ type: 'assistant', message: { content: [{ type: 'text', text: 'Working.' }] } })
   out({ type: 'result', subtype: 'success', is_error: false, result: /QUESTION/.test(input) ? 'Which one, A or B?' : 'Done.' })
 })()
@@ -615,6 +622,108 @@ test('a run in a worktree that leaves a commit on no remote: the worktree stays,
     assert.equal(one.task.audit.unpushed.length, 0, "the worktree's commit is not the checkout run's")
     assert.equal(one.task.decision, null)
     assert.ok(git(dir, 'worktree', 'list').includes(wt))
+  } finally {
+    workers.close()
+  }
+})
+
+// --- the helper folder ---------------------------------------------------------------------
+
+test('gitState: what is untracked in the helper folder is no change; what git tracks there, and other folders, are', async () => {
+  const status = [
+    '?? .voice-scratch/',
+    '?? ".voice-scratch/\\303\\244 b.png"',
+    ' M .voice-scratch/kept.txt',
+    '?? notes.txt',
+    '?? .voice-sc/',
+    '?? .voice-scratchy',
+    '?? src/.voice-scratch/',
+  ].join('\n')
+  const answers = { status, branch: 'main\n', remote: '' }
+  const state = await gitState(async (dir, command) => answers[command] ?? '', '/work/alpha')
+  assert.deepEqual(state.dirty, ['.voice-scratch/kept.txt', 'notes.txt', '.voice-sc/', '.voice-scratchy', 'src/.voice-scratch/'])
+})
+
+test('the rules name the helper folder, and that a run ends with its turn, in every variant', () => {
+  for (const rules of [
+    workerRules(undefined),
+    workerRules('read-only'),
+    workerRules('full'),
+    workerRules('full', { pushDirect: true }),
+    workerRules('pr', { draft: true, worktree: true }),
+  ]) {
+    assert.match(rules, /^- Helper files: put test reports, screenshots, logs, temporary files and any other scratch output, clones for\n  helpers too, in the folder \.voice-scratch at the top of the folder you work in, never elsewhere in the\n  repository\. Never commit it or add it to an ignore file, and delete what you no longer need\./m)
+    assert.match(rules, /^- The run ends when you end your turn, and the gateway checks it then\. Never end it while a test suite, a\n  build or a helper agent still runs in the background/m)
+  }
+})
+
+test('the helper folder in the checkout: no push decision, no question about uncommitted files at the next run, and it stays', async () => {
+  const { dir, ledger, workers, dispatch } = setup()
+  const tripped = []
+  const measured = new Map()
+  const guard = new RunGuard({
+    workers,
+    runner: workers.runner,
+    killswitch: { trip: event => tripped.push(event) },
+    ghBin: join(BIN, 'gh'),
+    limits: { maxFiles: 1, maxHelperFiles: 10 },
+    mainCheckSeconds: 3600,
+    log: () => {},
+  })
+  guard.on('measured', (task, size) => measured.set(task.id, size))
+  try {
+    // The size check counts commits by the second: the repository's first one is older.
+    await new Promise(resolve => setTimeout(resolve, 1100))
+    const one = await dispatch('HELPERS one')
+    await ended(one.task)
+    assert.equal(auditSummary(one.task.audit), 'clean')
+    assert.equal(one.task.decision, null)
+    assert.match(callOf(one.task.id).rules, /^- Helper files: [^]*? in the folder \.voice-scratch at the top of the folder you work in/m)
+    assert.ok(existsSync(join(dir, '.voice-scratch', 'shots', 'page.png')), 'kept in the checkout')
+    // Three entries untracked there, the clone as one: over maxFiles, not over its own limit.
+    assert.deepEqual(await until(() => measured.get(one.task.id)), { commits: 0, files: 0, lines: 0, pushed: false })
+    assert.deepEqual(tripped, [])
+
+    // The next run there starts without asking; only what it left elsewhere is a decision.
+    const two = await dispatch('HELPERS LEAVE two')
+    assert.equal(two.status, 'started')
+    assert.match((await until(() => callOf(two.task.id))).input, /^- Uncommitted files before you start: none$/m)
+    await ended(two.task)
+    assert.equal(auditSummary(two.task.audit), '1 new uncommitted file')
+    assert.deepEqual(ledger.get(two.task.decision).details.files, ['left-over.txt'])
+    await until(() => measured.get(two.task.id))
+    assert.deepEqual(tripped, [], 'one file of its own, as many as maxFiles')
+
+    // Over the helper folder's own limit it locks.
+    guard.maxHelperFiles = 2
+    ledger.close(ledger.get(two.task.decision), { outcome: 'test', by: 'driver' })
+    const three = await dispatch('HELPERS three', { allowDirty: true })
+    await ended(three.task)
+    await until(() => measured.get(three.task.id))
+    assert.equal(tripped.length, 1)
+    assert.equal(tripped[0].reason, `many changes: 3 untracked files in the helper folder .voice-scratch after one run (limit 2) (worker alpha, task ${three.task.id})`)
+  } finally {
+    guard.close()
+    workers.close()
+  }
+})
+
+test('the helper folder in a worktree: no push decision, and it goes with the worktree, clones too', async () => {
+  const { root, dir, workers, dispatch } = setup({ maxPerRepo: 2 })
+  try {
+    const a = hold()
+    const one = await dispatch(`HOLD:${a} one`)
+    const two = await dispatch('HELPERS two', { parallel: true })
+    const wt = join(worktreesOf(root), two.task.id)
+    assert.match((await until(() => callOf(two.task.id))).input, /^- The gateway removes this worktree after the run once nothing is left uncommitted or unpushed in it, and your helper folder with it\.$/m)
+    await ended(two.task)
+    assert.equal(auditSummary(two.task.audit), 'clean')
+    assert.equal(two.task.decision, null)
+    assert.equal(two.task.worktreeRemoved, true)
+    assert.ok(!existsSync(wt), 'the worktree is gone, its helper folder with it')
+    release(a)
+    await ended(one.task)
+    assert.ok(!existsSync(join(dir, '.voice-scratch')), 'nothing in the checkout')
   } finally {
     workers.close()
   }

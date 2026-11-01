@@ -246,10 +246,13 @@ export const config = {
   killSwitchMode: KILLSWITCH_MODES.includes(env.VOICE_GW_KILLSWITCH) ? env.VOICE_GW_KILLSWITCH : 'auto',
   killSwitchSetting: env.VOICE_GW_KILLSWITCH ?? '',
   // The kill switch's rules on a worker run (guard.mjs): at most this many file
-  // edits, and at the end at most this many files and lines changed.
+  // edits, and at the end at most this many files and lines changed. Apart
+  // from them, the run's helper folder (.voice-scratch, workspaces.mjs): at
+  // most this many file edits there, and untracked files there at the end.
   killMaxEdits: num(env.VOICE_GW_KILL_MAX_EDITS, 500),
   killMaxFiles: num(env.VOICE_GW_KILL_MAX_FILES, 300),
   killMaxLines: num(env.VOICE_GW_KILL_MAX_LINES, 30000),
+  killMaxHelperFiles: num(env.VOICE_GW_KILL_MAX_SCRATCH_FILES, 10000),
   // Folders, besides the repository and the temporary ones, that workers may
   // write to; comma-separated.
   killAllowPaths: (env.VOICE_GW_KILL_ALLOW_PATHS || '')

@@ -29,7 +29,10 @@
 //                   files or lines changed than maxFiles or maxLines, counting
 //                   commits made during the run on any branch and what is not
 //                   committed; in a work folder, more files in it than
-//                   maxFiles.
+//                   maxFiles. The run's helper folder (HELPER_FOLDER,
+//                   workspaces.mjs) counts apart, against maxHelperFiles: the
+//                   file edits there, and at the end what is untracked there.
+//                   What is committed or tracked from it counts as before.
 //
 // What the size check at the end finds, with whether the run pushed, also
 // goes to the statistics ('measured', stats.mjs): the commits made during
@@ -47,6 +50,7 @@ import { homedir } from 'node:os'
 import { posix } from 'node:path'
 import { log as defaultLog, preview } from './log.mjs'
 import { tempFolders } from './platform.mjs'
+import { HELPER_FOLDER, inHelperFolder } from './workspaces.mjs'
 import { WORKTREES, listWorktrees } from './worktrees.mjs'
 
 // The Claude Code memory folder of a session in the given folder, where its
@@ -462,6 +466,7 @@ export class RunGuard extends EventEmitter {
     this.maxEdits = limits.maxEdits ?? 500
     this.maxFiles = limits.maxFiles ?? 300
     this.maxLines = limits.maxLines ?? 30000
+    this.maxHelperFiles = limits.maxHelperFiles ?? 10000 // in the helper folder: files at the end, and edits
     this.log = log
     this.allowedPaths = allowed // VOICE_GW_KILL_ALLOW_PATHS
     this.runs = new Map() // task id -> what the rules know about the run
@@ -530,6 +535,7 @@ export class RunGuard extends EventEmitter {
       head: null,
       pushed: new Set(), // branches the run's git push commands name
       edits: 0,
+      helperEdits: 0, // file edits in the helper folder, which count apart
       files: new Set(),
       tripped: new Set(),
       checking: null,
@@ -565,14 +571,17 @@ export class RunGuard extends EventEmitter {
     if (!run) return
     if (FILE_TOOLS[part.name]) {
       const path = part.input?.[FILE_TOOLS[part.name]]
-      run.edits++
-      if (typeof path === 'string') {
-        const target = this.resolve(run, run.dir, path)
-        if (target) run.files.add(target)
-        if (target && !this.allowed(run, target)) this.violation(run, 'write outside the allowed folders', `${part.name} ${target}`)
-      }
+      const target = typeof path === 'string' ? this.resolve(run, run.dir, path) : null
+      if (target) run.files.add(target)
+      if (target && !this.allowed(run, target)) this.violation(run, 'write outside the allowed folders', `${part.name} ${target}`)
+      // A work folder is all the run's own; its edits count as edits.
+      if (target && !run.scratch && inHelperFolder(posix.relative(run.dir, target))) run.helperEdits++
+      else run.edits++
       if (run.edits > this.maxEdits) {
         this.violation(run, 'many changes', `more than ${this.maxEdits} file edits in one run`)
+      }
+      if (run.helperEdits > this.maxHelperFiles) {
+        this.violation(run, 'many changes', `more than ${this.maxHelperFiles} file edits in the helper folder ${HELPER_FOLDER} in one run`)
       }
     } else if (part.name === 'Bash' && typeof part.input?.command === 'string') {
       // Claude Code keeps the shell's folder from one Bash call to the next
@@ -819,7 +828,9 @@ export class RunGuard extends EventEmitter {
   }
 
   // Returns what it found, { commits, files, lines }, or null for a work
-  // folder.
+  // folder. What is untracked in the helper folder is no change of the run's:
+  // it counts apart, against maxHelperFiles, and not in what it found. What
+  // was committed from there, or is tracked there, counts as anywhere else.
   async checkSize(run) {
     if (run.scratch) {
       await this.checkFiles(run)
@@ -842,10 +853,19 @@ export class RunGuard extends EventEmitter {
       files.add(path)
       lines += (Number(added) || 0) + (Number(deleted) || 0)
     }
-    for (const path of (untracked ?? '').split('\n')) if (path) files.add(path)
-    if (files.size > this.maxFiles || lines > this.maxLines) {
-      this.violation(run, 'many changes', `${files.size} files and ${lines} lines changed in one run (limits ${this.maxFiles} files, ${this.maxLines} lines)`)
+    let helpers = 0
+    for (const path of (untracked ?? '').split('\n')) {
+      if (path && inHelperFolder(path)) helpers++
+      else if (path) files.add(path)
     }
+    const over = []
+    if (files.size > this.maxFiles || lines > this.maxLines) {
+      over.push(`${files.size} files and ${lines} lines changed in one run (limits ${this.maxFiles} files, ${this.maxLines} lines)`)
+    }
+    if (helpers > this.maxHelperFiles) {
+      over.push(`${helpers} untracked files in the helper folder ${HELPER_FOLDER} after one run (limit ${this.maxHelperFiles})`)
+    }
+    if (over.length) this.violation(run, 'many changes', over.join('; '))
     return { commits, files: files.size, lines }
   }
 

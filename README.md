@@ -657,6 +657,16 @@ What applies to every worker run (`src/workers.mjs`):
   counts again in its own check, and the files they are about need no `allow_dirty` and are not
   called someone else's in its prompt. A commit you already decided to keep local raises no new
   decision.
+- **The helper folder:** test reports, screenshots, logs, temporary files and other scratch output
+  go to `.voice-scratch` at the top of the run's checkout or worktree; the worker's rules say so,
+  and to commit none of it and delete what it no longer needs. What is untracked there is no
+  change: the look for uncommitted files before a run and the check after it pass over it, so it
+  raises no push decision, and the kill switch counts it apart, against a limit of its own
+  ([5.9](#59-the-kill-switch)). What is committed from there counts as any change. The gateway
+  goes by the path and writes nothing into your repository's `.gitignore` or `info/exclude`, so
+  `git status` at the desk shows it. A worktree takes it along when the gateway removes it; in the
+  checkout it stays, for a follow-up in the same session and a look at the desk, and what is left
+  there counts again at the end of the next run there.
 - **The gateway's own checkout** gets the same look whenever the controller replies "done": if it
   has uncommitted changes or commits on no remote, the reply's result says so in one line
   (`VOICE_GW_SELF_CHECKOUT`), and it becomes an open push decision, until you were asked. Only the
@@ -668,9 +678,11 @@ What applies to every worker run (`src/workers.mjs`):
   `controller/CLAUDE.md`. `VOICE_GW_WORKER_SELF=1` lists it anyway. In Docker, the container's
   clones are what counts.
 - **Rules for the run** (`WORKER_RULES`): branch `voice/<name>`, commit only its own changes, never
-  force-push, merge or delete branches, ask before pushing a public repository, never end with
-  commits on no remote or uncommitted changes without naming them and asking about the push. These
-  are rules, not limits; the check after the run is code.
+  force-push, merge or delete branches, ask before pushing a public repository, scratch output only
+  in the helper folder, never end the turn, which ends the run, while tests, a build or a helper
+  agent still run in the background, never end with commits on no remote or uncommitted changes
+  without naming them and asking about the push. These are rules, not limits; the check after the
+  run is code.
 - **Pull requests** are opened ready for review, so that automatic reviews start at once.
   `VOICE_GW_PR_DRAFT=1` makes them drafts, as before; bot reviewers usually skip a draft, and it
   has to be marked ready before a merge.
@@ -749,11 +761,11 @@ still protects your subscription.
   session continues.
 - **After a run.** The gateway's git check looks at the worktree: the commits its HEAD has and its
   files; a run in the checkout is not blamed for the commits of runs in worktrees. With nothing
-  uncommitted, nothing unpushed and no commit only its HEAD has, the worktree is removed;
-  otherwise it is kept, and the push decision names it. A decision about a worktree holds only the
-  tasks for that worktree. `list_workers` and `worker_status` show every run and the kept
-  worktrees; the result event says `worktree="…"`. Kept worktrees that nothing needs any more are
-  looked at again every ten minutes, and removed once nothing would be lost.
+  uncommitted, nothing unpushed and no commit only its HEAD has, the worktree is removed, its
+  helper folder with it; otherwise it is kept, and the push decision names it. A decision about a
+  worktree holds only the tasks for that worktree. `list_workers` and `worker_status` show every
+  run and the kept worktrees; the result event says `worktree="…"`. Kept worktrees that nothing
+  needs any more are looked at again every ten minutes, and removed once nothing would be lost.
 - **Interrupted runs.** A run in a worktree that a restart of the gateway or the computer, the time
   limit, a crash or `stop_worker` interrupts goes back to the queue with its worktree, in front for
   its repository, at most three times. At its turn it resumes there, in its session where that can
@@ -1010,7 +1022,7 @@ at every start.
 | Telegram | `/stop` or a phrase | See 5.8 |
 | Rule: default branch | A push to the default branch, or a merge, without a direct dispatch at level `full`, in a repository with pull requests turned on | In the run's commands: `git push` to the default branch, `--all`, `--mirror`, `gh pr merge`, and `gh api` calls that merge (`PUT …/pulls/<n>/merge`, `POST …/merges`, the GraphQL mutations `mergePullRequest`, `enablePullRequestAutoMerge`, `mergeBranch`). With `gh`, every `VOICE_GW_KILL_CHECK` seconds and at the end: the default branch moved on GitHub, and the worker's repository holds the new head, or the new head merged a pull request of the run (below) |
 | Rule: outside | Writes outside the repository (for a run in a [worktree](#several-runs-per-repository), outside its worktree), `/tmp`, `/var/tmp` (and the system's temp folder on this computer), the run's own Claude Code memory folder (`~/.claude/projects/<repository path with - for every other character>/memory`, where auto memory writes; another project's is outside) and `VOICE_GW_KILL_ALLOW_PATHS`; for a run in a [work folder](#work-folders), writes outside that folder, those temporary folders and its memory folder; writing to `/dev/null`, the standard streams, a terminal or `/dev/fd/N` is none | The file tools by path. Shell commands by explicit targets: redirections, `tee`, `cp`, `mv`, `rm`, `mkdir`, `touch`, `ln`, `chmod`, `chown`, `truncate`, `sed -i`, `dd of=`, also after `cd`; `$HOME` and `~` are expanded. The command line is read as a shell reads it: quoted text, comments, here-strings and heredoc bodies are data, so a `>` or `;` in a pattern, a commit message or a script written to a file is none; the commands in `$(…)`, backticks, `<(…)`, `>(…)`, `sh -c`, `eval` and a heredoc a shell reads are checked like any other, and so is a script written from a heredoc that the same call runs |
-| Rule: many changes | More than 500 file edits in a run; at its end more than 300 files or 30,000 lines changed; in a work folder, more than 300 files in it | Edits as they happen; at the end the commits made during the run plus what is not committed, or the files in the work folder. `VOICE_GW_KILL_MAX_*` |
+| Rule: many changes | More than 500 file edits in a run; at its end more than 300 files or 30,000 lines changed; in a work folder, more than 300 files in it. Apart from these, the run's [helper folder](#55-workers-on-this-computer-or-in-docker) `.voice-scratch`, for its test reports, screenshots and logs: more than 10,000 file edits there, or untracked files there at the end | Edits as they happen; at the end the commits made during the run plus what is not committed, or the files in the work folder. What is untracked in the helper folder counts only against its own limit, so the limit for real code stays as strict; what is committed or tracked there counts as any change. `VOICE_GW_KILL_MAX_*` |
 | Controller | `raise_alarm` with a reason | One more signal, never the only one |
 
 **Whose merge it is.** A merge on GitHub makes a commit that the worker's repository does not
@@ -2246,6 +2258,7 @@ limits at once.
 | `VOICE_GW_KILL_MAX_EDITS` | `500` | Kill switch: file edits in one run |
 | `VOICE_GW_KILL_MAX_FILES` | `300` | Kill switch: files changed in one run |
 | `VOICE_GW_KILL_MAX_LINES` | `30000` | Kill switch: lines changed in one run |
+| `VOICE_GW_KILL_MAX_SCRATCH_FILES` | `10000` | Kill switch: untracked files in a run's helper folder `.voice-scratch` at its end, and file edits there; they count for none of the three above |
 | `VOICE_GW_KILL_ALLOW_PATHS` | empty | More folders workers may write to, comma-separated |
 | `VOICE_GW_KILL_CHECK` | `30` | Seconds between checks of the default branch and, while locked, of the container |
 | `VOICE_GW_MCP_JSON` | `controller/.mcp.json` | Plugin mode: where `src/plugin.mjs` reads the env block |

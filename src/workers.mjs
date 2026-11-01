@@ -50,7 +50,9 @@
 // instructions. What the worker does with git is up to its instructions;
 // after the run the gateway looks again (audit): commits on no remote,
 // uncommitted files that were not there at the start, and the branch. The
-// controller gets that with the result, whatever the worker wrote.
+// controller gets that with the result, whatever the worker wrote. What is
+// untracked in the run's helper folder (HELPER_FOLDER, workspaces.mjs) is
+// scratch output, and counts for neither look.
 //
 // The run output holds every tool input and result, so .state/tasks and
 // .state/workers.json are for this user only (folders 0700, files 0600).
@@ -70,6 +72,7 @@ import { orderRule } from './orders.mjs'
 import { SUBAGENT_TOOLS, addResult } from './stats.mjs'
 import { DockerRunner, HostRunner, MARK, MAX_FILES, alive, startOf } from './runners.mjs'
 import {
+  HELPER_FOLDER,
   Repositories,
   SCRATCH_NEW,
   SCRATCH_RULES,
@@ -77,6 +80,7 @@ import {
   fileChanges,
   filesSummary,
   filesText,
+  inHelperFolder,
   kindOf,
   scratchEntries,
   scratchPrompt,
@@ -185,10 +189,18 @@ summarise your result for them. Nobody can answer you during the run.
 - At the end, switch back to the starting branch, so the checkout is as the driver left it.
 - Run the tests that cover your change. Tasks that change nothing, such as questions or test runs, need no
   branch.
+- Helper files: put test reports, screenshots, logs, temporary files and any other scratch output, clones for
+  helpers too, in the folder ${HELPER_FOLDER} at the top of the folder you work in, never elsewhere in the
+  repository. Never commit it or add it to an ignore file, and delete what you no longer need. The gateway
+  counts it apart from your changes.
 - Finish the job yourself: once the work is done and tested, commit, push and open the pull request as the
   Publish rule says, without asking first. Whatever you run near the end, a review, a subagent or a skill,
   carry on afterwards: its report is not your result. For a security review, read the diff yourself or give
   it to a subagent; the security-review skill is not available to you.
+- The run ends when you end your turn, and the gateway checks it then. Never end it while a test suite, a
+  build or a helper agent still runs in the background, and never with "I will push once it passes": wait
+  for it, finish the work, delete from ${HELPER_FOLDER} what you no longer need, and only then end with your
+  report.
 - Before you end, look at git status and git log --branches --not --remotes. Never end a run with commits of
   yours on no remote, or uncommitted changes of yours, without naming them in your result. Where the Publish
   rule lets you push and you did not, end by asking whether to push. The gateway checks git after every run
@@ -487,11 +499,13 @@ function workerEnv(marks = {}) {
 
 const processes = n => `${n} process${n === 1 ? '' : 'es'}`
 
-// The files in the output of git status --porcelain.
+// The files in the output of git status --porcelain, without what is
+// untracked in the helper folder (HELPER_FOLDER): scratch output, no change.
+// What git tracks there counts as anywhere else.
 const changedFiles = status =>
   (status ?? '')
     .split('\n')
-    .filter(Boolean)
+    .filter(line => line && !(line.startsWith('?? ') && inHelperFolder(line.slice(3))))
     .map(line => line.slice(3))
 
 // What git says about a checkout: its branch, the uncommitted files, whether

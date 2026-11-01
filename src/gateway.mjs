@@ -234,7 +234,12 @@ const guard = new RunGuard({
   runner,
   killswitch,
   ghBin: config.ghBin,
-  limits: { maxEdits: config.killMaxEdits, maxFiles: config.killMaxFiles, maxLines: config.killMaxLines },
+  limits: {
+    maxEdits: config.killMaxEdits,
+    maxFiles: config.killMaxFiles,
+    maxLines: config.killMaxLines,
+    maxHelperFiles: config.killMaxHelperFiles,
+  },
   allowed: config.killAllowPaths,
   mainCheckSeconds: config.killCheckSeconds,
 })

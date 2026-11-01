@@ -461,6 +461,76 @@ test('rule: unusually many changes, in edits during the run and in git at its en
   small.guard.close()
 })
 
+test('rule: many changes, the helper folder apart: what is untracked there has a limit of its own, real code stays as strict', async () => {
+  const helpers = n => Array.from({ length: n }, (_, i) => `.voice-scratch/shots/s${i}.png`).join('\n')
+  const code = (n, folder = 'src') => Array.from({ length: n }, (_, i) => `100\t50\t${folder}/f${i}.js`).join('\n')
+  const limits = { maxFiles: 10, maxLines: 100000 }
+  const end = async options => {
+    const run = guarded(options)
+    const measured = []
+    run.guard.on('measured', (task, size) => measured.push(size))
+    await run.guard.ended(run.task)
+    run.guard.close()
+    return { tripped: run.tripped, measured }
+  }
+
+  // As the run of 2026-11-01: far more helper files than files may change,
+  // reports, screenshots and clones for helpers, next to a few files of code.
+  const scratch = await end({
+    limits,
+    git: { 'log --all': '10\t2\tsrc/a.js\n5\t5\tsrc/b.js', 'diff --numstat': '1\t1\tREADME.md', 'ls-files': `${helpers(40)}\n.voice-scratch/clone-1/\nnew.txt` },
+  })
+  assert.deepEqual(scratch.tripped, [], 'helper files over the limit for files do not lock')
+  assert.deepEqual(scratch.measured, [{ commits: 0, files: 4, lines: 24, pushed: false }], 'nor count as changed files')
+
+  // Real code over the limit still locks, the helper files aside.
+  const big = await end({ limits, git: { 'log --all': code(11), 'ls-files': helpers(40) } })
+  assert.equal(big.tripped.length, 1)
+  assert.equal(big.tripped[0].reason, 'many changes: 11 files and 1650 lines changed in one run (limits 10 files, 100000 lines) (worker alpha, task tabc)')
+
+  // What is committed from the helper folder counts as any change, and so do
+  // untracked files elsewhere, such as in a folder of another name.
+  const committed = await end({ limits, git: { 'log --all': code(11, '.voice-scratch') } })
+  assert.match(committed.tripped[0]?.reason ?? '', /^many changes: 11 files and 1650 lines changed in one run/)
+  const elsewhere = await end({ limits, git: { 'ls-files': Array.from({ length: 11 }, (_, i) => `.voice-sc/r${i}.txt`).join('\n') } })
+  assert.match(elsewhere.tripped[0]?.reason ?? '', /^many changes: 11 files and 0 lines changed in one run/)
+
+  // Over the helper folder's own limit, it locks with a reason of its own.
+  const many = await end({ limits: { ...limits, maxHelperFiles: 30 }, git: { 'ls-files': helpers(40) } })
+  assert.equal(many.tripped.length, 1)
+  assert.equal(many.tripped[0].reason, 'many changes: 40 untracked files in the helper folder .voice-scratch after one run (limit 30) (worker alpha, task tabc)')
+  const both = await end({ limits: { ...limits, maxHelperFiles: 30 }, git: { 'log --all': code(11), 'ls-files': helpers(40) } })
+  assert.match(both.tripped[0].reason, /^many changes: 11 files and 1650 lines changed in one run \(limits 10 files, 100000 lines\); 40 untracked files in the helper folder \.voice-scratch after one run \(limit 30\)/)
+
+  const defaults = guarded()
+  assert.equal(defaults.guard.maxHelperFiles, 10000)
+  defaults.guard.close()
+})
+
+test('rule: many changes, file edits in the helper folder count apart, against its own limit', () => {
+  const run = guarded({ limits: { maxEdits: 3, maxHelperFiles: 5 } })
+  for (let i = 0; i < 3; i++) run.tool('Edit', { file_path: `src/f${i}.js`, old_string: 'a', new_string: 'b' })
+  for (let i = 0; i < 3; i++) run.tool('Write', { file_path: `/work/alpha/.voice-scratch/report-${i}.md`, content: 'x' })
+  run.tool('Write', { file_path: '.voice-scratch/a11y/summary.json', content: '{}' })
+  assert.equal(run.guard.runs.get('tabc').helperEdits, 4)
+  assert.deepEqual(run.tripped, [], 'three edits of code, four reports')
+  run.tool('Write', { file_path: '.voice-scratch/log-1.txt', content: 'x' })
+  run.tool('Write', { file_path: '.voice-scratch/log-2.txt', content: 'x' })
+  assert.equal(run.tripped.length, 1)
+  assert.equal(run.tripped[0].reason, 'many changes: more than 5 file edits in the helper folder .voice-scratch in one run (worker alpha, task tabc)')
+  run.guard.close()
+
+  // A folder of another name is code; so is a file named like the folder.
+  const code = guarded({ limits: { maxEdits: 3, maxHelperFiles: 5 } })
+  code.tool('Write', { file_path: '.voice-scratchy/a.txt', content: 'x' })
+  code.tool('Write', { file_path: '/work/alpha/.voice-scratch', content: 'x' })
+  code.tool('Write', { file_path: '/work/alpha/src/.voice-scratch/b.txt', content: 'x' })
+  code.tool('Edit', { file_path: 'src/a.js', old_string: 'a', new_string: 'b' })
+  assert.equal(code.tripped.length, 1)
+  assert.match(code.tripped[0].reason, /^many changes: more than 3 file edits in one run/)
+  code.guard.close()
+})
+
 // --- a dispatch in flight ------------------------------------------------------------------
 
 test('a dispatch still checking the repository when the switch trips starts nothing', async () => {
