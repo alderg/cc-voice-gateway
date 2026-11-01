@@ -306,18 +306,20 @@ everything blue is Claude Code.
 ![Flow of a request](docs/request-flow.drawio.svg)
 
 The voice AI calls `send` and then `get_reply` until the state is `done`. When you ask for
-something, it calls the tool straight away and speaks once it returns. `send` returns at once, and
-right after it the voice AI confirms in a few words of your language what it passed on, fitting the
-request and worded differently each time, such as "Der Abgleich der Branches ist unterwegs", "Die
-Frage zu den Tests ist bei Claude Code" or "Neustart ist angefragt". After `ask` it reads the answer,
-or confirms the same way while it still runs; after `approve` it confirms your decision in a short
-phrase ("Erlaubt", "Abgelehnt"); between polls it says in a short phrase that it is still running
-("Läuft noch"). The instructions and the tool descriptions are short and say only what to do, with
-examples of what fits, and name no sentences to avoid: a list of those made the voice AI say them more
-often. It never stays silent: in a car silence sounds as if you were not heard, so the instructions
-ask for an answer at once to everything you say, the results of `send` and of a running `ask` ask for
-the confirmation, and that of a poll without news for a short phrase. A beep would not do, since it
-sounds like an error. Every result starts with a
+something, its reply begins with the tool call, and it speaks once the call returns. `send` returns
+at once, and right after it the voice AI confirms in a few words of your language what it passed on,
+fitting the request and worded differently each time, such as "Der Abgleich der Branches ist
+unterwegs", "Die Frage zu den Tests ist bei Claude Code" or "Neustart ist angefragt". `ask` waits
+only briefly for a quick answer, 8 seconds by default (`VOICE_GW_ASK_WAIT`), since you hear nothing
+until it returns; then the voice AI reads the answer, or confirms the same way while it still runs.
+After `approve` it confirms your decision in a short phrase ("Erlaubt", "Abgelehnt"); between polls
+it says in a short phrase that it is still running ("Läuft noch"). The instructions and the tool
+descriptions are short and say only what to do, with examples of what fits, once each, and name no
+sentences to avoid: a list of those made the voice AI say them more often, and a rule to answer "at
+once" invites a sentence before the call. It never stays silent: in a car silence sounds as if you
+were not heard, so the instructions ask for an answer to everything you say, the results of `send`
+and of a running `ask` ask for the confirmation, and that of a poll without news for a short phrase.
+A beep would not do, since it sounds like an error. Every result starts with a
 machine-readable line, for example `[state=working id=k7f3 elapsed=34s]`. Requests and approvals
 have these states:
 
@@ -2231,6 +2233,7 @@ limits at once.
 | `VOICE_GW_PERMISSION_TTL` | `900` | Seconds before an open approval leaves the voice view |
 | `VOICE_GW_DEFAULT_WAIT` | `25` | Seconds `get_reply` waits by default |
 | `VOICE_GW_MAX_WAIT` | `40` | Upper limit for `get_reply` and `ask` |
+| `VOICE_GW_ASK_WAIT` | `8` | Seconds `ask` waits for a quick answer before the voice AI confirms what it passed on; at most `VOICE_GW_MAX_WAIT` |
 | `VOICE_GW_HINT_AFTER` | `20` | Seconds without a reaction from the controller before a diagnostic hint |
 | `VOICE_GW_WORKER_ROOT` | The folder holding this repository | Every git repository directly in it has a worker |
 | `VOICE_GW_WORKER_SELF` | off | `1`: this repository's own checkout is a worker on this computer too |
