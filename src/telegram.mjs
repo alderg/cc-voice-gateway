@@ -14,28 +14,39 @@
 // mode or not: the kill switch alarm, alerts about suspicious requests and
 // sign-ins (ipguard.mjs), the Funnel (funnel.mjs) and the watchdog.
 //
-// Inbound, the gateway takes a few commands from the configured private chat:
-// the kill switch (/stop or an emergency phrase), the Tailscale Funnel on
-// and off (/funnel on, /funnel off, /funnel, "keep alive"; see funnel.mjs),
-// and the statistics (/stats, /stats all; see stats.mjs). And the driver's
-// answers to its questions (TelegramAnswers, VOICE_GW_TELEGRAM_ANSWERS): a
-// Reply to a question's message, or a message with the question's code, goes
-// to the controller as their answer, like one by voice. Any other message is
-// a request of theirs, as one by voice is (VOICE_GW_TELEGRAM_REQUESTS). The
+// Inbound, the gateway takes messages only from the driver: their own user id,
+// in their private chat with the bot, which is the configured chat (in a
+// private chat the chat's id is the user's). Groups, supergroups, channels,
+// other senders and bots are ignored without a word back; forwarded, edited
+// and non-text messages of the driver's are refused, with the reason in the
+// chat. Every message, accepted or not, goes into the input log
+// (TelegramInputLog). From the driver: a few commands, the kill switch first
+// (/stop or an emergency phrase), the Tailscale Funnel on and off (/funnel
+// on, /funnel off, /funnel, "keep alive"; see funnel.mjs), the statistics
+// (/stats, /stats all; see stats.mjs) and night mode. And, only when the
+// driver turned Telegram input on (off by default), their answers to its
+// questions (TelegramAnswers, VOICE_GW_TELEGRAM_ANSWERS): a Reply to a
+// question's message, or a message with the question's code, goes to the
+// controller as their answer, like one by voice. Any other message is a
+// request of theirs, as one by voice is (VOICE_GW_TELEGRAM_REQUESTS). The
 // controller's replies to either come back to the chat.
 //
 // On only when .secrets/telegram_token and .secrets/telegram_chat_id both
 // exist and are not empty. The token is part of every API address, so it must
-// never reach a log line or an error message.
+// never reach a log line or an error message; the gateway keeps its file
+// 0600 in the 0700 secrets folder (secureSecrets) and out of the environment
+// of everything it starts (scrubEnv).
 
 import { EventEmitter } from 'node:events'
-import { readFileSync } from 'node:fs'
+import { chmodSync, readFileSync, statSync } from 'node:fs'
+import { basename } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { emergencyPhrase } from './killswitch.mjs'
-import { log as defaultLog, preview } from './log.mjs'
+import { log as defaultLog, fileLog, preview } from './log.mjs'
 
 const MAX_TEXT = 4000 // Telegram takes up to 4096 characters
 const SEND_TIMEOUT_MS = 10000
+const SENT_KEPT = 2000 // the ids of the messages this gateway sent, for quotes
 
 function readSecret(file) {
   try {
@@ -88,11 +99,21 @@ export function loadTelegram({ tokenFile, chatIdFile, apiBase }) {
   return new Telegram({ token, chatId, apiBase })
 }
 
+// The driver's Telegram user id: in a private chat with the bot, the chat's
+// id is the user's, so the configured chat id is the driver's id too, and
+// needs no setting of its own. null when the configured chat is no person's:
+// the id of a group, a supergroup or a channel is negative.
+export const driverId = chatId => {
+  const text = String(chatId ?? '').trim()
+  return /^\d{1,20}$/.test(text) ? text : null
+}
+
 export class Telegram {
   constructor({ token, chatId, apiBase = 'https://api.telegram.org' }) {
     this.token = token
     this.chatId = chatId
     this.apiBase = apiBase
+    this.sentIds = new Set() // the messages this gateway sent since its start
   }
 
   call(method, body, options = {}) {
@@ -105,14 +126,27 @@ export class Telegram {
   async send(text, { replyTo = null } = {}) {
     const body = { chat_id: this.chatId, text: String(text).slice(0, MAX_TEXT) }
     if (replyTo !== null) body.reply_parameters = { message_id: replyTo, allow_sending_without_reply: true }
-    return this.call('sendMessage', body)
+    const message = await this.call('sendMessage', body)
+    if (Number.isInteger(message?.message_id)) {
+      this.sentIds.add(message.message_id)
+      if (this.sentIds.size > SENT_KEPT) this.sentIds.delete(this.sentIds.values().next().value)
+    }
+    return message
   }
 
-  // Updates for the bot, waiting up to `timeout` seconds for new ones.
+  // Whether this gateway sent the message with this id, since its start: a
+  // message of the bot's that it did not send may come from whoever else
+  // has the token, and is never quoted to the controller.
+  sent(id) {
+    return this.sentIds.has(id)
+  }
+
+  // Updates for the bot, waiting up to `timeout` seconds for new ones:
+  // messages, and edits of them, which are refused (TelegramCommands).
   async getUpdates({ offset, timeout = 25, signal } = {}) {
     const result = await this.call(
       'getUpdates',
-      { offset, timeout, allowed_updates: ['message'] },
+      { offset, timeout, allowed_updates: ['message', 'edited_message'] },
       { timeoutMs: (timeout + 15) * 1000, signal },
     )
     return Array.isArray(result) ? result : []
@@ -179,31 +213,75 @@ export const pause = (ms, signal) => delay(ms, undefined, { signal }).catch(() =
 // Whether a message was forwarded from elsewhere: someone else's words, not
 // the driver's own.
 const forwarded = message =>
-  Boolean(message.forward_origin ?? message.forward_from ?? message.forward_from_chat ?? message.forward_sender_name ?? message.forward_date)
+  Boolean(
+    message.forward_origin ??
+      message.forward_from ??
+      message.forward_from_chat ??
+      message.forward_sender_name ??
+      message.forward_date ??
+      message.is_automatic_forward,
+  )
 
-// Inbound: polls the bot for messages from the configured private chat and
-// emits 'stop' for a stop command, 'funnel' for a Funnel command, 'away' for
-// night mode on or off and 'stats' for the statistics. With answers, also
-// 'answer' ({ text, replyTo, messageId, quoted, forwarded }) for a Reply to a
-// message that asks something, whatever it says unless it is a stop or a
+// What a message without text holds, for the input log.
+function contentOf(message) {
+  const kinds = ['voice', 'audio', 'photo', 'video', 'video_note', 'document', 'sticker', 'animation', 'location', 'contact', 'poll']
+  return kinds.find(kind => message[kind] !== undefined)?.replace('_', ' ') ?? 'no text'
+}
+
+// Why a message of the driver's own does not count here, or null: their own
+// words, written as a new text message.
+function notOwn(message, edited) {
+  if (typeof message.text !== 'string') return 'it holds no text. Only text messages are read here.'
+  if (edited) return 'it is an edit of an earlier message, which is never read again. Write a new message instead.'
+  if (forwarded(message)) return 'it is forwarded, so its words are not your own. Write what you want in a message of your own.'
+  if (message.via_bot) return 'it was written through an inline bot, so its words are not your own. Write what you want yourself.'
+  return null
+}
+
+// The answer when Telegram input is off (VOICE_GW_TELEGRAM_ANSWERS and
+// VOICE_GW_TELEGRAM_REQUESTS, off by default).
+export const INPUT_OFF =
+  'Telegram input is off: here only commands count, such as /stop, /funnel, /stats, /night and /back. ' +
+  'Answer and ask in voice mode, or turn Telegram input on in the setup.'
+
+// Inbound: polls the bot, and takes only the driver's own messages: from
+// their user id, in their private chat with the bot, which is the configured
+// chat. Everything else, a group, a supergroup, a channel, another sender, a
+// bot or a message on behalf of a chat, is ignored without a word back,
+// logged once, and kept in the input log (record). Of the driver's, a stop
+// command or an emergency phrase comes first, always, and locks the kill
+// switch ('stop'), also forwarded or edited. A message without text, an
+// edit, a forwarded message or one written through an inline bot holds no
+// words of theirs and is refused ('refused', { why, messageId }, which the
+// chat hears). Then 'funnel' for a Funnel command, 'away' for night mode on
+// or off and 'stats' for the statistics. With answers (Telegram input on),
+// also 'answer' ({ text, replyTo, messageId, quoted, forwarded, seen }) for a
+// Reply to a message that asks something, whatever it says unless it is a
 // slash command, and for any other text that is no command: TelegramAnswers
-// decides whether it answers a question or is a new request. asks(id):
-// whether the gateway's message with that id asks the driver something, a
-// question or an approval request; by default every Reply counts as one.
-// quoted: the text of the bot's message a Reply answers, as Telegram has it.
-// Every other chat, and every other message, is ignored. A message older than
-// maxAgeSeconds, sent while the gateway was not listening, does not count:
-// Telegram keeps messages for a day, and yesterday's /funnel on must not open
-// the endpoint today, nor yesterday's "yes" answer a question. It emits
-// 'stale' instead, so that the sender hears why.
+// decides whether it answers a question or is a new request. Without, such a
+// message is refused (INPUT_OFF). asks(id): whether the gateway's message
+// with that id asks the driver something, a question or an approval request;
+// by default every Reply counts as one. quoted: the text of the bot's message
+// a Reply answers, as Telegram has it, and only when known(id) says that this
+// gateway sent it: whoever else has the token could send as the bot. A
+// message older than maxAgeSeconds, sent while the gateway was not listening,
+// does not count: Telegram keeps messages for a day, and yesterday's /funnel
+// on must not open the endpoint today, nor yesterday's "yes" answer a
+// question. It emits 'stale' instead, so that the sender hears why.
 export class TelegramCommands extends EventEmitter {
-  constructor(telegram, { pollSeconds = 25, maxAgeSeconds = 120, answers = false, asks = () => true, log = defaultLog } = {}) {
+  constructor(
+    telegram,
+    { pollSeconds = 25, maxAgeSeconds = 120, answers = false, asks = () => true, known = () => true, record = () => {}, log = defaultLog } = {},
+  ) {
     super()
     this.telegram = telegram
+    this.driver = driverId(telegram.chatId)
     this.pollSeconds = pollSeconds
     this.maxAgeSeconds = maxAgeSeconds
     this.answers = answers
     this.asks = asks
+    this.known = known
+    this.record = record
     this.log = log
     this.offset = undefined
     this.closed = false
@@ -254,47 +332,184 @@ export class TelegramCommands extends EventEmitter {
     }
   }
 
+  // Why a message is not the driver's own in their private chat with the
+  // bot, or null. In a private chat the chat's id is the user's, and only
+  // the user writes there; the sender is checked all the same.
+  stranger(message) {
+    const chat = message.chat ?? {}
+    if (chat.type !== 'private') return `from a ${chat.type ?? 'chat of no known type'}`
+    if (String(chat.id) !== String(this.telegram.chatId)) return 'from another chat'
+    if (message.sender_chat) return 'sent on behalf of a chat'
+    if (!message.from) return 'without a sender'
+    if (message.from.is_bot === true) return 'from a bot'
+    if (this.driver === null || String(message.from.id) !== this.driver) return 'from another sender'
+    return null
+  }
+
   handle(update) {
-    const message = update.message
-    if (!message || typeof message.text !== 'string') return
-    const chat = String(message.chat?.id)
-    if (chat !== String(this.telegram.chatId) || message.chat?.type !== 'private') {
-      this.warnOnce(`chat ${chat}`, 'telegram commands: ignored a message from another chat')
+    const edited = !update.message && Boolean(update.edited_message)
+    const message = update.message ?? update.edited_message
+    if (!message) return // nothing else is asked for (getUpdates)
+    const text = typeof message.text === 'string' ? message.text : null
+    // For the input log: who, where, and a few words of what.
+    const seen = {
+      from: message.from?.id ?? null,
+      chat: message.chat?.id ?? null,
+      type: message.chat?.type ?? null,
+      text: text ?? `(${contentOf(message)})`,
+      ...(edited ? { edited: true } : {}),
+    }
+    const stranger = this.stranger(message)
+    if (stranger) {
+      // Not a word back: a stranger learns nothing from the bot.
+      this.warnOnce(`ignored ${stranger}`, `telegram commands: ignored a message ${stranger}`)
+      this.record({ ...seen, decision: 'ignored', why: `a message ${stranger}` })
       return
     }
-    // The kill switch first, always. A Reply to a question is an answer,
-    // unless it is a slash command: "good night" in reply to a question
-    // answers it. A Reply to another message is read like any message.
-    const stop = isStopCommand(message.text)
-    const slash = message.text.trim().startsWith('/')
+    const messageId = Number.isInteger(message.message_id) ? message.message_id : null
+    const age = Math.round(Date.now() / 1000 - Number(edited ? (message.edit_date ?? message.date) : message.date))
+    const stale = () => {
+      this.log(`telegram commands: ignored "${preview(seen.text, 40)}", sent ${age} s ago`)
+      this.record({ ...seen, decision: 'ignored', why: `sent ${age} s ago, while the gateway was not listening` })
+      this.emit('stale', { text: seen.text, ageSeconds: age })
+    }
+    const refuse = why => {
+      if (age > this.maxAgeSeconds) return stale()
+      this.log('telegram message not passed on:', why)
+      this.record({ ...seen, decision: 'refused', why })
+      this.emit('refused', { why, messageId, text: seen.text })
+    }
+    const accept = (as, event, payload) => {
+      if (age > this.maxAgeSeconds) return stale()
+      this.record({ ...seen, decision: 'accepted', as })
+      this.emit(event, payload)
+    }
+    // The kill switch first, always, whatever the message is besides: a stop
+    // can only lock.
+    if (text !== null && isStopCommand(text)) return accept('stop', 'stop', { text })
+    const own = notOwn(message, edited)
+    if (own) return refuse(own)
+    // A Reply to a question is an answer, unless it is a slash command: "good
+    // night" in reply to a question answers it. A Reply to another message is
+    // read like any message.
+    const slash = text.trim().startsWith('/')
     const original = message.reply_to_message
     const replyTo = Number.isInteger(original?.message_id) ? original.message_id : null
-    const reply = this.answers && !stop && !slash && replyTo !== null && this.asks(replyTo)
-    const funnel = stop || reply ? null : funnelCommand(message.text)
-    const stats = stop || reply || funnel ? null : statsCommand(message.text)
-    const away = stop || reply || funnel || stats ? null : awayCommand(message.text)
-    const answer = this.answers && !stop && !slash && !funnel && !stats && !away
-    if (!stop && !funnel && !stats && !away && !answer) return
-    const age = Math.round(Date.now() / 1000 - Number(message.date))
-    if (age > this.maxAgeSeconds) {
-      this.log(`telegram commands: ignored "${preview(message.text, 40)}", sent ${age} s ago`)
-      this.emit('stale', { text: message.text, ageSeconds: age })
-      return
-    }
-    if (stop) this.emit('stop', { text: message.text })
-    else if (funnel) this.emit('funnel', { action: funnel, text: message.text })
-    else if (away) this.emit('away', { on: away === 'away', text: message.text })
-    else if (stats) this.emit('stats', { all: stats.all, text: message.text })
-    else {
-      this.emit('answer', {
-        text: message.text,
-        replyTo,
-        messageId: Number.isInteger(message.message_id) ? message.message_id : null,
-        quoted: original?.from?.is_bot === true && typeof original.text === 'string' ? original.text : null,
-        forwarded: forwarded(message),
-      })
+    const reply = this.answers && !slash && replyTo !== null && this.asks(replyTo)
+    const funnel = reply ? null : funnelCommand(text)
+    if (funnel) return accept(`funnel ${funnel}`, 'funnel', { action: funnel, text })
+    const stats = reply ? null : statsCommand(text)
+    if (stats) return accept(stats.all ? 'stats all' : 'stats', 'stats', { all: stats.all, text })
+    const away = reply ? null : awayCommand(text)
+    if (away) return accept(away === 'away' ? 'night on' : 'night off', 'away', { on: away === 'away', text })
+    if (slash) return refuse(`"${preview(text, 30)}" is no command here. The commands: /stop, /funnel, /stats, /night and /back.`)
+    if (!this.answers) return refuse(INPUT_OFF)
+    if (age > this.maxAgeSeconds) return stale()
+    // TelegramAnswers records what it makes of it.
+    const bot = original?.from?.is_bot === true && typeof original.text === 'string'
+    this.emit('answer', {
+      text,
+      replyTo,
+      messageId,
+      quoted: bot && this.known(replyTo) ? original.text : null,
+      forwarded: false,
+      seen: bot && !this.known(replyTo) ? { ...seen, note: 'it replies to a message of the bot that this gateway did not send since its start; not quoted' } : seen,
+    })
+  }
+}
+
+// --- the input log ------------------------------------------------------------
+
+// Anything shaped like a bot token: digits, a colon, then about 35 characters.
+const BOT_TOKEN = /\b\d{5,}:[A-Za-z0-9_-]{30,}/g
+const EXCERPT = 80
+
+// Every message the bot receives, the driver's and anyone else's, accepted,
+// refused or ignored, in an append-only file in the gateway's state folder
+// (config.telegramInputLog), one JSON line each: when, the sender's id, the
+// chat's id and type, a short excerpt, the decision (accepted, refused,
+// ignored), as what or why, and the request it became. So it shows who tried
+// what, also where nothing was said back. Bounded: past maxBytes it moves to
+// <file>.1, replacing the one before (log.mjs). Mode 0600, folder 0700. Never
+// the token: the secrets, and anything shaped like a bot token, are cut out
+// of the excerpt and the reason first. Never throws.
+export class TelegramInputLog {
+  constructor({ file, maxBytes = 1024 * 1024, secrets = [] }) {
+    this.file = file
+    this.secrets = secrets.filter(secret => typeof secret === 'string' && secret.length >= 6)
+    this.write = fileLog(file, { maxBytes })
+  }
+
+  clean(text) {
+    let clean = String(text ?? '')
+    for (const secret of this.secrets) clean = clean.split(secret).join('<token>')
+    return clean.replace(BOT_TOKEN, '<token>')
+  }
+
+  record({ from = null, chat = null, type = null, text = '', edited = false, decision, as = null, why = null, note = null, request = null, answers = null }) {
+    try {
+      const entry = { at: new Date().toISOString(), from, chat, type, text: preview(this.clean(text), EXCERPT), decision }
+      if (edited) entry.edited = true
+      if (as) entry.as = as
+      if (why) entry.why = preview(this.clean(why), 200)
+      if (note) entry.note = note
+      if (request) entry.request = request
+      if (answers) entry.answers = answers
+      this.write(`${JSON.stringify(entry)}\n`)
+    } catch {
+      // the input log must never stop a message
     }
   }
+}
+
+// --- the token -------------------------------------------------------------------
+
+// The secrets folder 0700, the bot token's and the chat id's files 0600: the
+// token lets whoever has it read what the driver writes to the bot, and
+// write to them as the bot. What is open to others (a file from an older
+// version, or one written by hand without umask 077) is tightened at the
+// gateway's start. Returns a line for the log for each, never the token.
+export function secureSecrets({ dir, tokenFile, files = [] }) {
+  const notes = []
+  const tighten = (path, mode, what, token) => {
+    let stat
+    try {
+      stat = statSync(path)
+    } catch {
+      return
+    }
+    if ((stat.mode & 0o077) === 0) return
+    const was = (stat.mode & 0o777).toString(8)
+    const advice = token
+      ? '. Whoever could read it may have the bot token: if that may have happened, get a new token from @BotFather ' +
+        '(/revoke) and enter it in the setup'
+      : ''
+    try {
+      chmodSync(path, mode)
+      notes.push(`telegram: ${what} was open to others (mode ${was}); now ${mode.toString(8)}${advice}`)
+    } catch (error) {
+      notes.push(`telegram: ${what} is open to others (mode ${was}) and could not be tightened (${error.code ?? error.message}): chmod ${mode.toString(8)} it${advice}`)
+    }
+  }
+  tighten(dir, 0o700, 'the secrets folder', true)
+  tighten(tokenFile, 0o600, basename(tokenFile), true)
+  for (const file of files) tighten(file, 0o600, basename(file), false)
+  return notes
+}
+
+// Removes from env every variable whose value holds one of the secrets, so
+// that nothing the gateway starts, a worker run above all, inherits the bot
+// token from it. Returns the names removed.
+export function scrubEnv(env, secrets) {
+  const kept = secrets.filter(secret => typeof secret === 'string' && secret.length >= 6)
+  const removed = []
+  for (const [name, value] of Object.entries(env)) {
+    if (kept.some(secret => String(value).includes(secret))) {
+      delete env[name]
+      removed.push(name)
+    }
+  }
+  return removed
 }
 
 // A question, with its code in the first line and in the last. answerable:
@@ -493,9 +708,27 @@ export class TelegramFallback {
 
 // --- answers and requests by Telegram ----------------------------------------
 
-// What VOICE_GW_TELEGRAM_ANSWERS=other leaves to the driver's voice: the
-// decisions of these kinds (ledger.mjs).
+// What always takes the driver's voice, whatever comes by Telegram: the
+// decisions of these kinds (ledger.mjs), and in channel.mjs the tools that
+// carry them out (takesVoice). Approvals too, which Telegram never gives.
 export const VOICE_ONLY_KINDS = ['push', 'merge', 'restart', 'delete']
+
+// The answer to a Telegram answer about such a decision: nothing done, the
+// decision stays open, and it must be confirmed by voice; in German when the
+// driver wrote in German, else in English.
+const KIND_DE = { push: 'Push', merge: 'Merge', restart: 'Neustart', delete: 'Lösch' }
+const GERMAN_WORDS = new Set(
+  'ja nein bitte und nicht mach mache ist das der den dem doch gerne gern klar genau jawohl passt los weiter alles auch aber noch sofort jetzt'.split(' '),
+)
+export const looksGerman = text =>
+  /[äöüß]/i.test(String(text)) || (String(text).toLowerCase().match(/\p{L}+/gu) ?? []).some(word => GERMAN_WORDS.has(word))
+
+export function voiceOnlyText(id, kind, text) {
+  return looksGerman(text)
+    ? `Nicht ausgeführt: ${id} ist eine ${KIND_DE[kind] ?? kind}-Entscheidung, und die muss per Voice bestätigt werden. ` +
+        `Sie bleibt offen. Sag es im Voice-Modus und nenne ${id}.`
+    : `Not done: ${id} is a ${kind} decision, which must be confirmed by voice. It stays open. Say it in voice mode and mention ${id}.`
+}
 
 // The words of a message that could be codes: four letters and digits, as
 // the gateway makes request ids (store.mjs) and decision ids (ledger.mjs).
@@ -533,12 +766,17 @@ export const quoteText = quoted => `(In reply to the gateway's message, quoted a
 // or without a controller); the chat hears why, and unlocking stays at the
 // computer. Nor a forwarded message, which holds someone else's words.
 //
+// Push, merge, restart and delete decisions are never answered here: an
+// answer to one is not passed on, nothing is done, the decision stays open,
+// and the chat hears that it must be confirmed by voice (voiceOnlyText).
+//
 // push(request): hands the request to the controller (channel.mjs). say(text,
 // replyTo): a message to the chat, as a reply to the driver's. held(): a
-// sentence when the controller waits for the usage limit, else ''. mode: on;
-// other, which leaves push, merge, restart and delete decisions to the
-// driver's voice; or off, where questions are answered by voice only.
-// requests: whether any other message is a new request.
+// sentence when the controller waits for the usage limit, else ''. mode: on,
+// answers to every other question; or off, where questions are answered by
+// voice only. requests: whether any other message is a new request.
+// record(entry): what it made of the message, for the input log
+// (TelegramInputLog).
 export class TelegramAnswers {
   constructor({
     store,
@@ -550,6 +788,7 @@ export class TelegramAnswers {
     killswitch = null,
     presence = null,
     held = () => '',
+    record = () => {},
     log = defaultLog,
   }) {
     this.store = store
@@ -561,6 +800,7 @@ export class TelegramAnswers {
     this.killswitch = killswitch
     this.presence = presence
     this.held = held
+    this.record = record
     this.log = log
   }
 
@@ -569,10 +809,9 @@ export class TelegramAnswers {
     return this.mode !== 'off' && !this.voiceOnly(request)
   }
 
-  // With mode other: the first open decision of the request that takes the
-  // driver's voice; else null.
+  // The first decision of the request that takes the driver's voice, push,
+  // merge, restart or delete; else null.
   voiceOnly(request) {
-    if (this.mode !== 'other') return null
     return this.ledger?.forRequest(request.id).find(d => VOICE_ONLY_KINDS.includes(d.kind)) ?? null
   }
 
@@ -658,7 +897,8 @@ export class TelegramAnswers {
   }
 
   // Whether and where a message goes: { question }, { request: true }, or
-  // { why } not.
+  // { why } not, with the whole answer for the chat in text when it is not
+  // the usual "Not passed on: <why>".
   check(text, replyTo, { forwarded = false } = {}) {
     if (this.killswitch?.locked) return { why: 'the kill switch is locked. It is unlocked only at the computer.' }
     const presence = this.presence?.state() ?? { active: true }
@@ -669,27 +909,32 @@ export class TelegramAnswers {
     const decision = this.voiceOnly(target.question)
     if (decision) {
       const id = target.question.id
-      return {
-        why: `${id} is a ${decision.kind} decision, which takes your voice (VOICE_GW_TELEGRAM_ANSWERS=other). Answer it in voice mode and mention ${id}.`,
-      }
+      return { why: `${id} is a ${decision.kind} decision, which must be confirmed by voice`, text: voiceOnlyText(id, decision.kind, text) }
     }
     return target
   }
 
   // A message from the driver's chat ({ text, replyTo, messageId, quoted,
-  // forwarded }, from TelegramCommands): passed on as their answer or as a
-  // new request, or not, and the chat hears which. Resolves with the request
-  // passed on, or null. Never throws.
-  async route({ text, replyTo = null, messageId = null, quoted = null, forwarded = false }) {
+  // forwarded, seen }, from TelegramCommands): passed on as their answer or
+  // as a new request, or not, and the chat hears which; the input log keeps
+  // it with seen, who sent it where. Resolves with the request passed on, or
+  // null. Never throws.
+  async route({ text, replyTo = null, messageId = null, quoted = null, forwarded = false, seen = null }) {
     const said = String(text ?? '').trim()
+    const record = entry => this.record({ ...(seen ?? { text: said }), ...entry })
     try {
       const result = this.check(said, replyTo, { forwarded })
       if (result.why) {
         this.log('telegram message not passed on:', result.why)
-        await this.say(`Not passed on: ${result.why}`, messageId)
+        record({ decision: 'refused', why: result.why })
+        await this.say(result.text ?? `Not passed on: ${result.why}`, messageId)
         return null
       }
-      if (result.request) return await this.start(said, { messageId, quoted: replyTo === null ? null : quoted })
+      if (result.request) {
+        const request = await this.start(said, { messageId, quoted: replyTo === null ? null : quoted })
+        record({ decision: 'accepted', as: 'request', request: request.id })
+        return request
+      }
       const { question } = result
       const request = this.store.createRequest(`(Answer to ${question.id}) ${said}`, { answers: question.id, via: 'telegram' })
       // The meta stays with it, for an event sent again after the usage limit.
@@ -698,10 +943,12 @@ export class TelegramAnswers {
       this.store.markAnswered(question, request.id)
       await this.push(request)
       this.log('telegram answer passed on', `id=${request.id}`, `answers=${question.id}`)
+      record({ decision: 'accepted', as: 'answer', request: request.id, answers: question.id })
       await this.say(`Passed on to the controller as your answer to ${question.id}.${this.heldText()}`, messageId)
       return request
     } catch (error) {
       this.log('telegram message failed:', error.message)
+      record({ decision: 'refused', why: error.message })
       await Promise.resolve(this.say(`Not passed on: ${error.message}.`, messageId)).catch(() => {})
       return null
     }

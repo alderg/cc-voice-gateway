@@ -354,10 +354,15 @@ test('restart_controller: first what would happen, running workers included; the
     assert.match(plan, new RegExp(`Queued tasks: ${entry} for alpha \\("Then fix the README\\."\\)\\. They stay queued and start by themselves after the restart`))
     assert.match(plan, /Open voice requests: 2\. Answers already given stay deliverable; a request not finished yet ends with a note/)
     assert.match(plan, /loads as the allowlisted plugin, so the session is back within about half a minute, without a confirmation/)
-    assert.match(plan, /Only after a yes: reply "done" to the driver first, then call restart_controller with confirm=true\./)
+    assert.match(plan, /Only after a yes: reply "done" to the driver first, then call restart_controller with confirm=true and their words\./)
     assert.equal(existsSync(join(lock, 'restart')), false, 'a plan restarts nothing')
 
-    assert.match(await g.controller('restart_controller', { confirm: true }), /^\[restart=requested\] The session ends in about 2 seconds/)
+    // Confirmed, but without the driver's words, or with words nobody said: nothing restarts.
+    assert.match(await g.controller('restart_controller', { confirm: true }), /^\[restart=needs_driver\] Nothing restarted\. It needs the driver's own words/)
+    assert.match(await g.controller('restart_controller', { confirm: true, words: 'restart it right away' }), /^\[restart=needs_driver\]/)
+    assert.equal(existsSync(join(lock, 'restart')), false, 'nothing restarted')
+
+    assert.match(await g.controller('restart_controller', { confirm: true, words: 'Restart the controller' }), /^\[restart=requested\] The session ends in about 2 seconds/)
     assert.equal(JSON.parse(readFileSync(join(lock, 'restart'), 'utf8')).by, 'voice')
     assert.ok(existsSync(join(g.state, 'requests.json')), 'the requests are saved for the next gateway')
     await waitUntil(() => existsSync(join(TMP, 'wrapper-term')), 6000)

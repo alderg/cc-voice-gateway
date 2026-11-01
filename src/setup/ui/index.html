@@ -182,14 +182,25 @@
     <p class="guide">Unticked, a saved bot token and chat ID are deleted when you write the setup.</p>
     <label>Silence before Telegram (seconds) <input data-setting="VOICE_GW_TELEGRAM_AFTER" inputmode="numeric"></label>
     <p class="guide">After this long without a voice call, voice mode counts as ended, and questions and approvals also go to Telegram. Results wait for the next voice call. Default 600: gaps of a few minutes are normal while you talk.</p>
+  </div>
+  <label><input type="checkbox" id="telegram-input-on"> Take answers and requests from Telegram too</label>
+  <p class="guide">Off by default: Telegram then only carries messages to you, and takes commands such as <code>/stop</code>.
+    Ticked, a Reply to a question there answers it, and any other message you write to the bot reaches the controller as a
+    request of yours, as one by voice does; its replies come back to the chat. Only messages from your own account, in your
+    private chat with the bot, count: groups, other senders and bots are ignored, forwarded and edited messages refused, and
+    every message is kept in <code>.state/telegram-input.log</code>. Push, merge, restart, delete and approvals still need your
+    voice: an answer to such a question is not carried out, and the chat says it must be confirmed by voice. Whoever is
+    signed in to your Telegram account can then start work as your voice can: turn on two-step verification there, and end
+    sessions you do not know (README 5.8).</p>
+  <div id="telegram-input" class="grid" hidden>
     <label>Answers in Telegram
-      <select data-setting="VOICE_GW_TELEGRAM_ANSWERS"><option value="1">to every question (default)</option><option value="other">not to push, merge, restart and delete questions</option><option value="0">off, only by voice</option></select>
+      <select id="telegram-answers" data-setting="VOICE_GW_TELEGRAM_ANSWERS"><option value="0">off, only by voice (default)</option><option value="1">on, but push, merge, restart and delete only by voice</option></select>
     </label>
-    <p class="guide">A Reply to a question there, or a message that starts with its code, such as "8cep yes", reaches the controller as your answer, as one by voice does; its replies come back to the chat. Approvals stay with your voice and the terminal.</p>
+    <p class="guide">A Reply to a question there, or a message that starts with its code, such as "8cep yes", reaches the controller as your answer, as one by voice does.</p>
     <label>Requests in Telegram
-      <select data-setting="VOICE_GW_TELEGRAM_REQUESTS"><option value="1">on, like a voice request (default)</option><option value="0">off, only commands and answers</option></select>
+      <select id="telegram-requests" data-setting="VOICE_GW_TELEGRAM_REQUESTS"><option value="0">off, only commands and answers (default)</option><option value="1">on, like a voice request</option></select>
     </label>
-    <p class="guide">Any other message you write to the bot reaches the controller as a request of yours, as one by voice does, and its replies come back as replies to your message. Your Telegram account then starts work as your voice does.</p>
+    <p class="guide">Any other message you write to the bot reaches the controller as a request of yours, and its replies come back as replies to your message.</p>
   </div>
 </section>
 

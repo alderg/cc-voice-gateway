@@ -37,7 +37,16 @@ import { Digest, digestMeta, digestText, fixLine, foldedText, pullKey, routineFi
 import { SettingsWatcher, othersText } from './live.mjs'
 import { Restarter } from './restart.mjs'
 import { PullWatcher } from './pulls.mjs'
-import { TelegramAnswers, TelegramCommands, TelegramFallback, loadTelegram } from './telegram.mjs'
+import {
+  TelegramAnswers,
+  TelegramCommands,
+  TelegramFallback,
+  TelegramInputLog,
+  driverId,
+  loadTelegram,
+  scrubEnv,
+  secureSecrets,
+} from './telegram.mjs'
 import { KillSwitch, alarmText, offText } from './killswitch.mjs'
 import { RunGuard } from './guard.mjs'
 import { realpathSync } from 'node:fs'
@@ -552,6 +561,18 @@ const telegram = loadTelegram({
   chatIdFile: config.telegramChatIdFile,
   apiBase: config.telegramApi,
 })
+// The bot token: its file 0600 in the 0700 secrets folder, and in no
+// variable that a worker or anything else the gateway starts inherits.
+let inputLog = null
+if (telegram) {
+  for (const note of secureSecrets({ dir: config.secretsDir, tokenFile: config.telegramTokenFile, files: [config.telegramChatIdFile] })) log(note)
+  const removed = scrubEnv(process.env, [telegram.token])
+  if (removed.length) {
+    log(`telegram: removed ${removed.join(', ')} from the environment: ${removed.length === 1 ? 'it holds' : 'they hold'} the bot token, which nothing the gateway starts may inherit`)
+  }
+  // Every message the bot receives, accepted, refused or ignored.
+  inputLog = new TelegramInputLog({ file: config.telegramInputLog, secrets: [telegram.token] })
+}
 let telegramCommands = null
 // The Funnel on demand (funnel.mjs): from Telegram, and off by itself when idle.
 const say = text => telegram?.send(text).catch(error => log('telegram message not sent:', error.message)) ?? Promise.resolve()
@@ -560,11 +581,14 @@ if (config.funnelIdleMinutes) {
   log(`funnel auto-off: ${config.funnelIdleMinutes} minutes after the last voice call${telegram ? '' : '; without Telegram, only at the computer on again'}`)
 }
 if (telegram) {
-  // The driver's answers to questions, typed in the chat as a Reply or with
-  // the question's code (VOICE_GW_TELEGRAM_ANSWERS), and their other
-  // messages as requests (VOICE_GW_TELEGRAM_REQUESTS): to the controller
-  // like answers and requests by voice, never past a locked kill switch or a
-  // standby.
+  const record = entry => inputLog?.record(entry)
+  const reply = (text, replyTo = null) =>
+    telegram.send(text, { replyTo }).catch(error => log('telegram message not sent:', error.message))
+  // Telegram as input, only when the driver turned it on (off by default):
+  // their answers to questions, typed in the chat as a Reply or with the
+  // question's code (VOICE_GW_TELEGRAM_ANSWERS), and their other messages as
+  // requests (VOICE_GW_TELEGRAM_REQUESTS), to the controller like answers and
+  // requests by voice, never past a locked kill switch or a standby.
   const answers =
     config.telegramAnswers === 'off' && !config.telegramRequests
       ? null
@@ -575,35 +599,50 @@ if (telegram) {
           requests: config.telegramRequests,
           killswitch,
           presence,
+          record,
           push: async request => {
             await channel.ready
             await channel.push(request, request.meta)
           },
-          say: (text, replyTo) =>
-            telegram.send(text, { replyTo }).catch(error => log('telegram message not sent:', error.message)),
+          say: reply,
           held: () => {
             const wait = limits.active('controller')
             return wait ? `The controller waits for the usage limit until ${clock(wait.until)} and reads it then.` : ''
           },
         })
-  if (config.telegramAnswersSetting.trim() && !['1', '0', 'other'].includes(config.telegramAnswersSetting.trim().toLowerCase())) {
-    log(`VOICE_GW_TELEGRAM_ANSWERS=${config.telegramAnswersSetting} is not 1, other or 0; 1 instead`)
+  // A value it does not know counts as off, so that a typo opens nothing.
+  const answersSetting = config.telegramAnswersSetting.trim().toLowerCase()
+  if (answersSetting === 'other') {
+    log('VOICE_GW_TELEGRAM_ANSWERS=other is the same as 1 now: push, merge, restart and delete take the voice either way')
+  } else if (answersSetting && !['1', '0'].includes(answersSetting)) {
+    log(`VOICE_GW_TELEGRAM_ANSWERS=${config.telegramAnswersSetting} is not 1 or 0; 0 (off) instead`)
   }
   log(
-    {
-      on: 'telegram answers on: a Reply to a question, or a message with its code, reaches the controller as the driver\'s answer',
-      other: 'telegram answers on, except for push, merge, restart and delete decisions, which take the driver\'s voice (VOICE_GW_TELEGRAM_ANSWERS=other)',
-      off: 'telegram answers off (VOICE_GW_TELEGRAM_ANSWERS=0): questions are answered by voice only',
-    }[config.telegramAnswers],
+    config.telegramAnswers === 'on'
+      ? 'telegram answers on (VOICE_GW_TELEGRAM_ANSWERS=1): a Reply to a question, or a message with its code, reaches the controller ' +
+          'as the driver\'s answer, except for push, merge, restart and delete decisions, which must be confirmed by voice'
+      : 'telegram answers off (VOICE_GW_TELEGRAM_ANSWERS not 1, off by default): questions are answered by voice only',
   )
   if (config.telegramRequestsSetting.trim() && !['1', '0'].includes(config.telegramRequestsSetting.trim())) {
-    log(`VOICE_GW_TELEGRAM_REQUESTS=${config.telegramRequestsSetting} is not 1 or 0; 1 instead`)
+    log(`VOICE_GW_TELEGRAM_REQUESTS=${config.telegramRequestsSetting} is not 1 or 0; 0 (off) instead`)
   }
   log(
     config.telegramRequests
-      ? 'telegram requests on: any other message from the chat reaches the controller as a request of the driver\'s, and its replies come back there'
-      : 'telegram requests off (VOICE_GW_TELEGRAM_REQUESTS=0): a message that is no command and no answer is not passed on',
+      ? 'telegram requests on (VOICE_GW_TELEGRAM_REQUESTS=1): any other message from the chat reaches the controller as a request of the driver\'s, and its replies come back there'
+      : 'telegram requests off (VOICE_GW_TELEGRAM_REQUESTS not 1, off by default): a message that is no command and no answer is not passed on',
   )
+  // Whose messages count: the driver's own, in their private chat with the
+  // bot. Its id is their user id, so the chat id is all the setup stores.
+  const driver = driverId(telegram.chatId)
+  log(
+    driver
+      ? `telegram input only from the driver's user id ${driver}, in their private chat with the bot (telegram_chat_id: in a private ` +
+          'chat the chat id is the user id); groups, channels, other senders and bots are ignored without an answer, forwarded, ' +
+          `edited and non-text messages refused; every message in ${config.telegramInputLog}`
+      : 'telegram: telegram_chat_id names no private chat (the id of a group or a channel is negative), so no message counts, ' +
+          'not even /stop; choose your private chat with the bot in the setup',
+  )
+  if (answers) log('telegram: push, merge, restart, delete and approvals take the driver\'s voice; words typed in Telegram settle none of them')
   // Paused in a standby, and in night mode, where Telegram carries alarms
   // only; what the night left, the morning summary names (night.mjs). The
   // controller's replies to an answer or a request typed there wait only in
@@ -616,16 +655,22 @@ if (telegram) {
     answerable: request => answers?.accepts(request) ?? false,
   })
   log(`telegram fallback ready: questions and approvals after ${config.telegramAfterSeconds} s without a voice call`)
-  // Inbound, only from the configured chat: the kill switch, the Funnel,
-  // night mode, the statistics, answers to questions and requests. With
-  // requests, a Reply to a message that asks nothing, news or an alarm, is
-  // read like any message: a command is a command there too.
+  // Inbound, only from the driver in the configured private chat: the kill
+  // switch, the Funnel, night mode, the statistics, and with Telegram input
+  // on, answers to questions and requests. With requests, a Reply to a
+  // message that asks nothing, news or an alarm, is read like any message: a
+  // command is a command there too. A Reply to a message of the bot's that
+  // this gateway did not send is never quoted.
   telegramCommands = new TelegramCommands(telegram, {
     pollSeconds: config.telegramPollSeconds,
     answers: Boolean(answers),
+    record,
+    known: id => telegram.sent(id) || (answers?.asks(id) ?? false),
     ...(config.telegramRequests ? { asks: id => answers.asks(id) } : {}),
   }).start()
   if (answers) telegramCommands.on('answer', message => answers.route(message))
+  // The driver's own message that does not count, and why.
+  telegramCommands.on('refused', ({ why, messageId }) => reply(`Not passed on: ${why}`, messageId))
   telegramCommands.on('stop', ({ text }) => {
     const state = killswitch.trip({ trigger: 'telegram', reason: `"${text}" on Telegram` })
     if (!state && !killswitch.locked) say(`cc-voice-gateway on ${hostname()}: "${text}" locked nothing. ${offText()}`)

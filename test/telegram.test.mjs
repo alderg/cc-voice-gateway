@@ -13,7 +13,7 @@ import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync, spawn } from 'node:child_process'
 import { getEventListeners } from 'node:events'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -23,11 +23,27 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import { z } from 'zod'
 import { adminRequest } from '../src/admin.mjs'
-import { spokenByDriver, takesVoice } from '../src/channel.mjs'
+import { restartTool, spokenByDriver, takesVoice, telegramInstructions } from '../src/channel.mjs'
 import { telegramAnswersMode, telegramRequestsOn } from '../src/config.mjs'
 import { Ledger } from '../src/ledger.mjs'
 import { Store } from '../src/store.mjs'
-import { Telegram, TelegramAnswers, TelegramCommands, TelegramFallback, callBotApi, loadTelegram, pause, quoteText } from '../src/telegram.mjs'
+import {
+  INPUT_OFF,
+  Telegram,
+  TelegramAnswers,
+  TelegramCommands,
+  TelegramFallback,
+  TelegramInputLog,
+  callBotApi,
+  driverId,
+  loadTelegram,
+  looksGerman,
+  pause,
+  quoteText,
+  scrubEnv,
+  secureSecrets,
+  voiceOnlyText,
+} from '../src/telegram.mjs'
 
 const GATEWAY = fileURLToPath(new URL('../src/gateway.mjs', import.meta.url))
 const TMP = mkdtempSync(join(tmpdir(), 'voice-gw-telegram-'))
@@ -46,7 +62,13 @@ const api = { messages: [], requests: 0, mode: 'ok', server: null, url: '', upda
 // A message from the driver's chat, a Reply to `replyTo` if given: one of
 // the bot's messages, which Telegram hands along with it.
 function driverSays(text, { replyTo = null, messageId = 1000 + api.nextUpdate } = {}) {
-  const message = { message_id: messageId, date: Math.floor(Date.now() / 1000), chat: { id: Number(CHAT_ID), type: 'private' }, text }
+  const message = {
+    message_id: messageId,
+    date: Math.floor(Date.now() / 1000),
+    chat: { id: Number(CHAT_ID), type: 'private' },
+    from: { id: Number(CHAT_ID), is_bot: false, first_name: 'Driver' },
+    text,
+  }
   if (replyTo !== null) message.reply_to_message = { message_id: replyTo, from: { is_bot: true }, text: api.messages[replyTo - 1]?.text }
   api.updates.push({ update_id: api.nextUpdate++, message })
   return messageId
@@ -463,7 +485,7 @@ function answering({ mode = 'on', requests = false, held = () => '', push = null
 
 test('Telegram answers: a Reply to a question reaches the controller as the driver\'s answer, via="telegram", and its words count', async () => {
   const t = answering()
-  const question = t.question('The tests pass. Open the pull request?', { kind: 'push', message: 11 })
+  const question = t.question('The tests pass. Update the changelog too?', { message: 11 })
   const [decision] = t.ledger.forRequest(question.id)
 
   const request = await t.answers.route({ text: '  Ja, öffne ihn bitte ', replyTo: 11, messageId: 12 })
@@ -498,8 +520,8 @@ test('Telegram answers: a Reply to a question reaches the controller as the driv
 
 test('Telegram answers: without a Reply, the code of exactly one open question; no code, several, or one not open is not passed on, and the chat hears why', async () => {
   const t = answering()
-  const first = t.question('Open the pull request?', { kind: 'push', message: 21 })
-  const second = t.question('Delete the old branch too?') // heard by voice only: no message here
+  const first = t.question('Rename the branch to fix-login?', { message: 21 })
+  const second = t.question('Keep the old notes too?') // heard by voice only: no message here
   const open = `Open: ${first.id} and ${second.id}. Reply to its message, or start yours with its code.`
 
   assert.equal(await t.answers.route({ text: 'ja', messageId: 30 }), null)
@@ -543,7 +565,7 @@ test('Telegram answers: without a Reply, the code of exactly one open question; 
 test('Telegram answers: nothing past a locked kill switch or an inactive gateway; the usage limit is said', async () => {
   let wait = ''
   const t = answering({ held: () => wait })
-  const question = t.question('Merge pull request 12?', { kind: 'merge', message: 50 })
+  const question = t.question('Rename pull request 12 to "Fix the login"?', { message: 50 })
 
   t.killswitch.locked = true
   await t.answers.route({ text: 'yes, merge it', replyTo: 50, messageId: 51 })
@@ -567,34 +589,55 @@ test('Telegram answers: nothing past a locked kill switch or an inactive gateway
 
   // The channel gone: said, never thrown.
   const broken = answering({ push: async () => { throw new Error('Not connected') } })
-  const other = broken.question('Restart the controller?', { kind: 'restart', message: 60 })
+  const other = broken.question('Use tabs or spaces?', { message: 60 })
   assert.equal(await broken.answers.route({ text: 'yes, restart', replyTo: 60, messageId: 61 }), null)
   assert.equal(broken.lastSaid(), 'Not passed on: Not connected.')
   assert.ok(broken.logged.some(line => line === 'telegram message failed: Not connected'))
   assert.equal(other.updates.length, 1)
 })
 
-test('VOICE_GW_TELEGRAM_ANSWERS: on by default; other leaves push, merge, restart and delete decisions to the voice; 0 off', async () => {
-  for (const value of [undefined, '', '1', 'yes', 'on']) assert.equal(telegramAnswersMode(value), 'on', String(value))
-  assert.equal(telegramAnswersMode(' Other '), 'other')
-  assert.equal(telegramAnswersMode('0'), 'off')
+test('VOICE_GW_TELEGRAM_ANSWERS: off by default and for any value it does not know; 1 on, other the same', async () => {
+  for (const value of [undefined, '', '0', ' 0 ', 'yes', 'on', 'true', 'all']) assert.equal(telegramAnswersMode(value), 'off', String(value))
+  for (const value of ['1', ' 1 ', 'other', ' Other ']) assert.equal(telegramAnswersMode(value), 'on', value)
+})
 
-  const on = answering()
-  assert.equal(on.answers.accepts(on.question('Push alpha?', { kind: 'push' })), true)
-
-  const t = answering({ mode: 'other' })
-  for (const kind of ['push', 'merge', 'restart', 'delete']) {
-    const question = t.question(`A ${kind} question?`, { kind, message: 70 })
+test('push, merge, restart and delete decisions take the voice: an answer by Telegram does nothing, the decision stays open, and the chat says it must be confirmed by voice, in German or English', async () => {
+  const t = answering()
+  const words = { push: 'ja, push es', merge: 'yes, merge it', restart: 'ja bitte', delete: 'go ahead and delete it' }
+  const kinds = { push: 'Push', merge: 'Merge', restart: 'Neustart', delete: 'Lösch' }
+  for (const [index, kind] of ['push', 'merge', 'restart', 'delete'].entries()) {
+    const message = 70 + 10 * index
+    const question = t.question(`A ${kind} question?`, { kind, message })
+    const [decision] = t.ledger.forRequest(question.id)
     assert.equal(t.answers.accepts(question), false, kind)
-    await t.answers.route({ text: `${question.id} yes`, messageId: 71 })
-    assert.equal(
-      t.lastSaid(),
-      `Not passed on: ${question.id} is a ${kind} decision, which takes your voice (VOICE_GW_TELEGRAM_ANSWERS=other). ` +
-        `Answer it in voice mode and mention ${question.id}.`,
-    )
-    assert.equal(question.state, 'question')
+    // By Reply, and by its code: the same.
+    for (const answer of [{ replyTo: message }, { text: `${question.id} ${words[kind]}` }]) {
+      const text = answer.text ?? words[kind]
+      assert.equal(await t.answers.route({ text, replyTo: answer.replyTo ?? null, messageId: message + 1 }), null)
+      assert.equal(
+        t.lastSaid(),
+        looksGerman(text)
+          ? `Nicht ausgeführt: ${question.id} ist eine ${kinds[kind]}-Entscheidung, und die muss per Voice bestätigt werden. ` +
+              `Sie bleibt offen. Sag es im Voice-Modus und nenne ${question.id}.`
+          : `Not done: ${question.id} is a ${kind} decision, which must be confirmed by voice. It stays open. ` +
+              `Say it in voice mode and mention ${question.id}.`,
+        `${kind}: ${text}`,
+      )
+      assert.equal(t.said.at(-1).replyTo, message + 1)
+    }
+    assert.equal(question.state, 'question', 'the question stays open, for the voice')
+    assert.equal(decision.state, 'asked', 'the decision keeps no answer')
+    assert.equal(decision.answer ?? null, null)
   }
-  assert.deepEqual(t.pushed, [])
+  assert.deepEqual(t.pushed, [], 'nothing reaches the controller')
+  assert.equal(voiceOnlyText('ab12', 'push', 'Push it'), 'Not done: ab12 is a push decision, which must be confirmed by voice. It stays open. Say it in voice mode and mention ab12.')
+  // German for the German answers above, English for the others.
+  assert.deepEqual(Object.values(words).map(looksGerman), [true, false, true, false])
+  assert.equal(looksGerman('Ja'), true)
+  assert.equal(looksGerman('Lösch es'), true)
+  assert.equal(looksGerman('yes, go ahead'), false)
+
+  // Every other question may be answered there.
   const plain = t.question('Use tabs or spaces?')
   assert.equal(t.answers.accepts(plain), true)
   assert.equal((await t.answers.route({ text: `${plain.id} spaces`, messageId: 72 })).answers, plain.id)
@@ -630,6 +673,7 @@ test('the command loop: a Reply is an answer whatever it says, unless a stop or 
       text,
       date: Math.floor(Date.now() / 1000) - age,
       chat: { id: chat, type: 'private' },
+      from: { id: chat, is_bot: false },
       ...(replyTo === null ? {} : { reply_to_message: { message_id: replyTo } }),
     },
   })
@@ -657,13 +701,17 @@ test('the command loop: a Reply is an answer whatever it says, unless a stop or 
   )
   assert.equal(heard[0][1].messageId, 500)
 
-  // Without answers, as before: only commands.
+  // Without answers, Telegram input off, the default: only commands; the rest is refused, and the chat hears why.
   heard.length = 0
   const before = listen(new TelegramCommands({ chatId: '4242' }, { log: () => {} }))
+  const refused = []
+  before.on('refused', event => refused.push(event))
   before.handle(message('Ja, öffne ihn', { replyTo: 7 }))
   before.handle(message('8cep nein'))
   before.handle(message('good night', { replyTo: 7 }))
   assert.deepEqual(heard.map(([name]) => name), ['away'])
+  assert.deepEqual(refused.map(event => [event.text, event.why]), [['Ja, öffne ihn', INPUT_OFF], ['8cep nein', INPUT_OFF]])
+  assert.match(INPUT_OFF, /^Telegram input is off: here only commands count, such as \/stop/)
 })
 
 test("the fallback: a question keeps its message's id; the controller's replies to a Telegram answer go back there, voice mode, night or not, and are no news", async () => {
@@ -847,9 +895,9 @@ test('Telegram requests: nothing past a locked kill switch or an inactive gatewa
   assert.equal(spokenByDriver(broken.store, 'run the tests', 30), false, 'so its words count for nothing')
 })
 
-test('VOICE_GW_TELEGRAM_REQUESTS: on by default, 0 off; with answers off, questions stay with the voice; with other, those decisions too', async () => {
-  for (const value of [undefined, '', '1', 'yes', ' on ']) assert.equal(telegramRequestsOn(value), true, String(value))
-  for (const value of ['0', ' 0 ']) assert.equal(telegramRequestsOn(value), false, value)
+test('VOICE_GW_TELEGRAM_REQUESTS: off by default and for any value it does not know, 1 on; with answers off, questions stay with the voice; push, merge, restart and delete always', async () => {
+  for (const value of [undefined, '', '0', ' 0 ', 'yes', ' on ', 'other']) assert.equal(telegramRequestsOn(value), false, String(value))
+  for (const value of ['1', ' 1 ']) assert.equal(telegramRequestsOn(value), true, value)
 
   // Answers off, requests on: a Reply to a question, or its code, is refused; other text is a request.
   const t = answering({ mode: 'off', requests: true })
@@ -867,31 +915,31 @@ test('VOICE_GW_TELEGRAM_REQUESTS: on by default, 0 off; with answers off, questi
   assert.equal(request.answers, undefined)
   assert.deepEqual(t.pushed, [request])
 
-  // Other: a push question takes the voice, a request does not.
-  const other = answering({ mode: 'other', requests: true })
+  // Answers on: a push question takes the voice, a request does not.
+  const other = answering({ mode: 'on', requests: true })
   const push = other.question('Push the commits?', { kind: 'push', message: 130 })
   await other.answers.route({ text: 'yes', replyTo: 130, messageId: 131 })
-  assert.match(other.lastSaid(), new RegExp(`^Not passed on: ${push.id} is a push decision, which takes your voice`))
+  assert.match(other.lastSaid(), new RegExp(`^Not done: ${push.id} is a push decision, which must be confirmed by voice\\.`))
   assert.equal((await other.answers.route({ text: 'Fix the README in alpha', messageId: 132 })).text, 'Fix the README in alpha')
-  // What takes the voice, in channel.mjs: resolve_decision and a confirmed delete_path.
-  for (const kind of ['push', 'merge', 'restart', 'delete']) {
-    assert.equal(takesVoice(kind, 'other'), true, kind)
-    assert.equal(takesVoice(kind, 'on'), false, kind)
-  }
-  assert.equal(takesVoice('other', 'other'), false)
+  // What takes the voice in channel.mjs, whatever the setting: resolve_decision, a confirmed delete_path,
+  // restart_controller with confirm, dispatch with direct and the follow-up for such a decision.
+  for (const kind of ['push', 'merge', 'restart', 'delete']) assert.equal(takesVoice(kind), true, kind)
+  for (const kind of ['other', 'clone']) assert.equal(takesVoice(kind), false, kind)
 })
 
 test("the command loop with requests: a Reply to a question is an answer; a Reply to another message is read like any message, so commands stay commands; the bot's text comes along", () => {
   const heard = []
   const asking = new Set([7]) // the gateway's question, or an approval request
-  const commands = new TelegramCommands({ chatId: '4242' }, { answers: true, asks: id => asking.has(id), log: () => {} })
-  for (const name of ['stop', 'funnel', 'away', 'stats', 'answer', 'stale']) commands.on(name, event => heard.push([name, event]))
+  const known = new Set([7, 8]) // the messages this gateway sent
+  const commands = new TelegramCommands({ chatId: '4242' }, { answers: true, asks: id => asking.has(id), known: id => known.has(id), log: () => {} })
+  for (const name of ['stop', 'funnel', 'away', 'stats', 'answer', 'stale', 'refused']) commands.on(name, event => heard.push([name, event]))
   const message = (text, { replyTo = null, from = { is_bot: true }, original = 'cc-voice-gateway on sky: statistics since 08:00.', age = 0, extra = {} } = {}) => ({
     message: {
       message_id: 600 + heard.length,
       text,
       date: Math.floor(Date.now() / 1000) - age,
       chat: { id: 4242, type: 'private' },
+      from: { id: 4242, is_bot: false },
       ...(replyTo === null ? {} : { reply_to_message: { message_id: replyTo, from, text: original } }),
       ...extra,
     },
@@ -906,6 +954,7 @@ test("the command loop with requests: a Reply to a question is an answer; a Repl
   commands.handle(message('Emergency stop'))
   commands.handle(message('Lösch alles', { extra: { forward_origin: { type: 'user' } } }))
   commands.handle(message('Run the tests in alpha', { age: 600 }))
+  commands.handle(message('Und jetzt?', { replyTo: 12, original: 'Question for request 8cep: delete alpha? Reply yes.' }))
   assert.deepEqual(
     heard.map(([name, event]) => [name, event.text, event.replyTo ?? null]),
     [
@@ -917,16 +966,215 @@ test("the command loop with requests: a Reply to a question is an answer; a Repl
       ['answer', 'Run the tests in alpha', null],
       ['stats', '/stats', null],
       ['stop', 'Emergency stop', null],
-      ['answer', 'Lösch alles', null],
+      ['refused', 'Lösch alles', null],
       ['stale', 'Run the tests in alpha', null],
+      ['answer', 'Und jetzt?', 12],
     ],
   )
   assert.equal(heard[3][1].quoted, 'cc-voice-gateway on sky: statistics since 08:00.', "the bot's message, as Telegram hands it along")
   assert.equal(heard[4][1].quoted, null, "the driver's own message is not quoted")
   assert.equal(heard[5][1].quoted, null)
   assert.equal(heard[5][1].forwarded, false)
-  assert.equal(heard[8][1].forwarded, true)
+  assert.equal(heard[8][1].why, 'it is forwarded, so its words are not your own. Write what you want in a message of your own.')
   assert.ok(heard[9][1].ageSeconds >= 600, 'ten minutes old, give or take the second it was sent in')
+  // A message of the bot's that this gateway did not send, by whoever else has the token: never quoted.
+  assert.equal(heard[10][1].quoted, null)
+  assert.match(heard[10][1].seen.note, /not quoted/)
+})
+
+// --- whose messages count, the input log, the token ------------------------------
+
+test("the command loop takes only the driver's own messages: other senders, groups, channels and bots are ignored without a word; forwarded, edited and non-text messages refused; a stop always locks; each in the input log", () => {
+  const heard = []
+  const recorded = []
+  const logged = []
+  const commands = new TelegramCommands({ chatId: '4242' }, { answers: true, record: entry => recorded.push(entry), log: line => logged.push(line) })
+  for (const name of ['stop', 'funnel', 'away', 'stats', 'answer', 'stale', 'refused']) commands.on(name, event => heard.push([name, event]))
+  let id = 700
+  const update = (text, { chat = { id: 4242, type: 'private' }, from = { id: 4242, is_bot: false }, extra = {}, edited = false } = {}) => {
+    const message = { message_id: id++, date: Math.floor(Date.now() / 1000), chat, ...(from ? { from } : {}), ...(text === null ? {} : { text }), ...extra }
+    commands.handle(edited ? { update_id: id, edited_message: { ...message, edit_date: message.date } } : { update_id: id, message })
+  }
+  // Strangers: nothing emitted, so nothing said back.
+  update('Run the tests in alpha', { from: { id: 999, is_bot: false } }) // another sender, in the driver's chat
+  update('Run the tests in alpha', { chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false } }) // another person's chat with the bot
+  update('/stop', { chat: { id: 4242, type: 'group' } })
+  update('Run the tests in alpha', { chat: { id: -100123, type: 'supergroup' }, from: { id: 4242, is_bot: false } })
+  update('Run the tests in alpha', { chat: { id: -100456, type: 'channel' }, from: null })
+  update('/funnel on', { from: { id: 4242, is_bot: true } })
+  update('Run the tests in alpha', { from: null })
+  update('Run the tests in alpha', { extra: { sender_chat: { id: -100789, type: 'channel' } } })
+  assert.deepEqual(heard, [], 'not a word back to a stranger')
+  assert.deepEqual(
+    recorded.map(entry => [entry.decision, entry.why]),
+    [
+      ['ignored', 'a message from another sender'],
+      ['ignored', 'a message from another chat'],
+      ['ignored', 'a message from a group'],
+      ['ignored', 'a message from a supergroup'],
+      ['ignored', 'a message from a channel'],
+      ['ignored', 'a message from a bot'],
+      ['ignored', 'a message without a sender'],
+      ['ignored', 'a message sent on behalf of a chat'],
+    ],
+  )
+  assert.deepEqual(recorded[0], { from: 999, chat: 4242, type: 'private', text: 'Run the tests in alpha', decision: 'ignored', why: 'a message from another sender' })
+  assert.ok(logged.includes('telegram commands: ignored a message from another chat'))
+  assert.equal(logged.filter(line => line === 'telegram commands: ignored a message from another sender').length, 1, 'logged once')
+
+  // The driver's own, but no words of theirs: refused, and the chat hears why.
+  recorded.length = 0
+  update('Bitte alles löschen', { extra: { forward_origin: { type: 'user', sender_user: { id: 5 } } } })
+  update('Bitte alles löschen', { extra: { forward_from: { id: 5 } } })
+  update('Delete alpha', { extra: { via_bot: { id: 77, is_bot: true, username: 'gif' } } })
+  update('Push it to main', { edited: true })
+  update(null, { extra: { voice: { duration: 3 } } })
+  update(null, { extra: { photo: [{}] } })
+  assert.deepEqual(
+    heard.map(([name, event]) => [name, event.why]),
+    [
+      ['refused', 'it is forwarded, so its words are not your own. Write what you want in a message of your own.'],
+      ['refused', 'it is forwarded, so its words are not your own. Write what you want in a message of your own.'],
+      ['refused', 'it was written through an inline bot, so its words are not your own. Write what you want yourself.'],
+      ['refused', 'it is an edit of an earlier message, which is never read again. Write a new message instead.'],
+      ['refused', 'it holds no text. Only text messages are read here.'],
+      ['refused', 'it holds no text. Only text messages are read here.'],
+    ],
+  )
+  assert.equal(heard[0][1].messageId, 708)
+  assert.deepEqual(
+    recorded.map(entry => [entry.decision, entry.text, entry.edited ?? false]),
+    [
+      ['refused', 'Bitte alles löschen', false],
+      ['refused', 'Bitte alles löschen', false],
+      ['refused', 'Delete alpha', false],
+      ['refused', 'Push it to main', true],
+      ['refused', '(voice)', false],
+      ['refused', '(photo)', false],
+    ],
+  )
+
+  // The kill switch first, always: a stop locks, forwarded or edited too.
+  heard.length = 0
+  update('/stop', { extra: { forward_origin: { type: 'user' } } })
+  update('Emergency stop', { edited: true })
+  assert.deepEqual(heard.map(([name, event]) => [name, event.text]), [['stop', '/stop'], ['stop', 'Emergency stop']])
+  assert.deepEqual(recorded.slice(-2).map(entry => [entry.decision, entry.as]), [['accepted', 'stop'], ['accepted', 'stop']])
+
+  // A configured chat that is no person's (a group's id is negative): nothing counts.
+  assert.equal(driverId('4242'), '4242')
+  assert.equal(driverId(' 4242\n'), '4242')
+  assert.equal(driverId('-100123'), null)
+  const group = new TelegramCommands({ chatId: '-100123' }, { answers: true, log: () => {} })
+  const groupHeard = []
+  group.on('stop', event => groupHeard.push(event))
+  group.handle({ message: { message_id: 1, date: Math.floor(Date.now() / 1000), chat: { id: -100123, type: 'group' }, from: { id: 4242, is_bot: false }, text: '/stop' } })
+  assert.deepEqual(groupHeard, [])
+})
+
+test('the input log: one JSON line per message, with sender, chat, an excerpt, the decision and the request; never the token; 0600 in a 0700 folder; bounded', () => {
+  const dir = join(TMP, 'input-log', 'state')
+  const file = join(dir, 'telegram-input.log')
+  const inputLog = new TelegramInputLog({ file, secrets: [TOKEN], maxBytes: 2000 })
+  inputLog.record({ from: 4242, chat: 4242, type: 'private', text: `my token is ${TOKEN}, run the tests`, decision: 'accepted', as: 'request', request: '7hqm' })
+  inputLog.record({ from: 999, chat: 999, type: 'private', text: 'x'.repeat(500), decision: 'ignored', why: 'a message from another chat' })
+  inputLog.record({ from: 4242, chat: 4242, type: 'private', text: 'Leaked: 987654321:ABCdefGHIjklMNOpqrSTUvwxYZ0123456789', decision: 'refused', why: `about ${TOKEN}` })
+  const lines = readFileSync(file, 'utf8').trim().split('\n').map(line => JSON.parse(line))
+  assert.equal(lines.length, 3)
+  assert.match(lines[0].at, /^\d{4}-\d\d-\d\dT/)
+  assert.deepEqual(
+    { ...lines[0], at: null },
+    { at: null, from: 4242, chat: 4242, type: 'private', text: 'my token is <token>, run the tests', decision: 'accepted', as: 'request', request: '7hqm' },
+  )
+  assert.equal(lines[1].text.length, 80, 'a short excerpt')
+  assert.equal(lines[1].why, 'a message from another chat')
+  assert.equal(lines[2].text, 'Leaked: <token>', 'anything shaped like a bot token')
+  assert.equal(lines[2].why, 'about <token>')
+  assert.ok(!readFileSync(file, 'utf8').includes(TOKEN))
+  assert.equal(statSync(file).mode & 0o777, 0o600)
+  assert.equal(statSync(dir).mode & 0o777, 0o700)
+  // Bounded: past its size it moves to .1, replacing the one before.
+  for (let i = 0; i < 40; i++) inputLog.record({ from: 1, chat: 1, type: 'private', text: `message ${i}`, decision: 'ignored', why: 'a message from another chat' })
+  assert.ok(existsSync(`${file}.1`))
+  assert.ok(statSync(file).size <= 2000)
+  assert.ok(statSync(`${file}.1`).size <= 2000)
+})
+
+test('the token: its file and the secrets folder tightened to 0600 and 0700 with a line for the log, never the token itself; no variable that holds it reaches what the gateway starts', () => {
+  const dir = join(TMP, 'loose-secrets')
+  mkdirSync(dir, { recursive: true })
+  chmodSync(dir, 0o755)
+  const tokenFile = join(dir, 'telegram_token')
+  const chatIdFile = join(dir, 'telegram_chat_id')
+  writeFileSync(tokenFile, `${TOKEN}\n`)
+  writeFileSync(chatIdFile, `${CHAT_ID}\n`)
+  chmodSync(tokenFile, 0o644)
+  chmodSync(chatIdFile, 0o640)
+  const notes = secureSecrets({ dir, tokenFile, files: [chatIdFile] })
+  assert.equal(statSync(dir).mode & 0o777, 0o700)
+  assert.equal(statSync(tokenFile).mode & 0o777, 0o600)
+  assert.equal(statSync(chatIdFile).mode & 0o777, 0o600)
+  const advice = 'Whoever could read it may have the bot token: if that may have happened, get a new token from @BotFather (/revoke) and enter it in the setup'
+  assert.deepEqual(notes, [
+    `telegram: the secrets folder was open to others (mode 755); now 700. ${advice}`,
+    `telegram: telegram_token was open to others (mode 644); now 600. ${advice}`,
+    'telegram: telegram_chat_id was open to others (mode 640); now 600',
+  ])
+  assert.ok(!notes.join('\n').includes(TOKEN))
+  assert.deepEqual(secureSecrets({ dir, tokenFile, files: [chatIdFile] }), [], 'nothing to say once they are tight')
+  assert.deepEqual(secureSecrets({ dir: join(dir, 'missing'), tokenFile: join(dir, 'missing', 'telegram_token') }), [])
+
+  const env = { PATH: '/usr/bin', TELEGRAM_BOT_TOKEN: TOKEN, NOTE: `bot ${TOKEN} here`, OTHER: '123456789:another-token' }
+  assert.deepEqual(scrubEnv(env, [TOKEN, '']), ['TELEGRAM_BOT_TOKEN', 'NOTE'])
+  assert.deepEqual(env, { PATH: '/usr/bin', OTHER: '123456789:another-token' })
+})
+
+test('Telegram.send keeps the ids of the messages it sent, so that only those are quoted', async () => {
+  api.mode = 'ok'
+  const telegram = new Telegram({ token: TOKEN, chatId: CHAT_ID, apiBase: api.url })
+  const message = await telegram.send('Hello')
+  assert.equal(telegram.sent(message.message_id), true)
+  assert.equal(telegram.sent(message.message_id + 1000), false)
+})
+
+test("restart_controller with confirm takes the driver's spoken words: words typed in Telegram, none or others restart nothing", () => {
+  const store = new Store()
+  const requested = []
+  const restarter = { watchdog: () => ({ ok: true }), plan: () => '[restart=plan]', request: ({ by }) => (requested.push(by), '[restart=requested]') }
+  const typed = store.createRequest('Restart the controller, please', { via: 'telegram' })
+  typed.meta = { via: 'telegram' }
+  assert.equal(restartTool(restarter, store, {}), '[restart=plan]', 'first the plan')
+  assert.match(
+    restartTool(restarter, store, { confirm: true, words: 'Restart the controller' }),
+    /^\[restart=needs_driver\] Nothing restarted: a restart must be confirmed by the driver's voice, and these words were typed in Telegram\. Tell the driver it needs their voice/,
+  )
+  assert.match(restartTool(restarter, store, { confirm: true }), /^\[restart=needs_driver\] Nothing restarted\. It needs the driver's own words/)
+  assert.match(restartTool(restarter, store, { confirm: true, words: 'something else entirely' }), /^\[restart=needs_driver\] Nothing restarted\. It needs/)
+  assert.deepEqual(requested, [], 'nothing restarted')
+  // By voice: restarted.
+  const spoken = store.createRequest('(Answer to ab12) Yes, restart it now.', { answers: 'ab12' })
+  assert.equal(spoken.origin, 'voice')
+  assert.equal(restartTool(restarter, store, { confirm: true, words: '(Answer to ab12) Yes, restart it now.' }), '[restart=requested]')
+  assert.deepEqual(requested, ['voice'])
+  // Without the watchdog, the plan says it cannot, whatever the words.
+  assert.equal(restartTool({ ...restarter, watchdog: () => ({ ok: false }) }, store, { confirm: true, words: 'Yes, restart it now' }), '[restart=plan]')
+})
+
+test("the controller's instructions on Telegram: nothing while input is off; with it on, that push, merge, restart, delete and approvals take the voice", () => {
+  assert.equal(telegramInstructions('off', false), '')
+  const cases = [
+    ['on', true, /^The driver may also write to you in their Telegram chat: a request, or an answer/],
+    ['off', true, /Answers to your questions come by voice\./],
+    ['on', false, /^The driver may also answer a question in their Telegram chat/],
+  ]
+  for (const [answers, requests, first] of cases) {
+    const text = telegramInstructions(answers, requests)
+    assert.match(text, first)
+    assert.match(
+      text,
+      /\nPush, merge, restart, delete and approvals always take the driver's voice\. When a message by Telegram asks for one,\nprepare it and ask the driver \(state "question", with its kind\), and say that it must be confirmed by voice; do not try\nit on their Telegram words\./,
+    )
+  }
 })
 
 test("the fallback: the controller's replies to a request by Telegram go back there as replies, working, question and done, voice mode, night or not, and are no news", async () => {
@@ -1191,12 +1439,10 @@ test('gateway with Telegram: questions after the voice mode ended, results never
     await gw.reply(third, 'question', 'To main or as a pull request?')
     await waitFor(() => api.messages.length === 1)
     assert.equal(api.messages[0].chat_id, CHAT_ID)
-    assert.match(
+    // Telegram input off, the default: the question is answered by voice.
+    assert.equal(
       api.messages[0].text,
-      new RegExp(
-        `^Question for request ${third} \\("Push the fix\\."\\)\n\nTo main or as a pull request\\?\n\nTo answer, reply to this ` +
-          `message, or write a message that starts with ${third}\\. Or answer in voice mode and mention ${third}\\.$`,
-      ),
+      `Question for request ${third} ("Push the fix.")\n\nTo main or as a pull request?\n\nAnswer in voice mode and mention ${third}.`,
     )
     assert.match(await gw.call('get_reply', { id: third }), /To main or as a pull request\?/)
 
@@ -1216,33 +1462,107 @@ test('gateway with Telegram: questions after the voice mode ended, results never
   }
 })
 
+test('gateway with Telegram input off, the default: answers and requests there are refused with the reason, strangers hear nothing, /stop still locks, and the input log keeps every message without the token', async () => {
+  api.mode = 'ok'
+  api.messages.length = 0
+  api.updates = []
+  const gw = await startGateway('input-off', { telegram: true, env: { VOICE_GW_TELEGRAM_POLL: '1' } })
+  const messageWith = text => api.messages.findIndex(m => m.text.includes(text)) + 1
+  const inputLog = join(TMP, 'input-off', 'state', 'telegram-input.log')
+  const entries = () => (existsSync(inputLog) ? readFileSync(inputLog, 'utf8').trim().split('\n').map(line => JSON.parse(line)) : [])
+  try {
+    assert.match(gw.log, /telegram answers off \(VOICE_GW_TELEGRAM_ANSWERS not 1, off by default\): questions are answered by voice only/)
+    assert.match(gw.log, /telegram requests off \(VOICE_GW_TELEGRAM_REQUESTS not 1, off by default\)/)
+    assert.match(gw.log, new RegExp(`telegram input only from the driver's user id ${CHAT_ID}, in their private chat with the bot`))
+    assert.doesNotMatch(gw.log, /push, merge, restart, delete and approvals take the driver's voice/)
+    assert.doesNotMatch(gw.claudeCode.getInstructions(), /Telegram chat/, 'the controller hears nothing of Telegram input')
+
+    // A question goes out, to be answered by voice.
+    const first = idOf(await gw.call('send', { message: 'Clean up the notes.' }))
+    await sleep(1300)
+    await gw.reply(first, 'question', 'Keep the old ones?')
+    await waitFor(() => messageWith('Keep the old ones?'))
+    assert.match(api.messages[messageWith('Keep the old ones?') - 1].text, new RegExp(`\n\nAnswer in voice mode and mention ${first}\\.$`))
+
+    // A Reply to it, and a plain message: refused, and the chat hears why.
+    const reply = driverSays('Ja, behalte sie', { replyTo: messageWith('Keep the old ones?') })
+    await waitFor(() => api.messages.filter(m => m.text.startsWith('Not passed on: Telegram input is off')).length === 1)
+    const plain = driverSays('Run the tests in alpha')
+    await waitFor(() => api.messages.filter(m => m.text.startsWith('Not passed on: Telegram input is off')).length === 2)
+    const refusals = api.messages.filter(m => m.text.startsWith('Not passed on: Telegram input is off'))
+    assert.equal(refusals[0].text, `Not passed on: ${INPUT_OFF}`)
+    assert.deepEqual(refusals.map(m => m.reply_parameters?.message_id), [reply, plain])
+    assert.ok(!gw.events.some(e => e.meta?.via === 'telegram'), 'nothing reaches the controller')
+    assert.match(await gw.call('get_reply', { id: first }), /Keep the old ones\?/, 'the question stays open for the voice')
+
+    // Strangers: another sender, and a group. Not a word back.
+    const sent = api.messages.length
+    api.updates.push({
+      update_id: api.nextUpdate++,
+      message: { message_id: 5001, date: Math.floor(Date.now() / 1000), chat: { id: 777, type: 'private' }, from: { id: 777, is_bot: false }, text: 'Run the tests in alpha' },
+    })
+    api.updates.push({
+      update_id: api.nextUpdate++,
+      message: { message_id: 5002, date: Math.floor(Date.now() / 1000), chat: { id: -100555, type: 'supergroup' }, from: { id: Number(CHAT_ID), is_bot: false }, text: '/stop' },
+    })
+    await waitFor(() => entries().filter(entry => entry.decision === 'ignored').length === 2)
+    await sleep(300)
+    assert.equal(api.messages.length, sent, 'no answer to a stranger')
+    assert.match(gw.log, /telegram commands: ignored a message from another chat/)
+    assert.match(gw.log, /telegram commands: ignored a message from a supergroup/)
+
+    // /stop locks, input on or off.
+    driverSays('/stop')
+    await waitFor(() => messageWith('KILL SWITCH'))
+
+    // The input log: every message, with what became of it, and never the token.
+    await waitFor(() => entries().some(entry => entry.as === 'stop'))
+    assert.deepEqual(
+      entries().map(entry => [entry.from, entry.chat, entry.type, entry.text, entry.decision, entry.as ?? entry.why]),
+      [
+        [Number(CHAT_ID), Number(CHAT_ID), 'private', 'Ja, behalte sie', 'refused', INPUT_OFF],
+        [Number(CHAT_ID), Number(CHAT_ID), 'private', 'Run the tests in alpha', 'refused', INPUT_OFF],
+        [777, 777, 'private', 'Run the tests in alpha', 'ignored', 'a message from another chat'],
+        [Number(CHAT_ID), -100555, 'supergroup', '/stop', 'ignored', 'a message from a supergroup'],
+        [Number(CHAT_ID), Number(CHAT_ID), 'private', '/stop', 'accepted', 'stop'],
+      ],
+    )
+    assert.equal(statSync(inputLog).mode & 0o777, 0o600)
+    assert.ok(!readFileSync(inputLog, 'utf8').includes(TOKEN))
+    assert.ok(!gw.log.includes(TOKEN))
+  } finally {
+    api.updates = null
+    await gw.close()
+  }
+})
+
 test('gateway with requests off: a Reply on Telegram, or a message with the code, answers a question as a spoken answer does; replies go back there; plain text is refused; nothing past the kill switch', async () => {
   api.mode = 'ok'
   api.messages.length = 0
   api.updates = []
-  const gw = await startGateway('answers', { telegram: true, env: { VOICE_GW_TELEGRAM_POLL: '1', VOICE_GW_TELEGRAM_REQUESTS: '0' } })
+  const gw = await startGateway('answers', { telegram: true, env: { VOICE_GW_TELEGRAM_POLL: '1', VOICE_GW_TELEGRAM_ANSWERS: '1', VOICE_GW_TELEGRAM_REQUESTS: '0' } })
   // The stand-in's message ids count from 1.
   const messageWith = text => api.messages.findIndex(m => m.text.includes(text)) + 1
   try {
-    assert.match(gw.log, /telegram answers on: a Reply to a question, or a message with its code, reaches the controller as the driver's answer/)
-    assert.match(gw.log, /telegram requests off \(VOICE_GW_TELEGRAM_REQUESTS=0\): a message that is no command and no answer is not passed on/)
+    assert.match(gw.log, /telegram answers on \(VOICE_GW_TELEGRAM_ANSWERS=1\): a Reply to a question, or a message with its code, reaches the controller as the driver's answer, except for push, merge, restart and delete decisions/)
+    assert.match(gw.log, /telegram requests off \(VOICE_GW_TELEGRAM_REQUESTS not 1, off by default\): a message that is no command and no answer is not passed on/)
     assert.match(gw.claudeCode.getInstructions(), /The driver may also answer a question in their Telegram chat: that answer arrives as/)
 
     // A question after the voice mode ended: on Telegram, with its code and how to answer there.
-    const first = idOf(await gw.call('send', { message: 'Push the fix.' }))
+    const first = idOf(await gw.call('send', { message: 'Fix the changelog.' }))
     await sleep(1300)
     const asked = await gw.claudeCode.callTool({
       name: 'reply',
-      arguments: { request_id: first, state: 'question', text: 'Open the pull request?', kind: 'push' },
+      arguments: { request_id: first, state: 'question', text: 'Update the changelog too?' },
     })
     const decision = /decision (d[a-z0-9]{3})/.exec(asked.content[0].text)[1]
-    await waitFor(() => messageWith('Open the pull request?'))
+    await waitFor(() => messageWith('Update the changelog too?'))
     assert.match(api.messages[0].text, new RegExp(`^Question for request ${first} .*reply to this message, or write a message that starts with ${first}\\.`, 's'))
 
     // The driver replies to it there: the controller gets it as their answer.
-    const reply = driverSays('Ja, öffne ihn', { replyTo: messageWith('Open the pull request?') })
+    const reply = driverSays('Ja, mach das', { replyTo: messageWith('Update the changelog too?') })
     const event = await waitFor(() => gw.events.find(e => e.meta?.via === 'telegram'))
-    assert.equal(event.content, `(Answer to ${first}) Ja, öffne ihn`)
+    assert.equal(event.content, `(Answer to ${first}) Ja, mach das`)
     assert.equal(event.meta.trusted, undefined, "the driver's own words")
     const answer = event.meta.request_id
     await waitFor(() => messageWith('Passed on to the controller'))
@@ -1254,14 +1574,14 @@ test('gateway with requests off: a Reply on Telegram, or a message with the code
     // Its words count, as a spoken answer's do.
     const closed = await gw.claudeCode.callTool({
       name: 'resolve_decision',
-      arguments: { id: decision, outcome: 'open the pull request', words: 'Ja, öffne ihn' },
+      arguments: { id: decision, outcome: 'update the changelog', words: 'Ja, mach das' },
     })
     assert.match(closed.content[0].text, new RegExp(`^\\[decision=closed id=${decision}\\]`))
     // The controller's reply goes back there, as a reply to the driver's message.
-    await gw.reply(answer, 'done', 'Der Pull Request ist unterwegs.')
-    await waitFor(() => messageWith('Der Pull Request ist unterwegs.'))
-    const back = api.messages[messageWith('Der Pull Request ist unterwegs.') - 1]
-    assert.equal(back.text, `On your answer to ${first}:\n\nDer Pull Request ist unterwegs.`)
+    await gw.reply(answer, 'done', 'Der Changelog ist unterwegs.')
+    await waitFor(() => messageWith('Der Changelog ist unterwegs.'))
+    const back = api.messages[messageWith('Der Changelog ist unterwegs.') - 1]
+    assert.equal(back.text, `On your answer to ${first}:\n\nDer Changelog ist unterwegs.`)
     assert.equal(back.reply_parameters.message_id, reply)
 
     // Plain text with no code: not passed on, and the chat hears why.
@@ -1330,17 +1650,19 @@ function workerRoot(name) {
   return { root, bin }
 }
 
-test("gateway: a plain message on Telegram is a request of the driver's, as by voice: via=\"telegram\", its words dispatch a worker and set night mode, its replies come back as replies; commands stay commands; nothing past the kill switch", async () => {
+test("gateway: a plain message on Telegram is a request of the driver's, as by voice: via=\"telegram\", its words dispatch a worker and set night mode, its replies come back as replies; push, merge, restart and delete need the voice; commands stay commands; nothing past the kill switch", async () => {
   api.mode = 'ok'
   api.messages.length = 0
   api.updates = []
   const { root, bin } = workerRoot('requests')
-  // With answers "other": push decisions take the voice, even for a request typed here.
+  // Telegram input on, as the setup turns it on: push, merge, restart and delete take the voice, even for a request typed here.
   const gw = await startGateway('requests', {
     telegram: true,
     env: {
       VOICE_GW_TELEGRAM_POLL: '1',
-      VOICE_GW_TELEGRAM_ANSWERS: 'other',
+      VOICE_GW_TELEGRAM_ANSWERS: '1',
+      VOICE_GW_TELEGRAM_REQUESTS: '1',
+      VOICE_GW_CONTROLLER_LEVEL: 'clone-delete', // for delete_path
       VOICE_GW_WORKER_ROOT: root,
       VOICE_GW_CLAUDE_BIN: join(bin, 'claude'),
       VOICE_GW_GH_BIN: join(bin, 'gh'),
@@ -1351,7 +1673,10 @@ test("gateway: a plain message on Telegram is a request of the driver's, as by v
   const sentWith = text => api.messages[messageWith(text) - 1]
   const tool = async (name, args) => (await gw.claudeCode.callTool({ name, arguments: args })).content[0].text
   try {
-    assert.match(gw.log, /telegram requests on: any other message from the chat reaches the controller as a request of the driver's, and its replies come back there/)
+    assert.match(gw.log, /telegram requests on \(VOICE_GW_TELEGRAM_REQUESTS=1\): any other message from the chat reaches the controller as a request of the driver's, and its replies come back there/)
+    assert.match(gw.log, /telegram: push, merge, restart, delete and approvals take the driver's voice; words typed in Telegram settle none of them/)
+    assert.match(gw.log, new RegExp(`telegram input only from the driver's user id ${CHAT_ID}, in their private chat with the bot`))
+    assert.match(gw.claudeCode.getInstructions(), /Push, merge, restart, delete and approvals always take the driver's voice\. When a message by Telegram asks for one,/)
     assert.match(
       gw.claudeCode.getInstructions(),
       /The driver may also write to you in their Telegram chat: a request, or an answer to a question as "\(Answer to <id>\) \.\.\.",\nboth with via="telegram"\./,
@@ -1401,19 +1726,77 @@ test("gateway: a plain message on Telegram is a request of the driver's, as by v
     await waitFor(() => messageWith('Die alten Notizen sind weg.'))
     assert.equal(sentWith('Die alten Notizen sind weg.').text, `On your answer to ${secondId}:\n\nDie alten Notizen sind weg.`)
 
-    // A push decision takes the voice here: no Reply, and no words typed here, settle it.
+    // A push decision takes the voice here: no Reply, and no words typed here, settle it; the chat says so, in German.
     driverSays('Push alpha, please')
     const push = (await waitFor(() => gw.events.find(e => e.content === 'Push alpha, please'))).meta.request_id
     const pushed = await tool('reply', { request_id: push, state: 'question', text: 'Push the commits in alpha?', kind: 'push' })
     const decision = /as decision (d[a-z0-9]{3}) \(push\)/.exec(pushed)[1]
     await waitFor(() => messageWith('Push the commits in alpha?'))
     assert.match(sentWith('Push the commits in alpha?').text, new RegExp(`\n\nAnswer in voice mode and mention ${push}\\.$`))
-    driverSays('ja, push', { replyTo: messageWith('Push the commits in alpha?') })
-    await waitFor(() => messageWith('which takes your voice'))
-    assert.match(await tool('resolve_decision', { id: decision, outcome: 'push them', words: 'Push alpha' }), new RegExp(
-      `^\\[decision=needs_driver id=${decision}\\] Nothing closed: a push decision takes the driver's voice ` +
-        '\\(VOICE_GW_TELEGRAM_ANSWERS=other\\), and these words were typed in Telegram\\.',
-    ))
+    const before = gw.events.length
+    const yes = driverSays('ja, push', { replyTo: messageWith('Push the commits in alpha?') })
+    await waitFor(() => messageWith('muss per Voice bestätigt werden'))
+    assert.equal(
+      sentWith('muss per Voice bestätigt werden').text,
+      `Nicht ausgeführt: ${push} ist eine Push-Entscheidung, und die muss per Voice bestätigt werden. Sie bleibt offen. ` +
+        `Sag es im Voice-Modus und nenne ${push}.`,
+    )
+    assert.equal(sentWith('muss per Voice bestätigt werden').reply_parameters.message_id, yes)
+    assert.ok(!gw.events.slice(before).some(e => /ja, push/.test(e.content)), 'nothing reaches the controller')
+    const voiceOnly = kind =>
+      new RegExp(`Nothing closed: a ${kind} decision must be confirmed by the driver's voice, and these words were typed in Telegram\\.`)
+    assert.match(await tool('resolve_decision', { id: decision, outcome: 'push them', words: 'Push alpha' }), voiceOnly('push'))
+    assert.match(await tool('open_items', {}), new RegExp(decision), 'the decision stays open')
+
+    // Merge: the question asked on a request typed here, and neither a Reply nor its words settle it.
+    driverSays('Merge pull request 3 in alpha')
+    const merge = (await waitFor(() => gw.events.find(e => e.content === 'Merge pull request 3 in alpha'))).meta.request_id
+    const merging = await tool('reply', { request_id: merge, state: 'question', text: 'Merge pull request 3, squashed?', kind: 'merge' })
+    const mergeDecision = /as decision (d[a-z0-9]{3}) \(merge\)/.exec(merging)[1]
+    await waitFor(() => messageWith('Merge pull request 3, squashed?'))
+    driverSays('yes, merge it', { replyTo: messageWith('Merge pull request 3, squashed?') })
+    await waitFor(() => messageWith(`Not done: ${merge} is a merge decision, which must be confirmed by voice.`))
+    assert.match(await tool('resolve_decision', { id: mergeDecision, outcome: 'merged', words: 'Merge pull request 3' }), voiceOnly('merge'))
+
+    // Delete, restart and a push straight to main: their tools refuse words typed here.
+    driverSays('Delete the folder alpha now')
+    await waitFor(() => gw.events.find(e => e.content === 'Delete the folder alpha now'))
+    assert.match(
+      await tool('delete_path', { path: 'alpha', confirm: true, words: 'Delete the folder alpha' }),
+      /^\[delete=needs_driver\] Nothing happened: a delete must be confirmed by the driver's voice, and these words were typed in Telegram\./,
+    )
+    assert.ok(existsSync(join(root, 'alpha')), 'nothing deleted')
+    driverSays('Push the fix in alpha straight to main')
+    await waitFor(() => gw.events.find(e => e.content === 'Push the fix in alpha straight to main'))
+    assert.match(
+      await tool('dispatch', { worker: 'alpha', task: 'Push the fix straight to main.', words: 'straight to main', direct: true }),
+      /^\[dispatch=needs_driver worker=alpha\] Nothing started: a push straight to the default branch must be confirmed by the driver's voice/,
+    )
+    // Nor under a standing order made of words typed here.
+    driverSays('Keep going with the notes in alpha tonight')
+    await waitFor(() => gw.events.find(e => e.content === 'Keep going with the notes in alpha tonight'))
+    const made = await tool('standing_order', { worker: 'alpha', scope: 'the notes', words: 'Keep going with the notes in alpha tonight' })
+    const order = /^\[order=(o[a-z0-9]{3}) /.exec(made)[1]
+    assert.match(
+      await tool('dispatch', { worker: 'alpha', task: 'Push the notes straight to main.', order, direct: true }),
+      /^\[dispatch=needs_driver worker=alpha\] Nothing started: a push straight to the default branch must be confirmed by the driver's voice, and these words, or those of the standing order, were typed in Telegram\./,
+    )
+    assert.match(await tool('end_order', { id: order }), new RegExp(order))
+    // The follow-up for an answer typed here, to a question that is also a push decision now.
+    driverSays('Tidy up the notes in alpha')
+    const notes = (await waitFor(() => gw.events.find(e => e.content === 'Tidy up the notes in alpha'))).meta.request_id
+    const keep = /as decision (d[a-z0-9]{3}) \(other\)/.exec(await tool('reply', { request_id: notes, state: 'question', text: 'Keep the old ones?' }))[1]
+    await waitFor(() => messageWith('Keep the old ones?'))
+    driverSays('No, drop them all', { replyTo: messageWith('Keep the old ones?') })
+    const dropped = await waitFor(() => gw.events.find(e => e.content === `(Answer to ${notes}) No, drop them all`))
+    // An ordinary decision: settled on these words. Then a push decision on the same request.
+    assert.match(await tool('resolve_decision', { id: keep, outcome: 'drop them', words: 'No, drop them all' }), /^\[decision=closed /)
+    assert.match(await tool('reply', { request_id: notes, state: 'question', text: 'And push the cleanup?', kind: 'push' }), /as decision d[a-z0-9]{3} \(push\)/)
+    assert.match(
+      await tool('dispatch', { worker: 'alpha', task: 'Drop the old notes and push.', words: `(Answer to ${notes}) No, drop them all` }),
+      /^\[dispatch=needs_driver worker=alpha\] Nothing started: the follow-up for an answer to a push decision must be confirmed by the driver's voice/,
+    )
+    assert.equal(dropped.meta.via, 'telegram')
 
     // A Reply to another message of the gateway's: a request, with that message quoted as data.
     driverSays('Was heisst das?', { replyTo: messageWith('Alle 12 Tests sind grün.') })
@@ -1423,12 +1806,12 @@ test("gateway: a plain message on Telegram is a request of the driver's, as by v
     assert.match(await tool('dispatch', { worker: 'alpha', task: 'Again.', words: 'Alle 12 Tests sind grün' }), /^\[dispatch=needs_driver worker=alpha\]/, 'the quote counts for nothing')
 
     // Commands stay commands, a Reply to news included.
-    const before = gw.events.length
+    const beforeCommands = gw.events.length
     driverSays('good night', { replyTo: messageWith('Alle 12 Tests sind grün.') })
     await waitFor(() => messageWith(': good night. Night mode is on'))
     driverSays('/back')
     await waitFor(() => messageWith(': good morning.'))
-    assert.ok(!gw.events.slice(before).some(e => /^(good night|\/back)/.test(e.content)), 'no request')
+    assert.ok(!gw.events.slice(beforeCommands).some(e => /^(good night|\/back)/.test(e.content)), 'no request')
 
     // Night mode on the words of a request typed here, as on an answer typed here; its replies still come back.
     driverSays('Ich gehe jetzt schlafen, bis morgen')

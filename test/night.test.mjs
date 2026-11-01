@@ -278,7 +278,7 @@ before(async () => {
 after(() => api.server?.close())
 
 const fromDriver = text =>
-  api.updates.push({ update_id: api.id++, message: { text, date: Math.floor(Date.now() / 1000), chat: { id: Number(CHAT_ID), type: 'private' } } })
+  api.updates.push({ update_id: api.id++, message: { text, date: Math.floor(Date.now() / 1000), chat: { id: Number(CHAT_ID), type: 'private' }, from: { id: Number(CHAT_ID), is_bot: false } } })
 
 async function freePort() {
   const server = createServer()

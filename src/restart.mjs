@@ -2,7 +2,8 @@
 // scripts/start-controller.sh.
 //
 // The controller asks the driver first (with what plan() says), and only after
-// a yes calls restart_controller with confirm=true. Then the gateway leaves a
+// a yes calls restart_controller with confirm=true and the driver's words,
+// which the channel checks (channel.mjs, restartTool). Then the gateway leaves a
 // note for the watchdog in its lock folder and ends the session (SIGTERM to
 // Claude Code, its parent). The watchdog sees the note and starts the session
 // again at once: a requested restart, without a pause, not counted as a crash.
@@ -123,7 +124,7 @@ export class Restarter {
     )
     lines.push(
       'Ask the driver, saying this in plain words, whether to restart. Only after a yes: reply "done" to the driver ' +
-        'first, then call restart_controller with confirm=true.',
+        'first, then call restart_controller with confirm=true and their words.',
     )
     return lines.join('\n')
   }

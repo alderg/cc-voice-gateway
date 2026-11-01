@@ -323,6 +323,8 @@ function fillSettings() {
   showDockerAvailability()
   showContainers()
   $('#telegram-on').checked = Boolean(state.secrets.telegramToken && state.secrets.telegramChatId)
+  $('#telegram-input-on').checked = state.settings.VOICE_GW_TELEGRAM_ANSWERS === '1' || state.settings.VOICE_GW_TELEGRAM_REQUESTS === '1'
+  showTelegramInput()
   $('#git-name').value = state.git.name
   $('#git-email').value = state.git.email
   for (const repo of state.repos.host) addRepo(repo.slug, false)
@@ -469,10 +471,25 @@ $('#controller-chrome').addEventListener('change', showChromeNotice)
 $('#funnel-port').addEventListener('change', showFunnelPortNote)
 $('#funnel-idle-on').addEventListener('change', () => ($('#funnel-idle').disabled = !$('#funnel-idle-on').checked))
 
+// Telegram as input: off by default. Ticked, answers and requests both on,
+// unless one was on already; unticked, both off.
+function showTelegramInput() {
+  $('#telegram-input').hidden = !$('#telegram-input-on').checked
+}
+$('#telegram-input-on').addEventListener('change', () => {
+  const on = $('#telegram-input-on').checked
+  const answers = $('#telegram-answers')
+  const requests = $('#telegram-requests')
+  if (on && answers.value !== '1' && requests.value !== '1') answers.value = requests.value = '1'
+  if (!on) answers.value = requests.value = '0'
+  showTelegramInput()
+})
+
 function collect() {
   const settings = {}
   for (const element of $$('[data-setting]')) settings[element.dataset.setting] = element.value.trim()
   if (!$('#funnel-idle-on').checked) settings.VOICE_GW_FUNNEL_IDLE = '0'
+  if (!$('#telegram-input-on').checked) settings.VOICE_GW_TELEGRAM_ANSWERS = settings.VOICE_GW_TELEGRAM_REQUESTS = '0'
   for (const select of $$('[data-model]')) {
     settings[select.dataset.model] = select.value === 'other' ? $(`#${select.id}-other`).value.trim() : select.value
   }

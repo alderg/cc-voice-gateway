@@ -80,7 +80,7 @@ export class Orders {
   // A new order, on the driver's words, which the caller checked: worker,
   // scope and words as said, request the voice request they came from,
   // until when, which is cut to MAX_HOURS.
-  add({ worker, scope, words, request = null, until }) {
+  add({ worker, scope, words, request = null, via = 'voice', until }) {
     const now = this.now()
     let id
     do id = `o${Array.from({ length: 3 }, () => ID_ALPHABET[randomInt(ID_ALPHABET.length)]).join('')}`
@@ -91,6 +91,7 @@ export class Orders {
       scope: preview(scope, 400),
       words: preview(words, 400),
       request,
+      via, // voice, or telegram for words typed there: no push straight to main under it (channel.mjs)
       createdAt: now,
       until: Math.min(Math.max(until, now + 60 * 1000), now + MAX_HOURS * 60 * 60 * 1000),
       endedAt: null,

@@ -420,10 +420,14 @@ test('the start: checks, current settings, repositories and the plugin, without 
   const html = readFileSync(join(ROOT, 'src', 'setup', 'ui', 'index.html'), 'utf8')
   assert.match(html, /<select data-setting="VOICE_GW_AUTO_FIX_REVIEWS"><option value="1">fixed without asking \(default\)<\/option><option value="0">fixed only when you ask<\/option><\/select>/)
   assert.match(html, /<input data-setting="VOICE_GW_AUTO_FIX_ROUNDS" inputmode="numeric">/)
-  assert.equal(data.settings.VOICE_GW_TELEGRAM_ANSWERS, '1', 'answers by Telegram to every question, by default')
-  assert.match(html, /<select data-setting="VOICE_GW_TELEGRAM_ANSWERS"><option value="1">to every question \(default\)<\/option><option value="other">not to push, merge, restart and delete questions<\/option><option value="0">off, only by voice<\/option><\/select>/)
-  assert.equal(data.settings.VOICE_GW_TELEGRAM_REQUESTS, '1', 'requests by Telegram on, by default')
-  assert.match(html, /<select data-setting="VOICE_GW_TELEGRAM_REQUESTS"><option value="1">on, like a voice request \(default\)<\/option><option value="0">off, only commands and answers<\/option><\/select>/)
+  // Telegram as input: off by default, an option of its own.
+  assert.equal(data.settings.VOICE_GW_TELEGRAM_ANSWERS, '0', 'no answers by Telegram, by default')
+  assert.match(html, /<select id="telegram-answers" data-setting="VOICE_GW_TELEGRAM_ANSWERS"><option value="0">off, only by voice \(default\)<\/option><option value="1">on, but push, merge, restart and delete only by voice<\/option><\/select>/)
+  assert.equal(data.settings.VOICE_GW_TELEGRAM_REQUESTS, '0', 'no requests by Telegram, by default')
+  assert.match(html, /<select id="telegram-requests" data-setting="VOICE_GW_TELEGRAM_REQUESTS"><option value="0">off, only commands and answers \(default\)<\/option><option value="1">on, like a voice request<\/option><\/select>/)
+  assert.match(html, /<label><input type="checkbox" id="telegram-input-on"> Take answers and requests from Telegram too<\/label>\s*<p class="guide">Off by default:/)
+  assert.match(html, /Push, merge, restart, delete and approvals still need your\s+voice/)
+  assert.match(html, /<div id="telegram-input" class="grid" hidden>/)
   assert.equal(data.settings.VOICE_GW_SCRATCH, '0', 'work folders off, by default')
   assert.equal(data.settings.VOICE_GW_SCRATCH_DOCKER, '', 'and on this computer when turned on')
   assert.equal(data.settings.VOICE_GW_SCRATCH_DAYS, '60')
@@ -956,13 +960,16 @@ async function page(settings, chrome, plugin = { mode: 'plugin', reason: '', all
   const select = $('#controller-chrome')
   select.dataset.setting = 'VOICE_GW_CONTROLLER_CHROME'
   $('#funnel-port').dataset.setting = 'VOICE_GW_FUNNEL_PORT'
+  $('#telegram-answers').dataset.setting = 'VOICE_GW_TELEGRAM_ANSWERS'
+  $('#telegram-requests').dataset.setting = 'VOICE_GW_TELEGRAM_REQUESTS'
+  const settingElements = [select, $('#funnel-port'), $('#telegram-answers'), $('#telegram-requests')]
   const state = {
     host: 'test', root: ROOT, remaining: { overallMs: 600000, idleMs: 600000 }, checks, overridden: [], settings,
     models: [], efforts: [], secrets: {}, git: { name: '', email: '' }, repos: { host: [], docker: [] },
     watchdog: { platform: 'linux', unit: 'cc-voice-gateway.service' }, plugin, chrome, ...more,
   }
   const context = vm.createContext({
-    document: { querySelector: $, querySelectorAll: selector => (selector === '[data-setting]' ? [select, $('#funnel-port')] : []) },
+    document: { querySelector: $, querySelectorAll: selector => (selector === '[data-setting]' ? settingElements : []) },
     fetch: async () => ({ ok: true, status: 200, json: async () => state }),
     setInterval: () => 0,
     clearInterval: () => {},
@@ -1055,6 +1062,54 @@ test('the Funnel port: 443 by default and never changed by itself, also with ano
     $('#funnel-port-note').textContent,
     "The Funnel is set to port 8443: Funnel serves it publicly, but claude.ai's connector did not connect to it in our test. Keep 443 for the connector.",
   )
+})
+
+test('Telegram as input in the setup: off by default; ticked, answers and requests on; unticked, both off; written only when on, and "other" from before shows as on', async () => {
+  const plugin = { mode: 'plugin', reason: '', allowlist: {} }
+  const off = (await page({}, { noticeSeen: true }, plugin)).$
+  assert.equal(off('#telegram-input-on').checked, false)
+  assert.equal(off('#telegram-input').hidden, true)
+  off('#telegram-input-on').checked = true
+  for (const listener of off('#telegram-input-on').listeners.change) listener()
+  assert.deepEqual([off('#telegram-answers').value, off('#telegram-requests').value], ['1', '1'], 'both on when ticked')
+  assert.equal(off('#telegram-input').hidden, false)
+  off('#telegram-input-on').checked = false
+  for (const listener of off('#telegram-input-on').listeners.change) listener()
+  assert.deepEqual([off('#telegram-answers').value, off('#telegram-requests').value], ['0', '0'], 'both off when unticked')
+  assert.equal(off('#telegram-input').hidden, true)
+  // On from before: ticked, as it was.
+  const on = (await page({ VOICE_GW_TELEGRAM_ANSWERS: '1', VOICE_GW_TELEGRAM_REQUESTS: '0' }, { noticeSeen: true }, plugin)).$
+  assert.equal(on('#telegram-input-on').checked, true)
+  assert.equal(on('#telegram-input').hidden, false)
+  assert.deepEqual([on('#telegram-answers').value, on('#telegram-requests').value], ['1', '0'])
+
+  // Written: on, both in the file; off, the default, left out.
+  const inputSetup = name => createSetup({ root: ROOT, secretsDir: join(TMP, `secrets-input-${name}`), env: setupEnv(), home: HOME, platform: 'linux', say })
+  const finish = async (setup, answers, requests) => {
+    const { job } = await setup.api['POST /api/finish']({
+      body: {
+        settings: { VOICE_GW_PORT: '8787', VOICE_GW_DOCKER: '', VOICE_GW_TELEGRAM_ANSWERS: answers, VOICE_GW_TELEGRAM_REQUESTS: requests },
+        telegram: { enabled: false },
+        docker: { enabled: false },
+        watchdog: {},
+      },
+    })
+    let done
+    for (let i = 0; i < 250 && (done = setup.api['GET /api/jobs/:id']({ id: job })).state === 'running'; i++) await sleep(20)
+    assert.equal(done.state, 'done', done.lines.join('\n'))
+  }
+  await finish(inputSetup('on'), '1', '1')
+  const written = readSettings(join(TMP, 'secrets-input-on', 'gateway.env'))
+  assert.deepEqual([written.VOICE_GW_TELEGRAM_ANSWERS, written.VOICE_GW_TELEGRAM_REQUESTS], ['1', '1'])
+  await finish(inputSetup('on'), '0', '0')
+  const cleared = readSettings(join(TMP, 'secrets-input-on', 'gateway.env'))
+  assert.deepEqual([cleared.VOICE_GW_TELEGRAM_ANSWERS, cleared.VOICE_GW_TELEGRAM_REQUESTS], [undefined, undefined], 'off, the default: left out')
+  const refused = await inputSetup('other').api['POST /api/finish']({ body: { settings: { VOICE_GW_TELEGRAM_ANSWERS: 'other' } } }).catch(error => error)
+  assert.match(refused.message, /VOICE_GW_TELEGRAM_ANSWERS: not a valid value/, 'the page offers 0 and 1 only')
+  // A file from before with other: shown as on.
+  mkdirSync(join(TMP, 'secrets-input-before'), { recursive: true, mode: 0o700 })
+  writeFileSync(join(TMP, 'secrets-input-before', 'gateway.env'), 'VOICE_GW_TELEGRAM_ANSWERS=other\n', { mode: 0o600 })
+  assert.equal((await inputSetup('before').api['GET /api/state']({})).settings.VOICE_GW_TELEGRAM_ANSWERS, '1')
 })
 
 test('Docker not available: section 1 says so, and the two container checkboxes cannot be ticked, with a line why; one on from before stays', async () => {

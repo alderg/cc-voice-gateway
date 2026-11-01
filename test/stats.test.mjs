@@ -437,7 +437,7 @@ test('/stats and /stats all on Telegram, only from the configured chat', () => {
   const commands = new TelegramCommands({ chatId: '4242' }, { log: () => {} })
   const heard = []
   commands.on('stats', event => heard.push(event))
-  const message = (text, chat = 4242) => ({ message: { text, date: Math.floor(Date.now() / 1000), chat: { id: chat, type: 'private' } } })
+  const message = (text, chat = 4242) => ({ message: { text, date: Math.floor(Date.now() / 1000), chat: { id: chat, type: 'private' }, from: { id: chat, is_bot: false } } })
   commands.handle(message('/stats'))
   commands.handle(message('/stats all'))
   commands.handle(message('/stats', 99))
@@ -594,7 +594,7 @@ test('the gateway: a run counted with its tokens, subagents and commit; the tool
     assert.match(text, /\n- Decisions: 1 raised \(1 other\)/)
 
     // /stats from the driver's chat.
-    telegram.updates.push({ update_id: 1, message: { text: '/stats', date: Math.floor(Date.now() / 1000), chat: { id: 4242, type: 'private' } } })
+    telegram.updates.push({ update_id: 1, message: { text: '/stats', date: Math.floor(Date.now() / 1000), chat: { id: 4242, type: 'private' }, from: { id: 4242, is_bot: false } } })
     const answer = await waitUntil(() => telegram.sent.slice(before).find(m => /: statistics since /.test(m.text)))
     assert.match(answer.text, /\n\nIn less than a minute: 1 worker run \(1 done\)/)
     assert.match(answer.text, /\nGit: 1 commit in 1 run/)

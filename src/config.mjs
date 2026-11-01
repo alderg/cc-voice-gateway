@@ -30,17 +30,24 @@ export const CONTROLLER_LEVELS = ['confined', 'clone-delete', 'unrestricted']
 // the rules.
 export const KILLSWITCH_MODES = ['off', 'manual', 'auto']
 
-// Answers by Telegram (VOICE_GW_TELEGRAM_ANSWERS, telegram.mjs): on, the
-// default and for any value it does not know; other, which leaves push,
-// merge, restart and delete decisions to the driver's voice; off with 0.
+// Telegram as an input channel is off unless the driver turns it on: their
+// Telegram account then speaks for them as their voice does, for ordinary
+// requests and answers. Push, merge, restart, delete and approvals take their
+// voice all the same, whatever the setting (README 5.8). A value it does not
+// know counts as off, so that a typo never opens it.
+//
+// Answers by Telegram (VOICE_GW_TELEGRAM_ANSWERS, telegram.mjs): on with 1,
+// for every question but those about push, merge, restart and delete;
+// other, its name before, means the same. Off, the default, with 0 and for
+// any value it does not know.
 export function telegramAnswersMode(value) {
   const text = String(value ?? '').trim().toLowerCase()
-  return text === '0' ? 'off' : text === 'other' ? 'other' : 'on'
+  return text === '1' || text === 'other' ? 'on' : 'off'
 }
 
-// Requests by Telegram (VOICE_GW_TELEGRAM_REQUESTS, telegram.mjs): on, the
-// default and for any value it does not know; off with 0.
-export const telegramRequestsOn = value => String(value ?? '').trim() !== '0'
+// Requests by Telegram (VOICE_GW_TELEGRAM_REQUESTS, telegram.mjs): on only
+// with 1; off, the default, with 0 and for any value it does not know.
+export const telegramRequestsOn = value => String(value ?? '').trim() === '1'
 
 // Where Claude voice mode calls from: Anthropic's published outbound range.
 export const ANTHROPIC_RANGES = ['160.79.104.0/21']
@@ -249,17 +256,19 @@ export const config = {
   // calls are normal while the driver talks.
   telegramAfterSeconds: num(env.VOICE_GW_TELEGRAM_AFTER, 600),
   telegramApi: env.VOICE_GW_TELEGRAM_API || 'https://api.telegram.org',
-  // Answers by Telegram (telegram.mjs, TelegramAnswers): a Reply to a
-  // question there, or a message with its code, reaches the controller as
-  // the driver's answer, as one by voice does. on, the default and for any
-  // value but these two; other: not for push, merge, restart and delete
-  // decisions, which then take the driver's voice; 0: off.
+  // Telegram as input, off by default (telegramAnswersMode). Answers by
+  // Telegram (telegram.mjs, TelegramAnswers): a Reply to a question there, or
+  // a message with its code, reaches the controller as the driver's answer,
+  // as one by voice does. 1 (or other): on, for every question but push,
+  // merge, restart and delete decisions, which take the driver's voice; 0,
+  // the default and any other value: off.
   telegramAnswers: telegramAnswersMode(env.VOICE_GW_TELEGRAM_ANSWERS),
   telegramAnswersSetting: env.VOICE_GW_TELEGRAM_ANSWERS ?? '',
   // Requests by Telegram (telegram.mjs, TelegramAnswers): any other message
   // from the driver's chat, no command and no answer, reaches the controller
   // as a request of theirs, as one by voice does, and its replies come back
-  // there. On, the default; 0: off, such a message is not passed on.
+  // there. 1: on; 0, the default and any other value: off, such a message is
+  // not passed on.
   telegramRequests: telegramRequestsOn(env.VOICE_GW_TELEGRAM_REQUESTS),
   telegramRequestsSetting: env.VOICE_GW_TELEGRAM_REQUESTS ?? '',
 
@@ -334,6 +343,9 @@ config.ordersFile = join(config.stateDir, 'orders.json')
 config.statsFile = join(config.stateDir, 'stats.json')
 config.telegramTokenFile = join(config.secretsDir, 'telegram_token')
 config.telegramChatIdFile = join(config.secretsDir, 'telegram_chat_id')
+// Every message the bot received, the driver's and anyone else's, with what
+// the gateway made of it (telegram.mjs, TelegramInputLog).
+config.telegramInputLog = join(config.stateDir, 'telegram-input.log')
 // The kill switch's state: outside controller/, and not in .secrets/worker.
 config.killSwitchFile = join(config.secretsDir, 'killswitch.json')
 // The worker container's secrets, mounted read-only into it.

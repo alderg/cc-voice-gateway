@@ -119,8 +119,10 @@ export function fields(root) {
     VOICE_GW_CONTROLLER_LEVEL: { default: 'confined', valid: ONE_OF(...CONTROLLER_LEVELS) },
     VOICE_GW_KILLSWITCH: { default: 'auto', valid: ONE_OF(...KILLSWITCH_MODES) },
     VOICE_GW_TELEGRAM_AFTER: { default: '600', valid: INT(10, 3600) },
-    VOICE_GW_TELEGRAM_ANSWERS: { default: '1', valid: ONE_OF('1', 'other', '0') },
-    VOICE_GW_TELEGRAM_REQUESTS: { default: '1', valid: ONE_OF('1', '0') },
+    // Telegram as input: off by default, both on when it is turned on
+    // (README 5.8); push, merge, restart and delete take the voice either way.
+    VOICE_GW_TELEGRAM_ANSWERS: { default: '0', valid: ONE_OF('0', '1') },
+    VOICE_GW_TELEGRAM_REQUESTS: { default: '0', valid: ONE_OF('0', '1') },
     VOICE_GW_FUNNEL_IDLE: { default: '0', valid: INT(0, 1440) },
     VOICE_GW_FUNNEL_PORT: { default: '443', valid: ONE_OF(...FUNNEL_PORTS) },
     VOICE_GW_DOCKER: { default: '', valid: NAME },
@@ -392,6 +394,8 @@ export function createSetup({
   async function state({ server }) {
     const current = readSettings(settingsFile)
     const settings = Object.fromEntries(Object.entries(FIELDS).map(([name, field]) => [name, current[name] ?? field.default]))
+    // Its name before: the same as 1 now.
+    if (settings.VOICE_GW_TELEGRAM_ANSWERS === 'other') settings.VOICE_GW_TELEGRAM_ANSWERS = '1'
     const [list, git, watchdog, linger, loaded] = await Promise.all([
       checks(),
       Promise.all([output(bin.git, ['config', '--global', 'user.name']), output(bin.git, ['config', '--global', 'user.email'])]),

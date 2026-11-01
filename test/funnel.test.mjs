@@ -46,7 +46,7 @@ const telegram = { server: null, url: '', sent: [], updates: [], nextId: 1 }
 function telegramUpdate(text, { chat = CHAT, age = 0 } = {}) {
   telegram.updates.push({
     update_id: telegram.nextId++,
-    message: { message_id: 1, date: Math.floor(Date.now() / 1000) - age, chat: { id: Number(chat), type: 'private' }, text },
+    message: { message_id: 1, date: Math.floor(Date.now() / 1000) - age, chat: { id: Number(chat), type: 'private' }, from: { id: Number(chat), is_bot: false }, text },
   })
 }
 
