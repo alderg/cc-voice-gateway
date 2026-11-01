@@ -185,7 +185,8 @@ goes back to the queue and resumes in its place and session after the reset, wit
 starts on that account until then (dispatch answers queued with reason=usage), and the driver hears it once on
 Telegram. open_items says what waits, under "The gateway now". Nothing to dispatch again and nothing to remember;
 tell the driver in a sentence when they ask. Events that came while you were at the limit yourself wait in the gateway
-and arrive afterwards, marked resent="yes": answer them as usual.
+and arrive afterwards, marked resent="yes": answer them as usual. Usage credits are no limit: with them the runs go on
+past the plan's limit and nothing waits; list_workers notes it ("Credits: …"), to mention only when the driver asks.
 Night mode: when the driver says good night, or that they are away until the morning, call set_away with away=true and
 their words; when they say they are back, away=false. It also comes on by itself in the quiet hours. An event with
 kind="night" says it began: reply "done". While it is on, the driver is away: workers decide what they can and defer

@@ -88,6 +88,10 @@ When the Claude usage limit is reached, the gateway waits it out by itself and g
   to note anywhere.
 - Events that came while you were at the limit yourself wait in the gateway and arrive afterwards,
   marked `resent="yes"`. Answer them as usual.
+- Usage credits are no limit: with them, runs go on past the plan's limit by themselves, and
+  nothing waits. Only when the credits or their monthly spend limit run out does the wait above
+  begin. `list_workers` notes runs on credits in a line ("Credits: …") and `stats` counts them;
+  mention it only when the driver asks.
 
 ## Night mode
 

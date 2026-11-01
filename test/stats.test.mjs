@@ -406,6 +406,28 @@ test('the texts: round numbers, what matters first, in two or three sentences', 
   assert.match(toolText({ current: p, total }, { allTime: true }), /^\[stats period=all-time .*\nSince 2026-10-20, in 5 h 20 min of running: /)
 })
 
+test('runs on usage credits: counted, said with the cost, and in the details with the shorter prompt cache', () => {
+  const { s, clock } = counted()
+  const a = run('t1', 'alpha', { startedAt: clock.now })
+  const b = run('t2', 'alpha', { startedAt: clock.now })
+  s.runStarted(a)
+  s.runStarted(b)
+  clock.now += 10 * MIN
+  Object.assign(a, { state: 'done', finishedAt: clock.now, credits: true })
+  Object.assign(b, { state: 'done', finishedAt: clock.now })
+  s.runEnded(a)
+  s.runEnded(b)
+  assert.equal(s.snapshot().current.runs.credits, 1)
+
+  const p = busy()
+  p.runs.credits = 2
+  assert.match(overviewText(p), /, with 2\.2 million tokens, about 23 dollars at API list prices, 2 runs partly on usage credits\. 25 voice requests/)
+  const lines = detailsLines(p)
+  assert.match(lines.find(l => l.startsWith('Worker runs:')), /, 2 in work folders, 2 partly on usage credits\. By repository/)
+  assert.match(lines.find(l => l.startsWith('Tokens:')), /About 23 dollars at API list prices\. 2 runs partly on usage credits, with the prompt cache kept 5 minutes instead of an hour\. 450 turns/)
+  assert.doesNotMatch(overviewText(busy()), /credits/, 'nothing without them')
+})
+
 // --- /stats on Telegram ---------------------------------------------------------------------
 
 test('/stats and /stats all on Telegram, only from the configured chat', () => {

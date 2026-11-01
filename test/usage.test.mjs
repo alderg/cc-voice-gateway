@@ -17,7 +17,7 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import { z } from 'zod'
 import { adminRequest } from '../src/admin.mjs'
-import { Limits, TranscriptWatch, clock, limitOf, parseReset, transcriptFile, waitText, worse } from '../src/limits.mjs'
+import { Limits, TranscriptWatch, clock, creditsOf, creditsText, limitOf, onCredits, parseReset, refused, track, transcriptFile, waitText, worse } from '../src/limits.mjs'
 import { openItems } from '../src/ledger.mjs'
 import { Ledger } from '../src/ledger.mjs'
 import { Store } from '../src/store.mjs'
@@ -100,6 +100,189 @@ test("limitOf: the controller's transcript shows it with isApiErrorMessage and t
   }
   assert.equal(limitOf(line).kind, 'usage')
   assert.ok(limitOf(line).resetsAt)
+})
+
+// --- usage credits ---------------------------------------------------------------------
+//
+// A run's stream-json as Claude Code 2.1 writes it around the plan's limit
+// with usage credits on: the rate_limit_info as it reads the API's headers,
+// isUsingOverage being status "rejected" with the overage allowed.
+
+const HOUR = 60 * 60 * 1000
+const SESSION = { session_id: '5f0c3a52-9d1e-4c57-a3a8-2f7b6c1d9e40' }
+const OVERAGE_RESET = RESET - 3600 // the credits' monthly spend limit resets an hour before the plan's limit
+const rateEvent = info => ({ type: 'rate_limit_event', rate_limit_info: info, uuid: 'b7d1f0e2-6a43-4d8e-9c21-0f5e7a3b8c64', ...SESSION })
+const say = text => ({ type: 'assistant', message: { model: 'claude-opus-5-5', role: 'assistant', content: [{ type: 'text', text }] }, parent_tool_use_id: null, ...SESSION })
+const toolUse = () => ({
+  type: 'assistant',
+  message: { model: 'claude-opus-5-5', role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_01', name: 'Bash', input: { command: 'npm test' } }] },
+  parent_tool_use_id: null,
+  ...SESSION,
+})
+const toolResult = () => ({ type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_01', content: '438 passed' }] }, parent_tool_use_id: null, ...SESSION })
+const result = (text, { error = false, subtype = 'success' } = {}) => ({ type: 'result', subtype, is_error: error, result: text, num_turns: 4, total_cost_usd: 0.42, ...SESSION })
+// The turn Claude Code ends at a refusal (a 429), with its typed kind.
+const refusal = (text, info) => ({
+  type: 'assistant',
+  message: { model: '<synthetic>', role: 'assistant', content: [{ type: 'text', text }] },
+  error: 'rate_limit',
+  is_api_error_message: true,
+  api_error_status: 429,
+  api_error: 'usage_limit_reached',
+  api_error_params: { rate_limit_info: info },
+  parent_tool_use_id: null,
+  ...SESSION,
+})
+const WARNING = { status: 'allowed_warning', resetsAt: RESET, rateLimitType: 'five_hour', utilization: 0.92, surpassedThreshold: 0.9, overageStatus: 'allowed', isUsingOverage: false }
+const ON_CREDITS = { status: 'rejected', resetsAt: RESET, rateLimitType: 'five_hour', overageStatus: 'allowed', overageResetsAt: OVERAGE_RESET, isUsingOverage: true, overageInUse: true }
+
+// A run's lines as Workers.handleLine reads them (track, creditsOf), and how
+// Workers.conclude ends it: limited when a limit it found ended it without
+// a good result.
+function runOf(lines) {
+  let limit = null
+  let credits = 0
+  let last = null
+  for (const line of lines.map(line => JSON.parse(JSON.stringify(line)))) {
+    limit = track(limit, line)
+    if (creditsOf(line)) credits++
+    if (line.type === 'result') last = line
+  }
+  const isError = Boolean(last && (last.is_error || last.subtype !== 'success'))
+  const ends = limit && (!last || isError) ? 'limited' : last && !isError ? 'done' : 'failed'
+  return { limit, credits, ends }
+}
+
+test('usage credits: past the plan\'s limit, after its warning, a run goes on on them; no line of it is a limit, and the credits are noted', () => {
+  const lines = [
+    { type: 'system', subtype: 'init', ...SESSION },
+    rateEvent(WARNING),
+    say('Running the tests first.'),
+    rateEvent(ON_CREDITS),
+    toolUse(),
+    toolResult(),
+    rateEvent({ ...ON_CREDITS, overageStatus: 'allowed_warning', utilization: 0.4 }), // the credits near their spend limit
+    say('All green; the fix is pushed.'),
+    result('All green; the fix is pushed.'),
+  ]
+  for (const line of lines) assert.equal(limitOf(line), null, JSON.stringify(line))
+  assert.deepEqual(runOf(lines), { limit: null, credits: 2, ends: 'done' })
+  assert.deepEqual(creditsOf(rateEvent(ON_CREDITS)), { limit: 'five_hour', resetsAt: RESET * 1000 })
+  assert.equal(creditsOf(rateEvent(WARNING)), null, 'the credits allowed, but the plan still pays')
+  assert.equal(creditsOf(say('Now using usage credits.')), null, 'only the event says so')
+  // Overage in use while the plan's limit is not reached, as for a model that bills to the credits.
+  assert.equal(onCredits({ status: 'allowed', rateLimitType: 'seven_day_overage_included', overageStatus: 'allowed', overageInUse: true }), true)
+})
+
+test('usage credits: "rejected" with the credits allowed is no limit, also as the last word of a run that ends otherwise: failed, not held', () => {
+  // Without isUsingOverage, as Claude Code before it wrote it.
+  const older = { status: 'rejected', resetsAt: RESET, rateLimitType: 'seven_day', overageStatus: 'allowed' }
+  assert.equal(refused(older), false)
+  assert.equal(onCredits(older), true)
+  assert.equal(limitOf(rateEvent(older)), null)
+  // Before, the event held the run and its account until the plan's reset.
+  const maxTurns = runOf([rateEvent(ON_CREDITS), toolUse(), toolResult(), rateEvent(older), result('', { error: true, subtype: 'error_max_turns' })])
+  assert.deepEqual(maxTurns, { limit: null, credits: 2, ends: 'failed' })
+  assert.deepEqual(runOf([rateEvent(ON_CREDITS), say('Building.'), rateEvent(ON_CREDITS)]), { limit: null, credits: 2, ends: 'failed' }, 'a crash on credits is a crash')
+  // An overloaded API at its end is the short wait, not the plan's reset.
+  const overloaded = { type: 'assistant', message: { model: '<synthetic>', content: [{ type: 'text', text: 'API Error: 529 Overloaded' }] }, error: 'overloaded', is_api_error_message: true }
+  const run = runOf([rateEvent(ON_CREDITS), say('Next.'), rateEvent(ON_CREDITS), overloaded, result('API Error: 529 Overloaded', { error: true })])
+  assert.equal(run.ends, 'limited')
+  assert.equal(run.limit.kind, 'throttle')
+  assert.equal(run.limit.resetsAt, null)
+})
+
+test('a real stop with usage credits on: credits_required, the credits refused or disabled, or none at all; the plan\'s reset', () => {
+  const required = { status: 'rejected', resetsAt: RESET, rateLimitType: 'seven_day', isUsingOverage: false, errorCode: 'credits_required', canUserPurchaseCredits: true, hasChargeableSavedPaymentMethod: true }
+  const weekly = "You've hit your weekly limit · resets Nov 5, 9am (Europe/Zurich)"
+  const run = runOf([say('Starting.'), rateEvent(required), refusal(weekly, required), result(weekly, { error: true })])
+  assert.equal(run.ends, 'limited')
+  assert.deepEqual(run.limit, { kind: 'usage', resetsAt: RESET * 1000, exact: true, limit: 'seven_day', text: weekly })
+  assert.equal(refused({ ...required, overageStatus: 'allowed' }), true, 'no credits can pay, whatever else it says')
+  assert.equal(onCredits({ ...required, overageStatus: 'allowed', isUsingOverage: true }), false)
+
+  const disabled = { status: 'rejected', resetsAt: RESET, rateLimitType: 'five_hour', overageStatus: 'rejected', overageDisabledReason: 'org_level_disabled', isUsingOverage: false }
+  const notProvisioned = { status: 'rejected', resetsAt: RESET, rateLimitType: 'five_hour', overageDisabledReason: 'overage_not_provisioned', isUsingOverage: false }
+  const none = { status: 'rejected', resetsAt: RESET, rateLimitType: 'five_hour' }
+  for (const info of [disabled, notProvisioned, none]) {
+    assert.equal(refused(info), true, JSON.stringify(info))
+    assert.equal(onCredits(info), false)
+    assert.deepEqual(limitOf(rateEvent(info)), { kind: 'usage', resetsAt: RESET * 1000, exact: true, limit: 'five_hour', text: 'usage limit reached' })
+    const stopped = runOf([say('Starting.'), rateEvent(info), refusal(LIMIT_TEXT, info), result(LIMIT_TEXT, { error: true })])
+    assert.deepEqual(stopped, { limit: { kind: 'usage', resetsAt: RESET * 1000, exact: true, limit: 'five_hour', text: LIMIT_TEXT }, credits: 0, ends: 'limited' })
+    // The refused event alone, and the run gone without a word more.
+    assert.equal(runOf([say('Starting.'), rateEvent(info)]).ends, 'limited')
+  }
+})
+
+test('the credits run out: out of usage credits, or their monthly spend limit; it waits until the plan\'s reset, or the spend limit\'s when that comes first', () => {
+  // An empty balance: the plan's reset, as no date refills it.
+  const empty = { status: 'rejected', resetsAt: RESET, rateLimitType: 'five_hour', overageStatus: 'rejected', overageResetsAt: OVERAGE_RESET, overageDisabledReason: 'out_of_credits', isUsingOverage: false }
+  const emptyText = "You're out of usage credits · resets 3pm (Europe/Zurich)"
+  const out = runOf([rateEvent(ON_CREDITS), toolUse(), toolResult(), rateEvent(empty), refusal(emptyText, empty), result(emptyText, { error: true })])
+  assert.deepEqual(out, { limit: { kind: 'usage', resetsAt: RESET * 1000, exact: true, limit: 'five_hour', text: emptyText }, credits: 1, ends: 'limited' })
+  // The monthly spend limit, which resets before the plan's limit: the credits pay again then.
+  const spend = { ...empty, overageDisabledReason: 'org_level_disabled_until' }
+  const spendText = "You've hit your monthly spend limit · raise it at https://claude.ai/settings/usage · your 5-hour limit resets 3pm (Europe/Zurich)"
+  const capped = runOf([rateEvent(ON_CREDITS), say('Next, the docs.'), rateEvent(spend), refusal(spendText, spend), result(spendText, { error: true })])
+  assert.deepEqual(capped, { limit: { kind: 'usage', resetsAt: OVERAGE_RESET * 1000, exact: true, limit: 'five_hour', text: spendText }, credits: 1, ends: 'limited' })
+  assert.equal(limitOf(rateEvent({ ...spend, overageResetsAt: RESET + 3600 })).resetsAt, RESET * 1000, 'the plan\'s reset when it comes first')
+})
+
+test('the run\'s final error alone says it: the usage limit, the monthly spend limit, out of usage credits; the reset from its text', () => {
+  for (const text of [
+    LIMIT_TEXT,
+    "You've hit your monthly spend limit · raise it at https://claude.ai/settings/usage · your 5-hour limit resets 3pm (Europe/Zurich)",
+    "You're out of usage credits · resets 3pm (Europe/Zurich)",
+  ]) {
+    const run = runOf([rateEvent(ON_CREDITS), say('Working.'), result(text, { error: true })])
+    assert.equal(run.ends, 'limited', text)
+    assert.equal(run.limit.kind, 'usage')
+    assert.equal(run.limit.exact, false)
+    assert.equal(new Date(run.limit.resetsAt).getHours(), 15, text)
+    assert.equal(run.limit.text, text)
+  }
+  // An API error with the text but without its typed kind, as older versions wrote it.
+  const flagged = { type: 'assistant', message: { content: [{ type: 'text', text: "You're out of usage credits · resets 3pm" }] }, error: 'rate_limit', is_api_error_message: true }
+  assert.equal(limitOf(flagged).kind, 'usage')
+  // What a worker writes about credits is nothing.
+  assert.equal(limitOf(say("You're out of usage credits, says the banner we built.")), null)
+  assert.equal(limitOf(result("You've hit your monthly spend limit is the banner's new text.")), null)
+})
+
+test('runs on usage credits: said once in the log, listed until the plan\'s reset, ended by a real stop; nothing waits', () => {
+  const { clockState, now } = clockAt()
+  const logged = []
+  const limits = new Limits({ now, log: line => logged.push(line) })
+  const resetsAt = clockState.now + 2 * HOUR
+  limits.credits('host', { limit: 'five_hour', resetsAt })
+  limits.credits('host', { limit: 'five_hour', resetsAt })
+  assert.equal(logged.length, 1, 'once')
+  assert.match(logged[0], /^usage credits: the workers on this computer run on usage credits since \d\d:\d\d, as the 5-hour limit is reached until it resets at \d\d:\d\d; nothing waits$/)
+  assert.equal(limits.active('host'), null, 'nothing waits')
+  assert.equal(limits.any(), false)
+  assert.deepEqual(limits.list(), [])
+  assert.deepEqual(limits.creditsList().map(item => item.account), ['host'])
+  // A later reset, of the weekly limit, extends it; once that is past, it is over.
+  limits.credits('host', { limit: 'seven_day', resetsAt: resetsAt + HOUR })
+  assert.deepEqual(limits.paying('host'), { since: clockState.now, until: resetsAt + HOUR, limit: 'seven_day', reset: true })
+  clockState.now = resetsAt + HOUR
+  assert.deepEqual(limits.creditsList(), [])
+  // A reset that is past, as in a run's output read again: nothing.
+  assert.equal(limits.credits('host', { limit: 'five_hour', resetsAt: clockState.now - HOUR }), null)
+  assert.deepEqual(limits.creditsList(), [])
+  // On credits again, without a reset time: said again; a real stop ends it.
+  limits.credits('host', {})
+  assert.equal(logged.length, 2)
+  assert.match(logged[1], /as the plan's limit is reached; nothing waits$/)
+  limits.hit('host', { kind: 'usage', resetsAt: clockState.now + HOUR, limit: 'overage', text: "You're out of usage credits · resets 3pm" })
+  assert.deepEqual(limits.creditsList(), [])
+  assert.match(waitText('host', limits.active('host'), clockState.now), /^the workers on this computer wait for the Claude usage limit \(usage credits\) until \d\d:\d\d, when it resets$/)
+  assert.equal(
+    creditsText('container:dev', { since: clockState.now, until: clockState.now + HOUR, limit: 'overage', reset: false }, clockState.now),
+    `the workers in the container dev run on usage credits since ${clock(clockState.now, clockState.now)}, as the plan's limit is reached; nothing waits`,
+  )
+  limits.close()
 })
 
 test('parseReset: the times Claude Code writes, the next such moment, in the computer\'s time', () => {

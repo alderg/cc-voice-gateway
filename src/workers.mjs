@@ -65,7 +65,7 @@ import { randomInt, randomUUID } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { chmodSync, closeSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join, posix, relative } from 'node:path'
-import { Limits, limitOf, waitText, worse } from './limits.mjs'
+import { Limits, creditsOf, track, waitText } from './limits.mjs'
 import { log, preview } from './log.mjs'
 import { NIGHT_RULE } from './night.mjs'
 import { orderRule } from './orders.mjs'
@@ -844,6 +844,11 @@ export class Workers extends EventEmitter {
   // The usage limit waits of the workers' accounts (limits.mjs), as sentences.
   waitLines() {
     return (this.limits?.list() ?? []).filter(item => item.account !== 'controller').map(item => item.text)
+  }
+
+  // The workers' accounts that run on usage credits past the plan's limit, as sentences.
+  creditLines() {
+    return (this.limits?.creditsList() ?? []).filter(item => item.account !== 'controller').map(item => item.text)
   }
 
   // --- repositories -------------------------------------------------------
@@ -2065,7 +2070,7 @@ export class Workers extends EventEmitter {
     if (!this.followed.has(task.id)) {
       // Read from the start, also by a gateway that took the run over: what
       // the output says is counted again, its figures for the statistics too.
-      Object.assign(task, { steps: [], results: 0, turnOpen: false, resultSeen: false, usage: null, tools: 0, subagents: 0, limit: null })
+      Object.assign(task, { steps: [], results: 0, turnOpen: false, resultSeen: false, usage: null, tools: 0, subagents: 0, limit: null, credits: false })
     }
     const cursor = this.followed.get(task.id) ?? { offset: 0, partial: '' }
     let fd
@@ -2112,10 +2117,15 @@ export class Workers extends EventEmitter {
       task.turnOpen = true
     }
     // The account's usage limit, or a throttle, that ends the turn (limits.mjs);
-    // the model answering after it means the run got past it.
-    const limit = limitOf(message)
-    if (limit) task.limit = worse(task.limit, limit)
-    else if (message.type === 'assistant' && !message.error && !message.is_api_error_message) task.limit = null
+    // the model answering after it means the run got past it. Usage credits
+    // that pay past the plan's limit are none: the run goes on, and they are
+    // only noted, for list_workers and the statistics.
+    task.limit = track(task.limit, message)
+    const credits = creditsOf(message)
+    if (credits) {
+      task.credits = true
+      this.limits?.credits(this.accountOf(task), credits)
+    }
     if (message.type === 'assistant') {
       for (const part of message.message?.content ?? []) {
         if (part.type === 'tool_use') {
@@ -2564,10 +2574,13 @@ export class Workers extends EventEmitter {
     const queued = this.queued().length
     const perRepo = this.maxPerRepo > 1 ? ` per_repo=${this.maxPerRepo}` : ''
     const waits = this.waitLines()
+    const credits = this.creditLines()
+    const usage = waits.length ? ' usage=waiting' : credits.length ? ' usage=credits' : ''
     const lines = [
       `[workers=${names.length} running=${this.running().length}${queued ? ` queued=${queued}` : ''} max=${this.maxRuns}${perRepo}` +
-        `${container ? ` docker=${container}` : ''}${this.scratch ? ' scratch=on' : ''}${waits.length ? ' usage=waiting' : ''}]`,
+        `${container ? ` docker=${container}` : ''}${this.scratch ? ' scratch=on' : ''}${usage}]`,
       ...waits.map(line => `Waiting: ${line}; nothing new starts there until then, and the queue goes on by itself.`),
+      ...credits.map(line => `Credits: ${line}.`),
     ]
     for (const f of facts) {
       const where = f.moved

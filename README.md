@@ -2009,6 +2009,18 @@ cap), nothing can run until it resets. The gateway waits it out by itself and go
   reached|<seconds>". An overloaded or throttled API (`error: "overloaded"`, or `"rate_limit"`
   without `usage_limit_reached`, after Claude Code's own retries) counts as a shorter wait of the
   same kind. Only API errors count, never what a worker writes about rate limits.
+- **Usage credits are no limit:** with usage credits on (once "extra usage"), Claude Code goes on
+  past the plan's limit by itself, headless runs too, and bills the credits. Its
+  `rate_limit_event` then still says `status: "rejected"`, but with `overageStatus: "allowed"`
+  (or `"allowed_warning"`) and `isUsingOverage: true`, so such an event counts only when the
+  credits are refused too: `overageStatus: "rejected"` or none, or `errorCode:
+  "credits_required"`. A run on credits goes on undisturbed, and nothing waits or is held. The
+  gateway notes it once in its log, in `list_workers` (`usage=credits`, `Credits: …`) until the
+  plan's reset, and in the statistics ("partly on usage credits"; Claude Code then keeps the
+  prompt cache 5 minutes instead of an hour). When the credits or their monthly spend limit run
+  out, the run fails at once ("You're out of usage credits · resets 3pm", "You've hit your
+  monthly spend limit · … · your 5-hour limit resets 3pm"), and that is a wait as below, until
+  the plan's reset or the spend limit's (`overageResetsAt`), whichever comes first.
 - **A worker run that meets it** goes back to the queue, in front for its repository, with its
   session, and its worktree if it had one, as a run interrupted by a restart does; in its checkout
   too, where what it found at its start still counts for the look at the end, so what it left is
@@ -2492,7 +2504,7 @@ src/
   ipguard.mjs        the door: access log, /mcp only from Anthropic's addresses, alerts on Telegram
   presence.mjs       which gateway answers the connector, and whether it is active
   standby.mjs        the standby when the connector is disconnected, until a new sign-in
-  limits.mjs         the Claude usage limit: seen in runs and the controller's transcript, waited out
+  limits.mjs         the Claude usage limit, in runs and the controller's transcript, waited out; credits noted
   night.mjs          night mode: the quiet hours, good night and I'm back, the morning summary
   orders.mjs         standing orders: what the controller may dispatch without fresh words, at night
   workers.mjs        workers: repositories, claude -p runs, the queue, the check after a run, results

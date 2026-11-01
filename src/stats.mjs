@@ -74,6 +74,7 @@ export function emptyPeriod(since = 0) {
       failed: 0,
       stopped: 0,
       limited: 0, // ended by the Claude usage limit, back in the queue to resume after the wait
+      credits: 0, // went on past the plan's limit on usage credits, at least in part (limits.mjs)
       followups: 0, // continued the session of an earlier run
       worktrees: 0,
       scratch: 0, // in work folders
@@ -406,6 +407,7 @@ export class Stats {
     const ms = Math.max(0, (task.finishedAt ?? this.now()) - (task.startedAt ?? this.now()))
     runs.ended++
     if (['done', 'failed', 'stopped', 'limited'].includes(task.state)) runs[task.state]++
+    if (task.credits) runs.credits++
     if (task.resumed) runs.followups++
     if (task.worktree) runs.worktrees++
     if (task.kind === 'scratch') runs.scratch++
@@ -598,6 +600,10 @@ function costText(t) {
   return `${t.costUnknown ? 'at least ' : ''}${dollars(t.costUsd)} at API list prices`
 }
 
+// The runs that went on on usage credits past the plan's limit, which the
+// account pays for apart from the plan.
+const creditsText = r => (r.credits ? `${plural(r.credits, 'run')} partly on usage credits` : '')
+
 const by = (counts, words = {}) =>
   Object.entries(counts)
     .filter(([, n]) => n > 0)
@@ -627,7 +633,7 @@ export function overviewText(p, { you = false, allTime = false } = {}) {
     if (p.git.commits) made.push(plural(p.git.commits, 'commit'))
     if (p.git.pullsOpened) made.push(`${plural(p.git.pullsOpened, 'pull request')} opened`)
     const tokens = tokenSum(p.tokens)
-    const cost = costText(p.tokens)
+    const cost = [costText(p.tokens), creditsText(r)].filter(Boolean).join(', ')
     const used = tokens ? `${amount(tokens)} tokens${cost ? `, ${cost}` : ''}` : ''
     if (made.length && used) sentences.push(`${capital(listed(made))}, with ${used}.`)
     else if (made.length) sentences.push(`${capital(listed(made))}.`)
@@ -720,6 +726,7 @@ export function detailsLines(p, { allTime = false, total = null } = {}) {
     if (r.worktrees) kinds.push(`${r.worktrees} in worktrees`)
     if (r.scratch) kinds.push(`${r.scratch} in work folders`)
     if (r.requeued) kinds.push(`${r.requeued} interrupted and queued again`)
+    if (r.credits) kinds.push(`${r.credits} partly on usage credits`)
     const repos = Object.entries(p.repos)
       .filter(([, entry]) => entry.runs)
       .sort((a, b) => b[1].runs - a[1].runs || b[1].ms - a[1].ms)
@@ -776,6 +783,8 @@ export function detailsLines(p, { allTime = false, total = null } = {}) {
     let line = `Tokens: ${parts.join('; ')}.`
     const cost = costText(tk)
     if (cost) line += ` ${capital(cost)}${tk.costUnknown ? ` (${plural(tk.costUnknown, 'run')} without a cost)` : ''}.`
+    // On usage credits, Claude Code keeps the prompt cache 5 minutes instead of an hour.
+    if (r.credits) line += ` ${capital(creditsText(r))}, with the prompt cache kept 5 minutes instead of an hour.`
     const count = (n, unit) => (n ? `${amount(n)} ${unit}${n === 1 ? '' : 's'}` : `no ${unit}s`)
     line += ` ${capital(count(tk.turns, 'turn'))}, ${count(tk.tools, 'tool call')}, ${count(tk.subagents, 'subagent')}.`
     lines.push(line)

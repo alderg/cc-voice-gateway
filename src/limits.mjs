@@ -14,6 +14,20 @@
 // usage_limit_reached) or "overloaded", after Claude Code's own retries: that
 // is a wait too, shorter, with the same backoff.
 //
+// Usage credits (once "extra usage", "overage" to the API) are no limit: with
+// them, Claude Code goes on by itself once the plan's included usage is used
+// up, in a headless run too, and bills the credits. Its rate_limit_event then
+// still says status "rejected" for the plan's limit, but with overageStatus
+// "allowed" (or "allowed_warning") and isUsingOverage true, as Claude Code
+// reads the API's headers itself; the requests go through, and nothing waits
+// (refused, onCredits). A real stop has the credits refused too: overageStatus
+// "rejected" (their monthly spend limit, an empty balance) or none at all (no
+// credits), or errorCode "credits_required"; then the turn ends with the API
+// error above, "You've hit your monthly spend limit · … · your 5-hour limit
+// resets 3pm" or "You're out of usage credits · resets 3pm", and the account
+// waits as for the plan's limit, until the earlier of the plan's reset and
+// the credits' (overageResetsAt), when Claude Code gives them.
+//
 // A wait belongs to an account: the workers on this computer ("host"), those
 // in a container ("container:<name>", which has its own login), and the
 // controller session ("controller"). Until it ends, no run starts on that
@@ -23,6 +37,8 @@
 // Code gives one, otherwise a backoff of 15, 30, then 60 minutes, counted
 // from the last wait on that account that ended without a run getting
 // through. Kept in .state/limits.json, so that a restart keeps waiting.
+// Runs on usage credits are only noted, once in the log and in list_workers
+// (Limits.credits), in memory.
 
 import { EventEmitter } from 'node:events'
 import { closeSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, statSync, writeFileSync } from 'node:fs'
@@ -33,10 +49,44 @@ import { log as defaultLog, preview } from './log.mjs'
 export const BACKOFF_MINUTES = [15, 30, 60]
 const MIN_WAIT_MS = 60 * 1000 // a reset that is due already still waits this long
 const MAX_WAIT_MS = 8 * 24 * 60 * 60 * 1000 // a weekly limit at most, and a little
+const CREDITS_MS = 5 * 60 * 60 * 1000 // runs on usage credits are noted this long without a reset time
 const MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec']
 
-// The texts Claude Code ends a turn with at the account's limit.
-const USAGE_TEXT = /you'?(?:ve| have) hit your [\w\s-]*limit|claude ai usage limit reached|usage limit reached/i
+// The texts Claude Code ends a turn with at the account's limit, the plan's
+// or that of its usage credits; the result's text starts with one of them.
+const USAGE_TEXT =
+  /you'?(?:ve| have) (?:hit|reached) your [\w\s-]*limit|you'?re out of (?:usage credits|extra usage)|your org is out of usage|claude ai usage limit reached|usage limit reached/i
+const USAGE_RESULT = /^(?:you'?(?:ve| have) (?:hit|reached) your|you'?re out of (?:usage credits|extra usage)|your org is out of usage|claude ai usage limit reached)/i
+
+// The overage statuses with which usage credits pay.
+const PAID = new Set(['allowed', 'allowed_warning'])
+
+// Whether a rate_limit_info says the account's requests are refused: the
+// plan's limit is reached (status "rejected"), and no usage credits pay for
+// them, as none can (credits_required), they are refused too, or there are
+// none. With credits paying (isUsingOverage, or overageStatus allowed), not.
+export function refused(info) {
+  if (info?.status !== 'rejected') return false
+  if (info.errorCode === 'credits_required') return true
+  return !(info.isUsingOverage === true || PAID.has(info.overageStatus))
+}
+
+// Whether a rate_limit_info says that usage credits pay for the account's
+// requests: past the plan's limit with the credits allowed, or overage in use.
+export function onCredits(info) {
+  if (!info || typeof info !== 'object' || refused(info) || info.errorCode === 'credits_required') return false
+  return info.isUsingOverage === true || info.overageInUse === true || (info.status === 'rejected' && PAID.has(info.overageStatus))
+}
+
+// When a refusal ends, in ms, or null if Claude Code gives no time: the
+// plan's reset, or the credits' when their spend limit refused them and it
+// comes first; not for an empty balance, which no date refills.
+function resetOf(info) {
+  const times = [info?.resetsAt]
+  if (info?.overageStatus === 'rejected' && info.overageDisabledReason !== 'out_of_credits') times.push(info.overageResetsAt)
+  const known = times.filter(Number.isFinite).map(seconds)
+  return known.length ? Math.min(...known) : null
+}
 
 // A reset time in a limit's text: "resets 3pm", "resets 3:30pm (Europe/Zurich)",
 // "resets Nov 1, 9am", "resets at 15:00", in the computer's time, which is
@@ -89,7 +139,9 @@ const GENERIC = 'usage limit reached'
 // usage limit or a throttle ended the turn: { kind: 'usage' | 'throttle',
 // resetsAt (ms) or null, exact (the reset time from rate_limit_info, not
 // from the text), limit (the kind of limit, if said), text } or null. Only
-// API errors count, never what a worker wrote about rate limits.
+// API errors count, never what a worker wrote about rate limits, and a
+// rate_limit_event only when it says the requests are refused: not when
+// usage credits pay for them (refused).
 export function limitOf(message) {
   if (!message || typeof message !== 'object') return null
   const info = (message.type === 'rate_limit_event' ? message.rate_limit_info : null) ??
@@ -97,10 +149,11 @@ export function limitOf(message) {
     message.apiErrorParams?.rate_limit_info ??
     message.message?.api_error_params?.rate_limit_info ??
     null
-  const exact = Number.isFinite(info?.resetsAt)
-  const usage = text => ({ kind: 'usage', resetsAt: exact ? seconds(info.resetsAt) : parseReset(text), exact, limit: info?.rateLimitType ?? null })
+  const reset = resetOf(info)
+  const exact = reset !== null
+  const usage = text => ({ kind: 'usage', resetsAt: exact ? reset : parseReset(text), exact, limit: info?.rateLimitType ?? null })
   const throttle = text => ({ kind: 'throttle', resetsAt: null, exact: false, limit: null, text: preview(text, 160) })
-  if (message.type === 'rate_limit_event') return info?.status === 'rejected' ? { ...usage(''), text: GENERIC } : null
+  if (message.type === 'rate_limit_event') return refused(info) ? { ...usage(''), text: GENERIC } : null
   const apiError = message.api_error ?? message.apiError ?? message.message?.api_error ?? null
   const error = message.error ?? message.message?.error ?? null
   const flagged = Boolean(message.is_api_error_message ?? message.isApiErrorMessage ?? message.message?.is_api_error_message)
@@ -114,12 +167,31 @@ export function limitOf(message) {
   }
   if (message.type === 'result' && (message.is_error || message.subtype !== 'success')) {
     const text = String(message.result ?? '').trim()
-    if (/^(?:you'?(?:ve| have) hit your|claude ai usage limit reached)/i.test(text)) return { ...usage(text), text: preview(text, 160) }
+    if (USAGE_RESULT.test(text)) return { ...usage(text), text: preview(text, 160) }
     if (/^api error:?\s*(?:429|529)\b|^api error.*\boverloaded/i.test(text) || [429, 529].includes(message.api_error_status)) {
       return throttle(text || 'the API was overloaded')
     }
   }
   return null
+}
+
+// What a run's output says about the limit so far, after one more line: a
+// limit or a throttle found (limitOf), the worse of two; the model answering
+// after it means the run got past it (Workers.handleLine).
+export function track(found, message) {
+  const limit = limitOf(message)
+  if (limit) return worse(found, limit)
+  if (message?.type === 'assistant' && !message.error && !message.is_api_error_message) return null
+  return found
+}
+
+// Whether a run's output line says usage credits pay for its requests
+// (onCredits): { limit (the plan's limit that is reached, if said), resetsAt
+// (ms) or null } or null.
+export function creditsOf(message) {
+  if (message?.type !== 'rate_limit_event' || !onCredits(message.rate_limit_info)) return null
+  const info = message.rate_limit_info
+  return { limit: info.rateLimitType ?? null, resetsAt: Number.isFinite(info.resetsAt) ? seconds(info.resetsAt) : null }
 }
 
 // Two findings of one run as one: a usage limit over a throttle; the exact
@@ -170,6 +242,7 @@ export class Limits extends EventEmitter {
     this.log = log
     this.waits = {} // account -> { kind, limit, text, since, until, reset, source, tasks }
     this.strikes = {} // account -> waits without a reset time in a row, for the backoff
+    this.credited = {} // account -> { since, until, limit, reset }: usage credits pay for its runs (credits)
     this.timer = null
     this.load()
   }
@@ -229,6 +302,7 @@ export class Limits extends EventEmitter {
     }
     until = Math.max(until, now + this.minWaitMs)
     const tasks = [...new Set([...(going?.tasks ?? []), ...(task ? [task] : [])])]
+    if (kind === 'usage') delete this.credited[account] // the credits, if any, pay no more
     if (going) {
       going.until = Math.max(going.until, until)
       going.tasks = tasks
@@ -304,6 +378,54 @@ export class Limits extends EventEmitter {
       .filter(item => item.wait)
       .map(({ account, wait }) => ({ account, wait, text: waitText(account, wait, this.now()) }))
   }
+
+  // Usage credits pay for an account's runs (creditsOf): its plan's limit is
+  // reached, and Claude Code goes on by itself. Nothing waits, nothing is
+  // held, and the driver is not told: said once in the log, and in
+  // list_workers while it lasts, until the plan's reset, else for CREDITS_MS;
+  // a later reset extends it. One past already, as in a run's output read
+  // again after a restart, is the plan's own usage again. In memory only.
+  credits(account, { limit = null, resetsAt = null } = {}) {
+    const now = this.now()
+    const reset = Number.isFinite(resetsAt)
+    if (reset && resetsAt <= now) return null
+    const until = Math.min(reset ? resetsAt : now + CREDITS_MS, now + MAX_WAIT_MS)
+    const going = this.credited[account]
+    if (going && now < going.until) {
+      if (until > going.until) Object.assign(going, { until, reset, limit: limit ?? going.limit })
+      return going
+    }
+    const entry = { since: now, until, limit, reset }
+    this.credited[account] = entry
+    this.log(`usage credits: ${creditsText(account, entry, now)}`)
+    return entry
+  }
+
+  // The usage credits that pay for an account's runs, or null; not while it waits.
+  paying(account) {
+    const entry = this.credited[account]
+    if (!entry) return null
+    if (this.now() >= entry.until) {
+      delete this.credited[account]
+      return null
+    }
+    return this.active(account) ? null : entry
+  }
+
+  // The accounts on usage credits, as lines for list_workers: [{ account, entry, text }].
+  creditsList() {
+    return Object.keys(this.credited)
+      .map(account => ({ account, entry: this.paying(account) }))
+      .filter(item => item.entry)
+      .map(({ account, entry }) => ({ account, entry, text: creditsText(account, entry, this.now()) }))
+  }
+}
+
+// An account on usage credits in a sentence.
+export function creditsText(account, entry, now = Date.now()) {
+  const plan = PLAN_LIMITS.has(entry.limit) ? `the ${limitName(entry.limit)}` : "the plan's limit"
+  const until = entry.reset ? ` until it resets at ${clock(entry.until, now)}` : ''
+  return `${accountName(account)} run on usage credits since ${clock(entry.since, now)}, as ${plan} is reached${until}; nothing waits`
 }
 
 // One wait in a sentence.
@@ -313,9 +435,17 @@ export function waitText(account, wait, now = Date.now()) {
   return `${accountName(account)} wait for ${what} ${until}`
 }
 
-const limitName = limit =>
-  ({ five_hour: '5-hour limit', seven_day: 'weekly limit', seven_day_opus: 'Opus limit', seven_day_sonnet: 'Sonnet limit' })[limit] ??
-  String(limit).replace(/_/g, ' ')
+const LIMIT_NAMES = {
+  five_hour: '5-hour limit',
+  seven_day: 'weekly limit',
+  seven_day_opus: 'Opus limit',
+  seven_day_sonnet: 'Sonnet limit',
+  seven_day_overage_included: 'Fable limit',
+  overage: 'usage credits',
+}
+const limitName = limit => LIMIT_NAMES[limit] ?? String(limit).replace(/_/g, ' ')
+// The plan's own limits, which usage credits go past.
+const PLAN_LIMITS = new Set(Object.keys(LIMIT_NAMES).filter(limit => limit !== 'overage'))
 
 // --- the controller session's own transcript ------------------------------------
 

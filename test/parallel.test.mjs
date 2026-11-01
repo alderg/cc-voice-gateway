@@ -60,6 +60,8 @@ const { EXCLUDE_MARK, linkNodeModules, makeWorktree, removeWorktree } = await im
 //   CRASH        ends without a result, unless it resumes ("Resumed:")
 //   SLOWONCE     waits for good, unless it resumes
 //   LIMIT        meets the account's usage limit, resetting in a second, unless it resumes
+//   CREDITS      goes past the plan's limit on usage credits, as Claude Code does, before anything else
+//   SPEND        then meets the credits' monthly spend limit, which resets in a second, unless it resumes
 const FAKE_CLAUDE = `#!/usr/bin/env node
 const fs = require('fs')
 const path = require('path')
@@ -80,6 +82,26 @@ out({ type: 'system', subtype: 'init' })
   const hold = /HOLD:(\\w+)/.exec(input)?.[1]
   if (hold) while (!fs.existsSync(path.join(process.env.FAKE_HOLDS, hold))) await new Promise(r => setTimeout(r, 50))
   if (/SLOWONCE/.test(input) && !resumed) await new Promise(() => setInterval(() => {}, 1000))
+  if (/CREDITS/.test(input)) {
+    // As Claude Code 2.1 past the plan's limit with usage credits on (limits.mjs):
+    // the warning, then "rejected" with the credits paying, and it goes on.
+    const resetsAt = Math.floor(Date.now() / 1000) + 3600
+    const credits = { status: 'rejected', resetsAt, rateLimitType: 'five_hour', overageStatus: 'allowed', isUsingOverage: true, overageInUse: true }
+    out({ type: 'rate_limit_event', rate_limit_info: { status: 'allowed_warning', resetsAt, rateLimitType: 'five_hour', utilization: 0.92, overageStatus: 'allowed', isUsingOverage: false } })
+    out({ type: 'assistant', message: { content: [{ type: 'text', text: 'On it.' }] } })
+    out({ type: 'rate_limit_event', rate_limit_info: credits })
+    if (/SPEND/.test(input) && !resumed) {
+      // The credits' monthly spend limit: it resets before the plan's limit.
+      const spend = { status: 'rejected', resetsAt, rateLimitType: 'five_hour', overageStatus: 'rejected', overageResetsAt: Math.floor(Date.now() / 1000) + 3, overageDisabledReason: 'org_level_disabled_until', isUsingOverage: false }
+      const text = "You've hit your monthly spend limit · raise it at https://claude.ai/settings/usage · your 5-hour limit resets 3pm (Europe/Zurich)"
+      out({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'toolu_1', name: 'Bash', input: { command: 'npm test' } }] } })
+      out({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'ok' }] } })
+      out({ type: 'rate_limit_event', rate_limit_info: spend })
+      out({ type: 'assistant', message: { content: [{ type: 'text', text }] }, error: 'rate_limit', is_api_error_message: true, api_error: 'usage_limit_reached', api_error_params: { rate_limit_info: spend } })
+      out({ type: 'result', subtype: 'success', is_error: true, result: text })
+      process.exit(1)
+    }
+  }
   if (/CRASH/.test(input) && !resumed) process.exit(3)
   if (/LIMIT/.test(input) && !resumed) {
     // As Claude Code 2.1 at the account's limit (limits.mjs).
@@ -1235,6 +1257,76 @@ test('the usage limit ends a run in a worktree: back with its worktree and sessi
     assert.equal(resumed.state, 'done')
     release(a)
     await ended(one.task)
+  } finally {
+    workers.close()
+  }
+})
+
+test('usage credits: a run goes on past the plan\'s limit on them and is done; nothing waits or is held, and list_workers notes it', async () => {
+  const limits = new Limits({ minWaitMs: 0, log: () => {} })
+  const { workers, dispatch } = setup({ repos: ['alpha', 'beta'], limits })
+  try {
+    const one = await dispatch('CREDITS one')
+    await ended(one.task)
+    assert.equal(one.task.state, 'done')
+    assert.equal(one.task.credits, true)
+    assert.equal(one.task.requeuedAs, undefined)
+    assert.equal(limits.active('host'), null, 'nothing waits')
+    assert.equal(limits.active('controller'), null)
+    const list = await workers.listText()
+    assert.match(list, /usage=credits\]\nCredits: the workers on this computer run on usage credits since \d\d:\d\d, as the 5-hour limit is reached until it resets at \d\d:\d\d(?: on \d+ \w+)?; nothing waits\.\n/)
+    assert.doesNotMatch(list, /Waiting:/)
+    // The next task starts at once.
+    const other = await workers.dispatch({ worker: 'beta', task: 'two', words: 'the words' })
+    assert.equal(other.status, 'started')
+    await ended(other.task)
+  } finally {
+    workers.close()
+  }
+})
+
+test('usage credits: a run on them that crashes after their "rejected" is failed, not held up by the usage limit, and nothing waits', async () => {
+  // Before, that event, its last word, held the run and its account until the plan's reset.
+  const limits = new Limits({ minWaitMs: 0, log: () => {} })
+  const { ledger, workers, dispatch } = setup({ repos: ['alpha', 'beta'], limits })
+  try {
+    const one = await dispatch('CREDITS CRASH one')
+    await ended(one.task)
+    assert.equal(one.task.state, 'failed')
+    assert.equal(one.task.limit, null)
+    assert.equal(one.task.requeuedAs, undefined, 'not back in the queue')
+    assert.deepEqual(workers.queued('alpha'), [])
+    assert.equal(limits.active('host'), null)
+    assert.deepEqual(ledger.open(), [])
+    const other = await workers.dispatch({ worker: 'beta', task: 'two', words: 'the words' })
+    assert.equal(other.status, 'started')
+    await ended(other.task)
+  } finally {
+    workers.close()
+  }
+})
+
+test('usage credits that run out (their monthly spend limit) are a real stop: back in the queue, the account waits until the spend limit resets, before the plan\'s limit; then it resumes', async () => {
+  const limits = new Limits({ minWaitMs: 0, log: () => {} })
+  const waits = []
+  limits.on('wait', (account, wait, first) => first && waits.push({ account, ...wait }))
+  const { workers, dispatch } = setup({ limits })
+  try {
+    const one = await dispatch('CREDITS SPEND one')
+    await until(() => one.task.state === 'limited')
+    assert.match(one.task.error, /^the Claude usage limit was reached \(You've hit your monthly spend limit · raise it at/)
+    assert.equal(one.task.credits, true)
+    const host = waits.find(wait => wait.account === 'host')
+    assert.equal(host.reset, true)
+    assert.ok(host.until < Date.now() + 60 * 1000, 'the spend limit\'s reset in seconds, not the plan\'s in an hour')
+    assert.equal(host.limit, 'five_hour')
+    const back = workers.queued('alpha')[0]
+    assert.equal(back.id, one.task.requeuedAs)
+    const resumed = await until(() => workers.state.tasks.find(t => t.queued === back.id))
+    assert.equal((await until(() => callOf(resumed.id))).resumed, true)
+    await ended(resumed)
+    assert.equal(resumed.state, 'done', 'on the credits again')
+    assert.equal(limits.active('host'), null)
   } finally {
     workers.close()
   }
