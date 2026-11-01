@@ -161,6 +161,10 @@ as a new message "(Answer to <id>) ...": pass it to the same worker with dispatc
 The git attribute is the gateway's own look at the checkout after the run, whatever the worker wrote: "clean", or
 commits on no remote, new uncommitted files, a checkout not back on its branch. Tell the driver about anything but
 "clean". A "done" reply may come back with a line about the gateway's own checkout; mention it to the driver once.
+Every run in a repository has a run folder of its own outside the repository, for what belongs nowhere in it, such
+as screenshots or files for the driver; the worker's prompt names it, and a result names it when something is in it,
+so that you can tell the driver where to find it. Never ask a worker to write anywhere else outside its repository,
+not even a folder of your choosing: the kill switch locks on it. Ask for such files "in your run folder".
 When the run opened or updated a pull request, the tag also has pull_request="<number>": say only briefly
 that it is out, and which one. Never offer or suggest a review; details only when the driver asks.${DRAFT_INSTRUCTIONS}
 Checks and reviews that run on such a pull request by themselves arrive later as <channel source="${CHANNEL_SOURCE}"

@@ -72,7 +72,8 @@ const arg = name => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] 
 const session_id = arg('--session-id') ?? arg('--resume')
 fs.appendFileSync(process.env.FAKE_CALLS, JSON.stringify({
   cwd: process.cwd(), input, task: process.env.VOICE_GW_TASK, session: session_id, resumed: args.includes('--resume'),
-  rules: arg('--append-system-prompt'),
+  rules: arg('--append-system-prompt'), tmpdir: process.env.TMPDIR ?? null, runFolder: process.env.VOICE_GW_RUN_FOLDER ?? null,
+  runFolderThere: Boolean(process.env.VOICE_GW_RUN_FOLDER) && fs.existsSync(process.env.VOICE_GW_RUN_FOLDER),
 }) + '\\n')
 const out = message => process.stdout.write(JSON.stringify({ ...message, session_id }) + '\\n')
 const git = (...a) => execFileSync('git', ['-c', 'user.name=W', '-c', 'user.email=w@example.com', ...a], { stdio: 'ignore' })
@@ -128,6 +129,16 @@ out({ type: 'system', subtype: 'init' })
     fs.writeFileSync('.voice-scratch/a11y-report.json', '{}')
     fs.writeFileSync('.voice-scratch/shots/page.png', 'png')
     if (!fs.existsSync('.voice-scratch/clone-1')) execFileSync('git', ['init', '-q', '.voice-scratch/clone-1'])
+  }
+  if (/SHOTS/.test(input)) {
+    // Screenshots for the driver in the run folder, and a temporary file of
+    // Claude Code's own and of a tool, as TMPDIR leads them there.
+    const folder = process.env.VOICE_GW_RUN_FOLDER
+    fs.mkdirSync(path.join(folder, 'shots'), { recursive: true })
+    fs.writeFileSync(path.join(folder, 'shots', 'home-' + process.pid + '.png'), 'png')
+    fs.mkdirSync(path.join(process.env.TMPDIR, 'claude-1000', 'tasks'), { recursive: true })
+    fs.writeFileSync(path.join(process.env.TMPDIR, 'claude-1000', 'tasks', 'a.output'), 'x')
+    fs.writeFileSync(path.join(process.env.TMPDIR, 'tool.tmp'), 'x')
   }
   out({ type: 'assistant', message: { content: [{ type: 'text', text: 'Working.' }] } })
   out({ type: 'result', subtype: 'success', is_error: false, result: /QUESTION/.test(input) ? 'Which one, A or B?' : 'Done.' })
@@ -675,7 +686,172 @@ test('the rules name the helper folder, and that a run ends with its turn, in ev
     workerRules('pr', { draft: true, worktree: true }),
   ]) {
     assert.match(rules, /^- Helper files: put test reports, screenshots, logs, temporary files and any other scratch output, clones for\n  helpers too, in the folder \.voice-scratch at the top of the folder you work in, never elsewhere in the\n  repository\. Never commit it or add it to an ignore file, and delete what you no longer need\./m)
+    // And what belongs nowhere in the repository: the run folder outside it.
+    assert.match(rules, / What belongs\n  nowhere in the repository, such as screenshots or files for the driver, browser profiles, downloads and\n  temporary files, goes to your run folder outside it, named in the task and in \$VOICE_GW_RUN_FOLDER, which is\n  also your \$TMPDIR;/)
+    assert.match(rules, /Write\n  nowhere else outside the repository, also where the task names another place: put such files in the run\n  folder and say so\. The gateway counts both folders apart from your changes, and stops all work when a run\n  writes anywhere else\./)
     assert.match(rules, /^- The run ends when you end your turn, and the gateway checks it then\. Never end it while a test suite, a\n  build or a helper agent still runs in the background/m)
+  }
+})
+
+// --- the run folder ------------------------------------------------------------------------
+
+const runFoldersOf = (root, repo = 'alpha') => join(root, '.voice-runs', repo)
+
+test('the run folder: made before the run outside the repository, as TMPDIR and VOICE_GW_RUN_FOLDER; the session keeps it, a new session and a worktree get their own', async () => {
+  const { root, dir, workers, dispatch } = setup({ maxPerRepo: 2 })
+  try {
+    const one = await dispatch('SHOTS one')
+    const call = await until(() => callOf(one.task.id))
+    const folder = one.task.runFolder
+    assert.match(folder, new RegExp(`^${runFoldersOf(root)}/\\d{4}-\\d{2}-\\d{2}-[a-z0-9]{4}$`), 'next to the repositories, outside the checkout')
+    assert.deepEqual([call.tmpdir, call.runFolder, call.runFolderThere], [folder, folder, true], 'there before claude starts')
+    assert.equal((lstatSync(folder).mode & 0o777).toString(8), '700')
+    assert.match(call.input, new RegExp(`^- Run folder: ${folder}, outside the repository, also \\$VOICE_GW_RUN_FOLDER and \\$TMPDIR: new and empty\\. Helper files that belong nowhere in the repository go there, as the Helper files rule says\\.$`, 'm'))
+    await ended(one.task)
+    assert.equal(auditSummary(one.task.audit), 'clean', 'nothing of it in the checkout')
+    // The result and worker_status name it, with its files, the newest first,
+    // without Claude Code's own temporary folder.
+    assert.deepEqual(one.task.runFiles.count, 2)
+    const line = workers.resultText(one.task).split('\n').find(l => l.startsWith('Run folder'))
+    assert.match(line, new RegExp(`^Run folder of its session, outside the repository: ${folder} on this computer, with 2 files \\(newest: (shots/home-\\d+\\.png, tool\\.tmp|tool\\.tmp, shots/home-\\d+\\.png)\\)\\. The driver finds there what the run made for them`))
+    assert.match(workers.statusText('alpha'), /^Run folder of its session, outside the repository: /m)
+    assert.equal(workers.state.repos.alpha.runFolder, folder)
+
+    // A follow-up in the same session: the same folder, as it was left.
+    const two = await dispatch('SHOTS two')
+    assert.equal(two.task.runFolder, folder)
+    assert.match((await until(() => callOf(two.task.id))).input, /: as earlier runs of this session left it\./)
+    await ended(two.task)
+    assert.equal(two.task.runFiles.count, 3)
+
+    // A run next to it, in a worktree: a folder of its own; then the
+    // worktree's next run in its session, the same one.
+    const a = hold()
+    const three = await dispatch(`HOLD:${a} three`)
+    const four = await dispatch('SHOTS four', { parallel: true })
+    const fourCall = await until(() => callOf(four.task.id))
+    assert.ok(four.task.worktree)
+    assert.notEqual(four.task.runFolder, folder)
+    assert.equal(fourCall.runFolder, four.task.runFolder)
+    assert.ok(fourCall.runFolderThere)
+    assert.ok(four.task.runFolder.startsWith(runFoldersOf(root) + '/'))
+    assert.equal(workers.state.worktrees[four.task.worktree].runFolder, four.task.runFolder)
+    await ended(four.task)
+    assert.ok(existsSync(join(four.task.runFolder, 'shots')), 'the worktree goes, its run folder stays')
+    release(a)
+    await ended(three.task)
+    assert.equal(three.task.runFolder, folder)
+
+    // A fresh session: a new folder; the old one stays where it is.
+    const five = await dispatch('five', { fresh: true })
+    await ended(five.task)
+    assert.notEqual(five.task.runFolder, folder)
+    assert.notEqual(five.task.runFolder, four.task.runFolder)
+    assert.ok(existsSync(folder))
+    assert.equal(five.task.runFiles.count, 0)
+    assert.ok(!workers.resultText(five.task).includes('Run folder'), 'an empty one is not named in the result')
+    assert.ok(!git(dir, 'status', '--porcelain'), 'nothing in the checkout')
+  } finally {
+    workers.close()
+  }
+})
+
+test('run folders go some days after their last run, not while a run of the repository goes or the kill switch is locked; the session makes its folder again at the same path', async () => {
+  const { root, workers, killswitch, dispatch, make } = setup({ sweepMs: 0 })
+  try {
+    const one = await dispatch('SHOTS one')
+    await ended(one.task)
+    const folder = one.task.runFolder
+    const fresh = await dispatch('two', { fresh: true })
+    await ended(fresh.task)
+    const later = fresh.task.runFolder
+    const day = 24 * 60 * 60 * 1000
+
+    // Seven days after: not while a run of alpha goes, nor while locked.
+    const a = hold()
+    const busy = await dispatch(`HOLD:${a} busy`)
+    await until(() => callOf(busy.task.id))
+    assert.equal(await workers.sweepRunFolders(Date.now() + 8 * day), null)
+    release(a)
+    await ended(busy.task)
+    killswitch.locked = true
+    assert.equal(await workers.sweepRunFolders(Date.now() + 8 * day), null)
+    killswitch.locked = false
+    // Within the days: kept.
+    await workers.sweepRunFolders(Date.now() + 2 * day)
+    assert.ok(existsSync(folder) && existsSync(later))
+
+    // After them: both go. The current session's stays known, the other is forgotten.
+    workers.runSweptAt = 0
+    await workers.sweepRunFolders(Date.now() + 8 * day)
+    assert.ok(!existsSync(folder) && !existsSync(later))
+    assert.equal(workers.state.runFolders[later]?.removedAt > 0, true, "the current session's, removed but known")
+    assert.equal(workers.state.runFolders[folder], undefined, 'no session has it any more')
+    workers.runSweptAt = 0
+    await workers.sweepRunFolders(Date.now() + 8 * day)
+    assert.ok(workers.state.runFolders[later], 'kept while its session has it')
+
+    // The session goes on: the same path, made again, and the prompt says so.
+    const again = await dispatch('again')
+    assert.equal(again.task.runFolder, later)
+    const call = await until(() => callOf(again.task.id))
+    assert.ok(call.runFolderThere)
+    assert.match(call.input, /: made again, empty, as its days were over\./)
+    await ended(again.task)
+    assert.equal(workers.state.runFolders[later].removedAt, null)
+
+    // After a restart, the same; days 0 keep them for good.
+    workers.close()
+    const kept = make({ runFolderDays: 0, sweepMs: 0 })
+    try {
+      assert.ok(kept.state.runFolders[later])
+      assert.equal(kept.sweepRunFolders(Date.now() + 365 * day), null)
+      assert.ok(existsSync(later))
+    } finally {
+      kept.close()
+    }
+    assert.ok(existsSync(runFoldersOf(root)))
+  } finally {
+    workers.close()
+  }
+})
+
+test('the saved run folders: only paths the gateway makes, of their own repository; a session or worktree keeps only such a one', async () => {
+  const { root, stateDir, make, workers: first } = setup()
+  first.close()
+  const good = join(root, '.voice-runs', 'alpha', '2026-11-01-abcd')
+  mkdirSync(stateDir, { recursive: true })
+  writeFileSync(
+    join(stateDir, 'workers.json'),
+    JSON.stringify({
+      repos: { alpha: { sessionId: 's1', runFolder: '/etc' } },
+      tasks: [],
+      queue: [],
+      worktrees: {
+        tabc: { repo: 'alpha', dir: join(root, '.voice-worktrees', 'alpha', 'tabc'), runFolder: '/etc' },
+        tdef: { repo: 'alpha', dir: join(root, '.voice-worktrees', 'alpha', 'tdef'), runFolder: good },
+      },
+      runFolders: {
+        [good]: { repo: 'alpha', usedAt: 1 },
+        '/etc': { repo: 'alpha', usedAt: 1 },
+        [join(root, '.voice-runs', 'beta', '2026-11-01-wxyz')]: { repo: 'alpha', usedAt: 1 },
+        [join(root, '.voice-runs', 'alpha', '..')]: { repo: 'alpha', usedAt: 1 },
+        [join(root, '.voice-runs', 'alpha', '2026-11-01-ab/d')]: { repo: 'alpha', usedAt: 1 },
+      },
+    }),
+  )
+  const workers = make()
+  try {
+    assert.deepEqual(Object.keys(workers.state.runFolders), [good])
+    assert.equal(workers.state.worktrees.tabc.runFolder, null)
+    assert.equal(workers.state.worktrees.tdef.runFolder, good)
+    // A session's folder that is none of them is not taken: a new one instead.
+    const run = await workers.dispatch({ worker: 'alpha', task: 'one', words: 'the words' })
+    assert.ok(run.task.runFolder.startsWith(join(root, '.voice-runs', 'alpha') + '/'))
+    assert.notEqual(run.task.runFolder, '/etc')
+    await ended(run.task)
+  } finally {
+    workers.close()
   }
 })
 

@@ -175,6 +175,18 @@ test('delete and clone: not while a worker runs there, not while the kill switch
   const tools = new FolderTools({ root, workers, killswitch, self: join(root, 'gateway'), ghBin: join(BIN, 'gh'), log: quiet })
   assert.deepEqual(await tools.plan('plain/sub'), { status: 'busy', path: 'plain/sub', repo: 'plain', task: 'tq7x' })
   assert.equal((await tools.plan('alpha')).status, 'busy')
+  // The run folders of a repository's runs, while a run of it goes; another
+  // repository's may go.
+  mkdirSync(join(root, '.voice-runs', 'plain', '2026-11-01-abcd'), { recursive: true })
+  mkdirSync(join(root, '.voice-runs', 'other', '2026-11-01-wxyz'), { recursive: true })
+  assert.deepEqual(await tools.plan('.voice-runs/plain/2026-11-01-abcd'), {
+    status: 'busy',
+    path: '.voice-runs/plain/2026-11-01-abcd',
+    repo: 'plain',
+    task: 'tq7x',
+  })
+  assert.equal((await tools.plan('.voice-runs')).status, 'busy')
+  assert.equal((await tools.plan('.voice-runs/other/2026-11-01-wxyz')).status, 'plan')
   await tools.plan('file.txt')
   killswitch.locked = true
   killswitch.state = { at: new Date().toISOString(), trigger: 'voice', reason: 'test' }

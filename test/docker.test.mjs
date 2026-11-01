@@ -155,7 +155,7 @@ const FAKE_CLAUDE = `#!/usr/bin/env node
 import { appendFileSync, readFileSync } from 'node:fs'
 const args = process.argv.slice(2)
 const input = readFileSync(0, 'utf8')
-appendFileSync(process.env.FAKE_CLAUDE_LOG, JSON.stringify({ cwd: process.cwd(), args, input, pid: process.pid }) + '\\n')
+appendFileSync(process.env.FAKE_CLAUDE_LOG, JSON.stringify({ cwd: process.cwd(), args, input, pid: process.pid, tmpdir: process.env.TMPDIR ?? null, runFolder: process.env.VOICE_GW_RUN_FOLDER ?? null }) + '\\n')
 const arg = name => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : null }
 const session_id = arg('--session-id') ?? arg('--resume')
 const out = message => process.stdout.write(JSON.stringify({ ...message, session_id }) + '\\n')
@@ -502,7 +502,17 @@ test('Docker: runs go through voice-run in the container, with the rules of thei
   assert.match(readonly.text, /^\[dispatch=started worker=readonly task=t[a-z0-9]{3} session=new access=read-only\]/)
   let call = await runOf('readonly', readonly.id)
   const exec = dockerCalls().find(c => c.includes('voice-run') && c.includes(readonly.id))
-  assert.deepEqual(exec.slice(0, 8), ['exec', '-i', '-w', join(REPOS, 'readonly'), CONTAINER, 'voice-run', readonly.id, join(BIN, 'claude')])
+  // Its run folder in the container's mounted folder of clones, made there
+  // through docker exec, and handed to the run inside, not to the docker client.
+  const folder = /^- Run folder: (\S+), outside the repository/m.exec(call.input)?.[1]
+  assert.match(folder ?? '', new RegExp(`^${join(REPOS, '.voice-runs', 'readonly')}/\\d{4}-\\d{2}-\\d{2}-[a-z0-9]{4}$`))
+  assert.deepEqual(exec.slice(0, 12), [
+    'exec', '-i', '-w', join(REPOS, 'readonly'), '-e', `TMPDIR=${folder}`, '-e', `VOICE_GW_RUN_FOLDER=${folder}`,
+    CONTAINER, 'voice-run', readonly.id, join(BIN, 'claude'),
+  ])
+  assert.deepEqual([call.tmpdir, call.runFolder], [folder, folder])
+  assert.ok(existsSync(folder))
+  assert.ok(dockerCalls().some(c => c[0] === 'exec' && c.includes('sh') && c.includes(folder) && c.some(a => a.includes('mkdir'))))
   assert.equal(arg(call, '--permission-mode'), 'bypassPermissions')
   assert.equal(arg(call, '--model'), 'opus', 'VOICE_GW_WORKER_MODEL reaches the run in the container')
   assert.equal(arg(call, '--effort'), 'high', 'VOICE_GW_WORKER_EFFORT too')

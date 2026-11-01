@@ -163,6 +163,10 @@ export const config = {
   maxWorkersPerRepoSetting: env.VOICE_GW_MAX_WORKERS_PER_REPO ?? '',
   // 0: no time limit.
   workerTimeoutMinutes: env.VOICE_GW_WORKER_TIMEOUT?.trim() === '0' ? 0 : num(env.VOICE_GW_WORKER_TIMEOUT, 360),
+  // The run folders of runs in repositories (workspaces.mjs), outside every
+  // checkout: removed this many days after their session's last run; 0:
+  // never.
+  runFolderDays: env.VOICE_GW_RUN_FOLDER_DAYS?.trim() === '0' ? 0 : num(env.VOICE_GW_RUN_FOLDER_DAYS, 7),
   claudeBin: env.VOICE_GW_CLAUDE_BIN || 'claude',
   // Model and effort of the workers' runs (claude --model, --effort), on this
   // computer and in the container. Empty: Claude Code's defaults.

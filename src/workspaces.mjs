@@ -9,7 +9,8 @@
 //            time. Before a run the gateway looks at uncommitted files, the
 //            origin and the access level; after it, at git (Workers.audit),
 //            and what is left becomes a push decision, apart from its
-//            helper folder (HELPER_FOLDER).
+//            helper folder (HELPER_FOLDER). Each run also has a run folder
+//            outside the repository (RUN_FOLDERS).
 //   scratch  a work folder, only with VOICE_GW_SCRATCH=1: a new empty folder
 //            per task under VOICE_GW_SCRATCH_ROOT, for what needs no
 //            repository, such as a question to look up, research, a
@@ -49,6 +50,52 @@ export const HELPER_FOLDER = '.voice-scratch'
 // Whether a path relative to the top of the checkout, as git prints it
 // (in quotes where it has unusual characters), is inside the helper folder.
 export const inHelperFolder = path => String(path).replace(/^"/, '').startsWith(`${HELPER_FOLDER}/`)
+
+// The run folder of a run in a repository: a folder of its own outside every
+// checkout, at <repositories folder>/.voice-runs/<repository>/<date>-<id>,
+// next to the worktrees (worktrees.mjs) and through the runner, so the same on
+// this computer and in the worker container, where the repositories folder is
+// the mounted one. For what has no place in the repository at all, such as
+// browser profiles, screenshots for the driver, downloads and temporary
+// files: the run gets it as TMPDIR and as VOICE_GW_RUN_FOLDER (RUN_FOLDER_ENV),
+// and its rules and prompt name it. It belongs to the worker's Claude session:
+// the run that starts a session gets a new one, every later run in that
+// session the same one, at the same path, so that what the worker remembers
+// writing there it may write again; runs side by side have sessions of their
+// own, and so folders of their own. The kill switch lets the run write there
+// and nowhere else outside its repository and the temporary folders, never
+// into another run's folder or the folders around them (guard.mjs), and
+// counts its file edits there apart, with the helper folder's; there is no
+// git, so nothing in it is a change. Workers removes it RUN_FOLDER_DAYS after
+// its last run (VOICE_GW_RUN_FOLDER_DAYS), never while a run uses it, and
+// makes it again, empty, at the same path when its session goes on.
+export const RUN_FOLDERS = '.voice-runs'
+export const RUN_FOLDER_ENV = 'VOICE_GW_RUN_FOLDER'
+const RUN_FOLDER = /^\d{4}-\d{2}-\d{2}-[a-z0-9]{4}$/
+
+// Where a run folder of a repository is, as the runner reaches it; folder:
+// its own name, <date>-<id>.
+export const runFolderDir = (runner, repo, folder) => runner.dir(`${RUN_FOLDERS}/${repo}/${folder}`)
+
+// The saved run folders the gateway can use: { dir: { repo, container,
+// usedAt, removedAt } }, without a prototype; only paths the gateway makes,
+// <root>/.voice-runs/<repository>/<date>-<id>. Anything else, from an older
+// version or edited by hand, is left out: it could point anywhere.
+export function runFolderEntries(saved) {
+  const entries = Object.create(null)
+  for (const [dir, entry] of Object.entries(saved ?? {})) {
+    const parts = dir.split('/')
+    if (parts.length < 4 || parts.at(-3) !== RUN_FOLDERS || !RUN_FOLDER.test(parts.at(-1))) continue
+    if (entry?.repo !== parts.at(-2) || !Number.isFinite(entry.usedAt)) continue
+    entries[dir] = {
+      repo: entry.repo,
+      container: typeof entry.container === 'string' ? entry.container : null,
+      usedAt: entry.usedAt,
+      removedAt: Number.isFinite(entry.removedAt) ? entry.removedAt : null,
+    }
+  }
+  return entries
+}
 
 // The repositories in the worker root, as the runner lists them.
 export class Repositories {

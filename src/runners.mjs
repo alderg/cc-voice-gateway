@@ -289,9 +289,10 @@ export class HostRunner {
 
   // Detached: its own process group, so stopping it reaches the commands it
   // started, and a controller restart does not end it. env carries the
-  // run's marks (MARK).
-  spawn(taskId, command, args, { cwd, stdio, env }) {
-    return spawn(command, args, { cwd, detached: true, stdio, env })
+  // run's marks (MARK); runEnv what only the run itself gets, its run folder
+  // as TMPDIR (workspaces.mjs).
+  spawn(taskId, command, args, { cwd, stdio, env, runEnv = {} }) {
+    return spawn(command, args, { cwd, detached: true, stdio, env: { ...env, ...runEnv } })
   }
 
   // The kill switch stops the runs; there is no container here.
@@ -349,6 +350,17 @@ export class HostRunner {
       if (error.code === 'EEXIST') return false
       throw error
     }
+  }
+
+  // A run folder (workspaces.mjs), with its parents, for this user only. fresh:
+  // a new one, false when something is there already; otherwise one that may
+  // be there, made again if it is not.
+  async makeFolder(dir, { fresh = false } = {}) {
+    if (!fresh) {
+      mkdirSync(dir, { recursive: true, mode: 0o700 })
+      return true
+    }
+    return this.makeDir(dir)
   }
 
   // What is in a folder and below it, but folders: [{ path, bytes, mtime }],
@@ -484,11 +496,14 @@ export class DockerRunner {
   // ends with every process that has the mark. The docker client here is
   // detached like a worker on the host, so a controller restart does not end
   // it, and it carries the run's marks on this side; it lives as long as the
-  // run's own process in the container (voice-run waits for it).
-  spawn(taskId, command, args, { cwd, stdio, env }) {
+  // run's own process in the container (voice-run waits for it). runEnv goes
+  // into the container with docker exec -e, not to the docker client here: a
+  // TMPDIR of the container's is no folder on this computer.
+  spawn(taskId, command, args, { cwd, stdio, env, runEnv = {} }) {
+    const vars = Object.entries(runEnv).flatMap(([name, value]) => ['-e', `${name}=${value}`])
     return spawn(
       this.dockerBin,
-      ['exec', '-i', '-w', cwd, this.container, 'voice-run', taskId, command, ...args],
+      ['exec', '-i', '-w', cwd, ...vars, this.container, 'voice-run', taskId, command, ...args],
       { detached: true, stdio, env },
     )
   }
@@ -545,6 +560,16 @@ export class DockerRunner {
     const { ok, stderr, error } = await this.exec(['mkdir', '-m', '700', dir])
     if (ok) return true
     if (/exists/i.test(stderr)) return false
+    throw new Error(`The container ${this.container} could not make ${dir} (${(stderr || error?.message || '').trim().split('\n')[0]})`)
+  }
+
+  // As HostRunner.makeFolder, in the container, which reaches the mounted
+  // folder of clones as the runs see it.
+  async makeFolder(dir, { fresh = false } = {}) {
+    const script = fresh ? 'mkdir -p -- "$(dirname -- "$1")" && mkdir -m 700 -- "$1"' : 'mkdir -p -m 700 -- "$1"'
+    const { ok, stderr, error } = await this.exec(['sh', '-c', script, 'sh', dir])
+    if (ok) return true
+    if (fresh && /exists/i.test(stderr)) return false
     throw new Error(`The container ${this.container} could not make ${dir} (${(stderr || error?.message || '').trim().split('\n')[0]})`)
   }
 

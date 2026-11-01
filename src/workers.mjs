@@ -52,7 +52,10 @@
 // uncommitted files that were not there at the start, and the branch. The
 // controller gets that with the result, whatever the worker wrote. What is
 // untracked in the run's helper folder (HELPER_FOLDER, workspaces.mjs) is
-// scratch output, and counts for neither look.
+// scratch output, and counts for neither look. What has no place in the
+// repository at all goes to the run's run folder outside it (RUN_FOLDERS,
+// workspaces.mjs), its TMPDIR, made before the run and removed some days
+// after its session's last run (runFolderDays).
 //
 // The run output holds every tool input and result, so .state/tasks and
 // .state/workers.json are for this user only (folders 0700, files 0600).
@@ -73,6 +76,7 @@ import { SUBAGENT_TOOLS, addResult } from './stats.mjs'
 import { DockerRunner, HostRunner, MARK, MAX_FILES, alive, startOf } from './runners.mjs'
 import {
   HELPER_FOLDER,
+  RUN_FOLDER_ENV,
   Repositories,
   SCRATCH_NEW,
   SCRATCH_RULES,
@@ -82,6 +86,8 @@ import {
   filesText,
   inHelperFolder,
   kindOf,
+  runFolderDir,
+  runFolderEntries,
   scratchEntries,
   scratchPrompt,
 } from './workspaces.mjs'
@@ -191,8 +197,13 @@ summarise your result for them. Nobody can answer you during the run.
   branch.
 - Helper files: put test reports, screenshots, logs, temporary files and any other scratch output, clones for
   helpers too, in the folder ${HELPER_FOLDER} at the top of the folder you work in, never elsewhere in the
-  repository. Never commit it or add it to an ignore file, and delete what you no longer need. The gateway
-  counts it apart from your changes.
+  repository. Never commit it or add it to an ignore file, and delete what you no longer need. What belongs
+  nowhere in the repository, such as screenshots or files for the driver, browser profiles, downloads and
+  temporary files, goes to your run folder outside it, named in the task and in $${RUN_FOLDER_ENV}, which is
+  also your $TMPDIR; it stays a few days after your session's last run, for the driver to look at. Write
+  nowhere else outside the repository, also where the task names another place: put such files in the run
+  folder and say so. The gateway counts both folders apart from your changes, and stops all work when a run
+  writes anywhere else.
 - Finish the job yourself: once the work is done and tested, commit, push and open the pull request as the
   Publish rule says, without asking first. Whatever you run near the end, a review, a subagent or a skill,
   carry on afterwards: its report is not your result. For a security review, read the diff yourself or give
@@ -465,8 +476,9 @@ function baselineOf(saved) {
 }
 
 // The worktrees the state may hold: id -> { repo, dir, sessionId,
-// resumable, task, branch, createdAt, removedAt }; anything else is left out.
-function worktreeEntries(saved) {
+// resumable, task, branch, createdAt, removedAt, runFolder }, runFolder only
+// one of the saved run folders of its repository; anything else is left out.
+function worktreeEntries(saved, runFolders = Object.create(null)) {
   const entries = Object.create(null)
   for (const [id, wt] of Object.entries(saved ?? {})) {
     if (!/^t[a-z0-9]{3}$/.test(id) || typeof wt?.repo !== 'string' || typeof wt.dir !== 'string') continue
@@ -480,6 +492,7 @@ function worktreeEntries(saved) {
       branch: typeof wt.branch === 'string' ? wt.branch : null,
       createdAt: Number.isFinite(wt.createdAt) ? wt.createdAt : Date.now(),
       removedAt: Number.isFinite(wt.removedAt) ? wt.removedAt : null,
+      runFolder: typeof wt.runFolder === 'string' && runFolders[wt.runFolder]?.repo === wt.repo ? wt.runFolder : null,
     }
   }
   return entries
@@ -620,10 +633,12 @@ export class Workers extends EventEmitter {
     maxRuns = 2,
     maxPerRepo = 1,
     timeoutMinutes = 360, // 0: no time limit
+    runFolderDays = 7, // run folders removed this long after their last run; 0: never
     resultGraceMs = RESULT_GRACE_MS,
     killAfterMs = KILL_AFTER_MS,
   }) {
     super()
+    this.runFolderDays = runFolderDays
     this.runner = runner // the repositories'
     // The kinds of workspace, by name (workspaces.mjs); work folders only
     // when they are on.
@@ -710,25 +725,38 @@ export class Workers extends EventEmitter {
   // are known again when turned on. worktrees: the worktrees of runs, by the
   // id of the task that made them, also once removed, so that a follow-up
   // makes its worktree again at the same path, with its session. perRepo:
-  // the limit per repository the queue was planned for.
+  // the limit per repository the queue was planned for. runFolders: the run
+  // folders the gateway made (workspaces.mjs), by their path, for their
+  // removal; which one a session has, its checkout's or worktree's entry
+  // says (runFolder).
   load() {
     const origins = data => Object.assign(Object.create(null), data?.origins)
     try {
       const data = JSON.parse(readFileSync(this.stateFile, 'utf8'))
       const queue = (Array.isArray(data.queue) ? data.queue : []).filter(queuable).map(queueEntry)
       const perRepo = Number.isInteger(data.perRepo) && data.perRepo >= 1 ? data.perRepo : undefined
+      const runFolders = runFolderEntries(data.runFolders)
       return {
         repos: data.repos ?? {},
         tasks: data.tasks ?? [],
         origins: origins(data),
         queue,
         scratch: scratchEntries(data.scratch),
-        worktrees: worktreeEntries(data.worktrees),
+        worktrees: worktreeEntries(data.worktrees, runFolders),
         perRepo,
+        runFolders,
       }
     } catch (error) {
       if (error.code !== 'ENOENT') log('worker state unreadable, starting empty:', error.message)
-      return { repos: {}, tasks: [], origins: origins(null), queue: [], scratch: scratchEntries(null), worktrees: worktreeEntries(null) }
+      return {
+        repos: {},
+        tasks: [],
+        origins: origins(null),
+        queue: [],
+        scratch: scratchEntries(null),
+        worktrees: worktreeEntries(null),
+        runFolders: runFolderEntries(null),
+      }
     }
   }
 
@@ -1103,9 +1131,46 @@ export class Workers extends EventEmitter {
       // Never a second run in a checkout where a worker process still runs:
       // one of a run nobody follows is ended, and the task waits for it.
       if (this.stopStrays({ dir: facts.dir, why: 'found before a new run there' }).length) return { status: 'busy', strays: true }
+      // The run folder of the session it starts or goes on with, as start
+      // decides it: the checkout's session, unless it starts a new one.
+      const holder = this.state.repos[worker]
+      facts.runFolder = await this.runFolder(worker, { holder, resumed: !fresh && Boolean(holder?.sessionId) })
       return this.start(facts, { task, words, fresh, direct, draft, answers, order }, entry)
     } finally {
       this.starting.delete(worker)
+    }
+  }
+
+  // The run folder of a run in a repository (workspaces.mjs), made before it
+  // starts: in a session that has one, that one, at the same path, made
+  // again if it was removed; otherwise a new one, empty. holder: what keeps
+  // the session, the checkout's entry in the state or the worktree's;
+  // resumed: whether the run goes on in that session. { dir, made, again },
+  // or null when it cannot be made: the run starts without one then, and its
+  // prompt says so.
+  async runFolder(repo, { runner = this.runner, holder = null, resumed = false } = {}) {
+    if (!runner.makeFolder) return null
+    const use = dir => {
+      const was = this.state.runFolders[dir]
+      this.state.runFolders[dir] = { repo, container: runner.container ?? null, usedAt: Date.now(), removedAt: null }
+      return { dir, made: !was, again: Boolean(was?.removedAt) }
+    }
+    try {
+      const known = resumed && holder?.runFolder && this.state.runFolders[holder.runFolder]?.repo === repo ? holder.runFolder : null
+      if (known) {
+        await runner.makeFolder(known)
+        return use(known)
+      }
+      const date = new Date().toISOString().slice(0, 10)
+      for (let tries = 0; tries < 10; tries++) {
+        const dir = runFolderDir(runner, repo, `${date}-${randomId(4)}`)
+        if (this.state.runFolders[dir] || !(await runner.makeFolder(dir, { fresh: true }))) continue
+        return use(dir)
+      }
+      throw new Error('no free name for a new one')
+    } catch (error) {
+      log('worker run folder not made for', repo, error.message)
+      return null
     }
   }
 
@@ -1250,6 +1315,9 @@ export class Workers extends EventEmitter {
     }
     if (this.night?.active()) record.night = true // started in night mode: its rule (runLines)
     if (order) record.order = order // dispatched under a standing order: its scope (runLines)
+    // Its run folder outside the repository (launch); a run in a worktree
+    // gets its own when the worktree is ready (prepare).
+    if (!scratch && !wid) record.runFolder = facts.runFolder?.dir ?? null
     if (wid) {
       record.worktree = wid // the worktree it runs in, by the task that made it
       record.checkout = facts.dir // the repository's checkout, whose git the worktree shares
@@ -1297,8 +1365,12 @@ export class Workers extends EventEmitter {
         resumable: Boolean(previous),
         task: id,
       }
-    } else {
+    } else if (scratch) {
       this.state.repos[facts.name] = { sessionId }
+    } else {
+      // The session's run folder: this run's, or the one the session had.
+      const runFolder = record.runFolder ?? (previous ? this.state.repos[facts.name]?.runFolder : null) ?? null
+      this.state.repos[facts.name] = { sessionId, runFolder }
     }
     if (entry) this.state.queue = this.state.queue.filter(waiting => waiting.id !== entry.id)
     this.save()
@@ -1339,9 +1411,12 @@ export class Workers extends EventEmitter {
       ...(record.resumed ? ['--resume', record.sessionId] : ['--session-id', record.sessionId]),
     ]
     const env = workerEnv({ [MARK.run]: record.mark, [MARK.task]: record.id, [MARK.repo]: record.dir })
+    // Its run folder, for the run itself (workspaces.mjs): in the container
+    // through docker exec, not for the docker client here.
+    const runEnv = record.runFolder ? { TMPDIR: record.runFolder, [RUN_FOLDER_ENV]: record.runFolder } : {}
     let child
     try {
-      child = runner.spawn(record.id, this.claudeBin, args, { cwd: record.dir, stdio: ['pipe', out, err], env })
+      child = runner.spawn(record.id, this.claudeBin, args, { cwd: record.dir, stdio: ['pipe', out, err], env, runEnv })
     } finally {
       closeSync(out)
       closeSync(err)
@@ -1426,7 +1501,11 @@ export class Workers extends EventEmitter {
         resumed: entry?.requeued?.why ?? null,
         resumedSession: record.resumed,
       }
-      const promptFacts = { ...facts, dirty: now?.dirty ?? [], followed, worktree }
+      // Its run folder: the worktree's session's, or a new one (runFolder).
+      const runFolder = await this.runFolder(record.repo, { runner, holder: wt, resumed: record.resumed })
+      record.runFolder = runFolder?.dir ?? null
+      if (wt && (runFolder || !record.resumed)) wt.runFolder = record.runFolder
+      const promptFacts = { ...facts, dirty: now?.dirty ?? [], followed, worktree, runFolder }
       if (record.state !== 'running') return
       if (record.stopping || this.killswitch?.locked) return this.finish(record, 'stopped', record.stopping?.reason ?? 'kill switch')
       record.preparing = false
@@ -1915,7 +1994,47 @@ export class Workers extends EventEmitter {
     for (const task of this.unreported()) this.emit('finished', task)
     this.pump()
     this.sweep()
+    this.sweepRunFolders()
     this.tidyKept()
+  }
+
+  // Run folders (workspaces.mjs) whose last run ended more than
+  // runFolderDays ago are removed, never while a run of their repository
+  // goes or starts, nor while the kill switch is locked: what is in them may
+  // show what happened. A removed one stays known while a session has it,
+  // whose next run makes it again, empty, at the same path; otherwise it is
+  // forgotten too. At most every sweepMs; never with days 0. Returns the
+  // promise, for the tests.
+  sweepRunFolders(now = Date.now()) {
+    if (!this.runFolderDays || this.runSweeping || this.killswitch?.locked || now - (this.runSweptAt ?? 0) < this.sweepMs) {
+      return this.runSweeping ?? null
+    }
+    this.runSweptAt = now
+    const held = () =>
+      new Set([...Object.values(this.state.repos), ...Object.values(this.state.worktrees)].map(h => h?.runFolder).filter(Boolean))
+    const busy = repo => this.runsOf(repo).length > 0 || this.starting.has(repo)
+    const old = Object.entries(this.state.runFolders).filter(
+      ([dir, f]) => !busy(f.repo) && (f.removedAt ? !held().has(dir) : now - f.usedAt > this.runFolderDays * DAY_MS),
+    )
+    if (!old.length) return null
+    this.runSweeping = (async () => {
+      for (const [dir, entry] of old) {
+        try {
+          if (!entry.removedAt) {
+            if (busy(entry.repo) || this.killswitch?.locked) continue
+            const runner = this.runnerOf({ kind: 'repo', container: entry.container, dir })
+            if (!(await runner.remove(dir))) continue
+            entry.removedAt = Date.now()
+            log('worker run folder removed,', `${this.runFolderDays} days after its last run:`, dir)
+          }
+          if (!held().has(dir)) delete this.state.runFolders[dir]
+          this.save()
+        } catch (error) {
+          log('worker run folder not removed:', dir, error.message) // tried again at the next sweep
+        }
+      }
+    })().finally(() => (this.runSweeping = null))
+    return this.runSweeping
   }
 
   // Work folders whose last run is more than their days ago are removed,
@@ -2107,7 +2226,8 @@ export class Workers extends EventEmitter {
     const wt = task.worktree ? this.state.worktrees[task.worktree] : null
     if (message.session_id && message.session_id !== task.sessionId) {
       task.sessionId = message.session_id
-      if (!wt) this.state.repos[task.repo] = { sessionId: message.session_id }
+      // The run folder goes on with it (workspaces.mjs).
+      if (!wt) this.state.repos[task.repo] = { sessionId: message.session_id, ...(task.runFolder ? { runFolder: task.runFolder } : {}) }
     }
     if (wt && message.session_id && wt.task === task.id) Object.assign(wt, { sessionId: message.session_id, resumable: true })
     // For the end of a run that gave its result (check): when it last wrote,
@@ -2185,6 +2305,8 @@ export class Workers extends EventEmitter {
     task.preparing = false
     this.followed.delete(task.id)
     if (state === 'done') this.limits?.ok(this.accountOf(task)) // a run got through: the backoff starts again
+    // Its run folder's days count from now (sweepRunFolders).
+    if (task.runFolder && this.state.runFolders[task.runFolder]) this.state.runFolders[task.runFolder].usedAt = task.finishedAt
     if (task.worktree) this.afterWorktreeRun(task)
     // The run has ended whether or not the state can be saved: the rules and
     // the report hear about it first, then the caller about the save.
@@ -2377,6 +2499,9 @@ export class Workers extends EventEmitter {
         }
       }
       log('worker audit', task.repo, task.id, auditSummary(task.audit))
+      // What is in its run folder, for the controller, which may send the
+      // driver files from there (resultText).
+      if (task.runFolder) task.runFiles = await this.runFolderFiles(task)
       this.decide(task)
       if (worktree) await this.tidy(task, now)
     } finally {
@@ -2388,6 +2513,19 @@ export class Workers extends EventEmitter {
       log('worker state not saved:', error.message) // the audit holds in this gateway
     }
     return task.audit
+  }
+
+  // The files in a run's run folder: { count, more, newest }, the newest
+  // first, without Claude Code's own temporary folder there (claude-<uid>),
+  // as it is the run's TMPDIR; null when it cannot be read.
+  async runFolderFiles(task) {
+    const files = await Promise.resolve()
+      .then(() => this.runnerOf(task).files?.(task.runFolder, MAX_FILES))
+      .catch(() => null)
+    if (!files) return null
+    const own = files.filter(file => !/^claude-\d+\//.test(file.path))
+    const newest = [...own].sort((a, b) => b.mtime - a.mtime).slice(0, 5).map(file => file.path)
+    return { count: own.length, more: files.length > MAX_FILES, newest }
   }
 
   // The look at a work folder once its run has ended, whatever the worker
@@ -2658,6 +2796,7 @@ export class Workers extends EventEmitter {
     }
     lines.push(`Task: ${preview(task.task, 200)}`)
     if (task.review) lines.push(reviewLine(task.review))
+    if (task.runFolder) lines.push(runFolderLine(task))
     if (task.steps.length) lines.push(`Last steps: ${task.steps.join('; ')}`)
     if (task.audit) lines.push(this.checkText(task))
     if (task.state === 'running' && task.lastText) lines.push(`Last message: ${task.lastText}`)
@@ -2727,6 +2866,7 @@ export class Workers extends EventEmitter {
     }
     if (task.audit) lines.push(this.checkText(task))
     lines.push(...this.worktreeText(task))
+    if (task.runFiles?.count) lines.push(runFolderLine(task))
     if (kindOf(task) === 'scratch') {
       const mounted = task.container ? `, mounted in the container ${task.container}` : ''
       lines.push(
@@ -2776,6 +2916,23 @@ export function planText(plan, why = 'since the queue was planned') {
       'order, not what is done, so it needs no words of the driver. Reply "done" to this event; the driver does not ' +
       'hear it.',
   ].join('\n')
+}
+
+// A run's run folder (workspaces.mjs), for worker_status and the result: where
+// it is, and what is in it after the run, the newest first. The names are the
+// run's, so the text is the result's, with trusted="no".
+function runFolderLine(task) {
+  const where = task.container ? ` in the container ${task.container}, in its mounted folder of clones` : ' on this computer'
+  const files = task.runFiles
+  const what = !files
+    ? ''
+    : files.count
+      ? `, with ${plural(files.count, 'file')}${files.more ? ' or more' : ''} (newest: ${preview(files.newest.join(', '), 200)})`
+      : ', empty'
+  return (
+    `Run folder of its session, outside the repository: ${task.runFolder}${where}${what}. The driver finds there what the ` +
+    'run made for them, such as screenshots; it goes some days after the last run.'
+  )
 }
 
 // Where a fix for review comments came from, for worker_status and the result.
@@ -2847,6 +3004,15 @@ export function prompt({ task, words, facts, direct = false, draft = false, prDr
   if (followed.length && !wt) {
     lines.push(`- Uncommitted files an earlier run left, which this task follows up: ${followed.join(', ')}`)
   }
+  // facts.runFolder: the run folder of its session (Workers.runFolder).
+  const folder = facts.runFolder
+  lines.push(
+    folder
+      ? `- Run folder: ${folder.dir}, outside the repository, also $${RUN_FOLDER_ENV} and $TMPDIR: ` +
+          (folder.made ? 'new and empty' : folder.again ? 'made again, empty, as its days were over' : 'as earlier runs of this session left it') +
+          '. Helper files that belong nowhere in the repository go there, as the Helper files rule says.'
+      : `- Run folder: none this time, it could not be made; put helper files in ${HELPER_FOLDER} only.`,
+  )
   const target = facts.defaultBranch || 'the default branch'
   const asDraft = draft && !draftIgnored(facts, direct)
   if (facts.access) {

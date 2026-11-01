@@ -48,7 +48,7 @@ import { FolderTools, clonedText } from './folders.mjs'
 import { FunnelSwitch, staleText } from './funnel.mjs'
 import { Alerts, IpGuard } from './ipguard.mjs'
 import { Ledger, decisionLine, openItems, reminderText, startupText } from './ledger.mjs'
-import { ScratchFolders, scratchProblem } from './workspaces.mjs'
+import { RUN_FOLDERS, ScratchFolders, scratchProblem } from './workspaces.mjs'
 import { Stats, shutdownText, telegramText } from './stats.mjs'
 import { Standby } from './standby.mjs'
 import { Presence } from './presence.mjs'
@@ -229,7 +229,12 @@ const workers = new Workers({
   maxRuns: config.maxWorkers,
   maxPerRepo: config.maxWorkersPerRepo,
   timeoutMinutes: config.workerTimeoutMinutes,
+  runFolderDays: config.runFolderDays,
 })
+log(
+  `run folders of the workers' runs: in ${RUN_FOLDERS} in the repositories folder${config.docker ? ` of the container ${config.docker}` : ''}, ` +
+    (config.runFolderDays ? `removed ${config.runFolderDays} days after their last run` : 'kept for good (VOICE_GW_RUN_FOLDER_DAYS=0)'),
+)
 const guard = new RunGuard({
   workers,
   runner,

@@ -41,6 +41,8 @@ appendFileSync(process.env.FAKE_CLAUDE_LOG, JSON.stringify({
   cwd: process.cwd(), args, input, pid: process.pid,
   claudecode: process.env.CLAUDECODE ?? null,
   socket: process.env.CLAUDE_CODE_MESSAGING_SOCKET ?? null,
+  tmpdir: process.env.TMPDIR ?? null,
+  runFolder: process.env.VOICE_GW_RUN_FOLDER ?? null,
 }) + '\\n')
 const arg = name => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : null }
 const session_id = arg('--session-id') ?? arg('--resume')
@@ -310,9 +312,20 @@ test('dispatch runs claude -p in the checkout; the result reaches the controller
   assert.match(call.input, /Uncommitted files before you start: none/)
   assert.equal(call.claudecode, null, 'no CLAUDECODE from the controller session')
   assert.equal(call.socket, null, "no access to the controller's messaging socket")
+  // Its run folder, next to the repositories and outside the checkout: TMPDIR,
+  // VOICE_GW_RUN_FOLDER and a line of its prompt; the controller knows of it.
+  assert.match(call.runFolder ?? '', new RegExp(`^${join(ROOT, '.voice-runs', 'alpha')}/\\d{4}-\\d{2}-\\d{2}-[a-z0-9]{4}$`))
+  assert.equal(call.tmpdir, call.runFolder)
+  assert.ok(existsSync(call.runFolder))
+  assert.ok(call.input.includes(`\n- Run folder: ${call.runFolder}, outside the repository, also $VOICE_GW_RUN_FOLDER and $TMPDIR: new and empty.`))
+  assert.match(gw.claudeCode.getInstructions(), /^Every run in a repository has a run folder of its own outside the repository, for what belongs nowhere in it/m)
+  assert.match(gw.claudeCode.getInstructions(), /Never ask a worker to write anywhere else outside its repository,\nnot even a folder of your choosing: the kill switch locks on it\./)
+  assert.doesNotMatch(event.content, /Run folder/, 'empty: not in the result')
+  assert.ok(!(await controller('list_workers')).text.includes('.voice-runs'), 'no repository')
 
   const status = await controller('worker_status', { worker: 'alpha' })
   assert.match(status.text, new RegExp(`^\\[worker=alpha state=done task=${id} took=`))
+  assert.ok(status.text.includes(`\nRun folder of its session, outside the repository: ${call.runFolder} on this computer, empty.`))
   assert.match(status.text, /Last steps: Bash npm test/)
   assert.match(status.text, /Result: All 12 tests pass/)
 

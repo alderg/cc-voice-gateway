@@ -13,7 +13,8 @@
 //                   repository holds the new head, or the new head merged a
 //                   pull request of the run (mergedPull).
 //   outside         writes outside the repository (for a run in a worktree,
-//                   outside its worktree), the temporary folders and
+//                   outside its worktree), its run folder (workspaces.mjs),
+//                   the temporary folders and
 //                   the run's own Claude Code memory folder (memoryFolder):
 //                   the file tools by their path, shell commands by explicit
 //                   targets (redirections, tee, cp, mv, rm, mkdir, touch, ln,
@@ -33,6 +34,9 @@
 //                   workspaces.mjs) counts apart, against maxHelperFiles: the
 //                   file edits there, and at the end what is untracked there.
 //                   What is committed or tracked from it counts as before.
+//                   So do the file edits in its run folder and the temporary
+//                   folders, which hold no change of the repository's; what
+//                   is in them at the end is no change at all.
 //
 // What the size check at the end finds, with whether the run pushed, also
 // goes to the statistics ('measured', stats.mjs): the commits made during
@@ -391,6 +395,9 @@ class ShellParser {
 
 const basename = name => String(name ?? '').split('/').pop()
 
+// Whether a path is one of the folders, or inside one.
+const within = (path, roots) => roots.some(root => path === root || path.startsWith(root.replace(/\/$/, '') + '/'))
+
 // The command of a simple command's words: past keywords (if, do, …),
 // wrappers (sudo, env, …) and variable assignments. { name, args }.
 function commandOf(words) {
@@ -519,13 +526,20 @@ export class RunGuard extends EventEmitter {
     const runner = this.workers.runnerOf?.(task) ?? this.runner
     const { home, claudeConfig, temp, roots } = this.places(runner)
     const scratch = task.kind === 'scratch'
+    // A run in a repository also has its run folder (workspaces.mjs), its
+    // own: never the folders around it, nor another run's.
+    const runFolder = !scratch && typeof task.runFolder === 'string' && task.runFolder.startsWith('/') ? task.runFolder : null
     const run = {
       id: task.id,
       repo: task.repo,
       scratch,
       runner,
       home,
-      roots: scratch ? temp : roots, // where it may write besides its workspace and its memory folder
+      runFolder,
+      roots: scratch ? temp : [...roots, ...(runFolder ? [runFolder] : [])], // where it may write besides its workspace and its memory folder
+      // Where its file edits count apart, with the helper folder's: its run
+      // folder and the temporary folders, which hold no change of its own.
+      helpers: scratch ? [] : [...temp, ...(runFolder ? [runFolder] : [])],
       dir: task.dir ?? runner.dir(task.repo), // a run in a worktree: the worktree, not the checkout
       memories: [],
       slug: task.slug ?? null,
@@ -575,13 +589,18 @@ export class RunGuard extends EventEmitter {
       if (target) run.files.add(target)
       if (target && !this.allowed(run, target)) this.violation(run, 'write outside the allowed folders', `${part.name} ${target}`)
       // A work folder is all the run's own; its edits count as edits.
-      if (target && !run.scratch && inHelperFolder(posix.relative(run.dir, target))) run.helperEdits++
+      const helper = target && !run.scratch && (inHelperFolder(posix.relative(run.dir, target)) || within(target, run.helpers))
+      if (helper) run.helperEdits++
       else run.edits++
       if (run.edits > this.maxEdits) {
         this.violation(run, 'many changes', `more than ${this.maxEdits} file edits in one run`)
       }
       if (run.helperEdits > this.maxHelperFiles) {
-        this.violation(run, 'many changes', `more than ${this.maxHelperFiles} file edits in the helper folder ${HELPER_FOLDER} in one run`)
+        this.violation(
+          run,
+          'many changes',
+          `more than ${this.maxHelperFiles} file edits in the helper folder ${HELPER_FOLDER}, the run folder and the temporary folders in one run`,
+        )
       }
     } else if (part.name === 'Bash' && typeof part.input?.command === 'string') {
       // Claude Code keeps the shell's folder from one Bash call to the next
@@ -792,11 +811,13 @@ export class RunGuard extends EventEmitter {
   }
 
   // An absolute path, or null where a variable hides it; ~ and $HOME are
-  // the run's home.
+  // the run's home, $TMPDIR and $VOICE_GW_RUN_FOLDER its run folder, which
+  // the gateway set for it (workers.mjs).
   resolve(run, base, path) {
     let expanded = String(path)
     if (expanded === '~' || expanded.startsWith('~/')) expanded = run.home + expanded.slice(1)
     expanded = expanded.replace(/^\$\{?HOME\}?(?=\/|$)/, run.home)
+    if (run.runFolder) expanded = expanded.replace(/^\$(?:\{(TMPDIR|VOICE_GW_RUN_FOLDER)\}|(TMPDIR|VOICE_GW_RUN_FOLDER)\b)(?=\/|$)/, run.runFolder)
     if (/[$`]/.test(expanded)) return null
     if (!expanded.startsWith('/') && base === null) return null
     return posix.resolve(base ?? '/', expanded)
@@ -804,7 +825,7 @@ export class RunGuard extends EventEmitter {
 
   allowed(run, path) {
     if (isDevice(path)) return true
-    return [run.dir, ...run.memories, ...run.roots].some(root => path === root || path.startsWith(root.replace(/\/$/, '') + '/'))
+    return within(path, [run.dir, ...run.memories, ...run.roots])
   }
 
   // --- size ---------------------------------------------------------------------

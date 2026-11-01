@@ -685,6 +685,22 @@ What applies to every worker run (`src/workers.mjs`):
   `git status` at the desk shows it. A worktree takes it along when the gateway removes it; in the
   checkout it stays, for a follow-up in the same session and a look at the desk, and what is left
   there counts again at the end of the next run there.
+- **The run folder:** what belongs nowhere in the repository, such as screenshots and other files
+  for you, browser profiles, downloads and temporary files, goes to a folder of the run's own
+  outside every checkout, next to the worktrees: `<VOICE_GW_WORKER_ROOT>/.voice-runs/<repository>/<date>-<id>`
+  (in Docker `/repos/.voice-runs/…`, in the mounted folder of clones, so you find it on this
+  computer too). The gateway makes it before the run, for your user only, and hands it over as
+  `TMPDIR` and `VOICE_GW_RUN_FOLDER` (in Docker with `docker exec -e`, inside the container only);
+  the prompt names it, and the rules say to write nowhere else outside the repository, also when a
+  task names another place. It belongs to the worker's Claude session: a follow-up in the same
+  session gets the same folder, at the same path, so that what the worker remembers writing there
+  it may write again; a run next to it, in a worktree, or a `fresh` session gets one of its own. The
+  kill switch lets the run write there, and never into another run's folder or the folders around
+  them ([5.9](#59-the-kill-switch)); what is in it is no change. The result names it, with how many
+  files are in it and the newest, when it is not empty, and `worker_status` always does, so that
+  the controller can tell you where to find them. It is removed `VOICE_GW_RUN_FOLDER_DAYS` (7) days
+  after its session's last run, never while a run of that repository goes or the kill switch is
+  locked, and made again, empty, at the same path when the session goes on (`0`: kept for good).
 - **The gateway's own checkout** gets the same look whenever the controller replies "done": if it
   has uncommitted changes or commits on no remote, the reply's result says so in one line
   (`VOICE_GW_SELF_CHECKOUT`), and it becomes an open push decision, until you were asked. Only the
@@ -697,7 +713,7 @@ What applies to every worker run (`src/workers.mjs`):
   clones are what counts.
 - **Rules for the run** (`WORKER_RULES`): branch `voice/<name>`, commit only its own changes, never
   force-push, merge or delete branches, ask before pushing a public repository, scratch output only
-  in the helper folder, never end the turn, which ends the run, while tests, a build or a helper
+  in the helper folder and the run folder, never end the turn, which ends the run, while tests, a build or a helper
   agent still run in the background, never end with commits on no remote or uncommitted changes
   without naming them and asking about the push. These are rules, not limits; the check after the
   run is code.
@@ -1090,8 +1106,8 @@ at every start.
 | Voice | "emergency stop" or "kill switch"; or the tool `emergency_stop`, which the voice AI calls for the same words in any language | In `send` and `ask` before anything reaches the controller: the message starts with the phrase, or has at most six words |
 | Telegram | `/stop` or a phrase | See 5.8 |
 | Rule: default branch | A push to the default branch, or a merge, without a direct dispatch at level `full`, in a repository with pull requests turned on | In the run's commands: `git push` to the default branch, `--all`, `--mirror`, `gh pr merge`, and `gh api` calls that merge (`PUT …/pulls/<n>/merge`, `POST …/merges`, the GraphQL mutations `mergePullRequest`, `enablePullRequestAutoMerge`, `mergeBranch`). With `gh`, every `VOICE_GW_KILL_CHECK` seconds and at the end: the default branch moved on GitHub, and the worker's repository holds the new head, or the new head merged a pull request of the run (below) |
-| Rule: outside | Writes outside the repository (for a run in a [worktree](#several-runs-per-repository), outside its worktree), `/tmp`, `/var/tmp` (and the system's temp folder on this computer), the run's own Claude Code memory folder (`~/.claude/projects/<repository path with - for every other character>/memory`, where auto memory writes; another project's is outside) and `VOICE_GW_KILL_ALLOW_PATHS`; for a run in a [work folder](#work-folders), writes outside that folder, those temporary folders and its memory folder; writing to `/dev/null`, the standard streams, a terminal or `/dev/fd/N` is none | The file tools by path. Shell commands by explicit targets: redirections, `tee`, `cp`, `mv`, `rm`, `mkdir`, `touch`, `ln`, `chmod`, `chown`, `truncate`, `sed -i`, `dd of=`, also after `cd`; `$HOME` and `~` are expanded. The command line is read as a shell reads it: quoted text, comments, here-strings and heredoc bodies are data, so a `>` or `;` in a pattern, a commit message or a script written to a file is none; the commands in `$(…)`, backticks, `<(…)`, `>(…)`, `sh -c`, `eval` and a heredoc a shell reads are checked like any other, and so is a script written from a heredoc that the same call runs |
-| Rule: many changes | More than 500 file edits in a run; at its end more than 300 files or 30,000 lines changed; in a work folder, more than 300 files in it. Apart from these, the run's [helper folder](#55-workers-on-this-computer-or-in-docker) `.voice-scratch`, for its test reports, screenshots and logs: more than 10,000 file edits there, or untracked files there at the end | Edits as they happen; at the end the commits made during the run plus what is not committed, or the files in the work folder. What is untracked in the helper folder counts only against its own limit, so the limit for real code stays as strict; what is committed or tracked there counts as any change. `VOICE_GW_KILL_MAX_*` |
+| Rule: outside | Writes outside the repository (for a run in a [worktree](#several-runs-per-repository), outside its worktree), its own [run folder](#55-workers-on-this-computer-or-in-docker) (never another run's, nor `.voice-runs` around it, nor `~/voice-scratch`), `/tmp`, `/var/tmp` (and the system's temp folder on this computer), the run's own Claude Code memory folder (`~/.claude/projects/<repository path with - for every other character>/memory`, where auto memory writes; another project's is outside) and `VOICE_GW_KILL_ALLOW_PATHS`; for a run in a [work folder](#work-folders), writes outside that folder, those temporary folders and its memory folder; writing to `/dev/null`, the standard streams, a terminal or `/dev/fd/N` is none | The file tools by path. Shell commands by explicit targets: redirections, `tee`, `cp`, `mv`, `rm`, `mkdir`, `touch`, `ln`, `chmod`, `chown`, `truncate`, `sed -i`, `dd of=`, also after `cd`; `$HOME` and `~` are expanded, and so are `$TMPDIR` and `$VOICE_GW_RUN_FOLDER` to the run folder. The command line is read as a shell reads it: quoted text, comments, here-strings and heredoc bodies are data, so a `>` or `;` in a pattern, a commit message or a script written to a file is none; the commands in `$(…)`, backticks, `<(…)`, `>(…)`, `sh -c`, `eval` and a heredoc a shell reads are checked like any other, and so is a script written from a heredoc that the same call runs |
+| Rule: many changes | More than 500 file edits in a run; at its end more than 300 files or 30,000 lines changed; in a work folder, more than 300 files in it. Apart from these, the run's [helper folder](#55-workers-on-this-computer-or-in-docker) `.voice-scratch`, for its test reports, screenshots and logs: more than 10,000 file edits there, its run folder and the temporary folders together, or untracked files in the helper folder at the end | Edits as they happen; at the end the commits made during the run plus what is not committed, or the files in the work folder. What is untracked in the helper folder counts only against its own limit, so the limit for real code stays as strict; what is committed or tracked there counts as any change. What is in the run folder and the temporary folders at the end is no change at all. `VOICE_GW_KILL_MAX_*` |
 | Controller | `raise_alarm` with a reason | One more signal, never the only one |
 
 **Whose merge it is.** A merge on GitHub makes a commit that the worker's repository does not
@@ -2308,6 +2324,7 @@ limits at once.
 | `VOICE_GW_MAX_WORKERS` | `2` | Runs at the same time, in all; every run of a repository counts. Applies at once when the settings file changes, without a restart |
 | `VOICE_GW_MAX_WORKERS_PER_REPO` | `1` | Runs at the same time in one repository; further runs work in git worktrees of their own ([several runs per repository](#several-runs-per-repository)). Applies at once when the settings file changes |
 | `VOICE_GW_WORKER_TIMEOUT` | `360` | Minutes before a run is stopped; `0`: no time limit |
+| `VOICE_GW_RUN_FOLDER_DAYS` | `7` | Days after its session's last run before a run's [run folder](#55-workers-on-this-computer-or-in-docker) in `.voice-runs` is removed, never while a run of its repository goes or the kill switch is locked; `0`: never |
 | `VOICE_GW_WORKER_MODEL` | Claude Code's default | `--model` for every worker run, host and Docker |
 | `VOICE_GW_WORKER_EFFORT` | Claude Code's default | `--effort`: `low`, `medium`, `high`, `xhigh`, `max` |
 | `VOICE_GW_CLAUDE_BIN` | `claude` | Claude Code for workers (inside the container in Docker mode) |
@@ -2347,7 +2364,7 @@ limits at once.
 | `VOICE_GW_KILL_MAX_EDITS` | `500` | Kill switch: file edits in one run |
 | `VOICE_GW_KILL_MAX_FILES` | `300` | Kill switch: files changed in one run |
 | `VOICE_GW_KILL_MAX_LINES` | `30000` | Kill switch: lines changed in one run |
-| `VOICE_GW_KILL_MAX_SCRATCH_FILES` | `10000` | Kill switch: untracked files in a run's helper folder `.voice-scratch` at its end, and file edits there; they count for none of the three above |
+| `VOICE_GW_KILL_MAX_SCRATCH_FILES` | `10000` | Kill switch: untracked files in a run's helper folder `.voice-scratch` at its end, and file edits there, in its run folder and in the temporary folders; they count for none of the three above |
 | `VOICE_GW_KILL_ALLOW_PATHS` | empty | More folders workers may write to, comma-separated |
 | `VOICE_GW_KILL_CHECK` | `30` | Seconds between checks of the default branch and, while locked, of the container |
 | `VOICE_GW_MCP_JSON` | `controller/.mcp.json` | Plugin mode: where `src/plugin.mjs` reads the env block |
@@ -2469,6 +2486,8 @@ gateway; do not set them.
 | `dispatch=locked`, `[state=locked]` or an `[ALARM]` line | The kill switch is locked; the alarm names the trigger. `node scripts/unlock.mjs --status` shows it, `node scripts/unlock.mjs` at the server unlocks it. |
 | `dispatch=origin` | In the container, the repository's `origin` is no longer the GitHub repository the gateway saw first ([5.6](#56-access-levels-and-their-detection)). Check the clone at the desk; if the change is wanted, stop the controller and remove the repository's line under `origins` in `.state/workers.json`. |
 | The kill switch locked for no good reason | Read the reason. A rule that misfires: raise its `VOICE_GW_KILL_*` threshold, or add a folder to `VOICE_GW_KILL_ALLOW_PATHS`. |
+| The kill switch locked on `write outside the allowed folders` for screenshots or other helper files, such as in `~/voice-scratch/…` | The worker wrote outside its repository, its run folder and the temporary folders, often because a task named such a place. Its run folder (`.voice-runs/<repository>/…`, also `$TMPDIR`) is the place for them: its prompt and rules say so, and the controller's instructions say to ask for such files there and to name no other folder. A run from before this version has no run folder. A folder outside every repository that workers may really use goes into `VOICE_GW_KILL_ALLOW_PATHS`, never the work folders' root. |
+| A run folder in `.voice-runs` is gone, with the screenshots in it | It is removed `VOICE_GW_RUN_FOLDER_DAYS` (7) after its session's last run; copy out what you want to keep, or set `0`. `worker_status` names the folder of the last run, and `.state/workers.json` lists them under `runFolders`. |
 | An answer or a request on Telegram is "not passed on" | The reason follows in the chat. For an answer, reply to the question's own message, or name its code (the four characters after "Question for request"); a decision's code works too. Only questions still open count: one answered by voice is settled. A forwarded message is never passed on: write it yourself. While the kill switch is locked or the gateway is inactive nothing goes through; try again once it is unlocked or active again. `telegram answers off` in the log: `VOICE_GW_TELEGRAM_ANSWERS=0`; `telegram requests off`: `VOICE_GW_TELEGRAM_REQUESTS=0`. |
 | A message on Telegram became a request, not the answer you meant | Without a Reply to the question and without its code, a message is a new request. Reply to the question's own message, or start yours with its code. The controller sees the request all the same and may ask back. |
 | A message on Telegram became an answer, not a request | A Reply to a question answers it, whatever it says, and so does a message that names the code of exactly one open question. Write it without a Reply, and without that code. |

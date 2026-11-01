@@ -240,7 +240,7 @@ test('the setting VOICE_GW_KILLSWITCH: auto locks on everything, manual not on t
 
 // --- the rules ---------------------------------------------------------------------------
 
-function guarded({ git = {}, limits, direct = false, pushDirect = false } = {}) {
+function guarded({ git = {}, limits, direct = false, pushDirect = false, runFolder = null } = {}) {
   const workers = new EventEmitter()
   const tripped = []
   const runner = {
@@ -270,6 +270,7 @@ function guarded({ git = {}, limits, direct = false, pushDirect = false } = {}) 
     pushDirect,
     access: direct ? 'full' : null,
     startedAt: Date.now() - 1000,
+    ...(runFolder ? { runFolder } : {}),
   }
   workers.emit('started', task)
   const tool = (name, input) => workers.emit('tool', task, { type: 'tool_use', name, input })
@@ -315,6 +316,47 @@ test('rule: writes outside the repository and the temporary folders', () => {
     assert.match(run.tripped[0].reason, /\(worker alpha, task tabc\)$/)
     run.guard.close()
   }
+})
+
+test("rule: the run's own run folder is allowed, by path and as $TMPDIR or $VOICE_GW_RUN_FOLDER; the folders around it, another run's and ~/voice-scratch are not", () => {
+  const folder = '/work/.voice-runs/alpha/2026-11-01-abcd'
+  const inside = guarded({ runFolder: folder })
+  inside.bash(`mkdir -p /tmp/cfgtool/shots ${folder}/drawusaurus-redesign`)
+  inside.tool('Write', { file_path: `${folder}/shots/home.png`, content: 'x' })
+  inside.bash('mkdir -p "$VOICE_GW_RUN_FOLDER/profile" && node shot.js > "$TMPDIR/shot.log" 2>&1')
+  inside.bash('cp out/menu.png ${TMPDIR}/menu.png && cd "$VOICE_GW_RUN_FOLDER" && touch done.txt')
+  inside.bash(`rm -rf ${folder}/profile`)
+  assert.deepEqual(inside.tripped, [], 'all of it in the run folder or /tmp')
+  inside.guard.close()
+
+  // The incident of 2026-11-01, without a run folder of its own to go to;
+  // and with one, everything around it.
+  for (const [runFolder, command, path] of [
+    [null, `mkdir -p /tmp/cfgtool/shots ${homedir()}/voice-scratch/drawusaurus-redesign`, `${homedir()}/voice-scratch/drawusaurus-redesign`],
+    [folder, `mkdir -p ${homedir()}/voice-scratch/drawusaurus-redesign`, `${homedir()}/voice-scratch/drawusaurus-redesign`],
+    [folder, 'echo x > /work/.voice-runs/alpha/2026-11-01-wxyz/a.txt', '/work/.voice-runs/alpha/2026-11-01-wxyz/a.txt'],
+    [folder, 'touch /work/.voice-runs/alpha/x', '/work/.voice-runs/alpha/x'],
+    [folder, 'rm -rf /work/.voice-runs', '/work/.voice-runs'],
+    [folder, 'cp a.png "$TMPDIR/../2026-11-01-wxyz/a.png"', '/work/.voice-runs/alpha/2026-11-01-wxyz/a.png'],
+    [folder, 'echo x > "$VOICE_GW_RUN_FOLDER/../../beta/y"', '/work/.voice-runs/beta/y'],
+  ]) {
+    const run = guarded({ runFolder })
+    run.bash(command)
+    assert.equal(run.tripped.length, 1, command)
+    assert.match(run.tripped[0].reason, /^write outside the allowed folders: /, command)
+    assert.ok(run.tripped[0].reason.includes(path), `${command}: ${run.tripped[0].reason}`)
+    run.guard.close()
+  }
+  // A Write the same way.
+  const write = guarded({ runFolder: folder })
+  write.tool('Write', { file_path: `${homedir()}/voice-scratch/2026-11-01-k3pz/notes.md`, content: 'x' })
+  assert.match(write.tripped[0]?.reason ?? '', /^write outside the allowed folders: Write .*voice-scratch\/2026-11-01-k3pz\/notes\.md/)
+  write.guard.close()
+  // Without a run folder, $TMPDIR is a variable it cannot see through, as before.
+  const none = guarded()
+  none.bash('echo x > "$TMPDIR/a.txt"')
+  assert.deepEqual(none.tripped, [])
+  none.guard.close()
 })
 
 test('rule: a push to the default branch or a merge, unless it was an explicit direct dispatch', () => {
@@ -517,8 +559,21 @@ test('rule: many changes, file edits in the helper folder count apart, against i
   run.tool('Write', { file_path: '.voice-scratch/log-1.txt', content: 'x' })
   run.tool('Write', { file_path: '.voice-scratch/log-2.txt', content: 'x' })
   assert.equal(run.tripped.length, 1)
-  assert.equal(run.tripped[0].reason, 'many changes: more than 5 file edits in the helper folder .voice-scratch in one run (worker alpha, task tabc)')
+  assert.equal(
+    run.tripped[0].reason,
+    'many changes: more than 5 file edits in the helper folder .voice-scratch, the run folder and the temporary folders in one run (worker alpha, task tabc)',
+  )
   run.guard.close()
+
+  // The run folder and the temporary folders count with the helper folder:
+  // nothing there is a change of the repository's.
+  const folder = guarded({ limits: { maxEdits: 2, maxHelperFiles: 100 }, runFolder: '/work/.voice-runs/alpha/2026-11-01-abcd' })
+  for (let i = 0; i < 5; i++) folder.tool('Write', { file_path: `/work/.voice-runs/alpha/2026-11-01-abcd/shots/s${i}.png`, content: 'x' })
+  for (let i = 0; i < 5; i++) folder.tool('Write', { file_path: `/tmp/cfgtool/shots/s${i}.png`, content: 'x' })
+  assert.equal(folder.guard.runs.get('tabc').helperEdits, 10)
+  assert.equal(folder.guard.runs.get('tabc').edits, 0)
+  assert.deepEqual(folder.tripped, [])
+  folder.guard.close()
 
   // A folder of another name is code; so is a file named like the folder.
   const code = guarded({ limits: { maxEdits: 3, maxHelperFiles: 5 } })

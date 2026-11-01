@@ -23,6 +23,7 @@ import { lstatSync, readdirSync, realpathSync, rmSync } from 'node:fs'
 import { basename, dirname, isAbsolute, join, normalize, relative, sep } from 'node:path'
 import { ROOT } from './config.mjs'
 import { log as defaultLog, preview } from './log.mjs'
+import { RUN_FOLDERS } from './workspaces.mjs'
 import { WORKTREES } from './worktrees.mjs'
 
 const CLONE_TIMEOUT_MS = 30 * 60 * 1000
@@ -213,17 +214,20 @@ export class FolderTools extends EventEmitter {
     if (inside(target, self) || inside(self, target)) return { status: 'self', path: rel }
     const shown = relative(root, target)
     // The worktrees of runs (worktrees.mjs) are in .voice-worktrees/<repository>/<id>:
-    // busy while a run of that repository works in one.
+    // busy while a run of that repository works in one. Their run folders
+    // (workspaces.mjs) are in .voice-runs/<repository>/<folder>: busy while a
+    // run of that repository goes, which may use one.
     const parts = shown.split(sep)
     const inWorktrees = parts[0] === WORKTREES
-    const repo = inWorktrees ? (parts[1] ?? null) : parts[0]
+    const inRunFolders = parts[0] === RUN_FOLDERS
+    const repo = inWorktrees || inRunFolders ? (parts[1] ?? null) : parts[0]
     const running = this.workers
       ?.running()
-      .find(task => (inWorktrees ? Boolean(task.worktree) && (!repo || task.repo === repo) : task.repo === repo))
+      .find(task => (inWorktrees ? Boolean(task.worktree) && (!repo || task.repo === repo) : inRunFolders ? !repo || task.repo === repo : task.repo === repo))
     if (running || (repo && (this.workers?.starting?.has(repo) || this.cloning.has(repo)))) {
-      return { status: 'busy', path: shown, repo: repo ?? WORKTREES, task: running?.id ?? null }
+      return { status: 'busy', path: shown, repo: repo ?? parts[0], task: running?.id ?? null }
     }
-    const top = inWorktrees ? parts.slice(0, 3).join(sep) : repo
+    const top = inWorktrees || inRunFolders ? parts.slice(0, 3).join(sep) : repo
     return { status: 'ok', path: shown, target, stat, repo: join(root, top) }
   }
 
