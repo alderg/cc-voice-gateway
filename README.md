@@ -1175,7 +1175,7 @@ at every start.
 |---|---|---|
 | Voice | "emergency stop" or "kill switch"; or the tool `emergency_stop`, which the voice AI calls for the same words in any language | In `send` and `ask` before anything reaches the controller: the message starts with the phrase, or has at most six words |
 | Telegram | `/stop` or a phrase | See 5.8 |
-| Rule: default branch | A push to the default branch, or a merge, without a direct dispatch at level `full`, in a repository with pull requests turned on | In the run's commands: `git push` to the default branch, `--all`, `--mirror`, `gh pr merge`, and `gh api` calls that merge (`PUT …/pulls/<n>/merge`, `POST …/merges`, the GraphQL mutations `mergePullRequest`, `enablePullRequestAutoMerge`, `mergeBranch`). With `gh`, every `VOICE_GW_KILL_CHECK` seconds and at the end: the default branch moved on GitHub, and the worker's repository holds the new head, or the new head merged a pull request of the run (below) |
+| Rule: default branch | A push to the default branch, or a merge into it, without a direct dispatch at level `full`, in a repository with pull requests turned on | In the run's commands: `git push` to the default branch, `--all`, `--mirror`; `gh pr merge` of a pull request whose base on GitHub is the default branch, and every `gh pr merge` the rule cannot be sure of (below); and `gh api` calls that merge, whatever the base (`PUT …/pulls/<n>/merge`, `POST …/merges`, the GraphQL mutations `mergePullRequest`, `enablePullRequestAutoMerge`, `mergeBranch`). With `gh`, every `VOICE_GW_KILL_CHECK` seconds and at the end: the default branch moved on GitHub, and the worker's repository holds the new head, or the new head merged a pull request of the run (below) |
 | Rule: outside | Writes outside the repository (for a run in a [worktree](#several-runs-per-repository), outside its worktree), its own [run folder](#55-workers-on-this-computer-or-in-docker) (never another run's, nor `.voice-runs` around it, nor `~/voice-scratch`), `/tmp`, `/var/tmp` (and the system's temp folder on this computer), the run's own Claude Code memory folder (`~/.claude/projects/<repository path with - for every other character>/memory`, where auto memory writes; another project's is outside) and `VOICE_GW_KILL_ALLOW_PATHS`; for a run in a [work folder](#work-folders), writes outside that folder, those temporary folders and its memory folder; writing to `/dev/null`, the standard streams, a terminal or `/dev/fd/N` is none | The file tools by path. Shell commands by explicit targets: redirections, `tee`, `cp`, `mv`, `rm`, `mkdir`, `touch`, `ln`, `chmod`, `chown`, `truncate`, `sed -i`, `dd of=`, also after `cd`; `$HOME` and `~` are expanded, and so are `$TMPDIR` and `$VOICE_GW_RUN_FOLDER` to the run folder. The command line is read as a shell reads it: quoted text, comments, here-strings and heredoc bodies are data, so a `>` or `;` in a pattern, a commit message or a script written to a file is none; the commands in `$(…)`, backticks, `<(…)`, `>(…)`, `sh -c`, `eval` and a heredoc a shell reads are checked like any other, and so is a script written from a heredoc that the same call runs |
 | Rule: many changes | More than 500 file edits in a run; at its end more than 300 files or 30,000 lines changed; in a work folder, more than 300 files in it. Apart from these, the run's [helper folder](#55-workers-on-this-computer-or-in-docker) `.voice-scratch`, for its test reports, screenshots and logs: more than 10,000 file edits there, its run folder and the temporary folders together, or untracked files in the helper folder at the end | Edits as they happen; at the end the commits made during the run plus what is not committed, or the files in the work folder. What is untracked in the helper folder counts only against its own limit, so the limit for real code stays as strict; what is committed or tracked there counts as any change. What is in the run folder and the temporary folders at the end is no change at all. `VOICE_GW_KILL_MAX_*` |
 | Controller | `raise_alarm` with a reason | One more signal, never the only one |
@@ -1194,6 +1194,43 @@ your merge at the desk of an earlier worker's pull request does not trip the swi
 the running worker's own pull request does, so wait until the run has ended. GitHub cannot tell
 who merged when you and the workers use the same account. Direct dispatches and repositories with
 pull requests turned off are exempt, as for pushes.
+
+**Where `gh pr merge` merges.** A worker's `gh pr merge` merges into the pull request's base, such
+as `simple-modern` for a pull request stacked on another one, which only GitHub knows. So the
+gateway looks the base up there with its own `gh` on this computer, also for workers in Docker
+(`gh api repos/{owner}/{repo}/pulls/{n}`, or for a branch the open pull requests from it), and
+locks only when the base is the default branch, as GitHub names it now or as the run knew it at
+its start. A merge it lets go is logged (`kill switch rule on the default branch: let gh pr merge
+of pull request 1080 in jgraph/drawio-dev go, into simple-modern, not the default branch dev
+(worker drawio-dev, task t…)`). It reads the argument as `gh` does: a number, a URL, a branch, or
+none for the current branch's pull request; the repository from `--repo`/`-R`, the URL, or else
+the git remote of the folder the command runs in. Whatever it cannot be sure of locks, as every
+`gh pr merge` did before:
+
+- the command not alone on its line as one plain `gh pr merge`: with `;`, `&&`, `||`, a pipe,
+  `&`, a subshell, a substitution, a heredoc, a comment, a variable assignment or a wrapper such
+  as `env` around it, or inside `sh -c`, `eval` or a script, since another command there could
+  change the base meanwhile; or a variable, a pattern or braces in its words;
+- `--auto`, which merges later, `--admin`, and any flag the rule does not read (`--disable-auto`
+  too);
+- another repository than the worker's, by `--repo` or the URL, also on another host;
+- without `--repo` or a URL: a folder with more than one remote, or whose remote is not the
+  worker's repository on GitHub (as `git remote -v` shows it, after `url.*.insteadOf`), another
+  repository set with `gh repo set-default`, `GH_REPO` in the environment on this computer, or a
+  folder the rule is not sure of after a `cd` it could not follow or a script run with `source`;
+  for the current branch's pull request also a detached HEAD, or a branch that tracks or pushes
+  to another branch or remote;
+- a lookup that fails, finds no open pull request, or takes longer than 10 seconds.
+
+The rules see a step after it started, so the merge goes on meanwhile: one into the default branch
+locks once GitHub has answered, a moment after the command, as a push to it does once its command
+shows. A merge the rule let go is looked at again half a minute later and at the end of the run:
+merged into the default branch after all, as its base changed after the lookup, it locks too; and
+the check of the default branch above still runs. A gateway that takes a run over reads its
+commands again, and for a merge an earlier gateway let go it looks up the pull requests kept with
+the task in `.state/workers.json`, not the branch as it is now. `gh pr edit --base` is no merge
+and does not count. The worker's rules still say never to merge: a merge belongs only in a task
+that asks for it.
 
 **Effects**, at once:
 
@@ -1291,7 +1328,8 @@ is guarded as follows:
 - **Nothing is undone.** A push, a merged pull request or a deleted branch stays as it is. The kill
   switch stops what comes next.
 - **The rules see a step only after it ran.** They read the commands Claude Code reports; the
-  command that breaks a rule has usually run already.
+  command that breaks a rule has usually run already. A `gh pr merge` into the default branch
+  locks once GitHub has told its base ([5.9](#59-the-kill-switch)).
 - **Hidden actions are missed.** Not seen:
   - a push or a write inside a script, an alias or another language; of a shell script that `cat`
     or `tee` writes from a heredoc, only what the same Bash call runs is seen;
@@ -2591,6 +2629,7 @@ gateway; do not set them.
 | `dispatch=locked`, `[state=locked]` or an `[ALARM]` line | The kill switch is locked; the alarm names the trigger. `node scripts/unlock.mjs --status` shows it, `node scripts/unlock.mjs` at the server unlocks it. |
 | `dispatch=origin` | In the container, the repository's `origin` is no longer the GitHub repository the gateway saw first ([5.6](#56-access-levels-and-their-detection)). Check the clone at the desk; if the change is wanted, stop the controller and remove the repository's line under `origins` in `.state/workers.json`. |
 | The kill switch locked for no good reason | Read the reason. A rule that misfires: raise its `VOICE_GW_KILL_*` threshold, or add a folder to `VOICE_GW_KILL_ALLOW_PATHS`. |
+| The kill switch locked on `push to the default branch` for a `gh pr merge` | Read the reason after the command. "Into main, the default branch" is a merge into it. Otherwise it names what the rule could not be sure of ([5.9](#59-the-kill-switch)): the command on one line with others, `--auto`, a folder with two remotes and no `--repo`, a lookup that failed or took too long. A merge into another branch, such as a stacked pull request's base, goes when it is `gh pr merge <number> --repo owner/name` alone on its line; the log names each one it let go (`let gh pr merge of pull request …`). |
 | The kill switch locked on `write outside the allowed folders` for screenshots or other helper files, such as in `~/voice-scratch/…` | The worker wrote outside its repository, its run folder and the temporary folders, often because a task named such a place. Its run folder (`.voice-runs/<repository>/…`, also `$TMPDIR`) is the place for them: its prompt and rules say so, and the controller's instructions say to ask for such files there and to name no other folder. A run from before this version has no run folder. A folder outside every repository that workers may really use goes into `VOICE_GW_KILL_ALLOW_PATHS`, never the work folders' root. |
 | A run folder in `.voice-runs` is gone, with the screenshots in it | It is removed `VOICE_GW_RUN_FOLDER_DAYS` (7) after its session's last run; copy out what you want to keep, or set `0`. `worker_status` names the folder of the last run, and `.state/workers.json` lists them under `runFolders`. |
 | An answer or a request on Telegram is "not passed on" | The reason follows in the chat. "Telegram input is off": turn it on in the setup (section 4), or set `VOICE_GW_TELEGRAM_ANSWERS=1` and `VOICE_GW_TELEGRAM_REQUESTS=1`; it is off by default, also after an update. For an answer, reply to the question's own message, or name its code (the four characters after "Question for request"); a decision's code works too. Only questions still open count: one answered by voice is settled. A push, merge, restart or delete question is never answered there ("must be confirmed by voice"): say it in voice mode. A forwarded or edited message, or one without text, is never passed on: write it yourself, as a new message. While the kill switch is locked or the gateway is inactive nothing goes through; try again once it is unlocked or active again. `telegram answers off` in the log: `VOICE_GW_TELEGRAM_ANSWERS` is not `1`; `telegram requests off`: `VOICE_GW_TELEGRAM_REQUESTS` is not `1`. `.state/telegram-input.log` says for every message what became of it. |
