@@ -102,8 +102,8 @@ export const config = {
   // after 60 s, so a single call must return well before that.
   defaultWaitSeconds: num(env.VOICE_GW_DEFAULT_WAIT, 25),
   maxWaitSeconds: num(env.VOICE_GW_MAX_WAIT, 40),
-  // ask waits only briefly, at most maxWaitSeconds: the voice assistant says
-  // nothing before the call, so the driver hears nothing until it returns.
+  // ask waits only briefly, at most maxWaitSeconds: after the voice
+  // assistant's acknowledgement the driver hears nothing until it returns.
   askWaitSeconds: num(env.VOICE_GW_ASK_WAIT, 8),
 
   // After this many seconds without any reaction from the controller, the

@@ -213,66 +213,110 @@ test('the connector names its gateway, for a driver with several: in the instruc
   assert.match(raw, /^Gateway Testbox \(e2e\): active\n\[gateway=ok controller=/)
 })
 
-// Asked for in the car: no answer at all before a request is passed on, then a
-// short one that fits it, worded differently each time. And no rules about
-// what not to say: naming the sentences to avoid made the voice AI say them
-// more often. So positive rules and examples only, everywhere.
-const PROHIBITIONS =
-  /\b[Nn]ever\b|\b[Dd]on't\b|\b[Dd]o not\b|instead of|lead-in|schau|nachsehen|sehe mal|let me check|have a look|look or check|weitergegeben|Passed on/
+// What the voice assistant says, as in the texts of 31 October, with which it
+// said varied, fitting things: before send and ask a short line of its own
+// that fits the request, and at least a short okay after everything the user
+// says. "Say nothing before the call" and "your reply begins with the call"
+// (1 November) left the moment before the call to one stock filler. And no
+// text names a filler, in any language, not even as a ban: naming one made the
+// voice AI say it more often.
+const FILLERS =
+  /schau|nachseh|sehe mal|\bmoment|augenblick|let me (check|see|look)|have a look|look or check|look(ing)? (it up )?yourself|check (it )?yourself|weitergegeben|passed on/i
 
-test('what the voice assistant says around a call: nothing before it, a confirmation after a request went on that fits it; positive rules only', async () => {
+test('what the voice assistant says around a call: before send and ask a short line of its own that fits the request; no filler named anywhere', async () => {
   const instructions = voice.getInstructions()
   const lines = instructions.split('\n')
   const has = line => assert.ok(lines.includes(line), line)
   has(
-    "This connector reaches Claude Code on the user's own computer. The user is usually driving: keep everything short and in their language, and answer everything they say, since silence sounds as if they were not heard. If you did not understand, ask back.",
+    "This connector reaches Claude Code sessions running on the user's own computer. The user is usually driving, so keep everything you say short.",
   )
-  // The tool call comes first; ask's own wait (VOICE_GW_ASK_WAIT, 1 s here) keeps the silence before its result short.
+  // Never silent: in a car, silence sounds as if the request was not heard.
   has(
-    'When the user asks for something, your reply begins with the tool call, and you speak once it returns. Requests go on with send, which returns at once, or ask, which waits up to 1 second for a quick answer. Right after send, and after ask while it still runs, confirm in a few words what you passed on, fitting the request and worded differently each time. Then call get_reply while the state is "sent" or "working"; between calls, say in a short phrase that it is still running.',
+    'Never leave the user in silence: they cannot look at the screen, and silence sounds as if they were not heard. Whenever they have said something, say something back at once, at least a short okay in their language, and before every tool call. If you did not understand, ask back instead of staying quiet.',
   )
-  has('Claude Code does the work: relay its answers and questions faithfully, shortened if you like.')
-  has('Approvals: read them out, and call approve only after the user explicitly said yes or no to that action.')
-  has('News: results of work Claude Code finished in the background come with any call; read them out too.')
+  // ask's own wait (VOICE_GW_ASK_WAIT, 1 s here) and get_reply's (VOICE_GW_DEFAULT_WAIT, 2 s here).
+  has(
+    'Workflow: send (or ask) -> get_reply, repeated while state is "sent" or "working" (ask waits up to 1 second for a quick answer, each get_reply up to 2 seconds) -> read the answer. Before send or ask, acknowledge in one short line in the user\'s language that fits the request and names what it is about: a task is on its way, a question goes to Claude Code and its answer follows. Word it freshly each time. Claude Code does the work, you pass it on. Between polls tell the user in a few words that it is still running. Relay Claude Code\'s answers faithfully; you may shorten them but never invent results.',
+  )
+  has('Approvals: read them out and call approve only after the user explicitly said yes or no to that action.')
+  has('News: results of work Claude Code finished in the background arrive with any call. Read them out too.')
   has(
     'Emergency: when the user says "emergency stop" or "kill switch", in any language, call emergency_stop at once, without asking back. An [ALARM] line in any result is read out first.',
   )
-  assert.doesNotMatch(instructions, PROHIBITIONS)
-  // "Answer at once" was met with a sentence before the call.
-  assert.doesNotMatch(instructions, /short okay|before every tool call|[Bb]efore (the call|ask|send|status|approve)|answer at once/)
+  assert.doesNotMatch(instructions, FILLERS)
+  // Nothing left of the rules that kept it quiet before the call.
+  assert.doesNotMatch(instructions, /begins with|say nothing|right after send|once it returns/i)
 
   const { tools } = await voice.listTools()
   const description = name => tools.find(t => t.name === name).description
   const includes = (name, sentence) => assert.ok(description(name).includes(sentence), `${name}: ${sentence}`)
+  const ack = examples =>
+    `Before the call, always, say one short line to the user in their language that fits this request and names what it is about: for a task, that it is on its way (in the sense of "will do"); for a plain question, that it goes to Claude Code and the answer follows. Word it freshly each time, in your own words, such as ${examples}, not as a fixed phrase. You only pass the request on; Claude Code does the work.`
   includes(
     'send',
-    "Use it, rather than your own knowledge or the web, for anything about the user's projects, code, computer or Claude Code sessions: Claude Code sees their machine. Your reply begins with this call, which returns at once with an id. Right after it, confirm in a few words of their language what you passed on, fitting the request and worded differently each time, such as \"The branch sync is on its way\", \"Your question about the tests is with Claude Code\" or \"Restart requested\" (in German \"Der Abgleich der Branches ist unterwegs\", \"Die Frage zu den Tests ist bei Claude Code\", \"Neustart ist angefragt\"). Then follow the id with get_reply until the state is done or question.",
+    "Send the user's request to Claude Code on their computer. Use it for anything about the user's projects, code, computer or running Claude Code sessions: you cannot see their machine, Claude Code can. Pass the request on instead of answering from your own knowledge or searching the web. Returns immediately with an id; then call get_reply with that id until state is done or question. ",
+  )
+  // Examples that fit the tool, in German and English, of different shapes.
+  includes('send', ack('"Ich gebe den Abgleich der Branches an Claude Code weiter" or "The README fix is on its way"'))
+  includes(
+    'ask',
+    'Send a short question to Claude Code and wait up to 1 second for the answer in one call. Use it for anything about',
   )
   includes(
     'ask',
-    'Like send, but waits up to 1 second for a quick answer, in one call. Your reply begins with this call; then read the answer, or, while it still runs (state=sent or working), confirm what you passed on as after send and follow the id with get_reply: the question is sent already.',
+    ' If the result says state=sent or working, continue with get_reply and the returned id; never call ask again for the same request, that would send it twice. ',
   )
+  includes('ask', ack('"Ich frage Claude Code nach den Tests" or "Asking Claude Code whether the build is green"'))
   includes(
     'get_reply',
-    'state=sent or working: read out briefly what Claude Code said, or else say in a short phrase that it is still running, varied and fitting the request, such as "Still running" or "The sync is still going" (in German "Läuft noch", "Der Abgleich läuft noch"); then call get_reply again with the same id.',
+    'state=sent or working: tell the user briefly, in a few varied words of their language, that Claude Code is still on it, and call get_reply again with the same id.',
   )
   includes(
     'approve',
-    'Call it only after you read the request to the user and they explicitly said yes (allow) or no (deny) to this action. Right after it, confirm their decision in a short phrase of their language, such as "Allowed" or "Denied" (in German "Erlaubt", "Abgelehnt").',
+    'Only call this after you read the request to the user and they explicitly said yes (allow) or no (deny) to this specific action. Never approve on your own. Before the call, confirm their decision in a few words of their language.',
   )
   assert.match(
     description('emergency_stop'),
     /^Emergency stop \(kill switch\)\. Call it at once, without asking back, when the user says "emergency stop" or "kill switch", in any language\./,
   )
-  // The examples of a confirmation stand once, in send's description.
-  assert.doesNotMatch(instructions, /on its way|unterwegs/)
+  // The examples stand once each, in send's and in ask's description.
+  for (const example of ['Abgleich der Branches', 'README fix', 'nach den Tests', 'build is green']) {
+    assert.equal(tools.filter(tool => tool.description.includes(example)).length, 1, example)
+    assert.ok(!instructions.includes(example), example)
+  }
   for (const tool of tools) {
-    if (tool.name !== 'send') assert.doesNotMatch(tool.description, /on its way|unterwegs/, tool.name)
-    assert.doesNotMatch(tool.description, PROHIBITIONS, tool.name)
-    assert.doesNotMatch(tool.description, /[Bb]efore the call/, tool.name)
+    assert.doesNotMatch(tool.description, FILLERS, tool.name)
+    assert.doesNotMatch(tool.description, /begins with this call|say nothing/i, tool.name)
     for (const [key, schema] of Object.entries(tool.inputSchema.properties ?? {})) {
-      assert.doesNotMatch(schema.description ?? '', PROHIBITIONS, `${tool.name}.${key}`)
+      assert.doesNotMatch(schema.description ?? '', FILLERS, `${tool.name}.${key}`)
     }
+  }
+})
+
+test('the filler check catches a named filler in German and English, and lets the acknowledgement rules through', () => {
+  for (const named of [
+    'Einen Moment, ich schaue mal nach',
+    'Moment, ich schau mal nach',
+    'lass mich nachsehen',
+    'ich sehe mal nach',
+    'Let me check',
+    "I'll have a look",
+    'One moment',
+    'Never say you will look or check yourself',
+    'never that you are looking yourself',
+    'Ist weitergegeben',
+    'Passed on',
+  ]) {
+    assert.match(named, FILLERS, named)
+  }
+  for (const fine of [
+    'Ich gebe den Abgleich der Branches an Claude Code weiter',
+    'You only pass the request on; Claude Code does the work.',
+    'Never leave the user in silence',
+    'ask back instead of staying quiet',
+    'Check the terminal of the controller session',
+  ]) {
+    assert.doesNotMatch(fine, FILLERS, fine)
   }
 })
 
@@ -342,25 +386,21 @@ test('status and the hint work before the controller ever answered', async () =>
   assert.match(hint, /has not answered once/)
   assert.match(hint, /--dangerously-load-development-channels server:voice/)
   assert.match(hint, /login expired/)
-  // A poll without news: a short phrase that it is still running.
-  assert.match(
-    hint,
-    new RegExp(`\\nStill working\\. Tell the user in a short phrase that it is still running, fitting the request, and call get_reply again with id=${id}\\.$`),
-  )
-  assert.doesNotMatch(hint, PROHIBITIONS)
+  assert.match(hint, new RegExp(`\\nStill working\\. Tell the user briefly and call get_reply again with id=${id}\\.$`))
+  assert.doesNotMatch(hint, FILLERS)
 })
 
 test('send -> channel event -> reply(working, done) -> get_reply', async () => {
   const sent = await voiceCall('send', { message: 'How many files are in the playground?' })
   const id = idOf(sent)
   assert.match(sent, /^\[state=sent id=[a-z0-9]{4}\]/)
-  // Nothing was said before it: its result asks for the confirmation, in a
-  // few words that fit the request.
+  // The acknowledgement came before the call: once is enough. Without it, a
+  // short okay now, so that the user is never left in silence.
   assert.match(
     sent,
-    new RegExp(`\\] Handed over\\. Now confirm to the user in a few words of their language what you passed on, fitting this request and worded differently each time\\. Then call get_reply with id=${id}\\.$`),
+    new RegExp(`\\] Handed over\\. If you have acknowledged the request already, call get_reply with id=${id} now; otherwise say a short okay in their language first\\.$`),
   )
-  assert.doesNotMatch(sent, PROHIBITIONS)
+  assert.doesNotMatch(sent, FILLERS)
 
   const event = await waitUntil(() => channelEvents.find(e => e.meta?.request_id === id))
   assert.equal(event.content, 'How many files are in the playground?')
@@ -369,7 +409,6 @@ test('send -> channel event -> reply(working, done) -> get_reply', async () => {
   const first = await voiceCall('get_reply', { id })
   assert.match(first, new RegExp(`^\\[state=working id=${id} `))
   assert.match(first, /Claude Code: Looking\./)
-  // With news from Claude Code, its words, briefly; not just a short phrase.
   assert.match(first, /\nStill working\. Tell the user briefly and call get_reply again/)
 
   // The long poll returns as soon as the answer arrives, not after the full wait.
@@ -394,22 +433,17 @@ test('ask waits in one call', async () => {
   assert.match(out, /Yes, green\./)
 })
 
-// ask said nothing before the call, so it waits only briefly, here 1 s
-// (VOICE_GW_ASK_WAIT) rather than get_reply's 3 s at most: while it still
-// runs, its result asks for the confirmation that fits the request, not for
-// "still running".
-test('ask still running: back after its own short wait, its result asks for a confirmation of what went on', async () => {
+// ask waits only briefly, here 1 s (VOICE_GW_ASK_WAIT) rather than get_reply's
+// 3 s at most: after the acknowledgement before the call the driver hears
+// nothing until it returns. While it still runs, on with get_reply.
+test('ask still running: back after its own short wait, then on with get_reply', async () => {
   const out = await voiceCall('ask', { message: 'Sync the branches with main.' })
   const id = idOf(out)
   assert.match(out, /^\[state=sent id=\w+ elapsed=[12]s\]/)
-  assert.match(
-    out,
-    new RegExp(`\\nStill working\\. Now confirm to the user in a few words of their language what you passed on, fitting this request and worded differently each time\\. Then call get_reply with id=${id}\\.$`),
-  )
-  assert.doesNotMatch(out, PROHIBITIONS)
-  // The next poll is a poll: a short phrase that it is still running.
+  assert.match(out, new RegExp(`\\nStill working\\. Tell the user briefly and call get_reply again with id=${id}\\.$`))
+  assert.doesNotMatch(out, FILLERS)
   const poll = await voiceCall('get_reply', { id, wait_seconds: 1 })
-  assert.match(poll, /\nStill working\. Tell the user in a short phrase that it is still running, fitting the request, and call get_reply again/)
+  assert.match(poll, /\nStill working\. Tell the user briefly and call get_reply again/)
   await controllerReply(id, 'done', 'Synced.')
 })
 
@@ -469,7 +503,7 @@ test('permission relay: prompt -> get_reply -> approve -> verdict to Claude Code
   assert.match(out, /Approval needed \(code=abcde\): Write – Create playground\/hello\.txt\. Details: /)
   assert.match(out, /"content": "Grüezi"/)
   assert.match(out, /\nRead the approval to the user and ask: allow or deny\? Call approve with the code only after their explicit yes or no\.\n/)
-  assert.doesNotMatch(out, PROHIBITIONS)
+  assert.doesNotMatch(out, FILLERS)
 
   assert.match(await voiceCall('status'), /Pending approvals: abcde \(Write\)/)
 
