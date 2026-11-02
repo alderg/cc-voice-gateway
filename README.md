@@ -1035,12 +1035,12 @@ folder, `.git` included.
   reason in the chat. Commands: the kill switch (`/stop`, `/killswitch`, `/emergencystop` or an
   emergency phrase), the Funnel (`/funnel on`, `/funnel off`, `/funnel`, "keep alive";
   [7.3](#73-publishing-the-endpoint)), the statistics (`/stats`, `/stats all`;
-  [8.5](#85-statistics)) and night mode (`/night`, "good night" on; `/back`, "I'm back" off;
-  [night mode](#night-mode)). The kill switch comes first, also in a forwarded or edited message:
-  a stop can only lock. With Telegram input on, also answers to questions and any other message
-  as a request (below); a Reply to a question is its answer, whatever it says, and with requests
-  on, a command stays a command as a Reply to any other message, such as news. Approvals cannot be
-  answered by Telegram.
+  [8.5](#85-statistics)) and night mode (`/night`, "good night" on, `/night 09:00` until then;
+  `/back`, "I'm back" off; [night mode](#night-mode)). The kill switch comes first, also in a
+  forwarded or edited message: a stop can only lock. With Telegram input on, also answers to
+  questions and any other message as a request (below); a Reply to a question is its answer,
+  whatever it says, and with requests on, a command stays a command as a Reply to any other
+  message, such as news. Approvals cannot be answered by Telegram.
 - **Telegram input, off by default.** Answers and requests by Telegram are an option in the setup
   assistant ("Take answers and requests from Telegram too"), which turns both on
   (`VOICE_GW_TELEGRAM_ANSWERS=1`, `VOICE_GW_TELEGRAM_REQUESTS=1`). Off, the chat takes only the
@@ -1101,7 +1101,8 @@ folder, `.git` included.
   with its code, is not passed on, while other messages are still requests while
   `VOICE_GW_TELEGRAM_REQUESTS=1`.
 - **Night mode and Telegram.** "good night" or `/night` there turns night mode on at once, as a
-  command. A longer request, such as "I'm off to bed, keep going with alpha", reaches the
+  command, and `/night 09:00` or `/night until 2026-11-03T09:00` until then. A longer request,
+  such as "I'm off to bed, keep going with alpha" or "good night until 9", reaches the
   controller, which calls `set_away` on its words, as it would on the same words spoken or typed
   as an answer there; the night's log says it came by Telegram.
 - **Only if recent.** A command, an answer or a request counts only if Telegram's timestamp on it
@@ -2050,6 +2051,7 @@ at most three short sentences, without code, paths or lists.
 | "Emergency stop!" | The kill switch locks before anything reaches the controller ([5.9](#59-the-kill-switch)) |
 | "Restart the controller." | Restart through the watchdog after your yes ([8.3](#83-restarting-the-controller-by-voice)) |
 | "Good night." / "I'm back." | `set_away`: [night mode](#night-mode) on until the end of the quiet hours, or off, with the summary of the night |
+| "Do not disturb until tomorrow morning at 9." | `set_away` with `until`: night mode on, or longer or shorter if it is on, until 09:00 |
 | "Keep going with the Simple Modern milestones in alpha tonight." | `standing_order`: until the end of the quiet hours the controller dispatches the next tasks there within that scope itself ([standing orders](#standing-orders)) |
 
 **Work folders by voice**, once they are turned on ([work folders](#work-folders)), for a task
@@ -2325,8 +2327,17 @@ defers what needs you, goes on with other work meanwhile, and tells you in the m
   from a recent voice request, as `dispatch` checks them, or from a request or an answer you typed
   on Telegram), or `/night` or "good night" on Telegram.
   Then it lasts until the end of the quiet hours, or 12 hours without them.
-- **Off:** at the end of the quiet hours, or with "I'm back" by voice, `/back` or "I'm back" on
-  Telegram, which also ends the rest of the quiet hours; the next ones count again.
+- **Until a time you name:** "until tomorrow morning at 9" by voice, and the controller passes the
+  end to `set_away` as `until`: a clock time such as `09:00`, in the computer's time zone as the
+  quiet hours are, the next time it comes, or a date and time such as `2026-11-03T09:00`; on
+  Telegram `/night 09:00`. It must lie in the future and at most 48 hours ahead, else nothing
+  changes and the controller hears why. Said again while night mode is on, the new end counts,
+  also to make it longer. The end you name is the end: later than the quiet hours, night mode
+  holds past them; within them, it ends them then, as "I'm back" would, unless they just begin
+  at that time. Kept with the rest in `.state/night.json`.
+- **Off:** at the end of the quiet hours or of the time you named, or with "I'm back" by voice,
+  `/back` or "I'm back" on Telegram, which also ends the rest of the quiet hours; the next ones
+  count again.
 - **While it is on:**
   - Worker runs started in it get a rule: decide what the concept, the task or sensible defaults
     allow, choosing the conservative option; note each such choice as an assumption, in the report

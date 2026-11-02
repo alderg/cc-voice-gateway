@@ -16,9 +16,9 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import { z } from 'zod'
 import { adminRequest } from '../src/admin.mjs'
-import { AWAY_HOURS, NIGHT_RULE, Night, morningText, nextEnd, parseQuietHours, sections, windowAt } from '../src/night.mjs'
+import { AWAY_HOURS, MAX_AWAY_HOURS, NIGHT_RULE, Night, morningText, nextEnd, parseQuietHours, parseUntil, sections, windowAt } from '../src/night.mjs'
 import { Store } from '../src/store.mjs'
-import { TelegramFallback, awayCommand } from '../src/telegram.mjs'
+import { TelegramFallback, awayCommand, awayUntil } from '../src/telegram.mjs'
 import { runLines } from '../src/workers.mjs'
 
 const GATEWAY = fileURLToPath(new URL('../src/gateway.mjs', import.meta.url))
@@ -27,6 +27,7 @@ const TOKEN = '123456789:TEST-token-never-in-a-log'
 const CHAT_ID = '4242'
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 const at = (day, hour, minute = 0) => new Date(2026, 9, day, hour, minute).getTime() // October 2026, local time
+const nov = (day, hour, minute = 0) => new Date(2026, 10, day, hour, minute).getTime() // November 2026, local time
 
 after(() => rmSync(TMP, { recursive: true, force: true }))
 
@@ -134,6 +135,191 @@ test(`"good night" without quiet hours: on for ${AWAY_HOURS} hours, unless "I'm 
   assert.equal(night.state.away, null)
 })
 
+// --- until a time the driver names ------------------------------------------------------
+
+test('parseUntil: a clock time the next time it comes, or a date and time; in the future, at most MAX_AWAY_HOURS ahead', () => {
+  const now = nov(2, 18, 46) // 2 November, as the evening it was asked for
+  assert.equal(MAX_AWAY_HOURS, 48)
+  assert.deepEqual(parseUntil('09:00', now), { at: nov(3, 9) }, 'tomorrow morning')
+  assert.deepEqual(parseUntil('9', now), { at: nov(3, 9) })
+  assert.deepEqual(parseUntil(' 9.30 ', now), { at: nov(3, 9, 30) })
+  assert.deepEqual(parseUntil('22:15', now), { at: nov(2, 22, 15) }, 'later today')
+  assert.deepEqual(parseUntil('18:46', now), { at: nov(3, 18, 46) }, 'now is not the future: the next time it comes')
+  assert.deepEqual(parseUntil('0:00', now), { at: nov(3, 0) })
+  assert.deepEqual(parseUntil('2026-11-03T09:00', now), { at: nov(3, 9) }, "in the computer's time")
+  assert.deepEqual(parseUntil('2026-11-03 09:00:30', now), { at: nov(3, 9) + 30000 })
+  assert.deepEqual(parseUntil('2026-11-03T08:00Z', now), { at: Date.UTC(2026, 10, 3, 8) })
+  assert.deepEqual(parseUntil('2026-11-03T09:00+01:00', now), { at: Date.UTC(2026, 10, 3, 8) })
+  assert.deepEqual(parseUntil('2026-11-03T03:00-0500', now), { at: Date.UTC(2026, 10, 3, 8) })
+  assert.deepEqual(parseUntil('2026-11-04T18:46', now), { at: nov(4, 18, 46) }, 'just 48 hours ahead')
+  for (const bad of ['', 'tomorrow at nine', '25:00', '9:60', '9:5', '2026-02-30T09:00', '2026-11-03T24:00', '2026-11-03', '2026-11-03T09:00+15:00', '/night', null]) {
+    assert.match(parseUntil(bad, now).error, /is no time: name a clock time such as 09:00, or a date and time such as 2026-11-03T09:00\.$/, String(bad))
+  }
+  assert.equal(parseUntil('2026-11-02T18:00', now).error, '"2026-11-02T18:00" has passed already: the end must lie in the future.')
+  assert.equal(parseUntil('2026-11-02T18:46', now).error, '"2026-11-02T18:46" has passed already: the end must lie in the future.', 'now is not the future')
+  assert.equal(parseUntil('2026-11-04T18:47', now).error, '"2026-11-04T18:47" is more than 48 hours ahead: night mode goes at most until 18:46 on 4 Nov.')
+  assert.match(parseUntil('2027-11-03T09:00', now).error, /^"2027-11-03T09:00" is more than 48 hours ahead/)
+})
+
+test('an end the driver names: the incident of 2 November, 09:00 instead of 12 hours; in the log, and in the text', () => {
+  const lines = []
+  const { clock, night, events } = nightAt(nov(2, 18, 46), { log: (...args) => lines.push(args.join(' ')) })
+  assert.equal(night.away('voice', parseUntil('09:00', clock.now).at), true)
+  assert.equal(night.until(), nov(3, 9))
+  assert.deepEqual(night.state.away, { since: nov(2, 18, 46), by: 'voice', until: nov(3, 9), named: true })
+  assert.match(night.text(), /^night mode is on since 18:46, as the driver said, until 09:00 on 3 Nov: /)
+  assert.match(lines.at(-1), /^night mode on, by voice, until \S+, as the driver named it$/)
+  assert.equal(events[0][1].until, nov(3, 9))
+  clock.now = nov(3, 6, 47) // where 12 hours would have ended
+  night.tick()
+  assert.equal(night.active(), true)
+  clock.now = nov(3, 9)
+  night.tick()
+  assert.equal(night.active(), false)
+  assert.deepEqual(events.map(([kind]) => kind), ['night', 'morning'])
+  assert.equal(events[1][1].by, 'its time')
+  assert.equal(night.state.away, null)
+  assert.equal(night.state.back, null, 'no quiet hours to end')
+})
+
+test('an end named again while it is on: the new one counts, longer or shorter, the beginning stays; without one, as before', () => {
+  const { clock, night, events } = nightAt(nov(2, 18, 46))
+  night.away('voice')
+  assert.equal(night.until(), nov(2, 18, 46) + AWAY_HOURS * 3600 * 1000, 'the default, unchanged')
+  assert.equal(night.state.away.named, false)
+  clock.now = nov(2, 22)
+  assert.equal(night.away('telegram', parseUntil('09:00', clock.now).at), false, 'on already')
+  assert.equal(night.until(), nov(3, 9))
+  assert.equal(night.state.away.since, nov(2, 18, 46))
+  assert.equal(night.state.away.by, 'telegram')
+  night.away('voice', parseUntil('02:00', clock.now).at)
+  assert.equal(night.until(), nov(3, 2), 'shorter too')
+  assert.deepEqual(events.map(([kind]) => kind), ['night'], 'one night')
+  clock.now = nov(3, 2)
+  night.tick()
+  assert.deepEqual(events.map(([kind]) => kind), ['night', 'morning'])
+  assert.equal(events[1][1].since, nov(2, 18, 46))
+  // A "good night" without an end after one with: the usual end again.
+  clock.now = nov(3, 20)
+  night.away('voice', nov(4, 9))
+  night.away('voice')
+  assert.equal(night.until(), nov(3, 20) + AWAY_HOURS * 3600 * 1000)
+  assert.equal(night.state.away.named, false)
+  night.away('voice', 'soon')
+  assert.equal(night.state.away.named, false, 'no end, no named end')
+})
+
+test('an end named with quiet hours: later, it holds past them; within them, it ends them then; at their start, they go on', () => {
+  const hours = { hours: '23:00-07:30' }
+  // Later than the quiet hours: until 09:00, not the max of the two.
+  const later = nightAt(nov(2, 18, 46), hours)
+  later.night.away('voice', nov(3, 9))
+  assert.equal(later.night.until(), nov(3, 9))
+  later.clock.now = nov(3, 1)
+  assert.equal(later.night.until(), nov(3, 9), 'also in the quiet hours')
+  later.clock.now = nov(3, 8)
+  later.night.tick()
+  assert.equal(later.night.active(), true, 'past the quiet hours')
+  later.clock.now = nov(3, 9)
+  later.night.tick()
+  assert.equal(later.night.active(), false)
+  assert.deepEqual(later.events.map(([kind]) => kind), ['night', 'morning'])
+
+  // Within the quiet hours: off at 05:00, and for the rest of them, as with "I'm back" then.
+  const within = nightAt(nov(2, 22), hours)
+  within.night.away('voice', nov(3, 5))
+  assert.equal(within.night.until(), nov(3, 5))
+  within.clock.now = nov(3, 1)
+  assert.match(within.night.text(), /, until 05:00: /)
+  within.clock.now = nov(3, 5)
+  within.night.tick()
+  assert.equal(within.night.active(), false)
+  assert.deepEqual(within.events.map(([kind]) => kind), ['night', 'morning'])
+  assert.equal(within.events[1][1].by, 'its time')
+  assert.equal(within.night.state.away, null)
+  assert.equal(within.night.state.back, nov(3, 5))
+  within.clock.now = nov(3, 6)
+  within.night.tick()
+  assert.equal(within.night.active(), false, 'the rest of the quiet hours')
+  within.clock.now = nov(3, 23, 1)
+  within.night.tick()
+  assert.equal(within.night.active(), true, 'the next quiet hours count again')
+  assert.equal(within.night.until(), nov(4, 7, 30))
+
+  // Said inside the quiet hours, for an earlier end than theirs.
+  const inside = nightAt(nov(3, 1), hours)
+  inside.night.tick()
+  inside.night.away('voice', parseUntil('6:00', inside.clock.now).at)
+  assert.equal(inside.night.until(), nov(3, 6))
+  inside.clock.now = nov(3, 6, 1)
+  inside.night.tick()
+  assert.equal(inside.night.active(), false)
+  assert.deepEqual(inside.events.map(([kind]) => kind), ['night', 'morning'])
+
+  // At their start: the quiet hours carry on, and say so.
+  const start = nightAt(nov(2, 18), hours)
+  start.night.away('voice', nov(2, 23))
+  assert.equal(start.night.until(), nov(3, 7, 30))
+  start.clock.now = nov(2, 23)
+  start.night.tick()
+  assert.equal(start.night.active(), true)
+  assert.equal(start.night.until(), nov(3, 7, 30))
+  start.clock.now = nov(3, 7, 30)
+  start.night.tick()
+  assert.equal(start.night.active(), false)
+  assert.equal(start.night.state.back, null, 'nothing ended early')
+  assert.deepEqual(start.events.map(([kind]) => kind), ['night', 'morning'])
+
+  // Before them: it ends, and they begin by themselves.
+  const before = nightAt(nov(2, 18), hours)
+  before.night.away('voice', nov(2, 21))
+  before.clock.now = nov(2, 21)
+  before.night.tick()
+  assert.equal(before.night.active(), false)
+  before.clock.now = nov(2, 23, 1)
+  before.night.tick()
+  assert.equal(before.night.active(), true)
+  assert.deepEqual(before.events.map(([kind]) => kind), ['night', 'morning', 'night'])
+
+  // "I'm back" still ends it at once.
+  const back = nightAt(nov(2, 22), hours)
+  back.night.away('voice', nov(3, 9))
+  back.clock.now = nov(3, 2)
+  assert.equal(back.night.back('voice'), true)
+  assert.equal(back.night.active(), false)
+  back.clock.now = nov(3, 8)
+  back.night.tick()
+  assert.equal(back.night.active(), false)
+  assert.deepEqual(back.events.map(([kind]) => kind), ['night', 'morning'])
+})
+
+test('an end the driver named is kept across a restart, as named; a file from before knows none', () => {
+  const file = join(TMP, 'night-named.json')
+  const first = nightAt(nov(2, 22), { hours: '23:00-07:30', file })
+  first.night.away('voice', nov(3, 5))
+  first.night.close()
+  const again = nightAt(nov(3, 1), { hours: '23:00-07:30', file })
+  again.night.start()
+  again.night.close()
+  assert.deepEqual(again.night.state.away, { since: nov(2, 22), by: 'voice', until: nov(3, 5), named: true })
+  assert.equal(again.night.until(), nov(3, 5))
+  assert.deepEqual(again.events, [])
+  // Down over the named end: the summary at the start, and the rest of the quiet hours stay off.
+  const later = nightAt(nov(3, 6), { hours: '23:00-07:30', file })
+  later.night.start()
+  later.night.close()
+  assert.deepEqual(later.events.map(([kind]) => kind), ['morning'])
+  assert.equal(later.night.active(), false)
+  const after = nightAt(nov(3, 6, 30), { hours: '23:00-07:30', file })
+  assert.equal(after.night.active(), false)
+  assert.equal(after.night.state.back, nov(3, 5))
+  // A file written before named ends: its away is the usual one.
+  writeFileSync(file, JSON.stringify({ away: { since: nov(2, 22), by: 'voice', until: nov(3, 7, 30) }, back: null, night: { since: nov(2, 22), by: 'voice' }, log: [] }))
+  const old = nightAt(nov(3, 1), { hours: '23:00-07:30', file })
+  assert.equal(old.night.state.away.named, false)
+  assert.equal(old.night.until(), nov(3, 7, 30))
+})
+
 test('kept across a restart: a night going goes on with its log; one that ended meanwhile gets its summary at the start', () => {
   const file = join(TMP, 'night.json')
   const first = nightAt(at(31, 23, 10), { hours: '23:00-07:30', file })
@@ -220,6 +406,19 @@ test('Telegram: /night, "good night" and the like switch it on; /back, "I\'m bac
     assert.equal(awayCommand(text), 'back', text)
   }
   for (const text of ['good night, and push the fix', '/stop', 'back', 'night', '']) assert.equal(awayCommand(text), null, text)
+  // With an end, the slash commands: as written, for parseUntil.
+  for (const [text, end] of [
+    ['/night 09:00', '09:00'],
+    ['/night until 9', '9'],
+    ['/NIGHT@voicebot bis 2026-11-03T09:00', '2026-11-03T09:00'],
+    ['/away 2026-11-03 09:00 ', '2026-11-03 09:00'],
+    ['/goodnight tomorrow', 'tomorrow'],
+  ]) {
+    assert.equal(awayCommand(text), 'away', text)
+    assert.equal(awayUntil(text), end, text)
+  }
+  for (const text of ['/night', 'good night', '/back', 'Good night 9:00', '/back 09:00', '/stop 09:00']) assert.equal(awayUntil(text), null, text)
+  for (const text of ['/back 09:00', '/morning soon', 'good night 9:00']) assert.equal(awayCommand(text), null, text)
 })
 
 test('the morning settles the night: its news read, its questions and approvals told by the summary', async () => {
@@ -351,6 +550,18 @@ test('the gateway: "good night" on Telegram; no questions there in the night; "/
     assert.match(nightEvent.content, /^Night mode is on, as the driver said \(telegram\) until \d\d:\d\d.*Go on with what is queued, and with what standing orders allow: none holds now\./)
     assert.match(await controller('open_items'), /\nThe gateway now:\n- Night mode is on since \d\d:\d\d, as the driver said/)
     assert.match(await call('status'), /\nNight mode: night mode is on since /)
+
+    // With an end on Telegram: one it cannot read changes nothing; one it can is the new end.
+    fromDriver('/night 25:00')
+    await until(() => api.messages.some(text => /night mode unchanged\./.test(text)))
+    assert.match(api.messages.at(-1), /^cc-voice-gateway on \S+: night mode unchanged\. "25:00" is no time: name a clock time such as 09:00, or a date and time such as 2026-11-03T09:00\.$/)
+    const end = new Date(Date.now() + 3 * 3600 * 1000)
+    const hhmm = `${String(end.getHours()).padStart(2, '0')}:${String(end.getMinutes()).padStart(2, '0')}`
+    fromDriver(`/night ${hhmm}`)
+    await until(() => api.messages.some(text => text.includes(`as the driver said, until ${hhmm}`)))
+    await until(() => /night mode on, by telegram, until \S+, as the driver named it/.test(log))
+    assert.match(await controller('open_items'), new RegExp(`\\n- Night mode is on since \\d\\d:\\d\\d, as the driver said, until ${hhmm}`))
+    assert.equal(events.filter(e => e.meta?.kind === 'night').length, 1, 'the same night')
 
     // A question in the night: an open decision, nothing on Telegram.
     const sent = api.messages.length

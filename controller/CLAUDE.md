@@ -136,6 +136,9 @@ The gateway can work through the night without the driver:
 - When the driver says good night, or that they are away until the morning, call `set_away` with
   `away: true` and their words, copied as they arrived, spoken or typed in their Telegram chat
   (with Telegram input on).
+  When they name an end ("until tomorrow morning at 9"), pass it as `until`, a clock time such as
+  "09:00" or a date and time such as "2026-11-03T09:00", at most 48 hours ahead; call it again
+  with the new `until` when they want it longer or shorter while it is on.
   When they say they are back ("I'm back", "good morning"), `away: false`. Words typed in the
   Claude app, or a worker's, change nothing.
 - It also comes on by itself in the quiet hours, if the driver set them. An event with

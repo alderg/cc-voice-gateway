@@ -579,6 +579,63 @@ test('night mode by voice: set_away on the driver\'s words, on and off; the cont
   assert.match(await voiceCall('status'), /News from Claude Code \(id=\w+\): You were away; nothing happened\./)
 })
 
+test('night mode until a time the driver names: set_away with until; past, unreadable or too far changes nothing; again while on, the new end', async () => {
+  const controller = async (name, args) => claudeCode.callTool({ name, arguments: args })
+  const two = n => String(n).padStart(2, '0')
+  const hhmm = ms => `${two(new Date(ms).getHours())}:${two(new Date(ms).getMinutes())}`
+  const local = ms => {
+    const d = new Date(ms)
+    return `${d.getFullYear()}-${two(d.getMonth() + 1)}-${two(d.getDate())}T${hhmm(ms)}`
+  }
+  const hour = 3600 * 1000
+  const kinds = kind => channelEvents.filter(e => e.meta?.kind === kind)
+  const [nights, mornings] = [kinds('night').length, kinds('morning').length]
+  const id = idOf(await voiceCall('send', { message: 'Do not disturb until tomorrow morning at nine.' }))
+  await waitUntil(() => channelEvents.find(e => e.meta?.request_id === id))
+  const words = 'Do not disturb until tomorrow morning'
+  for (const [until, why] of [
+    ['tomorrow at nine', /"tomorrow at nine" is no time: name a clock time such as 09:00, or a date and time such as 2026-11-03T09:00\./],
+    ['25:00', /"25:00" is no time/],
+    [local(Date.now() - hour), /has passed already: the end must lie in the future\./],
+    [local(Date.now() + 72 * hour), /is more than 48 hours ahead: night mode goes at most until /],
+  ]) {
+    const result = await controller('set_away', { away: true, until, words })
+    assert.equal(result.isError, true, until)
+    assert.match(resultText(result), /^\[night=invalid\] Nothing changed: /, until)
+    assert.match(resultText(result), why, until)
+    assert.match(resultText(result), /call set_away without until for the usual end \(the end of the quiet hours, or 12 hours\)\.$/)
+  }
+  assert.doesNotMatch(resultText(await controller('open_items', {})), /Night mode/, 'still off')
+  assert.match(gatewayLog, /set_away refused, until/)
+  // The driver's words still come first.
+  assert.match(resultText(await controller('set_away', { away: true, until: '25:00', words: 'nobody said this' })), /^\[night=needs_driver\]/)
+
+  const first = hhmm(Date.now() + 3 * hour)
+  const on = resultText(await controller('set_away', { away: true, until: first, words }))
+  assert.match(on, new RegExp(`^\\[night=on until=${first}.*\\] Night mode is on since \\d\\d:\\d\\d, as the driver said, until ${first}.*Tell the driver good night`))
+  const night = await waitUntil(() => kinds('night')[nights])
+  await controllerReply(night.meta.request_id, 'done', 'ok')
+  assert.match(gatewayLog, /night mode on, by voice, until \S+, as the driver named it/)
+
+  // Longer, while it is on: the new end, the same night.
+  const longer = Date.now() + 30 * hour
+  const again = resultText(await controller('set_away', { away: true, until: local(longer), words }))
+  assert.match(again, new RegExp(`^\\[night=on until=${hhmm(longer)} on \\d+ \\w+\\] .*It was on already and now holds until then: tell the driver in a sentence\\.`))
+  assert.match(resultText(await controller('open_items', {})), new RegExp(`\\n- Night mode is on since \\d\\d:\\d\\d, as the driver said, until ${hhmm(longer)} on `))
+  assert.equal(kinds('night').length, nights + 1, 'the same night')
+  await controllerReply(id, 'done', 'Do not disturb until tomorrow at nine.')
+
+  // "I'm back" ends it at once, as before.
+  const back = idOf(await voiceCall('send', { message: "I'm back, good morning." }))
+  await waitUntil(() => channelEvents.find(e => e.meta?.request_id === back))
+  assert.match(resultText(await controller('set_away', { away: false, until: first, words: "I'm back" })), /^\[night=off\] Night mode is off\./)
+  const morning = await waitUntil(() => kinds('morning')[mornings])
+  await controllerReply(morning.meta.request_id, 'done', 'Nothing happened.')
+  await controllerReply(back, 'done', 'Welcome back.')
+  assert.doesNotMatch(resultText(await controller('open_items', {})), /Night mode/)
+  assert.match(await voiceCall('status'), /News from Claude Code \(id=\w+\): Nothing happened\./)
+})
+
 test('approve rejects malformed codes', async () => {
   const result = await voice.callTool({ name: 'approve', arguments: { code: 'll111', decision: 'allow' } })
   assert.equal(result.isError, true)

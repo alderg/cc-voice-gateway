@@ -180,24 +180,39 @@ export function funnelCommand(text) {
 }
 
 // Night mode (night.mjs): 'away' for /night, /goodnight, /away or "good night"
-// (and the same in German, French, Italian, Spanish); 'back' for /back,
-// /morning, "I'm back" or "good morning". null otherwise.
+// (and the same in German, French, Italian, Spanish), the slash commands also
+// with an end ("/night 09:00", "/night until 2026-11-03T09:00", awayUntil);
+// 'back' for /back, /morning, "I'm back" or "good morning". null otherwise:
+// digits count as words, so that "good night 9:00" is no bare "good night"
+// that drops the end, but a request for the controller, with until.
 const AWAY_WORDS = ['good night', 'goodnight', 'gute nacht', 'bonne nuit', 'buona notte', 'buonanotte', 'buenas noches']
 const BACK_WORDS = ["i'm back", 'im back', 'i am back', 'good morning', 'guten morgen', 'bin zurück', 'ich bin zurück', 'bonjour', 'buongiorno', 'buenos días']
+const AWAY_SLASH = /^\/(night|goodnight|away|back|morning)(?:@\w+)?(?:\s+(?:until\s+|bis\s+)?(\S.*))?$/i
 
 export function awayCommand(text) {
-  const slash = /^\/(night|goodnight|away|back|morning)(?:@\w+)?$/i.exec(String(text).trim())
-  if (slash) return ['back', 'morning'].includes(slash[1].toLowerCase()) ? 'back' : 'away'
+  const slash = AWAY_SLASH.exec(String(text).trim())
+  if (slash) {
+    const back = ['back', 'morning'].includes(slash[1].toLowerCase())
+    if (back && slash[2]) return null
+    return back ? 'back' : 'away'
+  }
   const words = String(text)
     .normalize('NFC')
     .toLowerCase()
     .replace(/[’`]/g, "'")
-    .replace(/[^\p{L}\s']+/gu, ' ')
+    .replace(/[^\p{L}\p{N}\s']+/gu, ' ')
     .replace(/\s+/g, ' ')
     .trim()
   if (AWAY_WORDS.includes(words)) return 'away'
   if (BACK_WORDS.includes(words)) return 'back'
   return null
+}
+
+// The end named after /night, /goodnight or /away, as written ("09:00"), for
+// night.mjs's parseUntil; null without one.
+export function awayUntil(text) {
+  const slash = AWAY_SLASH.exec(String(text).trim())
+  return slash?.[2] && awayCommand(text) === 'away' ? slash[2].trim() : null
 }
 
 // The statistics: /stats for this running time, /stats all for all time.
@@ -401,7 +416,7 @@ export class TelegramCommands extends EventEmitter {
     const stats = reply ? null : statsCommand(text)
     if (stats) return accept(stats.all ? 'stats all' : 'stats', 'stats', { all: stats.all, text })
     const away = reply ? null : awayCommand(text)
-    if (away) return accept(away === 'away' ? 'night on' : 'night off', 'away', { on: away === 'away', text })
+    if (away) return accept(away === 'away' ? 'night on' : 'night off', 'away', { on: away === 'away', until: awayUntil(text), text })
     if (slash) return refuse(`"${preview(text, 30)}" is no command here. The commands: /stop, /funnel, /stats, /night and /back.`)
     if (!this.answers) return refuse(INPUT_OFF)
     if (age > this.maxAgeSeconds) return stale()

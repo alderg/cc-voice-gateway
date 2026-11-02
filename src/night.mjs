@@ -2,8 +2,12 @@
 // quiet hours (VOICE_GW_QUIET_HOURS=23:00-07:30, in the computer's time), and
 // when the driver says so ("good night" by voice through the controller's
 // set_away, /night or "good night" on Telegram), until the end of the quiet
-// hours, or for AWAY_HOURS without them. "I'm back" (/back) ends it, also
-// within the quiet hours, for the rest of them.
+// hours, or for AWAY_HOURS without them, or until the end the driver named
+// ("until tomorrow morning at 9": set_away's until, /night 09:00; parseUntil),
+// at most MAX_AWAY_HOURS ahead. A named end is the end: later than the quiet
+// hours it holds past them, and within them it ends them then, as "I'm back"
+// would. "I'm back" (/back) ends it, also within the quiet hours, for the rest
+// of them.
 //
 // While it is on (workers.mjs, gateway.mjs): worker runs decide what the
 // concept, the task or sensible defaults allow, conservatively, note each
@@ -26,7 +30,9 @@ import { clock } from './limits.mjs'
 import { log as defaultLog, preview } from './log.mjs'
 
 export const AWAY_HOURS = 12 // "good night" without quiet hours lasts this long, unless "I'm back" comes first
+export const MAX_AWAY_HOURS = 48 // an end the driver names lies at most this far ahead
 const DAY = 24 * 60
+const HOUR_MS = 60 * 60 * 1000
 const KEEP = 200 // results noted in one night, at most
 
 // "23:00-07:30" as { start, end } in minutes after midnight, or null.
@@ -77,6 +83,50 @@ export function nextEnd(hours, now) {
   return null
 }
 
+// An end the driver named for night mode: a clock time in the computer's
+// time zone, as the quiet hours are ("09:00", "9", "9.30"), the next time it
+// comes; or a date and time ("2026-11-03T09:00", also with a space, seconds,
+// and Z or an offset such as +01:00; without, in the computer's time). Gives
+// { at } in ms, in the future and at most MAX_AWAY_HOURS ahead, else { error }
+// in a sentence.
+export function parseUntil(text, now = Date.now()) {
+  const value = String(text ?? '').trim()
+  const named = `"${preview(value, 40)}"`
+  let at = null
+  const time = /^(\d{1,2})(?:[:.](\d{2}))?$/.exec(value)
+  const iso = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?\s*(Z|[+-]\d{2}:?\d{2})?$/i.exec(value)
+  if (time) {
+    const [hours, minutes] = [Number(time[1]), Number(time[2] ?? 0)]
+    if (hours <= 23 && minutes <= 59) {
+      const date = new Date(now)
+      date.setHours(hours, minutes, 0, 0)
+      if (date.getTime() <= now) {
+        date.setDate(date.getDate() + 1)
+        date.setHours(hours, minutes, 0, 0)
+      }
+      at = date.getTime()
+    }
+  } else if (iso) {
+    const [year, month, day, hours, minutes, seconds] = iso.slice(1, 7).map(part => Number(part ?? 0))
+    const date = new Date(Date.UTC(year, month - 1, day))
+    const offset = /^([+-])(\d{2}):?(\d{2})$/.exec(iso[7] ?? '')
+    const zone = !iso[7] || /^z$/i.test(iso[7]) || (offset && Number(offset[2]) <= 14 && Number(offset[3]) <= 59)
+    if (date.getUTCMonth() === month - 1 && date.getUTCDate() === day && hours <= 23 && minutes <= 59 && seconds <= 59 && zone) {
+      if (!iso[7]) at = new Date(year, month - 1, day, hours, minutes, seconds).getTime()
+      else {
+        const shift = offset ? (offset[1] === '-' ? -1 : 1) * (Number(offset[2]) * 60 + Number(offset[3])) * 60000 : 0
+        at = Date.UTC(year, month - 1, day, hours, minutes, seconds) - shift
+      }
+    }
+  }
+  if (at === null) return { error: `${named} is no time: name a clock time such as 09:00, or a date and time such as 2026-11-03T09:00.` }
+  if (at <= now) return { error: `${named} has passed already: the end must lie in the future.` }
+  if (at - now > MAX_AWAY_HOURS * HOUR_MS) {
+    return { error: `${named} is more than ${MAX_AWAY_HOURS} hours ahead: night mode goes at most until ${clock(now + MAX_AWAY_HOURS * HOUR_MS, now)}.` }
+  }
+  return { at }
+}
+
 // What a worker's report says under "Assumptions:" and "Deferred questions:",
 // as the night's rule asks for: { assumptions, deferred }, the lines without
 // their dashes, "none" left out.
@@ -114,9 +164,10 @@ export class Night extends EventEmitter {
     this.now = now
     this.pollMs = pollMs
     this.log = log
-    // away: { since, by, until } after "good night"; back: when "I'm back" was
-    // said, which ends the quiet window it was said in; night: the night going,
-    // { since, by }, with its log of results and notes.
+    // away: { since, by, until, named } after "good night", named when until
+    // is the end the driver named; back: when "I'm back" was said, which ends
+    // the quiet window it was said in; night: the night going, { since, by },
+    // with its log of results and notes.
     this.state = { away: null, back: null, night: null, log: [] }
     this.timer = null
     this.load()
@@ -128,7 +179,10 @@ export class Night extends EventEmitter {
       const saved = JSON.parse(readFileSync(this.file, 'utf8'))
       const at = value => (Number.isFinite(value) ? value : null)
       this.state = {
-        away: saved.away && at(saved.away.since) ? { since: saved.away.since, by: String(saved.away.by ?? ''), until: at(saved.away.until) } : null,
+        away:
+          saved.away && at(saved.away.since)
+            ? { since: saved.away.since, by: String(saved.away.by ?? ''), until: at(saved.away.until), named: saved.away.named === true && at(saved.away.until) !== null }
+            : null,
         back: at(saved.back),
         night: saved.night && at(saved.night.since) ? { since: saved.night.since, by: String(saved.night.by ?? '') } : null,
         log: Array.isArray(saved.log) ? saved.log.filter(item => item && typeof item === 'object').slice(-KEEP) : [],
@@ -164,19 +218,39 @@ export class Night extends EventEmitter {
     clearInterval(this.timer)
   }
 
-  // Whether night mode is on now.
-  active(now = this.now()) {
+  // The driver's "good night" while it holds, else null.
+  holding(now = this.now()) {
     const away = this.state.away
-    if (away && (away.until === null || now < away.until)) return true
-    const window = windowAt(this.hours, now)
-    return Boolean(window && !(this.state.back && this.state.back >= window.from))
+    return away && (away.until === null || now < away.until) ? away : null
   }
 
-  // Until when it is on, in ms, or null when only "I'm back" ends it.
-  until(now = this.now()) {
-    const away = this.state.away && (this.state.away.until === null || now < this.state.away.until) ? this.state.away : null
+  // Whether the driver ended this quiet window before its time: "I'm back"
+  // said in it, or an end they named that came within it (not at its start,
+  // where the quiet hours carry on).
+  ended(window, now = this.now()) {
+    const { away, back } = this.state
+    if (back && back >= window.from) return true
+    return Boolean(away?.named && away.until > window.from && away.until <= now)
+  }
+
+  // Whether night mode is on now.
+  active(now = this.now()) {
+    if (this.holding(now)) return true
     const window = windowAt(this.hours, now)
-    const quiet = window && !(this.state.back && this.state.back >= window.from) ? window.to : null
+    return Boolean(window && !this.ended(window, now))
+  }
+
+  // Until when it is on, in ms, or null when only "I'm back" ends it. Of a
+  // "good night", the later of its end and the quiet window's; of an end the
+  // driver named, that end, unless the quiet hours begin just then.
+  until(now = this.now()) {
+    const away = this.holding(now)
+    if (away?.named) {
+      const next = windowAt(this.hours, away.until)
+      return next && next.from === away.until ? next.to : away.until
+    }
+    const window = windowAt(this.hours, now)
+    const quiet = window && !this.ended(window, now) ? window.to : null
     if (away) return away.until === null ? null : Math.max(away.until, quiet ?? 0)
     return quiet
   }
@@ -185,7 +259,7 @@ export class Night extends EventEmitter {
   text(now = this.now()) {
     if (!this.active(now)) return ''
     const until = this.until(now)
-    const why = this.state.away && (this.state.away.until === null || now < this.state.away.until) ? `since ${clock(this.state.away.since, now)}, as the driver said` : 'in the quiet hours'
+    const why = this.holding(now) ? `since ${clock(this.state.away.since, now)}, as the driver said` : 'in the quiet hours'
     return (
       `night mode is on ${why}, ${until ? `until ${clock(until, now)}` : 'until the driver says they are back'}: workers decide what they ` +
       'can, conservatively, note assumptions and defer what needs the driver; questions and decisions wait for the morning, ' +
@@ -193,16 +267,19 @@ export class Night extends EventEmitter {
     )
   }
 
-  // "Good night": on now, until the end of the quiet hours, or AWAY_HOURS.
+  // "Good night": on now, until the end of the quiet hours, or AWAY_HOURS;
+  // with end, the end the driver named (in ms, from parseUntil), also to
+  // extend or shorten a "good night" that holds, which keeps its beginning.
   // by: voice, telegram. Returns whether it changed.
-  away(by = 'voice') {
+  away(by = 'voice', end = null) {
     const now = this.now()
     const was = this.active(now)
-    const until = this.hours ? nextEnd(this.hours, now) : now + AWAY_HOURS * 60 * 60 * 1000
-    this.state.away = { since: now, by, until }
+    const named = Number.isFinite(end) && end > now
+    const until = named ? end : this.hours ? nextEnd(this.hours, now) : now + AWAY_HOURS * HOUR_MS
+    this.state.away = { since: this.holding(now)?.since ?? now, by, until, named }
     this.state.back = null
     this.save()
-    this.log(`night mode on, by ${by}, until ${new Date(until).toISOString()}`)
+    this.log(`night mode on, by ${by}, until ${new Date(until).toISOString()}${named ? ', as the driver named it' : ''}`)
     this.tick()
     return !was
   }
@@ -234,7 +311,13 @@ export class Night extends EventEmitter {
       const night = { since: this.state.night.since, until: now, by: by ?? (this.state.away ? 'its time' : 'the end of the quiet hours'), log: this.state.log }
       this.state.night = null
       this.state.log = []
-      if (this.state.away && this.state.away.until !== null && now >= this.state.away.until) this.state.away = null
+      const away = this.state.away
+      if (away && away.until !== null && now >= away.until) {
+        // A named end within the quiet hours ended them, as "I'm back" then
+        // would have; so it stays.
+        if (away.named && windowAt(this.hours, away.until)?.from < away.until) this.state.back = Math.max(this.state.back ?? 0, away.until)
+        this.state.away = null
+      }
       this.save()
       this.emit('morning', night)
     }

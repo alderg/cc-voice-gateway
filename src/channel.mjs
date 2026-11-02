@@ -41,7 +41,7 @@ import { draftIgnored, pullRequestKind, queueList, runList } from './workers.mjs
 import { DECISION_KINDS, decisionLine, openItems } from './ledger.mjs'
 import { toolText as statsText } from './stats.mjs'
 import { clock } from './limits.mjs'
-import { nextEnd } from './night.mjs'
+import { AWAY_HOURS, MAX_AWAY_HOURS, nextEnd, parseUntil } from './night.mjs'
 import { DEFAULT_HOURS, MAX_HOURS } from './orders.mjs'
 import { VOICE_ONLY_KINDS } from './telegram.mjs'
 
@@ -235,7 +235,8 @@ tell the driver in a sentence when they ask. Events that came while you were at 
 and arrive afterwards, marked resent="yes": answer them as usual. Usage credits are no limit: with them the runs go on
 past the plan's limit and nothing waits; list_workers notes it ("Credits: …"), to mention only when the driver asks.
 Night mode: when the driver says good night, or that they are away until the morning, call set_away with away=true and
-their words; when they say they are back, away=false. It also comes on by itself in the quiet hours. An event with
+their words, and with until when they name an end ("until tomorrow at 9"), also to extend it; when they say they are
+back, away=false. It also comes on by itself in the quiet hours. An event with
 kind="night" says it began: reply "done". While it is on, the driver is away: workers decide what they can and defer
 what needs the driver, and Telegram carries alarms only. Go on with what is queued; summarise results as usual. Ask
 questions as usual: they become open decisions that wait for the morning and hold only their repository, so other work
@@ -604,8 +605,10 @@ const AWAY_TOOL = {
   name: 'set_away',
   description:
     'Night mode on or off, on the driver\'s word: away=true when they say good night, or that they are away until the ' +
-    'morning; away=false when they say they are back ("I\'m back", "good morning"). While it is on, workers decide what ' +
-    'they can and defer what needs the driver, questions and decisions wait for the morning, and Telegram carries ' +
+    'morning; away=false when they say they are back ("I\'m back", "good morning"). Without "until" it lasts until the ' +
+    `end of the quiet hours, or ${AWAY_HOURS} hours; when the driver names an end ("until tomorrow morning at 9"), pass ` +
+    'it as "until". Called again while it is on, it sets the new end, also to extend it. While it is on, workers decide ' +
+    'what they can and defer what needs the driver, questions and decisions wait for the morning, and Telegram carries ' +
     'alarms only; when it ends, one summary of the night arrives as an event with kind="morning". It also comes on by ' +
     'itself in the quiet hours, if the driver set them. Changes nothing unless "words" come from a recent voice request ' +
     'of the driver, as for dispatch.',
@@ -613,6 +616,13 @@ const AWAY_TOOL = {
     type: 'object',
     properties: {
       away: { type: 'boolean', description: 'true: night mode on; false: off, the driver is back.' },
+      until: {
+        type: 'string',
+        description:
+          'Only with away=true, when the driver names an end: a clock time such as "09:00", in the computer\'s time ' +
+          'zone, the next time it comes; or a date and time such as "2026-11-03T09:00". It must lie in the future, at ' +
+          `most ${MAX_AWAY_HOURS} hours ahead. It is the end, also before or after the quiet hours.`,
+      },
       words: WORDS_PROPERTY,
     },
     required: ['away', 'words'],
@@ -726,12 +736,26 @@ function awayText(store, night, args) {
   }
   const by = said.via === 'telegram' ? 'telegram' : 'voice'
   if (args.away === true) {
-    night.away(by)
+    // An end the driver named: in the future, at most MAX_AWAY_HOURS ahead.
+    const named = args.until === undefined || args.until === null || String(args.until).trim() === '' ? null : parseUntil(args.until, night.now())
+    if (named?.error) {
+      log('set_away refused, until', preview(String(args.until)), named.error)
+      return toolText(
+        `[night=invalid] Nothing changed: ${named.error} Ask the driver for the end once more, or call set_away without ` +
+          `until for the usual end (the end of the quiet hours, or ${AWAY_HOURS} hours).`,
+        true,
+      )
+    }
+    const began = night.away(by, named?.at ?? null)
     const until = night.until()
+    const later = named && night.state.away?.named && until !== named.at ? ` The quiet hours begin at ${clock(named.at)}, so it lasts until ${clock(until)}.` : ''
     return toolText(
-      `[night=on${until ? ` until=${clock(until)}` : ''}] ${night.text().replace(/^n/, 'N')}. Tell the driver good night in ` +
-        'a sentence, and in a few words what goes on meanwhile (runs, queued tasks, standing orders). In the morning a ' +
-        'summary of the night arrives as an event with kind="morning".',
+      `[night=on${until ? ` until=${clock(until)}` : ''}] ${night.text().replace(/^n/, 'N')}.${later} ` +
+        (named && !began
+          ? 'It was on already and now holds until then: tell the driver in a sentence. '
+          : 'Tell the driver good night in a sentence, and in a few words what goes on meanwhile (runs, queued tasks, ' +
+            'standing orders). ') +
+        'In the morning a summary of the night arrives as an event with kind="morning".',
     )
   }
   if (!night.back(by)) return toolText('[night=off] Night mode was not on; nothing changed. Tell the driver in a few words.')

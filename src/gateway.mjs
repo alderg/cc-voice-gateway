@@ -63,7 +63,7 @@ import { Stats, shutdownText, telegramText } from './stats.mjs'
 import { Standby } from './standby.mjs'
 import { Presence } from './presence.mjs'
 import { Limits, TranscriptWatch, accountName, clock } from './limits.mjs'
-import { Night, morningText } from './night.mjs'
+import { Night, morningText, parseUntil } from './night.mjs'
 import { Orders } from './orders.mjs'
 
 // How long a shutdown waits at most for its message on Telegram.
@@ -676,11 +676,13 @@ if (telegram) {
     if (!state && !killswitch.locked) say(`cc-voice-gateway on ${hostname()}: "${text}" locked nothing. ${offText()}`)
   })
   telegramCommands.on('funnel', ({ action }) => funnel.command(action))
-  // Night mode on (/night, "good night") or off (/back, "I'm back"); off,
-  // the morning summary follows (night.mjs, below).
-  telegramCommands.on('away', ({ on }) => {
+  // Night mode on (/night, "good night", /night 09:00 with an end) or off
+  // (/back, "I'm back"); off, the morning summary follows (night.mjs, below).
+  telegramCommands.on('away', ({ on, until }) => {
     if (on) {
-      night.away('telegram')
+      const named = until ? parseUntil(until) : null
+      if (named?.error) return say(`cc-voice-gateway on ${hostname()}: night mode unchanged. ${named.error}`)
+      night.away('telegram', named?.at ?? null)
       say(`cc-voice-gateway on ${hostname()}: good night. ${capital(night.text())}. Send /back or "I'm back" to end it.`)
     } else if (!night.back('telegram')) {
       say(`cc-voice-gateway on ${hostname()}: night mode was not on.`)
