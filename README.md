@@ -1183,7 +1183,7 @@ at every start.
 | Telegram | `/stop` or a phrase | See 5.8 |
 | Rule: default branch | A push to the default branch, or a merge into it, without a direct dispatch at level `full`, in a repository with pull requests turned on | In the run's commands: `git push` to the default branch, `--all`, `--mirror`; `gh pr merge` of a pull request whose base on GitHub is the default branch, and every `gh pr merge` the rule cannot be sure of (below); and `gh api` calls that merge, whatever the base (`PUT …/pulls/<n>/merge`, `POST …/merges`, the GraphQL mutations `mergePullRequest`, `enablePullRequestAutoMerge`, `mergeBranch`). With `gh`, every `VOICE_GW_KILL_CHECK` seconds and at the end: the default branch moved on GitHub, and the worker's repository holds the new head, or the new head merged a pull request of the run (below) |
 | Rule: outside | Writes outside the repository (for a run in a [worktree](#several-runs-per-repository), outside its worktree), its own [run folder](#55-workers-on-this-computer-or-in-docker) (never another run's, nor `.voice-runs` around it, nor `~/voice-scratch`), `/tmp`, `/var/tmp` (and the system's temp folder on this computer), the run's own Claude Code memory folder (`~/.claude/projects/<repository path with - for every other character>/memory`, where auto memory writes; another project's is outside) and `VOICE_GW_KILL_ALLOW_PATHS`; for a run in a [work folder](#work-folders), writes outside that folder, those temporary folders and its memory folder; writing to `/dev/null`, the standard streams, a terminal or `/dev/fd/N` is none | The file tools by path. Shell commands by explicit targets: redirections, `tee`, `cp`, `mv`, `rm`, `mkdir`, `touch`, `ln`, `chmod`, `chown`, `truncate`, `sed -i`, `dd of=`, also after `cd`; `$HOME` and `~` are expanded, and so are `$TMPDIR` and `$VOICE_GW_RUN_FOLDER` to the run folder. The command line is read as a shell reads it: quoted text, comments, here-strings and heredoc bodies are data, so a `>` or `;` in a pattern, a commit message or a script written to a file is none; the commands in `$(…)`, backticks, `<(…)`, `>(…)`, `sh -c`, `eval` and a heredoc a shell reads are checked like any other, and so is a script written from a heredoc that the same call runs |
-| Rule: many changes | More than 500 file edits in a run; at its end more than 300 files or 30,000 lines changed; in a work folder, more than 300 files in it. Apart from these, the run's [helper folder](#55-workers-on-this-computer-or-in-docker) `.voice-scratch`, for its test reports, screenshots and logs: more than 10,000 file edits there, its run folder and the temporary folders together, or untracked files in the helper folder at the end | Edits as they happen; at the end the commits made during the run plus what is not committed, or the files in the work folder. What is untracked in the helper folder counts only against its own limit, so the limit for real code stays as strict; what is committed or tracked there counts as any change. What is in the run folder and the temporary folders at the end is no change at all. `VOICE_GW_KILL_MAX_*` |
+| Rule: many changes | More than 500 file edits in a run; at its end more than 300 files or 30,000 lines changed; in a work folder, more than 300 files in it. Apart from these, the run's [helper folder](#55-workers-on-this-computer-or-in-docker) `.voice-scratch`, for its test reports, screenshots and logs: more than 10,000 file edits there, its run folder and the temporary folders together, or untracked files in the helper folder at the end | Edits as they happen; at the end the commits made during the run, each by its own changes, plus what is not committed, or the files in the work folder. What commits on branches the run made take over from before it counts nothing, on a branch from before the run everything counts (below). What is untracked in the helper folder counts only against its own limit, so the limit for real code stays as strict; what is committed or tracked there counts as any change. What is in the run folder and the temporary folders at the end is no change at all. `VOICE_GW_KILL_MAX_*` |
 | Controller | `raise_alarm` with a reason | One more signal, never the only one |
 
 **Whose merge it is.** A merge on GitHub makes a commit that the worker's repository does not
@@ -1237,6 +1237,33 @@ commands again, and for a merge an earlier gateway let go it looks up the pull r
 the task in `.state/workers.json`, not the branch as it is now. `gh pr edit --base` is no merge
 and does not count. The worker's rules still say never to merge: a merge belongs only in a task
 that asks for it.
+
+**What a run took over.** The count of changes at the end is of what the run changed, not of the
+code it carried from one branch to another. Of a commit that only branches the run made hold (or
+no branch at all, such as a worktree's detached HEAD), a file counts nothing when the commit sets
+it to a version that a commit from before the run had at that path, or removes it where the
+default branch does not have it. So review-only branches made of a long-lived branch's existing
+code count nothing: on 2026-11-02 a drawio-dev run made one at the merge base of `simple-modern`
+and `dev` for each of six areas and one on it with `simple-modern`'s tree, and the count of
+223,478 lines in 161 files locked the switch, of which 678 lines in 77 files were the run's own
+fixes. Neither does a cherry-pick or a rebase of commits from before the run onto a new branch.
+Everything else counts, as before:
+
+- every commit that a branch from before the run holds, in the repository or as a remote branch:
+  setting such a branch back to old versions, removing its files, or rewriting its history and
+  force-pushing it counts in full. A branch is the run's when its reflog begins during the run
+  with its creation, for a remote branch by a push; a branch without a reflog counts as from
+  before;
+- new code, also a version from before the run under another path, and the removal of files the
+  default branch has, such as a wipe, on any branch;
+- what is not committed;
+- all of it after a `git push` to a URL or a path, which no remote branch in the repository shows,
+  and whatever git cannot tell.
+
+The gateway's log names what it left out (`kill switch rule on many changes: 77 files and 678
+lines changed in one run, not counting 222800 lines in 159 files that branches the run made took
+over from before it (worker drawio-dev, task tsz4)`), and so does the reason when it still locks.
+The statistics count what the rule counted.
 
 **Effects**, at once:
 
@@ -1346,6 +1373,11 @@ is guarded as follows:
   A worker that fetched someone else's push can look guilty. A push whose commit the worker did
   not keep is missed. A merge that you approved through the controller while a worker in the same
   repository fetches can also look like the worker's push.
+- **The count of changes goes by the repository's git.** It takes the commits by their committer
+  date since the run's start, and the branches the run made by their reflogs. Merges count
+  nothing of their own, and a force-push that only drops commits adds none to count. A remote
+  branch that the repository had not fetched looks like the run's after its push there, and a
+  branch moved with `gh api` or by another tool is not seen.
 - **On this computer the kill switch is a tripwire, not a boundary.** Host workers run as you,
   without approvals. They can write `.secrets/` (including `killswitch.json` and `gateway.env`),
   use your SSH keys and `gh` login, and change this repository's code (the gateway, the confine
@@ -2635,6 +2667,7 @@ gateway; do not set them.
 | `dispatch=locked`, `[state=locked]` or an `[ALARM]` line | The kill switch is locked; the alarm names the trigger. `node scripts/unlock.mjs --status` shows it, `node scripts/unlock.mjs` at the server unlocks it. |
 | `dispatch=origin` | In the container, the repository's `origin` is no longer the GitHub repository the gateway saw first ([5.6](#56-access-levels-and-their-detection)). Check the clone at the desk; if the change is wanted, stop the controller and remove the repository's line under `origins` in `.state/workers.json`. |
 | The kill switch locked for no good reason | Read the reason. A rule that misfires: raise its `VOICE_GW_KILL_*` threshold, or add a folder to `VOICE_GW_KILL_ALLOW_PATHS`. |
+| The kill switch locked on `many changes` for code that was there already, such as review branches or a rebase | It counts nothing only on branches the run made ([5.9](#59-the-kill-switch), "What a run took over"). Such commits on a branch from before the run count in full, and so does everything after a `git push` to a URL, or when the repository keeps no reflogs (`core.logAllRefUpdates=false`). `kill switch rule on many changes` in the gateway's log names what was left out. |
 | The kill switch locked on `push to the default branch` for a `gh pr merge` | Read the reason after the command. "Into main, the default branch" is a merge into it. Otherwise it names what the rule could not be sure of ([5.9](#59-the-kill-switch)): the command on one line with others, `--auto`, a folder with two remotes and no `--repo`, a lookup that failed or took too long. A merge into another branch, such as a stacked pull request's base, goes when it is `gh pr merge <number> --repo owner/name` alone on its line; the log names each one it let go (`let gh pr merge of pull request …`). |
 | The kill switch locked on `write outside the allowed folders` for screenshots or other helper files, such as in `~/voice-scratch/…` | The worker wrote outside its repository, its run folder and the temporary folders, often because a task named such a place. Its run folder (`.voice-runs/<repository>/…`, also `$TMPDIR`) is the place for them: its prompt and rules say so, and the controller's instructions say to ask for such files there and to name no other folder. A run from before this version has no run folder. A folder outside every repository that workers may really use goes into `VOICE_GW_KILL_ALLOW_PATHS`, never the work folders' root. |
 | A run folder in `.voice-runs` is gone, with the screenshots in it | It is removed `VOICE_GW_RUN_FOLDER_DAYS` (7) after its session's last run; copy out what you want to keep, or set `0`. `worker_status` names the folder of the last run, and `.state/workers.json` lists them under `runFolders`. |

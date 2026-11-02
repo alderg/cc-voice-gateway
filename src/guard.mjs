@@ -43,17 +43,27 @@
 //                   there and in its memory folder.
 //   many changes    more file edits in a run than maxEdits; at the end, more
 //                   files or lines changed than maxFiles or maxLines, counting
-//                   commits made during the run on any branch and what is not
-//                   committed; in a work folder, more files in it than
-//                   maxFiles. The run's helper folder (HELPER_FOLDER,
-//                   workspaces.mjs) counts apart, against maxHelperFiles: the
-//                   file edits there, and at the end what is untracked there.
-//                   What is committed or tracked from it counts as before.
-//                   So do the file edits in its run folder and the temporary
-//                   folders, which hold no change of the repository's; what
-//                   is in them at the end is no change at all.
+//                   commits made during the run on any branch, each by its
+//                   own changes, and what is not committed; in a work folder,
+//                   more files in it than maxFiles. What a commit that only
+//                   branches the run made hold takes over from before the run
+//                   counts nothing (reused): a file set to a version that a
+//                   commit from before the run had at that path, or removed
+//                   where the default branch does not have it, as review
+//                   branches made of existing code, a cherry-pick or a rebase
+//                   do. A commit on a branch from before the run (its reflog
+//                   tells) counts in full: setting it back, removing what it
+//                   has or rewriting its history is a change. So does all of
+//                   it after a push to a URL, and whatever git cannot tell.
+//                   The run's helper folder (HELPER_FOLDER, workspaces.mjs)
+//                   counts apart, against maxHelperFiles: the file edits
+//                   there, and at the end what is untracked there. What is
+//                   committed or tracked from it counts as before. So do the
+//                   file edits in its run folder and the temporary folders,
+//                   which hold no change of the repository's; what is in
+//                   them at the end is no change at all.
 //
-// What the size check at the end finds, with whether the run pushed, also
+// What the size check at the end counted, with whether the run pushed, also
 // goes to the statistics ('measured', stats.mjs): the commits made during
 // the run, the files and lines changed.
 //
@@ -109,6 +119,12 @@ const MERGE_MUTATIONS = /\b(mergePullRequest|enablePullRequestAutoMerge|mergeBra
 // A pull request opened this long before the run's start counts as opened
 // during it: the clocks here and on GitHub differ a little.
 const CLOCK_SLACK_MS = 60 * 1000
+// The size check's look through the history of the files that the run's
+// own branches changed (versionsBefore): at most this many paths in one git
+// call, this many calls, each within this time. Beyond, nothing is left out.
+const PATHS_PER_LOOK = 1000
+const MAX_LOOKS = 10
+const HISTORY_MS = 60 * 1000
 
 // The gh on this computer, the gateway's, also for runs in the container.
 function gh(ghBin, args, timeout = 30000) {
@@ -428,8 +444,10 @@ function commandOf(words) {
 }
 
 // git [-C dir] [-c key=value] push [options] [remote [refspec...]]: the
-// branches it names as targets, and whether it pushes all of them; null for
-// another git command.
+// branches it names as targets, whether it pushes all of them, and whether
+// it pushes to a URL or a path rather than to a remote, so that no remote
+// branch in the repository shows what it pushed; null for another git
+// command.
 function pushTargets(args) {
   let at = 0
   while (at < args.length && args[at] !== 'push') at += ['-C', '-c'].includes(args[at]) ? 2 : 1
@@ -443,6 +461,7 @@ function pushTargets(args) {
   return {
     all: rest.includes('--all') || rest.includes('--mirror'),
     branches: positional.slice(1).map(spec => spec.replace(/^\+/, '').split(':').pop().replace(/^refs\/heads\//, '')),
+    elsewhere: rest.some(arg => arg === '--repo' || arg.startsWith('--repo=')) || /[:/]/.test(positional[0] ?? ''),
   }
 }
 
@@ -687,6 +706,9 @@ export class RunGuard extends EventEmitter {
       startedAt: task.startedAt,
       head: null,
       pushed: new Set(), // branches the run's git push commands name
+      // A git push to a URL or a path: where its commits went, no remote
+      // branch in the repository shows (reused).
+      pushedElsewhere: false,
       edits: 0,
       helperEdits: 0, // file edits in the helper folder, which count apart
       files: new Set(),
@@ -1114,6 +1136,7 @@ export class RunGuard extends EventEmitter {
             run.pushed.add(branch)
             if (branch !== 'HEAD') this.pushedBy.set(`${run.repo}\0${branch}`, run.id)
           }
+          if (push.elsewhere) run.pushedElsewhere = true
           // Whatever the command line says, GitHub has the last word, a moment later.
           setTimeout(() => this.checkHead(run), 5000).unref()
         }
@@ -1231,6 +1254,8 @@ export class RunGuard extends EventEmitter {
   // folder. What is untracked in the helper folder is no change of the run's:
   // it counts apart, against maxHelperFiles, and not in what it found. What
   // was committed from there, or is tracked there, counts as anywhere else.
+  // What commits on the run's own branches took over from before the run
+  // counts nothing (reused), and is not in what it found either.
   async checkSize(run) {
     if (run.scratch) {
       await this.checkFiles(run)
@@ -1243,11 +1268,30 @@ export class RunGuard extends EventEmitter {
       run.runner.git(run.dir, 'diff', '--numstat', 'HEAD'),
       run.runner.git(run.dir, 'ls-files', '--others', '--exclude-standard'),
     ])
+    const reused = await this.reused(run, refs, committed).catch(() => new Set())
     const files = new Set()
     let lines = 0
     let commits = 0
-    for (const line of `${committed ?? ''}\n${pending ?? ''}`.split('\n')) {
-      if (line.startsWith('commit ')) commits++
+    const left = { files: new Set(), lines: 0 } // what reused left out, for the log
+    let sha = null
+    for (const line of (committed ?? '').split('\n')) {
+      if (line.startsWith('commit ')) {
+        commits++
+        sha = line.slice('commit '.length).trim()
+        continue
+      }
+      const [added, deleted, path] = line.split('\t')
+      if (!path) continue
+      const size = (Number(added) || 0) + (Number(deleted) || 0)
+      if (reused.has(`${sha}\0${path}`)) {
+        left.files.add(path)
+        left.lines += size
+      } else {
+        files.add(path)
+        lines += size
+      }
+    }
+    for (const line of (pending ?? '').split('\n')) {
       const [added, deleted, path] = line.split('\t')
       if (!path) continue
       files.add(path)
@@ -1258,15 +1302,158 @@ export class RunGuard extends EventEmitter {
       if (path && inHelperFolder(path)) helpers++
       else if (path) files.add(path)
     }
+    const notCounted = left.files.size
+      ? `, not counting ${left.lines} lines in ${left.files.size} files that branches the run made took over from before it`
+      : ''
+    if (notCounted) {
+      this.log(`kill switch rule on many changes: ${files.size} files and ${lines} lines changed in one run${notCounted} (worker ${run.repo}, task ${run.id})`)
+    }
     const over = []
     if (files.size > this.maxFiles || lines > this.maxLines) {
-      over.push(`${files.size} files and ${lines} lines changed in one run (limits ${this.maxFiles} files, ${this.maxLines} lines)`)
+      over.push(`${files.size} files and ${lines} lines changed in one run (limits ${this.maxFiles} files, ${this.maxLines} lines)${notCounted}`)
     }
     if (helpers > this.maxHelperFiles) {
       over.push(`${helpers} untracked files in the helper folder ${HELPER_FOLDER} after one run (limit ${this.maxHelperFiles})`)
     }
     if (over.length) this.violation(run, 'many changes', over.join('; '))
     return { commits, files: files.size, lines }
+  }
+
+  // The file changes of the run's commits, as `${sha}\0${path}`, that take
+  // over what was there before the run, and count nothing: on a branch the
+  // run made, or on no branch, a file set to a version that a commit from
+  // before the run had at that path (a review branch made of a branch's
+  // existing code, a cherry-pick, a rebase), or removed where the default
+  // branch does not have it (a branch without another branch's own files).
+  // A commit that a branch from before the run holds, in the repository or
+  // as a remote branch, counts in full: setting such a branch back, or
+  // removing what it has, is a change, and so is rewriting its history.
+  // Whatever git cannot tell counts, as before; so does all of it after a
+  // push to a URL or a path, which no remote branch here shows.
+  async reused(run, refs, committed) {
+    const none = new Set()
+    const shas = [...String(committed ?? '').matchAll(/^commit ([0-9a-f]{40,64})$/gm)].map(match => match[1])
+    if (!shas.length || run.pushedElsewhere) return none
+    const since = Math.floor(run.startedAt / 1000)
+    const git = (...args) => run.runner.git(run.dir, ...args)
+    // The branches that hold them, and of those the ones from before the run.
+    const holding = await git('for-each-ref', '--format=%(refname)', ...shas.map(sha => `--contains=${sha}`), 'refs/heads', 'refs/remotes')
+    if (holding === null) return none
+    const before = await this.branchesBefore(run, holding.split('\n').filter(Boolean))
+    if (!before) return none
+    const theirs = before.length ? await git('rev-list', `--since=@${since}`, ...before) : ''
+    if (theirs === null) return none
+    const onBefore = new Set(theirs.split('\n'))
+    const own = new Set(shas.filter(sha => !onBefore.has(sha)))
+    if (!own.size) return none
+    // What each of them did to each file: the version it left, or D. A
+    // rename or a copy (two paths) counts, as does a path git quoted.
+    const raw = await git('log', ...refs, `--since=@${since}`, '--raw', '--no-abbrev', '--format=commit %H')
+    if (raw === null) return none
+    const changes = []
+    let sha = null
+    for (const line of raw.split('\n')) {
+      if (line.startsWith('commit ')) sha = line.slice('commit '.length).trim()
+      if (!line.startsWith(':') || !own.has(sha)) continue
+      const [meta, path, renamed] = line.split('\t') // :mode mode before after status, then the path
+      const [, , , after, status] = meta.split(' ')
+      if (path && renamed === undefined && !path.startsWith('"')) changes.push({ key: `${sha}\0${path}`, path, after, status })
+    }
+    const kept = changes.filter(change => ['A', 'M', 'T'].includes(change.status))
+    const removed = changes.filter(change => change.status === 'D')
+    const [versions, onDefault] = await Promise.all([
+      kept.length ? this.versionsBefore(run, [...new Set(kept.map(change => change.path))]) : null,
+      removed.length ? this.defaultPaths(run) : null,
+    ])
+    const reused = new Set()
+    for (const change of kept) if (versions?.has(`${change.path}\0${change.after}`)) reused.add(change.key)
+    for (const change of removed) if (onDefault && !onDefault.has(change.path)) reused.add(change.key)
+    return reused
+  }
+
+  // Of the given branches, the ones from before the run: all but those it
+  // made, whose reflog begins during the run with the branch's creation,
+  // for a remote branch by a push (one a fetch brought was on the remote).
+  // A creation has no value before it, so ref@{n} past the oldest entry
+  // names none; after git expired older entries it names the value before.
+  // A branch without a reflog counts as from before. null when git cannot
+  // tell.
+  async branchesBefore(run, branches) {
+    if (!branches.length) return []
+    const since = Math.floor(run.startedAt / 1000)
+    const git = (...args) => run.runner.git(run.dir, ...args)
+    const reflog = await git('log', '--walk-reflogs', '--date=unix', '--format=%gD %gs', ...branches)
+    if (reflog === null) return null
+    const entries = new Map() // branch -> { count, at, what } of its oldest entry; the newest come first
+    for (const line of reflog.split('\n')) {
+      const match = /^(.+)@\{(\d+)\}(?: (.*))?$/.exec(line)
+      if (!match) continue
+      const entry = entries.get(match[1]) ?? { count: 0 }
+      entries.set(match[1], { count: entry.count + 1, at: Number(match[2]), what: match[3] ?? '' })
+    }
+    const made = await Promise.all(
+      branches.map(async branch => {
+        const oldest = entries.get(branch)
+        if (!oldest || oldest.at < since) return false
+        if (branch.startsWith('refs/remotes/') && oldest.what !== 'update by push') return false
+        // Its oldest entry names a value and nothing came before it: a
+        // creation, and not a git that did not answer.
+        const [last, past] = await Promise.all(
+          [oldest.count - 1, oldest.count].map(n => git('rev-parse', '--quiet', '--verify', `${branch}@{${n}}`)),
+        )
+        return last !== null && past === null
+      }),
+    )
+    return branches.filter((branch, i) => !made[i])
+  }
+
+  // The versions that commits from before the run had at the given paths,
+  // as `${path}\0${blob}`, from the whole history of the repository; null
+  // when git cannot tell, or for too many paths.
+  async versionsBefore(run, paths) {
+    if (paths.length > PATHS_PER_LOOK * MAX_LOOKS) return null
+    const until = Math.floor(run.startedAt / 1000) - 1
+    const versions = new Set()
+    for (let i = 0; i < paths.length; i += PATHS_PER_LOOK) {
+      const out = await this.slowGit(run, [
+        '--literal-pathspecs',
+        'log',
+        '--all',
+        `--until=@${until}`,
+        '--full-history',
+        '-m',
+        '--root',
+        '--no-renames',
+        '--raw',
+        '--no-abbrev',
+        '--format=',
+        '--',
+        ...paths.slice(i, i + PATHS_PER_LOOK),
+      ])
+      if (out === null) return null
+      for (const line of out.split('\n')) {
+        const [meta, path] = line.split('\t')
+        if (!line.startsWith(':') || !path) continue
+        const [, , before, after] = meta.split(' ')
+        for (const blob of [before, after]) if (!/^0+$/.test(blob)) versions.add(`${path}\0${blob}`)
+      }
+    }
+    return versions
+  }
+
+  // The paths of the default branch as the remote has it, or null.
+  async defaultPaths(run) {
+    if (!run.branch) return null
+    const out = await this.slowGit(run, ['ls-tree', '-r', '--name-only', '--full-tree', `refs/remotes/origin/${run.branch}`])
+    return out === null ? null : new Set(out.split('\n').filter(Boolean))
+  }
+
+  // git for a look that may take longer: with a time limit of its own where
+  // the runner has gitRun, on this computer or in the container.
+  async slowGit(run, args) {
+    if (!run.runner.gitRun) return run.runner.git(run.dir, ...args)
+    const { ok, stdout } = await run.runner.gitRun(run.dir, args, { timeout: HISTORY_MS })
+    return ok ? stdout : null
   }
 
   // A work folder has no git: the files in it at the end count.

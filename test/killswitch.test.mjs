@@ -23,6 +23,7 @@ import { z } from 'zod'
 import { adminRequest } from '../src/admin.mjs'
 import { KillSwitch, emergencyPhrase } from '../src/killswitch.mjs'
 import { RunGuard } from '../src/guard.mjs'
+import { HostRunner } from '../src/runners.mjs'
 import { Workers } from '../src/workers.mjs'
 import { Telegram, TelegramCommands, isStopCommand } from '../src/telegram.mjs'
 
@@ -922,6 +923,254 @@ test('rule: many changes, file edits in the helper folder count apart, against i
   assert.equal(code.tripped.length, 1)
   assert.match(code.tripped[0].reason, /^many changes: more than 3 file edits in one run/)
   code.guard.close()
+})
+
+// --- many changes, in a real repository ------------------------------------------------------
+
+// A repository with a remote, as the drawio-dev worker found it on
+// 2026-11-02, an hour before the run: the default branch main (src/core.js,
+// 1,500 lines), and a long-lived branch feature that left main at the merge
+// base with code of its own, in two areas: area1 (two new files of 400
+// lines, and 300 lines of src/core.js changed) and area2 (one new file of
+// 400 lines). Both pushed; main went on after (docs/notes.md).
+let sizeRepos = 0
+function sizeRepo() {
+  const root = join(TMP, `size${++sizeRepos}`)
+  const dir = join(root, 'alpha')
+  const remote = join(root, 'remote.git')
+  mkdirSync(dir, { recursive: true })
+  const who = { GIT_AUTHOR_NAME: 'T', GIT_AUTHOR_EMAIL: 't@example.com', GIT_COMMITTER_NAME: 'T', GIT_COMMITTER_EMAIL: 't@example.com' }
+  const hourAgo = `@${Math.floor(Date.now() / 1000) - 3600} +0000`
+  const gitIn = (cwd, env) => (...args) =>
+    execFileSync('git', args, { cwd, env: { ...process.env, ...who, ...env }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim()
+  const before = gitIn(dir, { GIT_AUTHOR_DATE: hourAgo, GIT_COMMITTER_DATE: hourAgo })
+  const write = (path, text) => {
+    mkdirSync(join(dir, path, '..'), { recursive: true })
+    writeFileSync(join(dir, path), text)
+  }
+  const lines = (n, word) => Array.from({ length: n }, (_, i) => `${word} ${i}`).join('\n') + '\n'
+  execFileSync('git', ['init', '-q', '--bare', '-b', 'main', remote])
+  before('init', '-q', '-b', 'main')
+  before('remote', 'add', 'origin', remote)
+  write('src/core.js', lines(1500, 'core'))
+  write('README.md', '# alpha\n')
+  before('add', '.')
+  before('commit', '-q', '-m', 'main')
+  const base = before('rev-parse', 'HEAD')
+  before('switch', '-q', '-c', 'feature')
+  write('area1/a1.js', lines(400, 'a1'))
+  write('area1/a2.js', lines(400, 'a2'))
+  write('src/core.js', lines(300, 'feature core') + lines(1500, 'core').split('\n').slice(300).join('\n'))
+  before('add', '.')
+  before('commit', '-q', '-m', 'feature: area 1')
+  write('area2/b1.js', lines(400, 'b1'))
+  before('add', '.')
+  before('commit', '-q', '-m', 'feature: area 2')
+  before('switch', '-q', 'main')
+  write('docs/notes.md', lines(10, 'note'))
+  before('add', '.')
+  before('commit', '-q', '-m', 'main goes on')
+  before('push', '-q', '-u', 'origin', 'main', 'feature')
+  return { root, dir, remote, base, git: gitIn(dir, {}), gitIn, write, lines, before }
+}
+
+// The run of 2026-11-02 in that repository: review branches made of the
+// existing code of feature, one pair per area: a base, feature with the
+// area set back to the merge base, and a head on it whose tree is feature's,
+// so that the head's diff is exactly the area's code. Then a small fix on a
+// branch of its own, 10 new lines. All pushed, to new remote branches.
+function reviewBranches(repo, git = repo.git) {
+  for (const [n, area, files] of [
+    [1, 'area1', ['src/core.js']],
+    [2, 'area2', []],
+  ]) {
+    git('switch', '-q', '-c', `review-base-${n}`, 'origin/feature')
+    for (const file of files) git('checkout', repo.base, '--', file)
+    git('rm', '-q', '-r', area)
+    git('commit', '-q', '-m', `Review-only base: ${area} as before feature (never merged)`)
+    const head = git('commit-tree', 'origin/feature^{tree}', '-p', 'HEAD', '-m', `Review-only head: ${area}`)
+    git('branch', `review-head-${n}`, head)
+  }
+  git('switch', '-q', '-c', 'review-fixes', 'origin/feature')
+  repo.write('src/fix.js', repo.lines(10, 'fix'))
+  git('add', 'src/fix.js')
+  git('commit', '-q', '-m', 'Fixes of the review')
+  git('push', '-q', 'origin', 'review-base-1', 'review-head-1', 'review-base-2', 'review-head-2', 'review-fixes')
+}
+
+// The size check at the end of a run in that repository: what act does is
+// the run's; pushes are the git push commands the rules see.
+async function sizeCheck(repo, act, { limits = { maxFiles: 100, maxLines: 1000 }, task: more = {}, runner = new HostRunner(repo.root), pushes = [] } = {}) {
+  const workers = new EventEmitter()
+  const tripped = []
+  const logged = []
+  const measured = []
+  const guard = new RunGuard({
+    workers,
+    runner,
+    killswitch: { trip: event => tripped.push(event.reason) },
+    limits,
+    mainCheckSeconds: 3600,
+    log: (...parts) => logged.push(parts.join(' ')),
+  })
+  guard.on('measured', (task, size) => measured.push(size))
+  const task = { id: 'tsz4', repo: 'alpha', dir: repo.dir, slug: null, defaultBranch: 'main', startedAt: Date.now() - 1000, ...more }
+  workers.emit('started', task)
+  act()
+  for (const command of pushes) workers.emit('tool', task, { type: 'tool_use', id: `toolu_${command.length}`, name: 'Bash', input: { command } })
+  await guard.ended(task)
+  guard.close()
+  return { tripped, logged, measured: measured[0] }
+}
+
+const REVIEW_PUSH = 'git push -q origin review-base-1 review-head-1 review-base-2 review-head-2 review-fixes'
+
+test('rule: many changes, the run of 2026-11-02: review branches made of existing code count nothing, a fix on them does', async () => {
+  const repo = sizeRepo()
+  const run = await sizeCheck(repo, () => reviewBranches(repo), { pushes: [REVIEW_PUSH] })
+  assert.deepEqual(run.tripped, [], 'the review branches took over what feature had: no lock')
+  // Counted as before, they were 2 * (600 + 800) + 2 * 400 = 3,600 lines in
+  // four files, and the fix; now only the fix.
+  assert.deepEqual(run.measured, { commits: 5, files: 1, lines: 10, pushed: true })
+  assert.ok(
+    run.logged.includes(
+      'kill switch rule on many changes: 1 files and 10 lines changed in one run, not counting 3600 lines in 4 files that branches the run made took over from before it (worker alpha, task tsz4)',
+    ),
+    run.logged.join('\n'),
+  )
+
+  // The same through a runner without gitRun, such as one in the container:
+  // every look goes through its git, in the run's folder.
+  const second = sizeRepo()
+  const calls = []
+  const host = new HostRunner(second.root)
+  const container = {
+    container: 'voice-workers',
+    dir: name => join(second.root, name),
+    git: (dir, ...args) => {
+      calls.push([dir, ...args])
+      return host.git(dir, ...args)
+    },
+  }
+  const inside = await sizeCheck(second, () => reviewBranches(second), { runner: container, pushes: [REVIEW_PUSH] })
+  assert.deepEqual(inside.tripped, [])
+  assert.deepEqual(inside.measured, { commits: 5, files: 1, lines: 10, pushed: true })
+  assert.ok(calls.every(([dir]) => dir === second.dir))
+  for (const look of ['for-each-ref', 'log --walk-reflogs', 'rev-parse', '--literal-pathspecs log', 'ls-tree']) {
+    assert.ok(calls.some(([, ...args]) => args.join(' ').startsWith(look)), look)
+  }
+})
+
+test('rule: many changes, what still counts: a branch from before the run set back or rewritten, new code, a wipe, a push it cannot follow', async () => {
+  const over = /^many changes: \d+ files and \d+ lines changed in one run \(limits 100 files, 1000 lines\)/
+
+  // The same base, but on feature itself, a branch from before the run:
+  // 1,800 lines of its code gone. Also when git expired the branch's reflog.
+  for (const expired of [false, true]) {
+    const repo = sizeRepo()
+    if (expired) repo.before('reflog', 'expire', '--expire=all', 'refs/heads/feature', 'refs/remotes/origin/feature')
+    const setBack = await sizeCheck(
+      repo,
+      () => {
+        repo.git('switch', '-q', 'feature')
+        repo.git('checkout', repo.base, '--', 'src/core.js')
+        repo.git('rm', '-q', '-r', 'area1', 'area2')
+        repo.git('commit', '-q', '-m', 'Set feature back')
+        repo.git('push', '-q', 'origin', 'feature')
+      },
+      { pushes: ['git push -q origin feature'] },
+    )
+    assert.equal(setBack.tripped.length, 1, `expired: ${expired}`)
+    assert.match(setBack.tripped[0], over)
+    assert.match(setBack.tripped[0], /: 4 files and 1800 lines changed/)
+    assert.deepEqual(setBack.logged, [], 'nothing left out')
+  }
+
+  // Its history rewritten: feature rebased onto main and force-pushed. The
+  // same rebase onto a branch the run made takes over what was there.
+  const rewritten = sizeRepo()
+  const rebase = await sizeCheck(
+    rewritten,
+    () => {
+      rewritten.git('switch', '-q', 'feature')
+      rewritten.git('rebase', '-q', 'origin/main')
+      rewritten.git('push', '-q', '-f', 'origin', 'feature')
+    },
+    { pushes: ['git push -q -f origin feature'] },
+  )
+  assert.equal(rebase.tripped.length, 1)
+  assert.match(rebase.tripped[0], /: 4 files and 1800 lines changed/)
+  const copied = sizeRepo()
+  const copy = await sizeCheck(
+    copied,
+    () => {
+      copied.git('switch', '-q', '-c', 'feature-on-main', 'origin/feature')
+      copied.git('rebase', '-q', 'origin/main')
+      copied.git('push', '-q', 'origin', 'feature-on-main')
+    },
+    { pushes: ['git push -q origin feature-on-main'] },
+  )
+  assert.deepEqual(copy.tripped, [])
+  assert.deepEqual(copy.measured, { commits: 2, files: 0, lines: 0, pushed: true })
+
+  // New code on a new branch: 1,200 lines nobody had.
+  const dumped = sizeRepo()
+  const dump = await sizeCheck(dumped, () => {
+    dumped.git('switch', '-q', '-c', 'voice/dump', 'origin/main')
+    dumped.write('data/dump.json', dumped.lines(1200, 'row'))
+    dumped.git('add', '.')
+    dumped.git('commit', '-q', '-m', 'Dump')
+  })
+  assert.equal(dump.tripped.length, 1)
+  assert.match(dump.tripped[0], /: 1 files and 1200 lines changed/)
+
+  // A wipe on a new branch: the files of the default branch count, removed.
+  const wiped = sizeRepo()
+  const wipe = await sizeCheck(wiped, () => {
+    wiped.git('switch', '-q', '-c', 'voice/wipe', 'origin/main')
+    wiped.git('rm', '-q', '-r', '.')
+    wiped.git('commit', '-q', '-m', 'Wipe')
+  })
+  assert.equal(wipe.tripped.length, 1)
+  assert.match(wipe.tripped[0], /: 3 files and 1511 lines changed/)
+
+  // A version from before the run, but as a new file elsewhere: new to its path.
+  const moved = sizeRepo()
+  const elsewhere = await sizeCheck(moved, () => {
+    moved.git('switch', '-q', '-c', 'voice/copy', 'origin/feature')
+    moved.write('copy/core.js', moved.git('show', 'origin/main:src/core.js') + '\n')
+    moved.git('add', '.')
+    moved.git('commit', '-q', '-m', 'Copy')
+  })
+  assert.equal(elsewhere.tripped.length, 1)
+  assert.match(elsewhere.tripped[0], /: 1 files and 1500 lines changed/)
+
+  // The review branches, but pushed to a URL: where they went, no remote
+  // branch here shows, so everything counts, as before.
+  const url = sizeRepo()
+  const byUrl = await sizeCheck(url, () => reviewBranches(url), { pushes: [`git push -q ${url.remote} review-base-1 review-head-1`] })
+  assert.equal(byUrl.tripped.length, 1)
+  assert.equal(byUrl.tripped[0], 'many changes: 5 files and 3610 lines changed in one run (limits 100 files, 1000 lines) (worker alpha, task tsz4)')
+})
+
+test('rule: many changes, a run in a worktree: review branches from its detached HEAD count nothing', async () => {
+  const repo = sizeRepo()
+  const wt = join(repo.root, '.voice-worktrees', 'alpha', 'tsz4')
+  repo.before('worktree', 'add', '-q', '--detach', wt, 'origin/feature')
+  const git = repo.gitIn(wt, {})
+  const run = await sizeCheck(
+    repo,
+    () => {
+      git('checkout', repo.base, '--', 'src/core.js')
+      git('rm', '-q', '-r', 'area1')
+      git('commit', '-q', '-m', 'Review-only base: area1 as before feature')
+      const head = git('commit-tree', 'origin/feature^{tree}', '-p', 'HEAD', '-m', 'Review-only head: area1')
+      git('push', '-q', 'origin', 'HEAD:refs/heads/review-base-1', `${head}:refs/heads/review-head-1`)
+    },
+    { task: { dir: wt, worktree: 'w1', checkout: repo.dir }, pushes: ['git push -q origin HEAD:refs/heads/review-base-1 abc1234:refs/heads/review-head-1'] },
+  )
+  assert.deepEqual(run.tripped, [])
+  assert.deepEqual(run.measured, { commits: 2, files: 0, lines: 0, pushed: true })
 })
 
 // --- a dispatch in flight ------------------------------------------------------------------
