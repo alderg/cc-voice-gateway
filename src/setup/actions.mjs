@@ -32,8 +32,9 @@ import { SETTINGS_FILE_NAME, formatSettings, readSettings } from '../settings.mj
 import { Telegram } from '../telegram.mjs'
 import { githubSlug } from '../workers.mjs'
 import { scratchProblem } from '../workspaces.mjs'
+import { allowlistCommand } from './allowlist.mjs'
 import { asAdmin, hostsCommand, hostsLine, markedLines, signInCheck } from './hosts.mjs'
-import { MARKETPLACE, PLUGIN, channelMode } from '../../scripts/channel-mode.mjs'
+import { MARKETPLACE, PLUGIN, allowlisted, channelMode, managedSettings, withAllowlist } from '../../scripts/channel-mode.mjs'
 import { chromeNoticeSeen } from '../../scripts/chrome-onboarding.mjs'
 import { markFolderTrust } from '../../scripts/folder-trust.mjs'
 
@@ -404,6 +405,7 @@ export function createSetup({
       platform === 'darwin' ? launchLoaded() : null,
     ])
     const plugin = channelMode({ env, root })
+    const managed = managedSettings({ env })
     return {
       host: hostname(),
       root,
@@ -432,6 +434,13 @@ export function createSetup({
         mode: plugin.mode,
         reason: plugin.reason,
         allowlist: { marketplace: MARKETPLACE, plugin: PLUGIN },
+        // The managed settings file here, and whether the plugin can go on
+        // its allowlist there: not with the organisation's managed settings,
+        // which come first, nor when VOICE_GW_CHANNEL decides.
+        computer: {
+          file: managed.file,
+          possible: plugin.mode === 'development' && !env.VOICE_GW_CHANNEL && managed.from !== 'organisation' && !allowlisted(managed.settings),
+        },
       },
       // Claude in Chrome's notice for the first start, confirmed already in
       // Claude Code's config: true, false, or null when it cannot tell. Read
@@ -1182,6 +1191,42 @@ export function createSetup({
 
   const removeSignIn = () => changeHosts(() => unprepare('"Remove it now"'))
 
+  // --- the channel allowlist in the managed settings file here (allowlist.mjs) ---
+
+  let allowlistBusy = false
+
+  // "Put it on the allowlist on this computer": { written, file, mode,
+  // reason }, the channel mode the next start takes, or without
+  // administrator rights here { written: false, command }.
+  async function allowlistHere() {
+    const { from, file, settings } = managedSettings({ env })
+    if (from === 'organisation') {
+      throw fail('Your organisation\'s managed settings come first on this computer, so the file here does not count. An Owner can add the plugin there.', 409)
+    }
+    if (allowlisted(settings)) throw fail(`${file} names the plugin already.`, 409)
+    let text = null
+    try {
+      text = readFileSync(file, 'utf8')
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw fail(`${file} cannot be read (${error.code ?? error.message}); it stays as it is.`, 409)
+    }
+    const next = withAllowlist(text)
+    if (next === null) {
+      throw fail(`${file} holds no JSON object with a list in allowedChannelPlugins; it stays as it is. Add the plugin by hand (README, "Known issues").`, 409)
+    }
+    if (allowlistBusy) throw fail('The allowlist is being written already; answer the password dialog first.', 409)
+    allowlistBusy = true
+    try {
+      const done = await asRoot(allowlistCommand(file, next))
+      if (!done.ok) return { written: false, command: done.command }
+      say(`setup: the plugin is on the channel allowlist in ${file} (${done.how})`)
+      const { mode, reason } = channelMode({ env, root })
+      return { written: true, file, mode, reason }
+    } finally {
+      allowlistBusy = false
+    }
+  }
+
   async function funnelStart() {
     if (jobs.get(funnelJob)?.state === 'running') throw fail('The Funnel is being started already.', 409)
     const port = funnelPort()
@@ -1279,6 +1324,7 @@ export function createSetup({
       'POST /api/funnel/start': funnelStart,
       'POST /api/signin/prepare': prepareSignIn,
       'POST /api/signin/remove': removeSignIn,
+      'POST /api/plugin/allowlist': allowlistHere,
     },
   }
 }

@@ -1485,7 +1485,7 @@ the `localhost` link).
 | Workers in Docker | Checks the GitHub token and shows the level per repository with the gateway's detection. Builds the image with its progress shown. Starts the container, sets git's name and email in it, and clones the chosen repositories inside it. While Docker does not answer (section 1), the checkbox is greyed out, with a line why and what it takes; one on from before stays as it is, and the line says that the container cannot run until Docker answers | A token from `claude setup-token`, optionally a GitHub token ([5.6](#56-access-levels-and-their-detection)), the repositories |
 | Work folders | Off by default. Turned on: checks their folder as the gateway does, and with a container of their own, builds the image if it is missing and starts the container with `start-workers-container.sh --scratch` ([work folders](#work-folders)). The container's checkbox is greyed out while Docker does not answer, as in section 5 | The folder, the days they are kept, and for the container its name and the token from `claude setup-token` |
 | Watchdog | On Linux, writes and enables a systemd user service that starts the controller in tmux at boot, and turns on lingering for your user so that it keeps running without a login (if that is refused, it shows the `sudo` command); or starts it now in tmux. On macOS it writes a LaunchAgent that starts it in tmux at login, checks it with `plutil`, and with "start it now" loads it with `launchctl bootstrap`, which starts it (`kickstart` if it is loaded already); without, launchd loads it at the next login. Before it starts the controller, it marks `controller/` as trusted in Claude Code's config, so that the first start does not wait at the folder trust question ([8.1](#81-starting-and-stopping)) | Choices |
-| Plugin | Shows whether `voice@cc-voice-gateway` is on the organisation's channel allowlist; registers the marketplace if it is; otherwise shows the admin steps | The admin |
+| Plugin | Shows whether `voice@cc-voice-gateway` is on the organisation's channel allowlist; registers the marketplace if it is; otherwise shows the admin steps, and, while the organisation has no managed settings of its own, "Put it on the allowlist on this computer", the unofficial workaround for personal accounts ([known issues](#810-known-issues)) | The admin, or your administrator password |
 | Finish | Writes `.secrets/` (5.10). Then it ends, or with "keep this page open" (the default) stays for the next step | Whether to stay |
 | Connect the Claude app | Shows whether the gateway runs; until it does, what to do: start the controller, or, while its tmux session runs, confirm what Claude Code waits for at the terminal, in a notice with the keys to press (`tmux attach -t voice`, the down arrow to "Yes, I trust this folder" and Enter, Enter for further questions, Ctrl-b d). It looks at the tmux pane (`tmux capture-pane`) for the folder trust question or the development channel's confirmation and names the one it sees; only which one reaches the page, never the pane's text. It notices by itself when the gateway runs. Then the Funnel's state on its port, a button that starts it with `scripts/funnel.sh start` and its output, the connector URL while it is on, and, once the Funnel is on, whether this computer gets the gateway's sign-in metadata under the connector URL as a browser here would; if not, why (naming another web server on 443 if `netstat -anv -p tcp` on macOS or `ss -ltnp` on Linux shows one, Tailscale's own left out) and two ways: another device, or "Prepare the sign-in on this computer", a marked line in `/etc/hosts` with administrator rights that it removes again by itself, with "Remove it now" ([known issues](#810-known-issues)); and a pairing code with a countdown, valid ten minutes and one sign-in, with "New code"; says when a client signed in with it, or why the code no longer works. Works before writing too, if a gateway runs already | Clicks |
 
@@ -2702,7 +2702,17 @@ EOF
 
 On macOS the file is `/Library/Application Support/ClaudeCode/managed-settings.json`; if it exists
 already, add the two keys to it. The start script reads the file and chooses the plugin at the next
-start. As in 7.4, the list replaces the default list of channel plugins, here for every user of this
+start.
+
+The setup assistant does it too: section 8 of its page, "Put it on the allowlist on this computer"
+(`src/setup/allowlist.mjs`). It reads the file as you, turns `channelsEnabled` on and adds the
+plugin to `allowedChannelPlugins`, keeping every other key and entry, and writes it with
+administrator rights as for `/etc/hosts` below: the system's password dialog on macOS, `pkexec` or
+`sudo -n` on Linux, otherwise the command for a terminal. The old file stays next to it as
+`managed-settings.json.cc-voice-gateway.bak`; the new one is readable for every user, as Claude Code
+reads it as theirs. A file that is no JSON object is left alone. The page offers it only while the
+organisation has no managed settings of its own: theirs come first, and a file here does not count
+then. As in 7.4, the list replaces the default list of channel plugins, here for every user of this
 computer. Anthropic documents the allowlist for organisations only, so this is unofficial and may
 break with any update of Claude Code: if a start waits for the confirmation again, confirm it as
 above and check whether the workaround still holds.
@@ -2778,7 +2788,8 @@ src/
   config.mjs         settings from the environment and .secrets/gateway.env
   settings.mjs       reads and writes .secrets/gateway.env
   platform.mjs       what differs on macOS: temporary folders, the autostart's PATH and names
-  setup/             the setup assistant: server.mjs (guard), actions.mjs (steps), ui/ (page)
+  setup/             the setup assistant: server.mjs (guard), actions.mjs (steps), ui/ (page),
+                     hosts.mjs and allowlist.mjs (/etc/hosts and the managed settings, as root)
   http.mjs, log.mjs  small HTTP helpers; log to stderr and file, never stdout
 controller/
   .mcp.json          starts the gateway as the server "voice"

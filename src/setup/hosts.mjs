@@ -56,8 +56,8 @@ export function markedLines(file) {
     .filter(({ line, address, host }) => IPV4.test(address) && HOST.test(host) && line === `${address} ${host} ${HOSTS_MARK}`)
 }
 
-// A string in single quotes for sh; the lines and paths here have none.
-const quote = text => `'${String(text).replace(/'/g, `'\\''`)}'`
+// A string in single quotes for sh.
+export const quote = text => `'${String(text).replace(/'/g, `'\\''`)}'`
 
 // The shell command, run as root, that takes the given lines out of the
 // file by an exact match and adds one, after a backup next to it; the rest

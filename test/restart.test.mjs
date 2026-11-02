@@ -23,7 +23,7 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 import { z } from 'zod'
 import { adminRequest } from '../src/admin.mjs'
 import { RESTART_NOTE } from '../src/store.mjs'
-import { channelMode } from '../scripts/channel-mode.mjs'
+import { allowlisted, channelMode, managedSettings, withAllowlist } from '../scripts/channel-mode.mjs'
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url)).replace(/\/$/, '')
 const GATEWAY = join(ROOT, 'src', 'gateway.mjs')
@@ -139,6 +139,48 @@ test('channel mode: the plugin only when the allowlist names it and this reposit
   assert.equal(mode({ VOICE_GW_CHANNEL: 'development' }), 'development')
   rmSync(endpoint)
   assert.equal(mode({ VOICE_GW_CHANNEL: 'plugin' }), 'plugin', 'forced, as long as the marketplace is registered')
+})
+
+test('the allowlist on this computer: added to the managed settings file, every other key and entry kept; a file that is no object left alone', () => {
+  const voice = { marketplace: 'cc-voice-gateway', plugin: 'voice' }
+  const telegram = { marketplace: 'claude-plugins-official', plugin: 'telegram' }
+  const parsed = text => JSON.parse(withAllowlist(text))
+  assert.deepEqual(parsed(null), { channelsEnabled: true, allowedChannelPlugins: [voice] }, 'a new file')
+  assert.deepEqual(parsed(' \n'), { channelsEnabled: true, allowedChannelPlugins: [voice] })
+  assert.deepEqual(parsed(JSON.stringify({ env: { A: '1' }, channelsEnabled: false, allowedChannelPlugins: [telegram] })), {
+    env: { A: '1' },
+    channelsEnabled: true,
+    allowedChannelPlugins: [telegram, voice],
+  })
+  assert.deepEqual(parsed(JSON.stringify({ allowedChannelPlugins: [voice, telegram] })).allowedChannelPlugins, [voice, telegram], 'once only')
+  assert.match(withAllowlist('{}'), /^\{\n  "channelsEnabled": true,\n/)
+  assert.ok(withAllowlist('{}').endsWith('}\n'))
+  for (const text of ['{ not json', '[]', 'null', '"x"', JSON.stringify({ allowedChannelPlugins: { voice: true } })]) {
+    assert.equal(withAllowlist(text), null, text)
+  }
+  // A key named __proto__ stays a key: no prototype changes.
+  const kept = parsed('{"__proto__": {"polluted": true}}')
+  assert.deepEqual(Object.getOwnPropertyDescriptor(kept, '__proto__')?.value, { polluted: true })
+  assert.equal({}.polluted, undefined)
+  assert.equal(allowlisted(kept), true)
+  assert.equal(allowlisted(null), false)
+  assert.equal(allowlisted({ allowedChannelPlugins: [telegram] }), false)
+
+  // Which managed settings count: the organisation's with any key, then the file here.
+  const dir = join(TMP, 'managed-sources')
+  const config = join(dir, 'config')
+  const file = join(dir, 'managed-settings.json')
+  mkdirSync(config, { recursive: true })
+  const env = { CLAUDE_CONFIG_DIR: config, VOICE_GW_MANAGED_SETTINGS: file }
+  assert.deepEqual(managedSettings({ env }), { settings: null, from: null, file })
+  writeFileSync(file, withAllowlist(null))
+  assert.equal(managedSettings({ env }).from, 'computer')
+  assert.equal(channelMode({ env, root: ROOT }).mode, 'plugin-register')
+  writeFileSync(join(config, 'remote-settings.json'), '{}')
+  assert.equal(managedSettings({ env }).from, 'computer', 'no keys: not counted')
+  writeFileSync(join(config, 'remote-settings.json'), JSON.stringify({ permissions: {} }))
+  assert.deepEqual(managedSettings({ env }), { settings: { permissions: {} }, from: 'organisation', file })
+  assert.equal(channelMode({ env, root: ROOT }).mode, 'development')
 })
 
 test('the plugin: settings from controller/.mcp.json, the channel named plugin:voice:voice', async () => {

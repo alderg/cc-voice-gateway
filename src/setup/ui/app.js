@@ -257,9 +257,9 @@ function showPrepared(prepared = []) {
 }
 
 // What to run in a terminal, where the setup has no administrator rights.
-function showCommand(command) {
-  $('#signin-command').hidden = !command
-  $('#signin-command').textContent = command ? `In a terminal on this computer:\n${command}` : ''
+function showCommand(command, target = '#signin-command') {
+  $(target).hidden = !command
+  $(target).textContent = command ? `In a terminal on this computer:\n${command}` : ''
 }
 
 // The work folders in a container of their own, when they are on.
@@ -354,6 +354,9 @@ function fillPlugin() {
         ? 'On the allowlist. This repository still has to be registered as the marketplace on this computer (the start script does it too).'
         : `The controller starts with the development flag: ${reason}.`
   $('#plugin-register-box').hidden = mode !== 'plugin-register'
+  // Stays after writing, with what came of it next to the button.
+  $('#plugin-computer').hidden = !state.plugin.computer?.possible
+  $('#plugin-file').textContent = state.plugin.computer?.file ?? ''
   $('#plugin-admin').hidden = mode !== 'development'
   $('#plugin-warning').hidden = mode !== 'development'
   $('#plugin-json').textContent = JSON.stringify({ channelsEnabled: true, allowedChannelPlugins: [allowlist] }, null, 2)
@@ -687,6 +690,17 @@ action('#signin-remove', '#signin-remove-state', async () => {
   if (result.command) throw new Error('The setup has no administrator rights here: run the command below.')
   connect()
   return result.removed ? 'Removed from /etc/hosts.' : 'Nothing to remove.'
+})
+
+action('#plugin-allowlist', '#plugin-allowlist-state', async () => {
+  const result = await api('/api/plugin/allowlist', {})
+  showCommand(result.written ? null : result.command, '#plugin-command')
+  if (!result.written) throw new Error('The setup has no administrator rights here: run the command below, then reload this page.')
+  state.plugin = { ...state.plugin, mode: result.mode, reason: result.reason }
+  fillPlugin()
+  return result.mode === 'development'
+    ? `Written to ${result.file}, but the controller still starts with the development flag: ${result.reason}.`
+    : `Written to ${result.file}. The next start of the controller uses the plugin, without the confirmation.`
 })
 
 action('#funnel-start', '#funnel-start-state', async () => {

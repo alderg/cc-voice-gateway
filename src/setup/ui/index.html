@@ -365,6 +365,26 @@
       <li>Save. The next start of the controller uses the plugin by itself.</li>
     </ol>
   </div>
+  <div id="plugin-computer" hidden>
+    <p class="guide">
+      Or, on this computer only: the plugin can go on the allowlist in the managed settings file
+      <code id="plugin-file"></code>, with administrator rights: on macOS the system's password dialog, on Linux pkexec
+      or sudo, otherwise a command for a terminal. This works with a personal account too, as long as your organisation
+      has no managed settings of its own.
+    </p>
+    <ul class="guide">
+      <li><strong>Unofficial:</strong> Anthropic documents the allowlist for organisations only, and an update of Claude
+        Code may end it; then a start waits for the confirmation again (README, "Known issues").</li>
+      <li><strong>For every user of this computer:</strong> an allowlist there replaces Anthropic's default list of
+        channel plugins. Telegram, Discord, iMessage and fakechat from <code>claude-plugins-official</code> stop working
+        as channels unless the file names them too.</li>
+    </ul>
+    <div class="row">
+      <button id="plugin-allowlist">Put it on the allowlist on this computer</button>
+      <span id="plugin-allowlist-state" class="state"></span>
+    </div>
+    <pre id="plugin-command" class="log" hidden></pre>
+  </div>
 </section>
 
 <section id="s-finish">

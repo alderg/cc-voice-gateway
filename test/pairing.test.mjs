@@ -9,10 +9,10 @@ import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync, spawn, spawnSync } from 'node:child_process'
 import { createHash, randomBytes } from 'node:crypto'
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import vm from 'node:vm'
 
@@ -25,6 +25,7 @@ const { startSetupServer } = await import('../src/setup/server.mjs')
 const { Auth } = await import('../src/oauth.mjs')
 const { adminRequest } = await import('../src/admin.mjs')
 const { HOSTS_MARK, hostsCommand, hostsLine, markedLines, signInCheck } = await import('../src/setup/hosts.mjs')
+const { allowlistCommand } = await import('../src/setup/allowlist.mjs')
 
 const SECRETS = join(TMP, 'secrets') // the gateway's, and the setup's
 const BIN = join(TMP, 'bin')
@@ -511,6 +512,96 @@ test('the marked line only: other lines kept, also similar ones and a last line 
   })
 })
 
+// The channel allowlist on this computer (section 8): the managed settings
+// file, here one of the test in a folder that does not exist yet, with a
+// space in its path as on macOS, written with administrator rights (the fake
+// pkexec, or osascript for macOS).
+const MANAGED = join(TMP, 'managed', 'Application Support', 'managed-settings.json')
+const MANAGED_CONFIG = join(TMP, 'allowlist-config') // Claude Code's, for the organisation's settings
+const ALLOWED = { marketplace: 'cc-voice-gateway', plugin: 'voice' }
+
+const allowlistSetup = ({ platform = 'linux', env = {} } = {}) =>
+  createSetup({
+    root: ROOT,
+    secretsDir: join(TMP, 'secrets-allowlist'),
+    env: { ...setupEnv(), VOICE_GW_MANAGED_SETTINGS: MANAGED, CLAUDE_CONFIG_DIR: MANAGED_CONFIG, ...env },
+    platform,
+    say,
+  })
+const allowlistHere = setup => setup.api['POST /api/plugin/allowlist']({ body: {} })
+
+test('"Put it on the allowlist on this computer": a new file in a new folder, readable for every user; the next start as the plugin; once only', async () => {
+  rmSync(join(TMP, 'managed'), { recursive: true, force: true })
+  mkdirSync(MANAGED_CONFIG, { recursive: true })
+  const setup = allowlistSetup()
+  const done = await allowlistHere(setup)
+  assert.deepEqual(done, { written: true, file: MANAGED, mode: 'plugin-register', reason: 'register this repository as the marketplace first' })
+  assert.deepEqual(JSON.parse(readFileSync(MANAGED, 'utf8')), { channelsEnabled: true, allowedChannelPlugins: [ALLOWED] })
+  assert.equal(statSync(MANAGED).mode & 0o777, 0o644)
+  assert.deepEqual(readdirSync(dirname(MANAGED)), ['managed-settings.json'], 'no backup of a file that was not there, no temporary file left')
+  assert.ok(terminal.includes(`setup: the plugin is on the channel allowlist in ${MANAGED} (pkexec)`))
+  await assert.rejects(allowlistHere(setup), { status: 409, message: `${MANAGED} names the plugin already.` })
+})
+
+test('the allowlist in a file there already: every other key and entry kept, a backup next to it', async () => {
+  const before = JSON.stringify({ env: { DISABLE_TELEMETRY: '1' }, allowedChannelPlugins: [{ marketplace: 'claude-plugins-official', plugin: 'telegram' }] }, null, 2)
+  rmSync(join(TMP, 'managed'), { recursive: true, force: true })
+  mkdirSync(dirname(MANAGED), { recursive: true })
+  writeFileSync(MANAGED, before)
+  assert.equal((await allowlistHere(allowlistSetup())).mode, 'plugin-register')
+  assert.deepEqual(JSON.parse(readFileSync(MANAGED, 'utf8')), {
+    env: { DISABLE_TELEMETRY: '1' },
+    allowedChannelPlugins: [{ marketplace: 'claude-plugins-official', plugin: 'telegram' }, ALLOWED],
+    channelsEnabled: true,
+  })
+  assert.equal(readFileSync(`${MANAGED}.cc-voice-gateway.bak`, 'utf8'), before)
+})
+
+test('the allowlist left alone: the organisation\'s managed settings first, a file that is no JSON object, no administrator rights', async () => {
+  rmSync(join(TMP, 'managed'), { recursive: true, force: true })
+  mkdirSync(MANAGED_CONFIG, { recursive: true })
+  writeFileSync(join(MANAGED_CONFIG, 'remote-settings.json'), JSON.stringify({ permissions: { deny: [] } }))
+  await assert.rejects(allowlistHere(allowlistSetup()), { status: 409, message: /^Your organisation's managed settings come first on this computer/ })
+  assert.equal(existsSync(MANAGED), false)
+  writeFileSync(join(MANAGED_CONFIG, 'remote-settings.json'), '{}') // no keys: the file here counts
+  mkdirSync(dirname(MANAGED), { recursive: true })
+  for (const text of ['{ not json', '[]', JSON.stringify({ allowedChannelPlugins: 'voice' })]) {
+    writeFileSync(MANAGED, text)
+    await assert.rejects(allowlistHere(allowlistSetup()), { status: 409, message: /holds no JSON object with a list in allowedChannelPlugins; it stays as it is/ })
+    assert.equal(readFileSync(MANAGED, 'utf8'), text)
+  }
+  rmSync(MANAGED)
+
+  // Neither pkexec nor sudo here: the command for a terminal, and no file.
+  const refused = await allowlistHere(allowlistSetup({ env: { VOICE_SETUP_PKEXEC_BIN: join(BIN, 'no-pkexec') } }))
+  assert.equal(refused.written, false)
+  assert.match(refused.command, /^sudo sh -c '\(mkdir -p /)
+  assert.equal(existsSync(MANAGED), false)
+  rmSync(join(MANAGED_CONFIG, 'remote-settings.json'))
+})
+
+test('the allowlist on macOS: through the system\'s password dialog, into a folder with a space in its name', async () => {
+  rmSync(join(TMP, 'managed'), { recursive: true, force: true })
+  rmSync(OSASCRIPT_LOG, { force: true })
+  const done = await allowlistHere(allowlistSetup({ platform: 'darwin' }))
+  assert.equal(done.written, true)
+  const asked = readFileSync(OSASCRIPT_LOG, 'utf8').trim()
+  assert.match(asked, /^-e do shell script ".*" with administrator privileges$/)
+  assert.equal(asked.split('\n').length, 1, 'on one line')
+  assert.deepEqual(JSON.parse(readFileSync(MANAGED, 'utf8')).allowedChannelPlugins, [ALLOWED])
+})
+
+test('the allowlist\'s command writes the text as it is: quotes, $( ) and backquotes stay text; only absolute paths', () => {
+  const file = join(TMP, 'command', 'managed-settings.json')
+  const touched = join(TMP, 'command-ran')
+  const text = `{"note": "it's $(touch ${touched}) \`touch ${touched}\` %s \\\\ \\" end"}\n`
+  assert.equal(spawnSync('sh', ['-c', allowlistCommand(file, text)]).status, 0)
+  assert.equal(readFileSync(file, 'utf8'), text)
+  assert.equal(existsSync(touched), false)
+  assert.throws(() => allowlistCommand('managed-settings.json', '{}'), /not a plain path/)
+  assert.throws(() => allowlistCommand('/etc/claude-code/x\n.json', '{}'), /not a plain path/)
+})
+
 test('the check from this computer: what answers must be the gateway; a refused connection is not', async () => {
   const closed = await freePort()
   assert.deepEqual(await signInCheck(`https://127.0.0.1:${closed}/mcp`), { ok: false, why: 'refused' })
@@ -684,6 +775,45 @@ async function page(answers) {
   }
   return { $, asked, click, poll }
 }
+
+test('the page, section 8: the allowlist on this computer while it can go there; written, the status as the next start takes it', async () => {
+  const computer = { file: '/etc/claude-code/managed-settings.json', possible: true }
+  const plugin = { mode: 'development', reason: 'voice@cc-voice-gateway is not on the organisation\'s channel allowlist (allowedChannelPlugins) yet', allowlist: ALLOWED, computer }
+  const state = {
+    host: 'test', root: ROOT, remaining: { overallMs: 600000, idleMs: 600000 }, checks: [], overridden: [], settings: {},
+    models: [], efforts: [], secrets: {}, git: { name: '', email: '' }, repos: { host: [], docker: [] },
+    watchdog: { platform: 'linux', unit: 'cc-voice-gateway.service' }, plugin, chrome: { noticeSeen: true },
+  }
+  let answer = { written: false, command: "sudo sh -c '(mkdir -p …)'" }
+  const ui = await page({ '/api/state': state, '/api/connect': { gateway: false, tmux: false, pairing: null }, '/api/plugin/allowlist': () => answer })
+  const { $ } = ui
+  assert.equal($('#plugin-computer').hidden, false)
+  assert.equal($('#plugin-file').textContent, '/etc/claude-code/managed-settings.json')
+  assert.equal($('#plugin-warning').hidden, false)
+
+  await ui.click('#plugin-allowlist')
+  assert.ok(ui.asked.includes('POST /api/plugin/allowlist'))
+  assert.equal($('#plugin-allowlist-state').textContent, 'The setup has no administrator rights here: run the command below, then reload this page.')
+  assert.equal($('#plugin-command').textContent, "In a terminal on this computer:\nsudo sh -c '(mkdir -p …)'")
+
+  answer = { written: true, file: computer.file, mode: 'plugin-register', reason: 'register this repository as the marketplace first' }
+  await ui.click('#plugin-allowlist')
+  assert.equal($('#plugin-allowlist-state').textContent, 'Written to /etc/claude-code/managed-settings.json. The next start of the controller uses the plugin, without the confirmation.')
+  assert.equal($('#plugin-command').hidden, true)
+  assert.match($('#plugin-status').textContent, /^On the allowlist\./)
+  assert.equal($('#plugin-warning').hidden, true)
+  assert.equal($('#plugin-admin').hidden, true)
+  assert.equal($('#plugin-register-box').hidden, false, 'registered when the setup is written')
+
+  // The organisation's managed settings come first: only an Owner can.
+  const theirs = await page({ '/api/state': { ...state, plugin: { ...plugin, computer: { ...computer, possible: false } } }, '/api/connect': { gateway: false, tmux: false, pairing: null } })
+  assert.equal(theirs.$('#plugin-computer').hidden, true)
+  assert.equal(theirs.$('#plugin-admin').hidden, false)
+  const html = readFileSync(join(ROOT, 'src', 'setup', 'ui', 'index.html'), 'utf8')
+  assert.match(html, /<button id="plugin-allowlist">Put it on the allowlist on this computer<\/button>/)
+  assert.match(html, /<strong>Unofficial:<\/strong> Anthropic documents the allowlist for organisations only/)
+  assert.match(html, /<strong>For every user of this computer:<\/strong> an allowlist there replaces Anthropic's default list of\s+channel plugins\./)
+})
 
 test('the page: what to do while the gateway is down, then a code with its time, a new one, and why one went away', async () => {
   const state = {

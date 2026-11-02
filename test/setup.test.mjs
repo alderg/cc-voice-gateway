@@ -436,6 +436,7 @@ test('the start: checks, current settings, repositories and the plugin, without 
   assert.deepEqual(data.git, { name: 'Test Driver', email: 'driver@example.com' })
   assert.equal(data.plugin.mode, 'development')
   assert.deepEqual(data.plugin.allowlist, { marketplace: 'cc-voice-gateway', plugin: 'voice' })
+  assert.deepEqual(data.plugin.computer, { file: join(TMP, 'no-managed-settings.json'), possible: true }, 'no organisation\'s managed settings here')
   assert.match(data.watchdog.unit, /systemd\/user\/cc-voice-gateway\.service$/)
   assert.equal(data.watchdog.linger, false)
   assert.ok(data.models.includes('opus'))
