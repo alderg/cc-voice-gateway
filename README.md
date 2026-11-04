@@ -585,7 +585,8 @@ and fails closed.
   explicit yes; that is an instruction, not enforcement.
 - **Answered in Telegram.** With answers by Telegram on (`VOICE_GW_TELEGRAM_ANSWERS=1`), an
   approval request the gateway sent to your chat is answered there too: a Reply with a plain yes
-  or no, or a message with its code and yes or no ([5.8](#58-the-telegram-fallback)). The verdict
+  or no, a message with its code and yes or no, or a plain yes or no alone while it is the only one
+  open; "yes to all" allows every one open ([5.8](#58-the-telegram-fallback)). The verdict
   goes to Claude Code as one by voice does; the first answer wins, and the voice AI hears that it
   was answered in Telegram. `VOICE_GW_TELEGRAM_CONFIRM=0` keeps approvals with the voice and the
   terminal.
@@ -1076,7 +1077,8 @@ folder, `.git` included.
   forwarded or edited message: a stop can only lock. With Telegram input on, also answers to
   questions and any other message as a request (below); a Reply to a question is its answer,
   whatever it says, and with requests on, a command stays a command as a Reply to any other
-  message, such as news. With answers on, approval requests too: a Reply with yes or no (below).
+  message, such as news. With answers on, approval requests too: a Reply with yes or no, or a plain
+  yes or no while only one is open (below).
 - **Telegram input, off by default.** Answers and requests by Telegram are an option in the setup
   assistant ("Take answers and requests from Telegram too"), which turns both on
   (`VOICE_GW_TELEGRAM_ANSWERS=1`, `VOICE_GW_TELEGRAM_REQUESTS=1`). Off, the chat takes only the
@@ -1120,7 +1122,9 @@ folder, `.git` included.
   several open questions; a Reply to a question that is answered or settled already, or to an
   approval request that is answered already, or with `VOICE_GW_TELEGRAM_CONFIRM=0` to any approval
   request, which never becomes a request either; an answer to an approval request that is not a
-  plain yes or no; a forwarded or edited message, or one without text; and anything while the kill
+  plain yes or no; a plain yes or no while several approval requests are open, or one and a
+  question shown after it, where the chat lists them and asks which one is meant, and with `VOICE_GW_TELEGRAM_CONFIRM=0` while any is open; a
+  forwarded or edited message, or one without text; and anything while the kill
   switch is locked ("It is unlocked at the computer, or in voice mode with a PIN sent here.") or
   the gateway is inactive, in a standby or without a controller. While the controller waits for the
   usage limit, the confirmation says until when. Telegram never unlocks.
@@ -1150,10 +1154,19 @@ folder, `.git` included.
   not wait for the voice. Its last line says how to answer it: Telegram's Reply on it with a plain
   yes or no ("ja", "ok", "allow"; "nein", "no", "deny"), or a message with its five-letter code and
   yes or no ("qwert yes"). Anything else, or both at once ("not ok"), leaves it open and the chat
-  asks for a plain yes or no. The verdict goes to Claude Code as one by voice does; the chat
-  confirms it ("Allowed: approval request qwert (Bash). Claude Code goes on."), the input log keeps
-  it, and the voice AI hears that it was answered in Telegram. The first answer wins: one answered
-  by voice or at the computer already is said to be settled. Every protection of Telegram input
+  asks for a plain yes or no. A message that is nothing but a yes or a no ("yes", "Ja.", "ok", "👍";
+  "no", "nein", "👎"), without a Reply and without a code, answers the approval request open when it
+  is the only one: the controller waits on it and would read such a message only afterwards anyway.
+  With several open it answers none: the chat lists them, each with its code and a few words, and
+  asks which one is meant; it asks too while a question shown after the only one is open, which the
+  yes may be meant for. Anything longer stays what it was, a request or an answer, and with none
+  open, so does the plain yes. "Yes to all" ("ja zu allen", "alle ja", "allow all") allows every
+  approval request open at that moment, "no to all" denies them all, and the chat lists each;
+  questions stay open, and with none open the chat says so. The verdict goes to Claude Code as one
+  by voice does; the chat confirms it and names it ("Allowed: approval request qwert (Bash: gh pr
+  merge 3 --repo driver/alpha --squash). Claude Code goes on."), the input log keeps it, and the
+  voice AI hears that it was answered in Telegram. The first answer wins: one answered by voice or
+  at the computer already is said to be settled, and a plain yes no longer counts for it. Every protection of Telegram input
   holds: only your own account in your private chat, no forwarded or edited message, nothing older
   than two minutes, nothing while the kill switch is locked (which denies every open approval
   anyway) or the gateway is inactive. With answers by Telegram off, or without the permission relay,
@@ -2840,7 +2853,7 @@ gateway; do not set them.
 | The kill switch locked on `write outside the allowed folders` for a relative path such as `../report.md` that went into the workspace | The rule counts it from the folder each call starts in, as Claude Code names it in the gateway's hook ([5.9](#the-folder-a-command-runs-in)). A line `no report of the guard's hook in this run` in `.logs/gateway.log` means the hooks did not run (for example `disableAllHooks` in your Claude Code settings, or managed settings that allow only managed hooks), and the rule followed the shell itself; a run from before this version has no hook either. Before this version a subagent's `cd` counted for the main thread's shell (2026-11-03). |
 | The kill switch locked on `write outside the allowed folders` for screenshots or other helper files, such as in `~/voice-scratch/…` | The worker wrote outside its repository, its run folder and the temporary folders, often because a task named such a place. Its run folder (`.voice-runs/<repository>/…`, also `$TMPDIR`) is the place for them: its prompt and rules say so, and the controller's instructions say to ask for such files there and to name no other folder. A run from before this version has no run folder. A folder outside every repository that workers may really use goes into `VOICE_GW_KILL_ALLOW_PATHS`, never the work folders' root. |
 | A run folder in `.voice-runs` is gone, with the screenshots in it | It is removed `VOICE_GW_RUN_FOLDER_DAYS` (7) after its session's last run; copy out what you want to keep, or set `0`. `worker_status` names the folder of the last run, and `.state/workers.json` lists them under `runFolders`. |
-| An answer or a request on Telegram is "not passed on" | The reason follows in the chat. "Telegram input is off": turn it on in the setup (section 4), or set `VOICE_GW_TELEGRAM_ANSWERS=1` and `VOICE_GW_TELEGRAM_REQUESTS=1`; it is off by default, also after an update. For an answer, reply to the question's own message, or name its code (the four characters after "Question for request"); a decision's code works too. Only questions still open count: one answered by voice is settled. With `VOICE_GW_TELEGRAM_CONFIRM=0`, a push, merge, restart or delete question, or an approval request, is never answered there ("must be confirmed by voice", "Telegram cannot approve"): say it in voice mode. An approval request takes a plain yes or no, as a Reply to it or with its code. A forwarded or edited message, or one without text, is never passed on: write it yourself, as a new message. While the kill switch is locked or the gateway is inactive nothing goes through; try again once it is unlocked or active again. `telegram answers off` in the log: `VOICE_GW_TELEGRAM_ANSWERS` is not `1`; `telegram requests off`: `VOICE_GW_TELEGRAM_REQUESTS` is not `1`. `.state/telegram-input.log` says for every message what became of it. |
+| An answer or a request on Telegram is "not passed on" | The reason follows in the chat. "Telegram input is off": turn it on in the setup (section 4), or set `VOICE_GW_TELEGRAM_ANSWERS=1` and `VOICE_GW_TELEGRAM_REQUESTS=1`; it is off by default, also after an update. For an answer, reply to the question's own message, or name its code (the four characters after "Question for request"); a decision's code works too. Only questions still open count: one answered by voice is settled. With `VOICE_GW_TELEGRAM_CONFIRM=0`, a push, merge, restart or delete question, or an approval request, is never answered there ("must be confirmed by voice", "Telegram cannot approve"): say it in voice mode. An approval request takes a plain yes or no, as a Reply to it, with its code, or alone while it is the only one open; with several open, a plain yes gets a list of them and the question which one is meant, and "yes to all" allows them all. A forwarded or edited message, or one without text, is never passed on: write it yourself, as a new message. While the kill switch is locked or the gateway is inactive nothing goes through; try again once it is unlocked or active again. `telegram answers off` in the log: `VOICE_GW_TELEGRAM_ANSWERS` is not `1`; `telegram requests off`: `VOICE_GW_TELEGRAM_REQUESTS` is not `1`. `.state/telegram-input.log` says for every message what became of it. |
 | A message on Telegram became a request, not the answer you meant | Without a Reply to the question and without its code, a message is a new request. Reply to the question's own message, or start yours with its code. The controller sees the request all the same and may ask back. |
 | A message on Telegram became an answer, not a request | A Reply to a question answers it, whatever it says, and so does a message that names the code of exactly one open question. Write it without a Reply, and without that code. |
 | `/stop` on Telegram does nothing, or the bot never answers | Only your own account in your private chat with the bot counts: messages from a group, another account or a bot are ignored without an answer (`telegram commands: ignored a message …` in the log, every one in `.state/telegram-input.log`). `telegram_chat_id names no private chat` in the log: choose your private chat in the setup. And the gateway must poll the bot: the log says `telegram commands: …` if a webhook or another program takes the updates; if that is not you, the token may have leaked: revoke it with @BotFather. |

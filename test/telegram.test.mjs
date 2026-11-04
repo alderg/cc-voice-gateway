@@ -34,6 +34,7 @@ import {
   TelegramCommands,
   TelegramFallback,
   TelegramInputLog,
+  bareVerdict,
   callBotApi,
   driverId,
   loadTelegram,
@@ -547,7 +548,7 @@ test('Telegram answers: without a Reply, the code of exactly one open question; 
   // A Reply to an approval request answers it, and is no answer to a question.
   t.approval('qwert', { message: 40 })
   await t.answers.route({ text: 'yes', replyTo: 40, messageId: 33 })
-  assert.equal(t.lastSaid(), 'Allowed: approval request qwert (Bash). Claude Code goes on.')
+  assert.equal(t.lastSaid(), 'Allowed: approval request qwert (Bash: gh pr merge 3 --repo driver/alpha --squash). Claude Code goes on.')
   assert.equal(t.store.getPermission('qwert').status, 'allow')
   assert.deepEqual(t.pushed, [], 'nothing passed on to the controller so far')
   assert.equal(first.state, 'question')
@@ -890,7 +891,7 @@ test('Telegram requests: a Reply to a question and an open code still answer; a 
   // A Reply to an approval request answers it, and is no request.
   t.approval('qwert', { message: 93 })
   await t.answers.route({ text: 'yes', replyTo: 93, messageId: 94 })
-  assert.equal(t.lastSaid(), 'Allowed: approval request qwert (Bash). Claude Code goes on.')
+  assert.equal(t.lastSaid(), 'Allowed: approval request qwert (Bash: gh pr merge 3 --repo driver/alpha --squash). Claude Code goes on.')
   // Again: answered already, and still no request.
   await t.answers.route({ text: 'yes, and run the tests', replyTo: 93, messageId: 94 })
   assert.equal(t.lastSaid(), 'Not passed on: approval request qwert was allowed already here; nothing to do.')
@@ -1013,7 +1014,7 @@ test('Telegram approvals: a Reply with yes or no, or a message with the code, an
   assert.deepEqual(t.verdicts, [['qwert', 'allow']])
   assert.equal(merge.status, 'allow')
   assert.equal(merge.by, 'telegram')
-  assert.deepEqual(t.said.at(-1), { text: 'Allowed: approval request qwert (Bash). Claude Code goes on.', replyTo: 41 })
+  assert.deepEqual(t.said.at(-1), { text: 'Allowed: approval request qwert (Bash: gh pr merge 3 --repo driver/alpha --squash). Claude Code goes on.', replyTo: 41 })
   assert.deepEqual(t.recorded.at(-1), { ...seen, decision: 'accepted', as: 'approval allowed', answers: 'qwert' })
   assert.ok(t.logged.includes('telegram approval code=qwert behavior=allow tool=Bash'))
   assert.deepEqual(t.pushed, [], 'no request for the controller')
@@ -1025,7 +1026,7 @@ test('Telegram approvals: a Reply with yes or no, or a message with the code, an
   const write = t.approval('asdfg', { tool: 'Write', description: 'Create playground/notes.md' })
   assert.equal(await t.answers.route({ text: 'Nein, ASDFG nicht', messageId: 42 }), write)
   assert.deepEqual(t.verdicts.at(-1), ['asdfg', 'deny'])
-  assert.equal(t.lastSaid(), 'Denied: approval request asdfg (Write). Claude Code does not run it.')
+  assert.equal(t.lastSaid(), 'Denied: approval request asdfg (Write: Create playground/notes.md). Claude Code does not run it.')
   assert.equal(t.recorded.at(-1).as, 'approval denied')
 
   // Neither a plain yes nor a plain no: it stays open.
@@ -1095,6 +1096,232 @@ test('Telegram approvals: nothing past a locked kill switch or a standby; not wi
   assert.deepEqual(broken.store.openPermissions(), [open])
 })
 
+// --- a plain yes or no, and "yes to all" -------------------------------------------------
+
+test('a plain yes or no is a message that is nothing else: a short list of words, any case, a full stop or an exclamation mark after it; "yes to all" and "no to all" with their like', () => {
+  const allow = { behavior: 'allow', all: false }
+  const deny = { behavior: 'deny', all: false }
+  for (const text of ['yes', 'Yes', 'YES!', 'y', 'yeah', 'yep.', 'ok', 'OK!!', 'Okay', 'approve', 'allow', 'ja', 'Ja.', 'jo', 'jawohl', 'oui', 'si', 'sì', 'sí', '👍', '👍🏽', ' yes ']) {
+    assert.deepEqual(bareVerdict(text), allow, text)
+  }
+  for (const text of ['no', 'No.', 'n', 'nope', 'deny', 'nein', 'Nein!', 'nee', 'non', '👎']) assert.deepEqual(bareVerdict(text), deny, text)
+  for (const text of ['yes to all', 'Yes to all!', 'yes, to all', 'yes for all', 'allow all', 'approve all', 'all yes', 'Ja zu allen', 'ja zu allem', 'alle ja', 'ja, alle', 'oui à tous', 'sì a tutti']) {
+    assert.deepEqual(bareVerdict(text), { behavior: 'allow', all: true }, text)
+  }
+  for (const text of ['no to all', 'deny all', 'Nein zu allen.', 'alle nein', 'non à tous']) assert.deepEqual(bareVerdict(text), { behavior: 'deny', all: true }, text)
+  // Anything longer, a question, both, or a word that is no plain answer, is none: it stays what it was.
+  for (const text of ['', 'yes?', 'yes, merge it', 'ja, mach', 'ok go', 'yes no', 'klar', 'sure', 'not ok', 'yes please', 'qwert yes', 'yes to all of them', '👍👍', 'Was ist offen?']) {
+    assert.equal(bareVerdict(text), null, text)
+  }
+})
+
+test('a plain yes or no without a Reply answers the only approval request open, also with requests on, and the chat names it; one answered at the computer or by voice is not answered again; with none open, or a longer message, nothing changes', async () => {
+  const t = answering({ requests: true })
+  const merge = t.approval('anezm', { description: 'Merge batch 17 pull request into simple-modern', message: 40 })
+  merge.announced = true
+  const seen = { from: 4242, chat: 4242, type: 'private', text: 'yes' }
+
+  // As on 2026-11-04: a plain "yes" while gh pr merge waits. It is the approval, not a request.
+  assert.equal(await t.answers.route({ text: 'yes', messageId: 41, seen }), merge)
+  assert.deepEqual(t.verdicts, [['anezm', 'allow']])
+  assert.equal(merge.status, 'allow')
+  assert.equal(merge.by, 'telegram')
+  assert.deepEqual(t.said.at(-1), {
+    text: 'Allowed: approval request anezm (Bash: Merge batch 17 pull request into simple-modern). Claude Code goes on.',
+    replyTo: 41,
+  })
+  assert.deepEqual(t.recorded.at(-1), { ...seen, decision: 'accepted', as: 'approval allowed', answers: 'anezm' })
+  assert.deepEqual(t.pushed, [], 'no request for the controller')
+  assert.deepEqual(t.store.takeAnsweredElsewhere().map(p => p.code), ['anezm'], 'the voice client hears it was answered there')
+
+  // A plain no denies it; an emoji counts too.
+  const write = t.approval('asdfg', { tool: 'Write', description: 'Create playground/notes.md.' })
+  assert.equal(await t.answers.route({ text: 'Nein!', messageId: 42 }), write)
+  assert.deepEqual(t.verdicts.at(-1), ['asdfg', 'deny'])
+  assert.equal(t.lastSaid(), 'Denied: approval request asdfg (Write: Create playground/notes.md). Claude Code does not run it.')
+  t.approval('zxcvb', { tool: 'Edit', description: 'Edit playground/a.md' })
+  await t.answers.route({ text: '👍', messageId: 43 })
+  assert.deepEqual(t.verdicts.at(-1), ['zxcvb', 'allow'])
+
+  // None open now: a plain yes is a request again, as before.
+  const request = await t.answers.route({ text: 'yes', messageId: 44 })
+  assert.equal(request.text, 'yes')
+  assert.equal(request.via, 'telegram')
+  // Answered by voice or at the computer meanwhile: closed, so the yes is no answer to it.
+  t.approval('voice', { message: 50 })
+  t.store.resolvePermission('voice', 'deny')
+  t.approval('compu', { message: 51 })
+  t.store.closePermissionsElsewhere()
+  assert.equal((await t.answers.route({ text: 'ok', messageId: 52 })).text, 'ok')
+  assert.equal(t.store.getPermission('voice').status, 'deny')
+  assert.equal(t.store.getPermission('compu').status, 'elsewhere')
+  assert.equal(t.verdicts.length, 3)
+
+  // With one open: a longer message is a request, as before; so is a plain yes as a Reply to another message of the gateway's.
+  const open = t.approval('hjkmn', { message: 60 })
+  assert.equal((await t.answers.route({ text: 'yes, and then run the tests', messageId: 61 })).text, 'yes, and then run the tests')
+  assert.equal((await t.answers.route({ text: 'yes?', messageId: 62 })).text, 'yes?')
+  assert.match((await t.answers.route({ text: 'yes', replyTo: 999, messageId: 63, quoted: 'Pull request 12 is out.' })).text, /^yes\n\n\(In reply to/)
+  assert.equal(open.status, 'open')
+  assert.equal(t.pushed.length, 5)
+
+  // Requests off: the same plain yes answers it; with none open, it is refused as before.
+  const off = answering()
+  off.approval('qwert', { message: 40 })
+  await off.answers.route({ text: 'Ja', messageId: 41 })
+  assert.deepEqual(off.verdicts, [['qwert', 'allow']])
+  await off.answers.route({ text: 'Ja', messageId: 42 })
+  assert.match(off.lastSaid(), /^Not passed on: it is no Reply to a question, and it names no open question by its code\./)
+  assert.equal(off.verdicts.length, 1)
+})
+
+test('a plain yes or no with several approval requests open answers none: the chat lists them and asks which one is meant, again until one is left; a question shown here after the only one asks back too', async () => {
+  const t = answering({ requests: true })
+  const merge = t.approval('mrgab', { description: 'gh pr merge 1125 --repo jgraph/drawio-dev --squash', message: 40 })
+  const write = t.approval('wrtab', { tool: 'Write', description: 'Create playground/notes.md', message: 41 })
+  const asked =
+    '2 approval requests are open: mrgab (Bash: gh pr merge 1125 --repo jgraph/drawio-dev --squash) and wrtab (Write: ' +
+    'Create playground/notes.md). Which one do you mean? Reply to its message with yes or no, or write its code with yes or ' +
+    'no. "Yes to all" allows them all, "no to all" denies them all.'
+  for (const [text, messageId] of [['yes', 42], ['no', 43], ['yes', 44]]) {
+    assert.equal(await t.answers.route({ text, messageId, seen: { text } }), null)
+    assert.deepEqual(t.said.at(-1), { text: asked, replyTo: messageId })
+  }
+  assert.deepEqual(t.recorded.at(-1), { text: 'yes', decision: 'refused', why: '2 approval requests are open, mrgab and wrtab; asked which one is meant' })
+  assert.deepEqual(t.verdicts, [])
+  assert.deepEqual(t.pushed, [], 'nor a request')
+  assert.equal(merge.status, 'open')
+  assert.equal(write.status, 'open')
+
+  // Answered by Reply, one is left: the plain yes answers that one.
+  await t.answers.route({ text: 'no', replyTo: 41, messageId: 45 })
+  assert.deepEqual(t.verdicts, [['wrtab', 'deny']])
+  await t.answers.route({ text: 'yes', messageId: 46 })
+  assert.deepEqual(t.verdicts.at(-1), ['mrgab', 'allow'])
+  assert.equal(t.lastSaid(), 'Allowed: approval request mrgab (Bash: gh pr merge 1125 --repo jgraph/drawio-dev --squash). Claude Code goes on.')
+
+  // A question shown here after the only approval request: the driver may mean either.
+  const earlier = t.question('Open the pull request?', { message: 47 })
+  const permission = t.approval('qwert', { message: 48 })
+  const later = t.question('Squash it?', { message: 49 })
+  await t.answers.route({ text: 'ja', messageId: 50 })
+  assert.equal(
+    t.lastSaid(),
+    `Approval request qwert (Bash: gh pr merge 3 --repo driver/alpha --squash) and question ${later.id} are both open. Which one ` +
+      'do you mean? Reply to its message, or write its code with your answer.',
+  )
+  assert.equal(permission.status, 'open')
+  assert.equal(later.state, 'question')
+  // Answered by its code, only the question shown before is left: the approval request wins over it.
+  await t.answers.route({ text: `${later.id} ja`, messageId: 51 })
+  assert.equal(later.state, 'done')
+  await t.answers.route({ text: 'ja', messageId: 52 })
+  assert.deepEqual(t.verdicts.at(-1), ['qwert', 'allow'])
+  assert.equal(earlier.state, 'question', 'still open')
+  // One never shown here, with a question that was: which one is meant is unclear too.
+  t.approval('unsen')
+  await t.answers.route({ text: 'ja', messageId: 53 })
+  assert.match(t.lastSaid(), new RegExp(`^Approval request unsen \\(Bash: .*\\) and question ${earlier.id} are both open\\. Which one do you mean\\?`))
+  assert.equal(t.verdicts.length, 3)
+})
+
+test('"yes to all" allows every approval request open and lists them, "no to all" denies them; questions stay open; with none open it says so; one Claude Code does not take stays open', async () => {
+  const t = answering({ requests: true })
+  const question = t.question('Squash it?', { message: 30 })
+  t.approval('mrgab', { description: 'gh pr merge 3 --repo driver/alpha --squash', message: 40 })
+  t.approval('wrtab', { tool: 'Write', description: 'Create playground/notes.md', message: 41 })
+  t.approval('edtab', { tool: 'Edit', description: 'Edit playground/todo.md' })
+  const seen = { text: 'Yes to all!' }
+
+  const answered = await t.answers.route({ text: 'Yes to all!', messageId: 42, seen })
+  assert.deepEqual(answered.map(p => p.code), ['mrgab', 'wrtab', 'edtab'])
+  assert.deepEqual(t.verdicts, [['mrgab', 'allow'], ['wrtab', 'allow'], ['edtab', 'allow']])
+  for (const permission of answered) assert.equal(permission.by, 'telegram')
+  assert.deepEqual(t.said.at(-1), {
+    text:
+      'Allowed 3 approval requests:\n- mrgab (Bash: gh pr merge 3 --repo driver/alpha --squash)\n- wrtab (Write: Create ' +
+      'playground/notes.md)\n- edtab (Edit: Edit playground/todo.md)\nClaude Code goes on.',
+    replyTo: 42,
+  })
+  assert.deepEqual(t.recorded.at(-1), { ...seen, decision: 'accepted', as: 'approvals allowed', answers: 'mrgab,wrtab,edtab' })
+  assert.equal(t.logged.filter(line => line.startsWith('telegram approval ') && line.endsWith('(to all)')).length, 3)
+  assert.equal(question.state, 'question', 'approvals only, never a question')
+  assert.deepEqual(t.pushed, [])
+
+  // None open now: it says so, and is no request.
+  assert.equal(await t.answers.route({ text: 'ja zu allen', messageId: 43 }), null)
+  assert.equal(t.lastSaid(), 'Not passed on: no approval request is open now, so there is nothing to allow.')
+  assert.deepEqual(t.pushed, [])
+
+  // No to all, with one: denied, and listed.
+  t.approval('rmrfx', { description: 'rm playground/old.md' })
+  await t.answers.route({ text: 'nein zu allen', messageId: 44 })
+  assert.deepEqual(t.verdicts.at(-1), ['rmrfx', 'deny'])
+  assert.equal(t.lastSaid(), 'Denied 1 approval request:\n- rmrfx (Bash: rm playground/old.md)\nClaude Code does not run it.')
+
+  // Claude Code does not take one: that one is open again, and listed as such; none at all, said as for one.
+  const fail = new Set(['wrtcd'])
+  const broken = answering({
+    verdict: async (code, behavior) => {
+      if (fail.has(code)) throw new Error('Not connected')
+      broken.verdicts.push([code, behavior])
+    },
+  })
+  broken.approval('mrgcd')
+  const lost = broken.approval('wrtcd', { tool: 'Write', description: 'Create playground/b.md' })
+  await broken.answers.route({ text: 'yes to all', messageId: 50 })
+  assert.deepEqual(broken.verdicts, [['mrgcd', 'allow']])
+  assert.equal(lost.status, 'open')
+  assert.equal(lost.by, undefined)
+  assert.equal(
+    broken.lastSaid(),
+    'Allowed 1 approval request:\n- mrgcd (Bash: gh pr merge 3 --repo driver/alpha --squash)\nClaude Code goes on.\n\n' +
+      'Still open, as Claude Code was not reached (Not connected):\n- wrtcd (Write: Create playground/b.md)',
+  )
+  assert.equal(await broken.answers.route({ text: 'yes to all', messageId: 51 }), null)
+  assert.equal(broken.lastSaid(), 'Not passed on: Not connected.')
+  assert.deepEqual(broken.store.openPermissions(), [lost])
+})
+
+test('a plain yes or no and "yes to all": nothing past a locked kill switch or a standby; with VOICE_GW_TELEGRAM_CONFIRM=0 or answers off, approvals stay with the voice and the chat says so', async () => {
+  const t = answering({ requests: true })
+  const permission = t.approval('qwert', { message: 40 })
+  t.approval('asdfg', { message: 41 })
+  for (const text of ['yes', 'yes to all']) {
+    t.killswitch.locked = true
+    assert.equal(await t.answers.route({ text, messageId: 42 }), null)
+    assert.equal(t.lastSaid(), 'Not passed on: the kill switch is locked. It is unlocked only at the computer.')
+    t.killswitch.locked = false
+    t.active = false
+    await t.answers.route({ text, messageId: 43 })
+    assert.equal(t.lastSaid(), 'Not passed on: this gateway is inactive, connector disconnected, in standby.')
+    t.active = true
+  }
+  assert.equal(permission.status, 'open')
+  assert.deepEqual(t.verdicts, [])
+  assert.deepEqual(t.pushed, [])
+
+  // Kept with the voice, or answers off: Telegram cannot approve, and the plain yes is no request either.
+  for (const options of [{ confirm: false, requests: true }, { mode: 'off', requests: true }]) {
+    const voice = answering(options)
+    const kept = voice.approval('qwert', { message: 40 })
+    await voice.answers.route({ text: 'yes', messageId: 41 })
+    assert.equal(voice.lastSaid(), 'Not passed on: approval request qwert is answered in voice mode or at the computer; Telegram cannot approve.')
+    await voice.answers.route({ text: 'yes to all', messageId: 42 })
+    assert.equal(voice.lastSaid(), 'Not passed on: approval request qwert is answered in voice mode or at the computer; Telegram cannot approve.')
+    voice.approval('asdfg', { message: 43 })
+    for (const text of ['ja', 'ja zu allen']) {
+      await voice.answers.route({ text, messageId: 44 })
+      assert.equal(voice.lastSaid(), 'Not passed on: approval requests qwert and asdfg are answered in voice mode or at the computer; Telegram cannot approve.')
+    }
+    assert.equal(kept.status, 'open')
+    assert.deepEqual(voice.verdicts, [])
+    assert.deepEqual(voice.pushed, [])
+    // Other text is still a request.
+    assert.equal((await voice.answers.route({ text: 'What is open?', messageId: 45 })).text, 'What is open?')
+  }
+})
+
 test('the fallback: an approval request says how to answer it there where the driver may; while they write in Telegram it goes there at once, voice mode, night or not; a standby holds it', async () => {
   const store = new Store()
   const sent = []
@@ -1126,7 +1353,8 @@ test('the fallback: an approval request says how to answer it there where the dr
   assert.equal(
     sent[0].text,
     'Approval request abcde (controller session)\n\nBash: gh pr merge 3 (abcde)\n\nTo allow it, reply to this message with yes, or with no ' +
-      'to deny it; or write a message with abcde and yes or no. Or answer in voice mode or at the terminal.',
+      'to deny it; or write a message with abcde and yes or no, or just yes or no while it is the only one open ("yes to all" ' +
+      'allows every one open). Or answer in voice mode or at the terminal.',
   )
   await waitFor(() => store.getPermission('abcde').telegramMessage === 201)
   // In the night too.
@@ -2049,14 +2277,14 @@ test("gateway: a plain message on Telegram is a request of the driver's, as by v
     assert.equal(
       sentWith('Approval request mrgab').text,
       'Approval request mrgab (controller session)\n\nBash: gh pr merge 3 --repo driver/alpha --squash\nDetails: {}\n\nTo allow it, ' +
-        'reply to this message with yes, or with no to deny it; or write a message with mrgab and yes or no. Or answer in ' +
-        'voice mode or at the terminal.',
+        'reply to this message with yes, or with no to deny it; or write a message with mrgab and yes or no, or just yes or no ' +
+        'while it is the only one open ("yes to all" allows every one open). Or answer in voice mode or at the terminal.',
     )
     const allowed = driverSays('Ja', { replyTo: messageWith('Approval request mrgab') })
     await waitFor(() => gw.verdicts.some(v => v.request_id === 'mrgab'))
     assert.deepEqual(gw.verdicts, [{ request_id: 'mrgab', behavior: 'allow' }])
     await waitFor(() => messageWith('Allowed: approval request mrgab'))
-    assert.equal(sentWith('Allowed: approval request mrgab').text, 'Allowed: approval request mrgab (Bash). Claude Code goes on.')
+    assert.equal(sentWith('Allowed: approval request mrgab').text, 'Allowed: approval request mrgab (Bash: gh pr merge 3 --repo driver/alpha --squash). Claude Code goes on.')
     assert.equal(sentWith('Allowed: approval request mrgab').reply_parameters.message_id, allowed)
     assert.match(gw.log, /telegram approval code=mrgab behavior=allow tool=Bash/)
     // A late answer by voice applies to nothing, and says so.
@@ -2070,7 +2298,29 @@ test("gateway: a plain message on Telegram is a request of the driver's, as by v
     driverSays('wrtab nein')
     await waitFor(() => gw.verdicts.some(v => v.request_id === 'wrtab'))
     assert.deepEqual(gw.verdicts.at(-1), { request_id: 'wrtab', behavior: 'deny' })
-    await waitFor(() => messageWith('Denied: approval request wrtab (Write). Claude Code does not run it.'))
+    await waitFor(() => messageWith('Denied: approval request wrtab (Write: Create playground/merged.md). Claude Code does not run it.'))
+    // A plain yes, without a Reply or the code, answers the only one open; with two open it asks back, and "yes to all"
+    // allows both and lists them. None of it reaches the controller as a request.
+    await gw.permission('plnab', 'Bash', 'gh pr merge 4 --repo driver/alpha --squash')
+    await waitFor(() => messageWith('Approval request plnab'))
+    driverSays('Yes')
+    await waitFor(() => gw.verdicts.some(v => v.request_id === 'plnab'))
+    assert.deepEqual(gw.verdicts.at(-1), { request_id: 'plnab', behavior: 'allow' })
+    await waitFor(() => messageWith('Allowed: approval request plnab (Bash: gh pr merge 4 --repo driver/alpha --squash). Claude Code goes on.'))
+    await gw.permission('allab', 'Bash', 'gh pr merge 5 --repo driver/alpha --squash')
+    await gw.permission('allcd', 'Write', 'Create playground/all.md')
+    await waitFor(() => messageWith('Approval request allcd'))
+    driverSays('ja')
+    await waitFor(() => messageWith('2 approval requests are open: allab (Bash: gh pr merge 5 --repo driver/alpha --squash) and allcd'))
+    assert.equal(gw.verdicts.length, 3)
+    driverSays('Yes to all')
+    await waitFor(() => messageWith('Allowed 2 approval requests:'))
+    assert.deepEqual(gw.verdicts.slice(-2), [{ request_id: 'allab', behavior: 'allow' }, { request_id: 'allcd', behavior: 'allow' }])
+    assert.equal(
+      sentWith('Allowed 2 approval requests:').text,
+      'Allowed 2 approval requests:\n- allab (Bash: gh pr merge 5 --repo driver/alpha --squash)\n- allcd (Write: Create playground/all.md)\nClaude Code goes on.',
+    )
+    assert.ok(!gw.events.some(e => ['Yes', 'ja', 'Yes to all'].includes(e.content)), 'no request for the controller')
 
     // Delete, restart and a push straight to main: their tools take words typed here.
     driverSays('Delete the folder old-notes now')

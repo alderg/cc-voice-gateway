@@ -577,19 +577,25 @@ function describeReply(request, update) {
   return `${about}${update.state === 'working' ? ', still working' : ''}:\n\n${update.text}`
 }
 
+// Claude Code's descriptions often end with a full stop already.
+const descriptionOf = permission => String(permission.description ?? '').replace(/[\s.]+$/, '')
+
+// An approval request in a few words, for the chat: "qwert (Bash: gh pr
+// merge 3 …)", so that the driver sees which one an answer went to.
+export const permissionBrief = permission => `${permission.code} (${permission.toolName}: ${preview(descriptionOf(permission), 60)})`
+
 // An approval request. approvable: whether the driver may answer it here
 // (TelegramAnswers.approves).
 function describePermission(permission, approvable = false) {
-  // Claude Code's descriptions often end with a full stop already.
-  const description = String(permission.description).replace(/[\s.]+$/, '')
   const details = preview(permission.inputPreview || '', 300)
-  const lines = [`Approval request ${permission.code} (controller session)`, '', `${permission.toolName}: ${description}`]
+  const lines = [`Approval request ${permission.code} (controller session)`, '', `${permission.toolName}: ${descriptionOf(permission)}`]
   if (details) lines.push(`Details: ${details}`)
   lines.push(
     '',
     approvable
       ? `To allow it, reply to this message with yes, or with no to deny it; or write a message with ${permission.code} ` +
-          'and yes or no. Or answer in voice mode or at the terminal.'
+          'and yes or no, or just yes or no while it is the only one open ("yes to all" allows every one open). Or answer ' +
+          'in voice mode or at the terminal.'
       : 'Answer in voice mode or at the terminal; Telegram cannot approve.',
   )
   return lines.join('\n')
@@ -850,6 +856,41 @@ export function verdictOf(text) {
   return allow === deny ? null : allow ? 'allow' : 'deny'
 }
 
+// A message that is nothing but a yes or a no, as the driver writes it to an
+// approval request without Telegram's Reply and without its code:
+// { behavior, all }, all for "yes to all" and its like, or null for anything
+// else. Stricter than verdictOf, which reads a message already known to answer
+// an approval request: here the whole message must be one of these, in any
+// case, with full stops, exclamation marks or commas after it; "yes?" or
+// "yes, merge it" is none.
+const BARE_ALLOW = new Set('yes y yeah yep ok okay approve allow ja jo jep jawohl oui si sì sí 👍'.split(' '))
+const BARE_DENY = new Set('no n nope deny nein ne nee non 👎'.split(' '))
+const ALL_ALLOW = new Set([
+  'yes to all', 'yes for all', 'yes all', 'all yes', 'allow all', 'approve all',
+  'ja zu allen', 'ja zu allem', 'ja für alle', 'ja alle', 'alle ja', 'alles ja', 'alle erlauben',
+  'oui à tous', 'oui pour tous', 'sì a tutti', 'si a tutti',
+])
+const ALL_DENY = new Set([
+  'no to all', 'no for all', 'no all', 'all no', 'deny all',
+  'nein zu allen', 'nein zu allem', 'nein für alle', 'nein alle', 'alle nein', 'alles nein', 'alle ablehnen',
+  'non à tous', 'non pour tous', 'no a tutti',
+])
+export function bareVerdict(text) {
+  const words = String(text)
+    .normalize('NFC')
+    .toLowerCase()
+    .replace(/[\u{1F3FB}-\u{1F3FF}\uFE0F]/gu, '') // skin tones, emoji presentation
+    .replace(/[,;:]/g, ' ')
+    .replace(/[\s.!…]+$/u, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (BARE_ALLOW.has(words)) return { behavior: 'allow', all: false }
+  if (BARE_DENY.has(words)) return { behavior: 'deny', all: false }
+  if (ALL_ALLOW.has(words)) return { behavior: 'allow', all: true }
+  if (ALL_DENY.has(words)) return { behavior: 'deny', all: true }
+  return null
+}
+
 const listed = items => (items.length > 1 ? `${items.slice(0, -1).join(', ')} and ${items.at(-1)}` : items.join(''))
 
 // The gateway's message a request replies to, quoted after the driver's own
@@ -886,11 +927,19 @@ export const quoteText = quoted => `(In reply to the gateway's message, quoted a
 // Push, merge, restart and delete decisions are answered here as any other
 // question, and an approval request of Claude Code's that the gateway sent
 // here is answered with a yes or a no, by Reply or with its code: the
-// verdict goes to Claude Code as one by voice does (approves). With confirm
-// off (VOICE_GW_TELEGRAM_CONFIRM=0) neither: an answer to such a decision is
+// verdict goes to Claude Code as one by voice does (approves). A message that
+// is nothing but a yes or a no (bareVerdict), without a Reply and without a
+// code, answers the approval request open now, when it is the only one: the
+// controller waits on it and could not read the message as a request before
+// it is answered anyway. With several open, or with a question shown here
+// after it, it answers none, and the chat asks which one is meant (bare). "Yes
+// to all" allows every approval request open, "no to all" denies them, and
+// the chat lists them; questions never. With confirm off
+// (VOICE_GW_TELEGRAM_CONFIRM=0) none of this: an answer to such a decision is
 // not passed on, nothing is done, the decision stays open, and the chat hears
 // that it must be confirmed by voice (voiceOnlyText); an approval request is
-// answered in voice mode or at the computer.
+// answered in voice mode or at the computer, and a plain yes or no while one
+// is open hears so too.
 //
 // push(request): hands the request to the controller (channel.mjs). say(text,
 // replyTo): a message to the chat, as a reply to the driver's. held(): a
@@ -1008,9 +1057,65 @@ export class TelegramAnswers {
     return { why: `approval request ${code} was ${how} already${permission.by === 'telegram' ? ' here' : ' in voice mode'}; nothing to do.` }
   }
 
+  // A plain yes or no ({ behavior, all }, bareVerdict) without a Reply or a
+  // code, with the approval requests open now: { permission, behavior } for
+  // the only one; { permissions, behavior } for all of them with "yes to all"
+  // or "no to all"; { why, text } that asks back which one is meant, with
+  // several open, or with an open question shown here after the only one,
+  // which the driver may be answering instead; { why } where Telegram cannot
+  // approve. null with none open, where the message is what it was before (a
+  // request, say), except that "yes to all" hears that none is open.
+  bare({ behavior, all }) {
+    const open = this.store.openPermissions().sort((a, b) => a.createdAt - b.createdAt)
+    if (!open.length) return all ? { why: `no approval request is open now, so there is nothing to ${behavior}.` } : null
+    if (!this.approves()) {
+      return open.length === 1
+        ? this.approving(open[0])
+        : { why: `approval requests ${listed(open.map(p => p.code))} are answered in voice mode or at the computer; Telegram cannot approve.` }
+    }
+    if (all) return { permissions: open, behavior }
+    if (open.length > 1) {
+      const codes = listed(open.map(p => p.code))
+      return {
+        why: `${open.length} approval requests are open, ${codes}; asked which one is meant`,
+        text:
+          `${open.length} approval requests are open: ${listed(open.map(permissionBrief))}. Which one do you mean? ` +
+          'Reply to its message with yes or no, or write its code with yes or no. "Yes to all" allows them all, ' +
+          '"no to all" denies them all.',
+      }
+    }
+    const [permission] = open
+    const question = this.laterQuestion(permission)
+    if (question) {
+      return {
+        why: `approval request ${permission.code} and question ${question.id}, shown here after it, are both open; asked which one is meant`,
+        text:
+          `Approval request ${permissionBrief(permission)} and question ${question.id} are both open. Which one do you mean? ` +
+          `Reply to its message, or write its code with your answer.`,
+      }
+    }
+    return { permission, behavior }
+  }
+
+  // The open question shown in this chat after the approval request, or
+  // before it was shown here at all; the latest, or null. Telegram numbers the
+  // messages of a chat in the order sent.
+  laterQuestion(permission) {
+    const after = Number.isInteger(permission.telegramMessage) ? permission.telegramMessage : -Infinity
+    let latest = null
+    let shown = after
+    for (const request of this.store.requests.values()) {
+      if (request.state !== 'question') continue
+      const message = request.updates.findLast(update => update.state === 'question' && Number.isInteger(update.telegramMessage))?.telegramMessage
+      if (message > shown) [latest, shown] = [request, message]
+    }
+    return latest
+  }
+
   // What a message is: the { question } it answers, the { permission } it
-  // approves or denies, { request: true } for a new request, or { why } it
-  // is none of these.
+  // approves or denies (with its behavior when it is a plain yes or no), the
+  // { permissions } "yes to all" or "no to all" answers, { request: true } for
+  // a new request, or { why } it is none of these.
   target(text, replyTo) {
     const sent = replyTo === null ? null : this.sentMessage(replyTo)
     if (sent?.permission) return this.approving(sent.permission)
@@ -1044,6 +1149,10 @@ export class TelegramAnswers {
     if (approvals.length === 1) return this.approving(approvals[0])
     if (open.size === 1) return this.answering([...open.values()][0])
     if (named.length) return this.approving(named[0])
+    // A plain yes or no, without a Reply: the approval request open now.
+    const bare = replyTo === null ? bareVerdict(text) : null
+    const pending = bare ? this.bare(bare) : null
+    if (pending) return pending
     // Anything else is a request of the driver's, where they allow it.
     if (this.requests) return text ? { request: true } : { why: 'it holds no text.' }
     if (closed.length) return { why: `${listed(closed)} ${closed.length === 1 ? 'has' : 'have'} no open question. ${this.openQuestions()}` }
@@ -1055,8 +1164,9 @@ export class TelegramAnswers {
   }
 
   // Whether and where a message goes: { question }, { permission, behavior },
-  // { request: true }, or { why } not, with the whole answer for the chat in
-  // text when it is not the usual "Not passed on: <why>".
+  // { permissions, behavior }, { request: true }, or { why } not, with the
+  // whole answer for the chat in text when it is not the usual "Not passed
+  // on: <why>".
   check(text, replyTo, { forwarded = false } = {}) {
     if (this.killswitch?.locked) {
       return {
@@ -1069,9 +1179,10 @@ export class TelegramAnswers {
     if (!presence.active) return { why: `this gateway is inactive, ${presence.why}.` }
     if (forwarded) return { why: 'it is forwarded, so its words are not your own. Write what you want in a message of your own.' }
     const target = this.target(text, replyTo)
+    if (target.permissions) return target
     if (target.permission) {
       // A plain yes or no, as by voice; anything else leaves it open.
-      const behavior = verdictOf(text)
+      const behavior = target.behavior ?? verdictOf(text)
       if (behavior) return { permission: target.permission, behavior }
       const { code } = target.permission
       return { why: `approval request ${code} takes a plain yes or no. Reply to it with yes to allow it, or with no to deny it.` }
@@ -1087,10 +1198,11 @@ export class TelegramAnswers {
 
   // A message from the driver's chat ({ text, replyTo, messageId, quoted,
   // forwarded, seen }, from TelegramCommands): passed on as their answer, as
-  // a new request or as their verdict on an approval request, or not, and the
-  // chat hears which; the input log keeps it with seen, who sent it where.
-  // Resolves with the request passed on, the approval request answered, or
-  // null. Never throws.
+  // a new request or as their verdict on one approval request or on all that
+  // are open, or not, and the chat hears which; the input log keeps it with
+  // seen, who sent it where. Resolves with the request passed on, the
+  // approval request answered (a list of them for "yes to all"), or null.
+  // Never throws.
   async route({ text, replyTo = null, messageId = null, quoted = null, forwarded = false, seen = null }) {
     const said = String(text ?? '').trim()
     const record = entry => this.record({ ...(seen ?? { text: said }), ...entry })
@@ -1103,6 +1215,7 @@ export class TelegramAnswers {
         return null
       }
       if (result.permission) return await this.approve(result.permission, result.behavior, { messageId, record })
+      if (result.permissions) return await this.approveAll(result.permissions, result.behavior, { messageId, record })
       if (result.request) {
         const request = await this.start(said, { messageId, quoted: replyTo === null ? null : quoted })
         record({ decision: 'accepted', as: 'request', request: request.id })
@@ -1166,11 +1279,49 @@ export class TelegramAnswers {
     record({ decision: 'accepted', as: behavior === 'allow' ? 'approval allowed' : 'approval denied', answers: code })
     await this.say(
       behavior === 'allow'
-        ? `Allowed: approval request ${code} (${toolName}). Claude Code goes on.`
-        : `Denied: approval request ${code} (${toolName}). Claude Code does not run it.`,
+        ? `Allowed: approval request ${permissionBrief(permission)}. Claude Code goes on.`
+        : `Denied: approval request ${permissionBrief(permission)}. Claude Code does not run it.`,
       messageId,
     )
     return permission
+  }
+
+  // "Yes to all" or "no to all": the driver's verdict on every approval
+  // request open now, each claimed and sent as approve does, then one message
+  // that lists what it allowed or denied. One that does not reach Claude Code
+  // is open again, and listed as still open; when none does, that is said as
+  // for a single one.
+  async approveAll(permissions, behavior, { messageId = null, record = () => {} } = {}) {
+    // All claimed at once, so that an answer elsewhere meanwhile finds them answered.
+    const claimed = permissions.filter(permission => this.store.resolvePermission(permission.code, behavior, 'telegram'))
+    const answered = []
+    const failed = []
+    let failure = null
+    for (const permission of claimed) {
+      try {
+        await this.verdict(permission.code, behavior)
+        answered.push(permission)
+        this.log('telegram approval', `code=${permission.code}`, `behavior=${behavior}`, `tool=${permission.toolName}`, '(to all)')
+      } catch (error) {
+        Object.assign(permission, { status: 'open', resolvedAt: undefined, by: undefined })
+        failed.push(permission)
+        failure ??= error
+      }
+    }
+    if (failed.length) this.store.changed()
+    if (!answered.length) throw failure ?? new Error('the approval requests were answered elsewhere meanwhile')
+    const codes = answered.map(permission => permission.code).join(',')
+    record({ decision: 'accepted', as: behavior === 'allow' ? 'approvals allowed' : 'approvals denied', answers: codes })
+    const count = n => `${n} approval request${n === 1 ? '' : 's'}`
+    const list = items => items.map(permission => `- ${permissionBrief(permission)}`)
+    const lines = [
+      `${behavior === 'allow' ? 'Allowed' : 'Denied'} ${count(answered.length)}:`,
+      ...list(answered),
+      behavior === 'allow' ? 'Claude Code goes on.' : `Claude Code does not run ${answered.length === 1 ? 'it' : 'them'}.`,
+    ]
+    if (failed.length) lines.push('', `Still open, as Claude Code was not reached (${failure.message}):`, ...list(failed))
+    await this.say(lines.join('\n'), messageId)
+    return answered
   }
 
   // The usage limit's sentence, when the controller waits for it.
