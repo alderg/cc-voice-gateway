@@ -24,7 +24,7 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 import { z } from 'zod'
 import { adminRequest } from '../src/admin.mjs'
 import { restartTool, spokenByDriver, takesVoice, telegramInstructions } from '../src/channel.mjs'
-import { telegramAnswersMode, telegramRequestsOn } from '../src/config.mjs'
+import { telegramAnswersMode, telegramConfirmOn, telegramRequestsOn } from '../src/config.mjs'
 import { Ledger } from '../src/ledger.mjs'
 import { Store } from '../src/store.mjs'
 import {
@@ -42,6 +42,7 @@ import {
   quoteText,
   scrubEnv,
   secureSecrets,
+  verdictOf,
   voiceOnlyText,
 } from '../src/telegram.mjs'
 
@@ -447,26 +448,38 @@ test("the command loop's pause leaves no abort listener behind, and ends at once
 // TelegramAnswers with a Store, a Ledger kept as the gateway keeps it, and
 // fakes for the channel, the chat, the kill switch and the gateway's state;
 // requests off, as with VOICE_GW_TELEGRAM_REQUESTS=0, unless asked for.
-function answering({ mode = 'on', requests = false, held = () => '', push = null } = {}) {
+// confirm: VOICE_GW_TELEGRAM_CONFIRM, on by default as there; verdicts: the
+// verdicts on approval requests sent to Claude Code (verdict).
+function answering({ mode = 'on', requests = false, confirm = true, held = () => '', push = null, verdict = null } = {}) {
   const store = new Store()
   const ledger = new Ledger({ log: () => {} })
   // As gateway.mjs: the decisions of the question keep the answer.
   store.on('answer', request =>
     ledger.answer(request.answers, { text: request.text.replace(/^\(Answer to [^)]*\)\s*/, ''), answerId: request.id }),
   )
-  const t = { store, ledger, pushed: [], said: [], logged: [], killswitch: { locked: false }, active: true }
+  const t = { store, ledger, pushed: [], said: [], logged: [], recorded: [], verdicts: [], killswitch: { locked: false }, active: true }
   t.answers = new TelegramAnswers({
     store,
     ledger,
     mode,
     requests,
+    confirm,
     held,
     killswitch: t.killswitch,
     presence: { state: () => (t.active ? { active: true } : { active: false, why: 'connector disconnected, in standby' }) },
     push: push ?? (async request => t.pushed.push(request)),
     say: async (text, replyTo) => t.said.push({ text, replyTo }),
+    verdict: verdict ?? (async (code, behavior) => t.verdicts.push([code, behavior])),
+    record: entry => t.recorded.push(entry),
     log: (...parts) => t.logged.push(parts.join(' ')),
   })
+  // An approval request of Claude Code's; with message, the id of the
+  // Telegram message that carried it.
+  t.approval = (code, { tool = 'Bash', description = 'gh pr merge 3 --repo driver/alpha --squash', message = null } = {}) => {
+    store.addPermission({ request_id: code, tool_name: tool, description, input_preview: '' })
+    if (message !== null) store.getPermission(code).telegramMessage = message
+    return store.getPermission(code)
+  }
   // A question of the controller's, as a decision of `kind`; with message,
   // the id of the Telegram message that carried it.
   t.question = (text, { kind = 'other', message = null } = {}) => {
@@ -531,13 +544,12 @@ test('Telegram answers: without a Reply, the code of exactly one open question; 
   // A Reply to a message of the gateway's that holds no question, without a code.
   await t.answers.route({ text: 'ok', replyTo: 999, messageId: 32 })
   assert.equal(t.lastSaid(), `Not passed on: the message it replies to holds no question, and it names no open question by its code. ${open}`)
-  // A Reply to an approval request: never an approval.
-  t.store.addPermission({ request_id: 'qwert', tool_name: 'Bash', description: 'Run ls', input_preview: '' })
-  t.store.getPermission('qwert').telegramMessage = 40
+  // A Reply to an approval request answers it, and is no answer to a question.
+  t.approval('qwert', { message: 40 })
   await t.answers.route({ text: 'yes', replyTo: 40, messageId: 33 })
-  assert.equal(t.lastSaid(), 'Not passed on: approval request qwert is answered in voice mode or at the computer; Telegram cannot approve.')
-  assert.equal(t.store.getPermission('qwert').status, 'open')
-  assert.deepEqual(t.pushed, [], 'nothing passed on so far')
+  assert.equal(t.lastSaid(), 'Allowed: approval request qwert (Bash). Claude Code goes on.')
+  assert.equal(t.store.getPermission('qwert').status, 'allow')
+  assert.deepEqual(t.pushed, [], 'nothing passed on to the controller so far')
   assert.equal(first.state, 'question')
   assert.equal(second.state, 'question')
 
@@ -601,8 +613,54 @@ test('VOICE_GW_TELEGRAM_ANSWERS: off by default and for any value it does not kn
   for (const value of ['1', ' 1 ', 'other', ' Other ']) assert.equal(telegramAnswersMode(value), 'on', value)
 })
 
-test('push, merge, restart and delete decisions take the voice: an answer by Telegram does nothing, the decision stays open, and the chat says it must be confirmed by voice, in German or English', async () => {
+test('VOICE_GW_TELEGRAM_CONFIRM: on by default and with 1; 0 and any value it does not know keep push, merge, restart, delete and approvals with the voice', () => {
+  for (const value of [undefined, '', ' ', '1', ' 1 ']) assert.equal(telegramConfirmOn(value), true, String(value))
+  for (const value of ['0', ' 0 ', 'yes', 'on', 'true', 'off', 'all']) assert.equal(telegramConfirmOn(value), false, value)
+})
+
+test('push, merge, restart and delete decisions are answered by Telegram as any other question: the answer reaches the controller, the question is answered, the decision keeps it, and the words count', async () => {
   const t = answering()
+  const words = { push: 'ja, push es', merge: 'yes, merge it', restart: 'ja bitte', delete: 'go ahead and delete it' }
+  for (const [index, kind] of ['push', 'merge', 'restart', 'delete'].entries()) {
+    const message = 70 + 10 * index
+    const question = t.question(`A ${kind} question?`, { kind, message })
+    const [decision] = t.ledger.forRequest(question.id)
+    assert.equal(t.answers.accepts(question), true, kind)
+    assert.equal(t.answers.voiceOnly(question), null, kind)
+    // By Reply for the first two, by its code for the others: the same.
+    const text = index < 2 ? words[kind] : `${question.id} ${words[kind]}`
+    const answer = await t.answers.route({ text, replyTo: index < 2 ? message : null, messageId: message + 1 })
+    assert.equal(answer.text, `(Answer to ${question.id}) ${text}`, kind)
+    assert.equal(answer.via, 'telegram')
+    assert.deepEqual(t.said.at(-1), { text: `Passed on to the controller as your answer to ${question.id}.`, replyTo: message + 1 })
+    assert.equal(question.state, 'done', 'the question is answered')
+    assert.equal(decision.state, 'answered', 'the decision keeps the answer')
+    assert.equal(decision.answer, text)
+    // resolve_decision, the follow-up dispatch, delete_path and restart_controller take these words, as spoken ones.
+    assert.equal(spokenByDriver(t.store, words[kind], 30, { telegram: !takesVoice(kind) }), answer, kind)
+  }
+  assert.equal(t.pushed.length, 4, 'every answer reaches the controller')
+  assert.ok(!t.said.some(said => /confirmed by voice|per Voice/.test(said.text)), 'nothing says it takes the voice')
+
+  // The question's message says how to answer it there, a push question's too.
+  const sent = []
+  const fallback = new TelegramFallback(t.store, {
+    afterSeconds: AFTER,
+    log: () => {},
+    answerable: request => t.answers.accepts(request),
+    send: async text => sent.push(text),
+  })
+  const push = t.question('Push beta?', { kind: 'push' })
+  await waitFor(() => sent.some(text => text.includes(push.id)))
+  assert.match(
+    sent.find(text => text.includes(push.id)),
+    new RegExp(`\n\nTo answer, reply to this message, or write a message that starts with ${push.id}\\. Or answer in voice mode and mention ${push.id}\\.$`),
+  )
+  fallback.close()
+})
+
+test('VOICE_GW_TELEGRAM_CONFIRM=0: push, merge, restart and delete decisions take the voice: an answer by Telegram does nothing, the decision stays open, and the chat says it must be confirmed by voice, in German or English', async () => {
+  const t = answering({ confirm: false })
   const words = { push: 'ja, push es', merge: 'yes, merge it', restart: 'ja bitte', delete: 'go ahead and delete it' }
   const kinds = { push: 'Push', merge: 'Merge', restart: 'Neustart', delete: 'Lösch' }
   for (const [index, kind] of ['push', 'merge', 'restart', 'delete'].entries()) {
@@ -817,7 +875,7 @@ test("Telegram requests: a plain message is a request of the driver's, via=\"tel
   assert.equal(waiting.lastSaid(), `Passed on to the controller as request ${later.id}. The controller waits for the usage limit until 15:00 and reads it then.`)
 })
 
-test('Telegram requests: a Reply to a question and an open code still answer; a settled question and an approval stay refused; any other message is a request', async () => {
+test('Telegram requests: a Reply to a question and an open code still answer; a settled question stays refused; an approval request is answered, never a request; any other message is a request', async () => {
   const t = answering({ requests: true })
   const replied = t.question('Open the pull request?', { message: 90 })
   const coded = t.question('Delete the old branch too?')
@@ -829,11 +887,13 @@ test('Telegram requests: a Reply to a question and an open code still answer; a 
   // Its message again: settled, refused as before, no new request.
   await t.answers.route({ text: 'Doch nicht', replyTo: 90, messageId: 92 })
   assert.match(t.lastSaid(), new RegExp(`^Not passed on: question ${replied.id} is not open any more: it was answered or settled\\.`))
-  // A Reply to an approval request: never an approval, and no request either.
-  t.store.addPermission({ request_id: 'qwert', tool_name: 'Bash', description: 'Run ls', input_preview: '' })
-  t.store.getPermission('qwert').telegramMessage = 93
+  // A Reply to an approval request answers it, and is no request.
+  t.approval('qwert', { message: 93 })
   await t.answers.route({ text: 'yes', replyTo: 93, messageId: 94 })
-  assert.equal(t.lastSaid(), 'Not passed on: approval request qwert is answered in voice mode or at the computer; Telegram cannot approve.')
+  assert.equal(t.lastSaid(), 'Allowed: approval request qwert (Bash). Claude Code goes on.')
+  // Again: answered already, and still no request.
+  await t.answers.route({ text: 'yes, and run the tests', replyTo: 93, messageId: 94 })
+  assert.equal(t.lastSaid(), 'Not passed on: approval request qwert was allowed already here; nothing to do.')
   // Two open codes: which one is meant is unclear.
   const third = t.question('Rename it?')
   await t.answers.route({ text: `${coded.id} ja, ${third.id} nein`, messageId: 95 })
@@ -895,7 +955,7 @@ test('Telegram requests: nothing past a locked kill switch or an inactive gatewa
   assert.equal(spokenByDriver(broken.store, 'run the tests', 30), false, 'so its words count for nothing')
 })
 
-test('VOICE_GW_TELEGRAM_REQUESTS: off by default and for any value it does not know, 1 on; with answers off, questions stay with the voice; push, merge, restart and delete always', async () => {
+test('VOICE_GW_TELEGRAM_REQUESTS: off by default and for any value it does not know, 1 on; with answers off, questions stay with the voice; push, merge, restart and delete only with VOICE_GW_TELEGRAM_CONFIRM=0', async () => {
   for (const value of [undefined, '', '0', ' 0 ', 'yes', ' on ', 'other']) assert.equal(telegramRequestsOn(value), false, String(value))
   for (const value of ['1', ' 1 ']) assert.equal(telegramRequestsOn(value), true, value)
 
@@ -915,16 +975,192 @@ test('VOICE_GW_TELEGRAM_REQUESTS: off by default and for any value it does not k
   assert.equal(request.answers, undefined)
   assert.deepEqual(t.pushed, [request])
 
-  // Answers on: a push question takes the voice, a request does not.
+  // Answers on: a push question is answered there, as by voice.
   const other = answering({ mode: 'on', requests: true })
   const push = other.question('Push the commits?', { kind: 'push', message: 130 })
-  await other.answers.route({ text: 'yes', replyTo: 130, messageId: 131 })
-  assert.match(other.lastSaid(), new RegExp(`^Not done: ${push.id} is a push decision, which must be confirmed by voice\\.`))
+  assert.equal((await other.answers.route({ text: 'yes', replyTo: 130, messageId: 131 })).answers, push.id)
   assert.equal((await other.answers.route({ text: 'Fix the README in alpha', messageId: 132 })).text, 'Fix the README in alpha')
-  // What takes the voice in channel.mjs, whatever the setting: resolve_decision, a confirmed delete_path,
-  // restart_controller with confirm, dispatch with direct and the follow-up for such a decision.
-  for (const kind of ['push', 'merge', 'restart', 'delete']) assert.equal(takesVoice(kind), true, kind)
-  for (const kind of ['other', 'clone']) assert.equal(takesVoice(kind), false, kind)
+  // With VOICE_GW_TELEGRAM_CONFIRM=0 it takes the voice; a request does not.
+  const voice = answering({ mode: 'on', requests: true, confirm: false })
+  const kept = voice.question('Push the commits?', { kind: 'push', message: 140 })
+  await voice.answers.route({ text: 'yes', replyTo: 140, messageId: 141 })
+  assert.match(voice.lastSaid(), new RegExp(`^Not done: ${kept.id} is a push decision, which must be confirmed by voice\\.`))
+  assert.equal((await voice.answers.route({ text: 'Fix the README in alpha', messageId: 142 })).text, 'Fix the README in alpha')
+  // What takes the voice in channel.mjs: nothing by default; with the setting at 0, resolve_decision, a confirmed
+  // delete_path, restart_controller with confirm, dispatch with direct and the follow-up for such a decision.
+  for (const kind of ['push', 'merge', 'restart', 'delete', 'other', 'clone']) assert.equal(takesVoice(kind), false, kind)
+  for (const kind of ['push', 'merge', 'restart', 'delete']) assert.equal(takesVoice(kind, false), true, kind)
+  for (const kind of ['other', 'clone']) assert.equal(takesVoice(kind, false), false, kind)
+})
+
+// --- approvals by Telegram ----------------------------------------------------------
+
+test('an approval takes a plain yes or a plain no: anything else, or both, is neither', () => {
+  for (const text of ['yes', 'Yes!', 'ok', 'Okay, go', 'Ja', 'ja, mach', 'Jawohl', 'klar', 'allow', 'qwert yes', 'sí', 'Oui']) assert.equal(verdictOf(text), 'allow', text)
+  for (const text of ['no', 'No.', 'nein', 'Nein, lass das', 'deny', 'nope', 'qwert no', 'cancel', 'nicht', "don't", 'don’t']) assert.equal(verdictOf(text), 'deny', text)
+  for (const text of ['', 'maybe later', 'not ok', 'nicht erlauben', 'ja nein', 'yes and no', 'what is it?', 'qwert']) assert.equal(verdictOf(text), null, text)
+})
+
+test('Telegram approvals: a Reply with yes or no, or a message with the code, answers an approval request; the verdict goes to Claude Code, the voice client hears it was answered there, the input log keeps it', async () => {
+  const t = answering()
+  assert.equal(t.answers.approves(), true)
+  const merge = t.approval('qwert', { message: 40 })
+  merge.announced = true // the voice client heard it too
+  const seen = { from: 4242, chat: 4242, type: 'private', text: 'Ja, mach' }
+
+  // By Reply.
+  assert.equal(await t.answers.route({ text: 'Ja, mach', replyTo: 40, messageId: 41, seen }), merge)
+  assert.deepEqual(t.verdicts, [['qwert', 'allow']])
+  assert.equal(merge.status, 'allow')
+  assert.equal(merge.by, 'telegram')
+  assert.deepEqual(t.said.at(-1), { text: 'Allowed: approval request qwert (Bash). Claude Code goes on.', replyTo: 41 })
+  assert.deepEqual(t.recorded.at(-1), { ...seen, decision: 'accepted', as: 'approval allowed', answers: 'qwert' })
+  assert.ok(t.logged.includes('telegram approval code=qwert behavior=allow tool=Bash'))
+  assert.deepEqual(t.pushed, [], 'no request for the controller')
+  // The voice client hears once that it was answered in Telegram.
+  assert.deepEqual(t.store.takeAnsweredElsewhere().map(p => p.code), ['qwert'])
+  assert.deepEqual(t.store.takeAnsweredElsewhere(), [])
+
+  // By its code, in any case and anywhere in the message.
+  const write = t.approval('asdfg', { tool: 'Write', description: 'Create playground/notes.md' })
+  assert.equal(await t.answers.route({ text: 'Nein, ASDFG nicht', messageId: 42 }), write)
+  assert.deepEqual(t.verdicts.at(-1), ['asdfg', 'deny'])
+  assert.equal(t.lastSaid(), 'Denied: approval request asdfg (Write). Claude Code does not run it.')
+  assert.equal(t.recorded.at(-1).as, 'approval denied')
+
+  // Neither a plain yes nor a plain no: it stays open.
+  const unclear = t.approval('hjkmn', { message: 50 })
+  for (const text of ['not ok', 'what does it do?']) {
+    assert.equal(await t.answers.route({ text, replyTo: 50, messageId: 51 }), null)
+    assert.equal(t.lastSaid(), 'Not passed on: approval request hjkmn takes a plain yes or no. Reply to it with yes to allow it, or with no to deny it.')
+  }
+  assert.equal(unclear.status, 'open')
+  assert.equal(t.verdicts.length, 2)
+
+  // Answered by voice, or at the computer, meanwhile: nothing to do, and no request.
+  t.store.resolvePermission('hjkmn', 'deny')
+  await t.answers.route({ text: 'yes', replyTo: 50, messageId: 52 })
+  assert.equal(t.lastSaid(), 'Not passed on: approval request hjkmn was denied already in voice mode; nothing to do.')
+  t.approval('pqrst', { message: 60 })
+  t.store.closePermissionsElsewhere()
+  await t.answers.route({ text: 'pqrst yes', messageId: 61 })
+  assert.equal(t.lastSaid(), 'Not passed on: approval request pqrst was answered at the computer; nothing to do.')
+  assert.equal(t.verdicts.length, 2)
+
+  // Two at once, or an approval and a question: which is meant is unclear.
+  t.approval('bcdef')
+  t.approval('ghijk')
+  await t.answers.route({ text: 'bcdef yes, ghijk no', messageId: 62 })
+  assert.equal(t.lastSaid(), 'Not passed on: it names 2 open questions and approval requests, bcdef and ghijk. Answer each in a message of its own.')
+  const question = t.question('Squash it?')
+  await t.answers.route({ text: `${question.id} yes, bcdef yes`, messageId: 63 })
+  assert.equal(t.lastSaid(), `Not passed on: it names 2 open questions and approval requests, ${question.id} and bcdef. Answer each in a message of its own.`)
+  assert.equal(t.verdicts.length, 2)
+  assert.deepEqual(t.pushed, [])
+})
+
+test('Telegram approvals: nothing past a locked kill switch or a standby; not with VOICE_GW_TELEGRAM_CONFIRM=0, with answers off or without the permission relay; a verdict that does not reach Claude Code leaves it open', async () => {
+  const t = answering()
+  const permission = t.approval('qwert', { message: 40 })
+  t.killswitch.locked = true
+  assert.equal(await t.answers.route({ text: 'yes', replyTo: 40, messageId: 41 }), null)
+  assert.equal(t.lastSaid(), 'Not passed on: the kill switch is locked. It is unlocked only at the computer.')
+  t.killswitch.locked = false
+  t.active = false
+  await t.answers.route({ text: 'yes', replyTo: 40, messageId: 42 })
+  assert.equal(t.lastSaid(), 'Not passed on: this gateway is inactive, connector disconnected, in standby.')
+  assert.equal(permission.status, 'open')
+  assert.deepEqual(t.verdicts, [])
+
+  // Kept with the voice, or answers off: Telegram cannot approve.
+  for (const options of [{ confirm: false }, { mode: 'off', requests: true }]) {
+    const voice = answering(options)
+    assert.equal(voice.answers.approves(), false)
+    const kept = voice.approval('qwert', { message: 40 })
+    await voice.answers.route({ text: 'yes', replyTo: 40, messageId: 41 })
+    assert.equal(voice.lastSaid(), 'Not passed on: approval request qwert is answered in voice mode or at the computer; Telegram cannot approve.')
+    assert.equal(kept.status, 'open')
+    assert.deepEqual(voice.verdicts, [])
+  }
+  // Without the permission relay there is no way to Claude Code.
+  assert.equal(new TelegramAnswers({ store: new Store(), push: async () => {}, say: async () => {} }).approves(), false)
+
+  // The channel gone: said, and the approval request is open again, to be answered elsewhere.
+  const broken = answering({ verdict: async () => { throw new Error('Not connected') } })
+  const open = broken.approval('qwert', { message: 40 })
+  assert.equal(await broken.answers.route({ text: 'yes', replyTo: 40, messageId: 41 }), null)
+  assert.equal(broken.lastSaid(), 'Not passed on: Not connected.')
+  assert.equal(open.status, 'open')
+  assert.equal(open.by, undefined)
+  assert.deepEqual(broken.store.openPermissions(), [open])
+})
+
+test('the fallback: an approval request says how to answer it there where the driver may; while they write in Telegram it goes there at once, voice mode, night or not; a standby holds it', async () => {
+  const store = new Store()
+  const sent = []
+  let approvable = true
+  let paused = false
+  let held = false
+  const fallback = new TelegramFallback(store, {
+    afterSeconds: AFTER,
+    log: () => {},
+    paused: () => paused,
+    held: () => held,
+    approvable: () => approvable,
+    send: async (text, options) => {
+      sent.push({ text, replyTo: options?.replyTo ?? null })
+      return { message_id: 200 + sent.length }
+    },
+  })
+  const ask = code => store.addPermission({ request_id: code, tool_name: 'Bash', description: `gh pr merge 3 (${code})`, input_preview: '' })
+  // The voice mode is on, and the driver's latest request was spoken: the voice client has it.
+  store.voiceCallStarted()
+  store.createRequest('Merge pull request 3 in alpha.')
+  ask('abcde')
+  await sleep(100)
+  assert.deepEqual(sent, [], 'the voice client has it')
+
+  // The driver answers in Telegram: from now on, approval requests go there at once.
+  const typed = store.createRequest('(Answer to ab12) yes, merge it', { answers: 'ab12', via: 'telegram' })
+  await waitFor(() => sent.length === 1)
+  assert.equal(
+    sent[0].text,
+    'Approval request abcde (controller session)\n\nBash: gh pr merge 3 (abcde)\n\nTo allow it, reply to this message with yes, or with no ' +
+      'to deny it; or write a message with abcde and yes or no. Or answer in voice mode or at the terminal.',
+  )
+  await waitFor(() => store.getPermission('abcde').telegramMessage === 201)
+  // In the night too.
+  paused = true
+  ask('fghjk')
+  await waitFor(() => sent.length === 2)
+  assert.match(sent[1].text, /^Approval request fghjk /)
+  // A standby holds it, until it is over.
+  held = true
+  ask('kmnop')
+  await sleep(100)
+  assert.equal(sent.length, 2)
+  held = false
+  store.changed()
+  await waitFor(() => sent.length === 3)
+  assert.match(sent[2].text, /^Approval request kmnop /)
+  store.changed()
+  await sleep(100)
+  assert.equal(sent.length, 3, 'each once')
+
+  // Not where they may not answer it there, nor after half an hour without a word there, nor once they speak again.
+  approvable = false
+  ask('qrstu')
+  await sleep(100)
+  approvable = true
+  typed.createdAt = Date.now() - 31 * 60 * 1000
+  ask('vwxyz')
+  await sleep(100)
+  store.createRequest('What is going on?')
+  ask('zyxwv')
+  await sleep(100)
+  assert.equal(sent.length, 3)
+  store.voiceCallEnded()
+  fallback.close()
 })
 
 test("the command loop with requests: a Reply to a question is an answer; a Reply to another message is read like any message, so commands stay commands; the bot's text comes along", () => {
@@ -1151,31 +1387,36 @@ test('Telegram.send keeps the ids of the messages it sent, so that only those ar
   assert.equal(heard[0].quoted, null)
 })
 
-test("restart_controller with confirm takes the driver's spoken words: words typed in Telegram, none or others restart nothing", () => {
+test("restart_controller with confirm takes the driver's words, spoken or typed in Telegram; none or others restart nothing; with VOICE_GW_TELEGRAM_CONFIRM=0 only spoken ones", () => {
   const store = new Store()
   const requested = []
   const restarter = { watchdog: () => ({ ok: true }), plan: () => '[restart=plan]', request: ({ by }) => (requested.push(by), '[restart=requested]') }
   const typed = store.createRequest('Restart the controller, please', { via: 'telegram' })
   typed.meta = { via: 'telegram' }
   assert.equal(restartTool(restarter, store, {}), '[restart=plan]', 'first the plan')
-  assert.match(
-    restartTool(restarter, store, { confirm: true, words: 'Restart the controller' }),
-    /^\[restart=needs_driver\] Nothing restarted: a restart must be confirmed by the driver's voice, and these words were typed in Telegram\. Tell the driver it needs their voice/,
-  )
   assert.match(restartTool(restarter, store, { confirm: true }), /^\[restart=needs_driver\] Nothing restarted\. It needs the driver's own words/)
   assert.match(restartTool(restarter, store, { confirm: true, words: 'something else entirely' }), /^\[restart=needs_driver\] Nothing restarted\. It needs/)
   assert.deepEqual(requested, [], 'nothing restarted')
-  // By voice: restarted.
+  // Kept with the voice: words typed in Telegram restart nothing.
+  assert.match(
+    restartTool(restarter, store, { confirm: true, words: 'Restart the controller' }, { confirm: false }),
+    /^\[restart=needs_driver\] Nothing restarted: a restart must be confirmed by the driver's voice, and these words were typed in Telegram\. Tell the driver it needs their voice/,
+  )
+  assert.deepEqual(requested, [], 'nothing restarted')
+  // Typed in Telegram, by default: restarted, as on spoken words, and the watchdog says where it was asked for.
+  assert.equal(restartTool(restarter, store, { confirm: true, words: 'Restart the controller' }), '[restart=requested]')
+  // By voice: restarted, also with the setting at 0.
   const spoken = store.createRequest('(Answer to ab12) Yes, restart it now.', { answers: 'ab12' })
   assert.equal(spoken.origin, 'voice')
-  assert.equal(restartTool(restarter, store, { confirm: true, words: '(Answer to ab12) Yes, restart it now.' }), '[restart=requested]')
-  assert.deepEqual(requested, ['voice'])
+  assert.equal(restartTool(restarter, store, { confirm: true, words: '(Answer to ab12) Yes, restart it now.' }, { confirm: false }), '[restart=requested]')
+  assert.deepEqual(requested, ['telegram', 'voice'])
   // Without the watchdog, the plan says it cannot, whatever the words.
   assert.equal(restartTool({ ...restarter, watchdog: () => ({ ok: false }) }, store, { confirm: true, words: 'Yes, restart it now' }), '[restart=plan]')
 })
 
-test("the controller's instructions on Telegram: nothing while input is off; with it on, that push, merge, restart, delete and approvals take the voice", () => {
+test("the controller's instructions on Telegram: nothing while input is off; with it on, that push, merge, restart and delete count there, and approvals with answers on; with VOICE_GW_TELEGRAM_CONFIRM=0, that they take the voice", () => {
   assert.equal(telegramInstructions('off', false), '')
+  assert.equal(telegramInstructions('off', false, false), '')
   const cases = [
     ['on', true, /^The driver may also write to you in their Telegram chat: a request, or an answer/],
     ['off', true, /Answers to your questions come by voice\./],
@@ -1184,9 +1425,19 @@ test("the controller's instructions on Telegram: nothing while input is off; wit
   for (const [answers, requests, first] of cases) {
     const text = telegramInstructions(answers, requests)
     assert.match(text, first)
+    assert.match(text, /\nThat holds for push, merge, restart and delete too: an? (answer or a )?request by Telegram confirms one as the same/)
     assert.match(
       text,
-      /\nPush, merge, restart, delete and approvals always take the driver's voice\. When a message by Telegram asks for one,\nprepare it and ask the driver \(state "question", with its kind\), and say that it must be confirmed by voice; do not try\nit on their Telegram words\./,
+      answers === 'on'
+        ? /Claude Code's approval prompts reach that chat as well, and the\ndriver may answer them there, so a merge or a deletion confirmed there does not wait for the voice\.$/
+        : /Claude Code's approval prompts are answered by voice\.$/,
+    )
+    assert.doesNotMatch(text, /always take the driver's voice|must be confirmed by voice/)
+    const kept = telegramInstructions(answers, requests, false)
+    assert.match(kept, first)
+    assert.match(
+      kept,
+      /\nPush, merge, restart, delete and approvals always take the driver's voice \(VOICE_GW_TELEGRAM_CONFIRM=0\)\. When a\nmessage by Telegram asks for one, prepare it and ask the driver \(state "question", with its kind\), and say that it must\nbe confirmed by voice; do not try it on their Telegram words\./,
     )
   }
 })
@@ -1352,7 +1603,7 @@ async function startGateway(name, { telegram, env = {} }) {
     writeFileSync(join(secrets, 'telegram_chat_id'), CHAT_ID, { mode: 0o600 })
   }
   const port = await freePort()
-  const gw = { events: [], log: '' }
+  const gw = { events: [], verdicts: [], log: '' }
   gw.claudeCode = new Client({ name: 'fake-claude-code', version: '0.0.0' })
   gw.claudeCode.setNotificationHandler(
     z.object({
@@ -1361,6 +1612,20 @@ async function startGateway(name, { telegram, env = {} }) {
     }),
     ({ params }) => gw.events.push(params),
   )
+  // The verdicts on approval requests, by voice or by Telegram.
+  gw.claudeCode.setNotificationHandler(
+    z.object({
+      method: z.literal('notifications/claude/channel/permission'),
+      params: z.object({ request_id: z.string(), behavior: z.enum(['allow', 'deny']) }),
+    }),
+    ({ params }) => gw.verdicts.push(params),
+  )
+  // An approval prompt, as Claude Code relays it.
+  gw.permission = (request_id, tool_name, description) =>
+    gw.claudeCode.notification({
+      method: 'notifications/claude/channel/permission_request',
+      params: { request_id, tool_name, description, input_preview: '{}' },
+    })
   const stdio = new StdioClientTransport({
     command: process.execPath,
     args: [GATEWAY],
@@ -1558,7 +1823,8 @@ test('gateway with requests off: a Reply on Telegram, or a message with the code
   // The stand-in's message ids count from 1.
   const messageWith = text => api.messages.findIndex(m => m.text.includes(text)) + 1
   try {
-    assert.match(gw.log, /telegram answers on \(VOICE_GW_TELEGRAM_ANSWERS=1\): a Reply to a question, or a message with its code, reaches the controller as the driver's answer, except for push, merge, restart and delete decisions/)
+    assert.match(gw.log, /telegram answers on \(VOICE_GW_TELEGRAM_ANSWERS=1\): a Reply to a question, or a message with its code, reaches the controller as the driver's answer\n/)
+    assert.match(gw.log, /telegram: push, merge, restart and delete count by Telegram as by voice \(VOICE_GW_TELEGRAM_CONFIRM=1, the default\); approval requests are answered there too, with a yes or a no/)
     assert.match(gw.log, /telegram requests off \(VOICE_GW_TELEGRAM_REQUESTS not 1, off by default\): a message that is no command and no answer is not passed on/)
     assert.match(gw.claudeCode.getInstructions(), /The driver may also answer a question in their Telegram chat: that answer arrives as/)
 
@@ -1668,12 +1934,14 @@ function workerRoot(name) {
   return { root, bin }
 }
 
-test("gateway: a plain message on Telegram is a request of the driver's, as by voice: via=\"telegram\", its words dispatch a worker and set night mode, its replies come back as replies; push, merge, restart and delete need the voice; commands stay commands; nothing past the kill switch", async () => {
+test("gateway: a plain message on Telegram is a request of the driver's, as by voice: via=\"telegram\", its words dispatch a worker and set night mode, its replies come back as replies; push, merge, restart and delete count there as by voice, and approval requests are answered there; commands stay commands; nothing past the kill switch", async () => {
   api.mode = 'ok'
   api.messages.length = 0
   api.updates = []
   const { root, bin } = workerRoot('requests')
-  // Telegram input on, as the setup turns it on: push, merge, restart and delete take the voice, even for a request typed here.
+  mkdirSync(join(root, 'old-notes'))
+  writeFileSync(join(root, 'old-notes', 'notes.md'), '# old\n')
+  // Telegram input on, as the setup turns it on: push, merge, restart and delete count there as by voice, by default.
   const gw = await startGateway('requests', {
     telegram: true,
     env: {
@@ -1692,9 +1960,12 @@ test("gateway: a plain message on Telegram is a request of the driver's, as by v
   const tool = async (name, args) => (await gw.claudeCode.callTool({ name, arguments: args })).content[0].text
   try {
     assert.match(gw.log, /telegram requests on \(VOICE_GW_TELEGRAM_REQUESTS=1\): any other message from the chat reaches the controller as a request of the driver's, and its replies come back there/)
-    assert.match(gw.log, /telegram: push, merge, restart, delete and approvals take the driver's voice; words typed in Telegram settle none of them/)
+    assert.match(gw.log, /telegram: push, merge, restart and delete count by Telegram as by voice \(VOICE_GW_TELEGRAM_CONFIRM=1, the default\); approval requests are answered there too, with a yes or a no/)
+    assert.doesNotMatch(gw.log, /take the driver's voice/)
     assert.match(gw.log, new RegExp(`telegram input only from the driver's user id ${CHAT_ID}, in their private chat with the bot`))
-    assert.match(gw.claudeCode.getInstructions(), /Push, merge, restart, delete and approvals always take the driver's voice\. When a message by Telegram asks for one,/)
+    assert.match(gw.claudeCode.getInstructions(), /\nThat holds for push, merge, restart and delete too: an answer or a request by Telegram confirms one as the same\n/)
+    assert.match(gw.claudeCode.getInstructions(), /Claude Code then asks for an approval, which the driver\ngives by voice or in their Telegram chat\./)
+    assert.doesNotMatch(gw.claudeCode.getInstructions(), /always take the driver's voice/)
     assert.match(
       gw.claudeCode.getInstructions(),
       /The driver may also write to you in their Telegram chat: a request, or an answer to a question as "\(Answer to <id>\) \.\.\.",\nboth with via="telegram"\./,
@@ -1744,75 +2015,98 @@ test("gateway: a plain message on Telegram is a request of the driver's, as by v
     await waitFor(() => messageWith('Die alten Notizen sind weg.'))
     assert.equal(sentWith('Die alten Notizen sind weg.').text, `On your answer to ${secondId}:\n\nDie alten Notizen sind weg.`)
 
-    // A push decision takes the voice here: no Reply, and no words typed here, settle it; the chat says so, in German.
+    // A push decision is answered here as any other: the Reply reaches the controller, and its words settle it.
     driverSays('Push alpha, please')
     const push = (await waitFor(() => gw.events.find(e => e.content === 'Push alpha, please'))).meta.request_id
     const pushed = await tool('reply', { request_id: push, state: 'question', text: 'Push the commits in alpha?', kind: 'push' })
     const decision = /as decision (d[a-z0-9]{3}) \(push\)/.exec(pushed)[1]
     await waitFor(() => messageWith('Push the commits in alpha?'))
-    assert.match(sentWith('Push the commits in alpha?').text, new RegExp(`\n\nAnswer in voice mode and mention ${push}\\.$`))
-    const before = gw.events.length
-    const yes = driverSays('ja, push', { replyTo: messageWith('Push the commits in alpha?') })
-    await waitFor(() => messageWith('muss per Voice bestätigt werden'))
-    assert.equal(
-      sentWith('muss per Voice bestätigt werden').text,
-      `Nicht ausgeführt: ${push} ist eine Push-Entscheidung, und die muss per Voice bestätigt werden. Sie bleibt offen. ` +
-        `Sag es im Voice-Modus und nenne ${push}.`,
+    assert.match(
+      sentWith('Push the commits in alpha?').text,
+      new RegExp(`\n\nTo answer, reply to this message, or write a message that starts with ${push}\\. Or answer in voice mode and mention ${push}\\.$`),
     )
-    assert.equal(sentWith('muss per Voice bestätigt werden').reply_parameters.message_id, yes)
-    assert.ok(!gw.events.slice(before).some(e => /ja, push/.test(e.content)), 'nothing reaches the controller')
-    const voiceOnly = kind =>
-      new RegExp(`Nothing closed: a ${kind} decision must be confirmed by the driver's voice, and these words were typed in Telegram\\.`)
-    assert.match(await tool('resolve_decision', { id: decision, outcome: 'push them', words: 'Push alpha' }), voiceOnly('push'))
-    assert.match(await tool('open_items', {}), new RegExp(decision), 'the decision stays open')
+    driverSays('ja, push', { replyTo: messageWith('Push the commits in alpha?') })
+    const pushAnswer = await waitFor(() => gw.events.find(e => e.content === `(Answer to ${push}) ja, push`))
+    assert.equal(pushAnswer.meta.via, 'telegram')
+    assert.equal(pushAnswer.meta.trusted, undefined, "the driver's own words")
+    await waitFor(() => messageWith(`Passed on to the controller as your answer to ${push}.`))
+    assert.ok(!api.messages.some(m => /per Voice|confirmed by voice/.test(m.text)), 'nothing says it takes the voice')
+    assert.match(await tool('resolve_decision', { id: decision, outcome: 'push them', words: 'ja, push' }), new RegExp(`^\\[decision=closed id=${decision}\\]`))
 
-    // Merge: the question asked on a request typed here, and neither a Reply nor its words settle it.
+    // Merge: the question asked on a request typed here, answered here; then Claude Code's approval of the merge, answered here too.
     driverSays('Merge pull request 3 in alpha')
     const merge = (await waitFor(() => gw.events.find(e => e.content === 'Merge pull request 3 in alpha'))).meta.request_id
     const merging = await tool('reply', { request_id: merge, state: 'question', text: 'Merge pull request 3, squashed?', kind: 'merge' })
     const mergeDecision = /as decision (d[a-z0-9]{3}) \(merge\)/.exec(merging)[1]
     await waitFor(() => messageWith('Merge pull request 3, squashed?'))
     driverSays('yes, merge it', { replyTo: messageWith('Merge pull request 3, squashed?') })
-    await waitFor(() => messageWith(`Not done: ${merge} is a merge decision, which must be confirmed by voice.`))
-    assert.match(await tool('resolve_decision', { id: mergeDecision, outcome: 'merged', words: 'Merge pull request 3' }), voiceOnly('merge'))
-
-    // Delete, restart and a push straight to main: their tools refuse words typed here.
-    driverSays('Delete the folder alpha now')
-    await waitFor(() => gw.events.find(e => e.content === 'Delete the folder alpha now'))
-    assert.match(
-      await tool('delete_path', { path: 'alpha', confirm: true, words: 'Delete the folder alpha' }),
-      /^\[delete=needs_driver\] Nothing happened: a delete must be confirmed by the driver's voice, and these words were typed in Telegram\./,
+    const mergeAnswer = (await waitFor(() => gw.events.find(e => e.content === `(Answer to ${merge}) yes, merge it`))).meta.request_id
+    assert.match(await tool('resolve_decision', { id: mergeDecision, outcome: 'merge it, squashed', words: 'yes, merge it' }), /^\[decision=closed /)
+    // The controller runs gh pr merge; the confine hook asks, and Claude Code relays the approval prompt. The driver
+    // wrote here last, so it comes here at once, voice mode or not.
+    await gw.permission('mrgab', 'Bash', 'gh pr merge 3 --repo driver/alpha --squash')
+    await waitFor(() => messageWith('Approval request mrgab'))
+    assert.equal(
+      sentWith('Approval request mrgab').text,
+      'Approval request mrgab (controller session)\n\nBash: gh pr merge 3 --repo driver/alpha --squash\nDetails: {}\n\nTo allow it, ' +
+        'reply to this message with yes, or with no to deny it; or write a message with mrgab and yes or no. Or answer in ' +
+        'voice mode or at the terminal.',
     )
-    assert.ok(existsSync(join(root, 'alpha')), 'nothing deleted')
+    const allowed = driverSays('Ja', { replyTo: messageWith('Approval request mrgab') })
+    await waitFor(() => gw.verdicts.some(v => v.request_id === 'mrgab'))
+    assert.deepEqual(gw.verdicts, [{ request_id: 'mrgab', behavior: 'allow' }])
+    await waitFor(() => messageWith('Allowed: approval request mrgab'))
+    assert.equal(sentWith('Allowed: approval request mrgab').text, 'Allowed: approval request mrgab (Bash). Claude Code goes on.')
+    assert.equal(sentWith('Allowed: approval request mrgab').reply_parameters.message_id, allowed)
+    assert.match(gw.log, /telegram approval code=mrgab behavior=allow tool=Bash/)
+    // A late answer by voice applies to nothing, and says so.
+    assert.match(await gw.call('approve', { code: 'mrgab', decision: 'deny' }), /\[approval=telegram code=mrgab\] Already allowed in Telegram; nothing to do\./)
+    assert.equal(gw.verdicts.length, 1)
+    await gw.reply(mergeAnswer, 'done', 'Pull request 3 is merged.')
+    await waitFor(() => messageWith('Pull request 3 is merged.'))
+    // Denied with its code instead of a Reply.
+    await gw.permission('wrtab', 'Write', 'Create playground/merged.md')
+    await waitFor(() => messageWith('Approval request wrtab'))
+    driverSays('wrtab nein')
+    await waitFor(() => gw.verdicts.some(v => v.request_id === 'wrtab'))
+    assert.deepEqual(gw.verdicts.at(-1), { request_id: 'wrtab', behavior: 'deny' })
+    await waitFor(() => messageWith('Denied: approval request wrtab (Write). Claude Code does not run it.'))
+
+    // Delete, restart and a push straight to main: their tools take words typed here.
+    driverSays('Delete the folder old-notes now')
+    await waitFor(() => gw.events.find(e => e.content === 'Delete the folder old-notes now'))
+    assert.match(await tool('delete_path', { path: 'old-notes' }), /^\[delete=plan path=old-notes\] .*which the driver gives by voice or in their Telegram chat\.$/)
+    assert.match(await tool('delete_path', { path: 'old-notes', confirm: true, words: 'Delete the folder old-notes' }), /^\[delete=done path=old-notes\] Deleted\./)
+    assert.ok(!existsSync(join(root, 'old-notes')), 'deleted')
     driverSays('Push the fix in alpha straight to main')
     await waitFor(() => gw.events.find(e => e.content === 'Push the fix in alpha straight to main'))
+    // Past the check of the words: here, on this computer, a direct push is refused for want of access level full.
     assert.match(
       await tool('dispatch', { worker: 'alpha', task: 'Push the fix straight to main.', words: 'straight to main', direct: true }),
-      /^\[dispatch=needs_driver worker=alpha\] Nothing started: a push straight to the default branch must be confirmed by the driver's voice/,
+      /^\[dispatch=refused worker=alpha\] Direct pushes need workers in Docker with access level full\./,
     )
-    // Nor under a standing order made of words typed here.
+    // So under a standing order made of words typed here.
     driverSays('Keep going with the notes in alpha tonight')
     await waitFor(() => gw.events.find(e => e.content === 'Keep going with the notes in alpha tonight'))
     const made = await tool('standing_order', { worker: 'alpha', scope: 'the notes', words: 'Keep going with the notes in alpha tonight' })
     const order = /^\[order=(o[a-z0-9]{3}) /.exec(made)[1]
     assert.match(
       await tool('dispatch', { worker: 'alpha', task: 'Push the notes straight to main.', order, direct: true }),
-      /^\[dispatch=needs_driver worker=alpha\] Nothing started: a push straight to the default branch must be confirmed by the driver's voice, and these words, or those of the standing order, were typed in Telegram\./,
+      /^\[dispatch=refused worker=alpha\] Direct pushes need workers in Docker/,
     )
     assert.match(await tool('end_order', { id: order }), new RegExp(order))
-    // The follow-up for an answer typed here, to a question that is also a push decision now.
+    // The follow-up for an answer typed here, to a request that has a push decision too.
     driverSays('Tidy up the notes in alpha')
     const notes = (await waitFor(() => gw.events.find(e => e.content === 'Tidy up the notes in alpha'))).meta.request_id
     const keep = /as decision (d[a-z0-9]{3}) \(other\)/.exec(await tool('reply', { request_id: notes, state: 'question', text: 'Keep the old ones?' }))[1]
     await waitFor(() => messageWith('Keep the old ones?'))
     driverSays('No, drop them all', { replyTo: messageWith('Keep the old ones?') })
     const dropped = await waitFor(() => gw.events.find(e => e.content === `(Answer to ${notes}) No, drop them all`))
-    // An ordinary decision: settled on these words. Then a push decision on the same request.
     assert.match(await tool('resolve_decision', { id: keep, outcome: 'drop them', words: 'No, drop them all' }), /^\[decision=closed /)
     assert.match(await tool('reply', { request_id: notes, state: 'question', text: 'And push the cleanup?', kind: 'push' }), /as decision d[a-z0-9]{3} \(push\)/)
     assert.match(
       await tool('dispatch', { worker: 'alpha', task: 'Drop the old notes and push.', words: `(Answer to ${notes}) No, drop them all` }),
-      /^\[dispatch=needs_driver worker=alpha\] Nothing started: the follow-up for an answer to a push decision must be confirmed by the driver's voice/,
+      /^\[dispatch=(started|queued) worker=alpha /,
     )
     assert.equal(dropped.meta.via, 'telegram')
 
@@ -1847,6 +2141,119 @@ test("gateway: a plain message on Telegram is a request of the driver's, as by v
     driverSays('Noch etwas, bitte')
     await waitFor(() => messageWith('Not passed on: the kill switch is locked'))
     assert.ok(!gw.events.slice(after).some(e => e.content.startsWith('Noch etwas')))
+    assert.ok(!gw.log.includes(TOKEN))
+  } finally {
+    api.updates = null
+    await gw.close()
+  }
+})
+
+test('gateway with VOICE_GW_TELEGRAM_CONFIRM=0: push, merge, restart, delete and approvals take the voice; an answer there does nothing, and their tools refuse words typed there', async () => {
+  api.mode = 'ok'
+  api.messages.length = 0
+  api.updates = []
+  const { root, bin } = workerRoot('voice-only')
+  const gw = await startGateway('voice-only', {
+    telegram: true,
+    env: {
+      VOICE_GW_TELEGRAM_POLL: '1',
+      VOICE_GW_TELEGRAM_ANSWERS: '1',
+      VOICE_GW_TELEGRAM_REQUESTS: '1',
+      VOICE_GW_TELEGRAM_CONFIRM: '0',
+      VOICE_GW_CONTROLLER_LEVEL: 'clone-delete', // for delete_path
+      VOICE_GW_WORKER_ROOT: root,
+      VOICE_GW_CLAUDE_BIN: join(bin, 'claude'),
+      VOICE_GW_GH_BIN: join(bin, 'gh'),
+    },
+  })
+  const messageWith = text => api.messages.findIndex(m => m.text.includes(text)) + 1
+  const sentWith = text => api.messages[messageWith(text) - 1]
+  const tool = async (name, args) => (await gw.claudeCode.callTool({ name, arguments: args })).content[0].text
+  try {
+    assert.match(gw.log, /telegram answers on \(VOICE_GW_TELEGRAM_ANSWERS=1\): .*, except for push, merge, restart and delete decisions, which must be confirmed by voice/)
+    assert.match(gw.log, /telegram: push, merge, restart, delete and approvals take the driver's voice \(VOICE_GW_TELEGRAM_CONFIRM=0\); words typed in Telegram settle none of them/)
+    assert.match(gw.claudeCode.getInstructions(), /Push, merge, restart, delete and approvals always take the driver's voice \(VOICE_GW_TELEGRAM_CONFIRM=0\)\. When a\nmessage by Telegram asks for one,/)
+    assert.match(gw.claudeCode.getInstructions(), /Claude Code then asks for an approval, which the driver\ngives by voice\./)
+
+    // A push decision: no Reply, and no words typed here, settle it; the chat says so, in German.
+    driverSays('Push alpha, please')
+    const push = (await waitFor(() => gw.events.find(e => e.content === 'Push alpha, please'))).meta.request_id
+    const pushed = await tool('reply', { request_id: push, state: 'question', text: 'Push the commits in alpha?', kind: 'push' })
+    const decision = /as decision (d[a-z0-9]{3}) \(push\)/.exec(pushed)[1]
+    await waitFor(() => messageWith('Push the commits in alpha?'))
+    assert.match(sentWith('Push the commits in alpha?').text, new RegExp(`\n\nAnswer in voice mode and mention ${push}\\.$`))
+    const before = gw.events.length
+    const yes = driverSays('ja, push', { replyTo: messageWith('Push the commits in alpha?') })
+    await waitFor(() => messageWith('muss per Voice bestätigt werden'))
+    assert.equal(
+      sentWith('muss per Voice bestätigt werden').text,
+      `Nicht ausgeführt: ${push} ist eine Push-Entscheidung, und die muss per Voice bestätigt werden. Sie bleibt offen. ` +
+        `Sag es im Voice-Modus und nenne ${push}.`,
+    )
+    assert.equal(sentWith('muss per Voice bestätigt werden').reply_parameters.message_id, yes)
+    assert.ok(!gw.events.slice(before).some(e => /ja, push/.test(e.content)), 'nothing reaches the controller')
+    const voiceOnly = kind =>
+      new RegExp(`Nothing closed: a ${kind} decision must be confirmed by the driver's voice, and these words were typed in Telegram\\.`)
+    assert.match(await tool('resolve_decision', { id: decision, outcome: 'push them', words: 'Push alpha' }), voiceOnly('push'))
+    assert.match(await tool('open_items', {}), new RegExp(decision), 'the decision stays open')
+
+    // Merge: neither a Reply nor the words of the request settle it, and its approval is not answered here.
+    driverSays('Merge pull request 3 in alpha')
+    const merge = (await waitFor(() => gw.events.find(e => e.content === 'Merge pull request 3 in alpha'))).meta.request_id
+    const merging = await tool('reply', { request_id: merge, state: 'question', text: 'Merge pull request 3, squashed?', kind: 'merge' })
+    const mergeDecision = /as decision (d[a-z0-9]{3}) \(merge\)/.exec(merging)[1]
+    await waitFor(() => messageWith('Merge pull request 3, squashed?'))
+    driverSays('yes, merge it', { replyTo: messageWith('Merge pull request 3, squashed?') })
+    await waitFor(() => messageWith(`Not done: ${merge} is a merge decision, which must be confirmed by voice.`))
+    assert.match(await tool('resolve_decision', { id: mergeDecision, outcome: 'merged', words: 'Merge pull request 3' }), voiceOnly('merge'))
+    // An approval request goes here only once the voice mode has ended, and cannot be answered here.
+    await gw.permission('mrgab', 'Bash', 'gh pr merge 3 --repo driver/alpha --squash')
+    await waitFor(() => messageWith('Approval request mrgab'))
+    assert.match(sentWith('Approval request mrgab').text, /\n\nAnswer in voice mode or at the terminal; Telegram cannot approve\.$/)
+    driverSays('yes', { replyTo: messageWith('Approval request mrgab') })
+    await waitFor(() => messageWith('Not passed on: approval request mrgab is answered in voice mode or at the computer; Telegram cannot approve.'))
+    assert.deepEqual(gw.verdicts, [], 'no verdict from Telegram')
+    // By voice it is.
+    assert.match(await gw.call('approve', { code: 'mrgab', decision: 'allow' }), /^\[approval=allow code=mrgab\]/m)
+    await waitFor(() => gw.verdicts.length === 1)
+
+    // Delete and a push straight to main: their tools refuse words typed here.
+    driverSays('Delete the folder alpha now')
+    await waitFor(() => gw.events.find(e => e.content === 'Delete the folder alpha now'))
+    assert.match(
+      await tool('delete_path', { path: 'alpha', confirm: true, words: 'Delete the folder alpha' }),
+      /^\[delete=needs_driver\] Nothing happened: a delete must be confirmed by the driver's voice, and these words were typed in Telegram\./,
+    )
+    assert.ok(existsSync(join(root, 'alpha')), 'nothing deleted')
+    driverSays('Push the fix in alpha straight to main')
+    await waitFor(() => gw.events.find(e => e.content === 'Push the fix in alpha straight to main'))
+    assert.match(
+      await tool('dispatch', { worker: 'alpha', task: 'Push the fix straight to main.', words: 'straight to main', direct: true }),
+      /^\[dispatch=needs_driver worker=alpha\] Nothing started: a push straight to the default branch must be confirmed by the driver's voice/,
+    )
+    // Nor under a standing order made of words typed here.
+    driverSays('Keep going with the notes in alpha tonight')
+    await waitFor(() => gw.events.find(e => e.content === 'Keep going with the notes in alpha tonight'))
+    const made = await tool('standing_order', { worker: 'alpha', scope: 'the notes', words: 'Keep going with the notes in alpha tonight' })
+    const order = /^\[order=(o[a-z0-9]{3}) /.exec(made)[1]
+    assert.match(
+      await tool('dispatch', { worker: 'alpha', task: 'Push the notes straight to main.', order, direct: true }),
+      /^\[dispatch=needs_driver worker=alpha\] Nothing started: a push straight to the default branch must be confirmed by the driver's voice, and these words, or those of the standing order, were typed in Telegram\./,
+    )
+    // The follow-up for an answer typed here, to a request that has a push decision too.
+    driverSays('Tidy up the notes in alpha')
+    const notes = (await waitFor(() => gw.events.find(e => e.content === 'Tidy up the notes in alpha'))).meta.request_id
+    const keep = /as decision (d[a-z0-9]{3}) \(other\)/.exec(await tool('reply', { request_id: notes, state: 'question', text: 'Keep the old ones?' }))[1]
+    await waitFor(() => messageWith('Keep the old ones?'))
+    driverSays('No, drop them all', { replyTo: messageWith('Keep the old ones?') })
+    await waitFor(() => gw.events.find(e => e.content === `(Answer to ${notes}) No, drop them all`))
+    // An ordinary decision: settled on these words. Then a push decision on the same request.
+    assert.match(await tool('resolve_decision', { id: keep, outcome: 'drop them', words: 'No, drop them all' }), /^\[decision=closed /)
+    assert.match(await tool('reply', { request_id: notes, state: 'question', text: 'And push the cleanup?', kind: 'push' }), /as decision d[a-z0-9]{3} \(push\)/)
+    assert.match(
+      await tool('dispatch', { worker: 'alpha', task: 'Drop the old notes and push.', words: `(Answer to ${notes}) No, drop them all` }),
+      /^\[dispatch=needs_driver worker=alpha\] Nothing started: the follow-up for an answer to a push decision must be confirmed by the driver's voice/,
+    )
     assert.ok(!gw.log.includes(TOKEN))
   } finally {
     api.updates = null

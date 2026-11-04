@@ -29,9 +29,12 @@
 // question's message, or a message with the question's code, goes to the
 // controller as their answer, like one by voice. Any other message is a
 // request of theirs, as one by voice is (VOICE_GW_TELEGRAM_REQUESTS). The
-// controller's replies to either come back to the chat. Nothing here unlocks
-// the kill switch: the PIN for the unlock in voice mode comes to the chat
-// (killswitch.mjs), and typed back here it counts for nothing, masked.
+// controller's replies to either come back to the chat. Push, merge, restart
+// and delete count here as by voice, and Claude Code's approval requests are
+// answered here with a yes or a no, unless VOICE_GW_TELEGRAM_CONFIRM=0 keeps
+// them with the voice. Nothing here unlocks the kill switch: the PIN for the
+// unlock in voice mode comes to the chat (killswitch.mjs), and typed back
+// here it counts for nothing, masked.
 //
 // On only when .secrets/telegram_token and .secrets/telegram_chat_id both
 // exist and are not empty. The token is part of every API address, so it must
@@ -574,13 +577,21 @@ function describeReply(request, update) {
   return `${about}${update.state === 'working' ? ', still working' : ''}:\n\n${update.text}`
 }
 
-function describePermission(permission) {
+// An approval request. approvable: whether the driver may answer it here
+// (TelegramAnswers.approves).
+function describePermission(permission, approvable = false) {
   // Claude Code's descriptions often end with a full stop already.
   const description = String(permission.description).replace(/[\s.]+$/, '')
   const details = preview(permission.inputPreview || '', 300)
   const lines = [`Approval request ${permission.code} (controller session)`, '', `${permission.toolName}: ${description}`]
   if (details) lines.push(`Details: ${details}`)
-  lines.push('', 'Answer in voice mode or at the terminal; Telegram cannot approve.')
+  lines.push(
+    '',
+    approvable
+      ? `To allow it, reply to this message with yes, or with no to deny it; or write a message with ${permission.code} ` +
+          'and yes or no. Or answer in voice mode or at the terminal.'
+      : 'Answer in voice mode or at the terminal; Telegram cannot approve.',
+  )
   return lines.join('\n')
 }
 
@@ -592,7 +603,23 @@ export class TelegramFallback {
   // answers and requests by Telegram wait too, by default when paused; the
   // gateway holds them only in a standby. answerable(request): whether the
   // driver may answer that request's question here (TelegramAnswers.accepts).
-  constructor(store, { send, afterSeconds = 600, paused = () => false, held = paused, answerable = () => false, log = defaultLog }) {
+  // approvable(): whether they may answer approval requests here
+  // (TelegramAnswers.approves); then an approval request also goes here at
+  // once while their latest request or answer came from here, in the last
+  // chatMinutes (approvals).
+  constructor(
+    store,
+    {
+      send,
+      afterSeconds = 600,
+      paused = () => false,
+      held = paused,
+      answerable = () => false,
+      approvable = () => false,
+      chatMinutes = 30,
+      log = defaultLog,
+    },
+  ) {
     this.store = store
     this.send = send
     this.afterSeconds = afterSeconds
@@ -600,6 +627,8 @@ export class TelegramFallback {
     this.paused = paused
     this.held = held
     this.answerable = answerable
+    this.approvable = approvable
+    this.chatMs = chatMinutes * 60 * 1000
     this.log = log
     this.voice = false // whether the voice mode was on at the last check
     this.timer = null
@@ -637,7 +666,10 @@ export class TelegramFallback {
   check() {
     try {
       clearTimeout(this.timer)
-      if (!this.held()) this.relay()
+      if (!this.held()) {
+        this.relay()
+        this.approvals()
+      }
       if (this.paused()) return
       const active = this.store.voiceActive(this.afterMs)
       if (active !== this.voice) {
@@ -682,11 +714,36 @@ export class TelegramFallback {
     }
     for (const permission of this.store.openPermissions()) {
       if (permission.announced || permission.telegram) continue
-      permission.telegram = true
-      this.deliver(describePermission(permission), { sent: id => (permission.telegramMessage = id) })
+      this.sendPermission(permission)
     }
     // The marks go into the saved requests, so a restart sends nothing twice.
     if (marked) this.store.save?.()
+  }
+
+  // An approval request, once; its message id, so that a Reply to it finds it.
+  sendPermission(permission) {
+    permission.telegram = true
+    this.deliver(() => describePermission(permission, this.approvable()), { sent: id => (permission.telegramMessage = id) })
+  }
+
+  // While the driver writes here, an approval request goes here at once,
+  // whether the voice mode is on or not, and in the night too, as the
+  // controller's replies to them do (relay): a merge or a deletion they
+  // confirmed here must not wait for the voice mode to end. Only where they
+  // may answer it here (approvable), and only while their latest request or
+  // answer, spoken or typed, came from here, in the last chatMinutes.
+  approvals() {
+    if (!this.approvable() || !this.inChat()) return
+    for (const permission of this.store.openPermissions()) {
+      if (!permission.telegram) this.sendPermission(permission)
+    }
+  }
+
+  // Whether the driver's latest request or answer came from this chat, in
+  // the last chatMinutes.
+  inChat() {
+    const latest = [...this.store.requests.values()].findLast(request => request.origin === 'voice')
+    return latest?.via === 'telegram' && Date.now() - latest.createdAt <= this.chatMs
   }
 
   // The controller's replies to an answer or a request the driver gave here
@@ -744,14 +801,16 @@ export class TelegramFallback {
 
 // --- answers and requests by Telegram ----------------------------------------
 
-// What always takes the driver's voice, whatever comes by Telegram: the
-// decisions of these kinds (ledger.mjs), and in channel.mjs the tools that
-// carry them out (takesVoice). Approvals too, which Telegram never gives.
+// What takes the driver's voice with VOICE_GW_TELEGRAM_CONFIRM=0, whatever
+// comes by Telegram: the decisions of these kinds (ledger.mjs), and in
+// channel.mjs the tools that carry them out (takesVoice). Approvals too,
+// which Telegram then never gives. By default they count by Telegram as by
+// voice.
 export const VOICE_ONLY_KINDS = ['push', 'merge', 'restart', 'delete']
 
-// The answer to a Telegram answer about such a decision: nothing done, the
-// decision stays open, and it must be confirmed by voice; in German when the
-// driver wrote in German, else in English.
+// The answer to a Telegram answer about such a decision, with the setting
+// at 0: nothing done, the decision stays open, and it must be confirmed by
+// voice; in German when the driver wrote in German, else in English.
 const KIND_DE = { push: 'Push', merge: 'Merge', restart: 'Neustart', delete: 'Lösch' }
 const GERMAN_WORDS = new Set(
   'ja nein bitte und nicht mach mache ist das der den dem doch gerne gern klar genau jawohl passt los weiter alles auch aber noch sofort jetzt'.split(' '),
@@ -769,6 +828,27 @@ export function voiceOnlyText(id, kind, text) {
 // The words of a message that could be codes: four letters and digits, as
 // the gateway makes request ids (store.mjs) and decision ids (ledger.mjs).
 const codesIn = text => [...new Set(String(text).toLowerCase().match(/[a-z0-9]+/g) ?? [])].filter(word => word.length === 4)
+
+// The words of a message that could be approval codes: five letters, as
+// Claude Code makes them.
+const approvalCodesIn = text => [...new Set(String(text).toLowerCase().match(/[a-z]+/g) ?? [])].filter(word => word.length === 5)
+
+// The driver's answer to an approval request: 'allow' for a plain yes,
+// 'deny' for a plain no, null for anything else, also a message with both
+// ("not ok", "nein, doch ja"): an approval takes an explicit answer, as by
+// voice.
+const ALLOW_WORDS = new Set(
+  'yes y yeah yep ok okay sure allow allowed approve approved go ja jo jep jawohl klar genau gerne erlauben erlaube erlaubt freigeben oui si sí sì'.split(' '),
+)
+const DENY_WORDS = new Set(
+  "no n nope not don't dont never deny denied reject refuse cancel stop nein ne nö nee nicht kein keine ablehnen verweigern abbrechen non".split(' '),
+)
+export function verdictOf(text) {
+  const words = String(text).normalize('NFC').toLowerCase().replace(/[’`]/g, "'").match(/[\p{L}']+/gu) ?? []
+  const allow = words.some(word => ALLOW_WORDS.has(word))
+  const deny = words.some(word => DENY_WORDS.has(word))
+  return allow === deny ? null : allow ? 'allow' : 'deny'
+}
 
 const listed = items => (items.length > 1 ? `${items.slice(0, -1).join(', ')} and ${items.at(-1)}` : items.join(''))
 
@@ -797,21 +877,29 @@ export const quoteText = quoted => `(In reply to the gateway's message, quoted a
 // is settled, stays refused.
 //
 // The controller's replies to either come back to the chat
-// (TelegramFallback.relay). Never an approval, and nothing while the kill
-// switch is locked or the gateway inactive (presence.mjs: in a standby, say,
-// or without a controller); the chat hears why, and that unlocking is at the
-// computer, or in voice mode with a PIN sent there (killswitch.mjs). Nor a
-// forwarded message, which holds someone else's words.
+// (TelegramFallback.relay). Nothing while the kill switch is locked or the
+// gateway inactive (presence.mjs: in a standby, say, or without a
+// controller); the chat hears why, and that unlocking is at the computer, or
+// in voice mode with a PIN sent there (killswitch.mjs). Nor a forwarded
+// message, which holds someone else's words.
 //
-// Push, merge, restart and delete decisions are never answered here: an
-// answer to one is not passed on, nothing is done, the decision stays open,
-// and the chat hears that it must be confirmed by voice (voiceOnlyText).
+// Push, merge, restart and delete decisions are answered here as any other
+// question, and an approval request of Claude Code's that the gateway sent
+// here is answered with a yes or a no, by Reply or with its code: the
+// verdict goes to Claude Code as one by voice does (approves). With confirm
+// off (VOICE_GW_TELEGRAM_CONFIRM=0) neither: an answer to such a decision is
+// not passed on, nothing is done, the decision stays open, and the chat hears
+// that it must be confirmed by voice (voiceOnlyText); an approval request is
+// answered in voice mode or at the computer.
 //
 // push(request): hands the request to the controller (channel.mjs). say(text,
 // replyTo): a message to the chat, as a reply to the driver's. held(): a
 // sentence when the controller waits for the usage limit, else ''. mode: on,
-// answers to every other question; or off, where questions are answered by
-// voice only. requests: whether any other message is a new request.
+// answers to questions; or off, where questions are answered by voice only.
+// requests: whether any other message is a new request. confirm: whether
+// push, merge, restart, delete and approvals count here. verdict(code,
+// behavior): sends the driver's verdict on an approval request to Claude
+// Code (channel.mjs); without it, approvals are not answered here.
 // record(entry): what it made of the message, for the input log
 // (TelegramInputLog).
 export class TelegramAnswers {
@@ -822,6 +910,8 @@ export class TelegramAnswers {
     say,
     mode = 'on',
     requests = false,
+    confirm = true,
+    verdict = null,
     killswitch = null,
     presence = null,
     held = () => '',
@@ -834,6 +924,8 @@ export class TelegramAnswers {
     this.say = say
     this.mode = mode
     this.requests = requests
+    this.confirm = confirm
+    this.verdict = verdict
     this.killswitch = killswitch
     this.presence = presence
     this.held = held
@@ -846,9 +938,17 @@ export class TelegramAnswers {
     return this.mode !== 'off' && !this.voiceOnly(request)
   }
 
+  // Whether the driver may answer approval requests here: with answers on,
+  // push, merge, restart, delete and approvals counting here, and a way to
+  // Claude Code.
+  approves() {
+    return this.mode !== 'off' && this.confirm && typeof this.verdict === 'function'
+  }
+
   // The first decision of the request that takes the driver's voice, push,
-  // merge, restart or delete; else null.
+  // merge, restart or delete, with confirm off; else null.
   voiceOnly(request) {
+    if (this.confirm) return null
     return this.ledger?.forRequest(request.id).find(d => VOICE_ONLY_KINDS.includes(d.kind)) ?? null
   }
 
@@ -897,13 +997,23 @@ export class TelegramAnswers {
     }
   }
 
-  // What a message is: the { question } it answers, { request: true } for a
-  // new request, or { why } it is neither.
+  // An approval request as the target of an answer, while it is open and
+  // the driver may answer it here; else why not.
+  approving(permission) {
+    const { code } = permission
+    if (!this.approves()) return { why: `approval request ${code} is answered in voice mode or at the computer; Telegram cannot approve.` }
+    if (permission.status === 'open') return { permission }
+    if (permission.status === 'elsewhere') return { why: `approval request ${code} was answered at the computer; nothing to do.` }
+    const how = permission.status === 'allow' ? 'allowed' : 'denied'
+    return { why: `approval request ${code} was ${how} already${permission.by === 'telegram' ? ' here' : ' in voice mode'}; nothing to do.` }
+  }
+
+  // What a message is: the { question } it answers, the { permission } it
+  // approves or denies, { request: true } for a new request, or { why } it
+  // is none of these.
   target(text, replyTo) {
     const sent = replyTo === null ? null : this.sentMessage(replyTo)
-    if (sent?.permission) {
-      return { why: `approval request ${sent.permission.code} is answered in voice mode or at the computer; Telegram cannot approve.` }
-    }
+    if (sent?.permission) return this.approving(sent.permission)
     if (sent?.request) {
       const { request } = sent
       return request.state === 'question'
@@ -921,8 +1031,19 @@ export class TelegramAnswers {
       if (question) open.set(question.id, question)
       else closed.push(code)
     }
+    // And the code of an approval request, where the driver may answer it
+    // here: one answered already is said, never a request.
+    const named = this.approves() ? approvalCodesIn(text).map(code => this.store.getPermission(code)).filter(Boolean) : []
+    const approvals = named.filter(permission => permission.status === 'open')
+    if (open.size + approvals.length > 1) {
+      const codes = listed([...open.keys(), ...approvals.map(permission => permission.code)])
+      return approvals.length
+        ? { why: `it names ${open.size + approvals.length} open questions and approval requests, ${codes}. Answer each in a message of its own.` }
+        : { why: `it names ${open.size} open questions, ${codes}. Answer each in a message of its own.` }
+    }
+    if (approvals.length === 1) return this.approving(approvals[0])
     if (open.size === 1) return this.answering([...open.values()][0])
-    if (open.size > 1) return { why: `it names ${open.size} open questions, ${listed([...open.keys()])}. Answer each in a message of its own.` }
+    if (named.length) return this.approving(named[0])
     // Anything else is a request of the driver's, where they allow it.
     if (this.requests) return text ? { request: true } : { why: 'it holds no text.' }
     if (closed.length) return { why: `${listed(closed)} ${closed.length === 1 ? 'has' : 'have'} no open question. ${this.openQuestions()}` }
@@ -933,9 +1054,9 @@ export class TelegramAnswers {
     }
   }
 
-  // Whether and where a message goes: { question }, { request: true }, or
-  // { why } not, with the whole answer for the chat in text when it is not
-  // the usual "Not passed on: <why>".
+  // Whether and where a message goes: { question }, { permission, behavior },
+  // { request: true }, or { why } not, with the whole answer for the chat in
+  // text when it is not the usual "Not passed on: <why>".
   check(text, replyTo, { forwarded = false } = {}) {
     if (this.killswitch?.locked) {
       return {
@@ -948,6 +1069,13 @@ export class TelegramAnswers {
     if (!presence.active) return { why: `this gateway is inactive, ${presence.why}.` }
     if (forwarded) return { why: 'it is forwarded, so its words are not your own. Write what you want in a message of your own.' }
     const target = this.target(text, replyTo)
+    if (target.permission) {
+      // A plain yes or no, as by voice; anything else leaves it open.
+      const behavior = verdictOf(text)
+      if (behavior) return { permission: target.permission, behavior }
+      const { code } = target.permission
+      return { why: `approval request ${code} takes a plain yes or no. Reply to it with yes to allow it, or with no to deny it.` }
+    }
     if (!target.question) return target
     const decision = this.voiceOnly(target.question)
     if (decision) {
@@ -958,9 +1086,10 @@ export class TelegramAnswers {
   }
 
   // A message from the driver's chat ({ text, replyTo, messageId, quoted,
-  // forwarded, seen }, from TelegramCommands): passed on as their answer or
-  // as a new request, or not, and the chat hears which; the input log keeps
-  // it with seen, who sent it where. Resolves with the request passed on, or
+  // forwarded, seen }, from TelegramCommands): passed on as their answer, as
+  // a new request or as their verdict on an approval request, or not, and the
+  // chat hears which; the input log keeps it with seen, who sent it where.
+  // Resolves with the request passed on, the approval request answered, or
   // null. Never throws.
   async route({ text, replyTo = null, messageId = null, quoted = null, forwarded = false, seen = null }) {
     const said = String(text ?? '').trim()
@@ -973,6 +1102,7 @@ export class TelegramAnswers {
         await this.say(result.text ?? `Not passed on: ${result.why}`, messageId)
         return null
       }
+      if (result.permission) return await this.approve(result.permission, result.behavior, { messageId, record })
       if (result.request) {
         const request = await this.start(said, { messageId, quoted: replyTo === null ? null : quoted })
         record({ decision: 'accepted', as: 'request', request: request.id })
@@ -1016,6 +1146,31 @@ export class TelegramAnswers {
     this.log('telegram request passed on', `id=${request.id}`, preview(said))
     await this.say(`Passed on to the controller as request ${request.id}.${this.heldText()}`, messageId)
     return request
+  }
+
+  // The driver's verdict on an approval request, as by voice (voice.mjs,
+  // approve): claimed in the store first, so that an answer elsewhere finds
+  // it answered, then sent to Claude Code. One that does not reach Claude
+  // Code is open again, to be answered elsewhere.
+  async approve(permission, behavior, { messageId = null, record = () => {} } = {}) {
+    const { code, toolName } = permission
+    this.store.resolvePermission(code, behavior, 'telegram')
+    try {
+      await this.verdict(code, behavior)
+    } catch (error) {
+      Object.assign(permission, { status: 'open', resolvedAt: undefined, by: undefined })
+      this.store.changed()
+      throw error
+    }
+    this.log('telegram approval', `code=${code}`, `behavior=${behavior}`, `tool=${toolName}`)
+    record({ decision: 'accepted', as: behavior === 'allow' ? 'approval allowed' : 'approval denied', answers: code })
+    await this.say(
+      behavior === 'allow'
+        ? `Allowed: approval request ${code} (${toolName}). Claude Code goes on.`
+        : `Denied: approval request ${code} (${toolName}). Claude Code does not run it.`,
+      messageId,
+    )
+    return permission
   }
 
   // The usage limit's sentence, when the controller waits for it.

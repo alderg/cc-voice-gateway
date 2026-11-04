@@ -31,15 +31,14 @@ export const CONTROLLER_LEVELS = ['confined', 'clone-delete', 'unrestricted']
 export const KILLSWITCH_MODES = ['off', 'manual', 'auto']
 
 // Telegram as an input channel is off unless the driver turns it on: their
-// Telegram account then speaks for them as their voice does, for ordinary
-// requests and answers. Push, merge, restart, delete and approvals take their
-// voice all the same, whatever the setting (README 5.8). A value it does not
-// know counts as off, so that a typo never opens it.
+// Telegram account then speaks for them as their voice does, push, merge,
+// restart, delete and approvals included, unless VOICE_GW_TELEGRAM_CONFIRM=0
+// keeps those with the voice (README 5.8). A value it does not know counts as
+// off, so that a typo never opens it.
 //
 // Answers by Telegram (VOICE_GW_TELEGRAM_ANSWERS, telegram.mjs): on with 1,
-// for every question but those about push, merge, restart and delete;
-// other, its name before, means the same. Off, the default, with 0 and for
-// any value it does not know.
+// for every question; other, its name before, means the same. Off, the
+// default, with 0 and for any value it does not know.
 export function telegramAnswersMode(value) {
   const text = String(value ?? '').trim().toLowerCase()
   return text === '1' || text === 'other' ? 'on' : 'off'
@@ -48,6 +47,17 @@ export function telegramAnswersMode(value) {
 // Requests by Telegram (VOICE_GW_TELEGRAM_REQUESTS, telegram.mjs): on only
 // with 1; off, the default, with 0 and for any value it does not know.
 export const telegramRequestsOn = value => String(value ?? '').trim() === '1'
+
+// Push, merge, restart, delete and approvals by Telegram
+// (VOICE_GW_TELEGRAM_CONFIRM, telegram.mjs and channel.mjs), with Telegram
+// input on: the driver's answers and requests there confirm them as the same
+// words spoken do, and approval requests are answered there, by default and
+// with 1. 0 keeps them with the voice, as before, and so does any value it
+// does not know, so that a typo never lets more through.
+export function telegramConfirmOn(value) {
+  const text = String(value ?? '').trim()
+  return text === '' || text === '1'
+}
 
 // Where Claude voice mode calls from: Anthropic's published outbound range.
 export const ANTHROPIC_RANGES = ['160.79.104.0/21']
@@ -259,9 +269,8 @@ export const config = {
   // Telegram as input, off by default (telegramAnswersMode). Answers by
   // Telegram (telegram.mjs, TelegramAnswers): a Reply to a question there, or
   // a message with its code, reaches the controller as the driver's answer,
-  // as one by voice does. 1 (or other): on, for every question but push,
-  // merge, restart and delete decisions, which take the driver's voice; 0,
-  // the default and any other value: off.
+  // as one by voice does. 1 (or other): on, for every question; 0, the
+  // default and any other value: off.
   telegramAnswers: telegramAnswersMode(env.VOICE_GW_TELEGRAM_ANSWERS),
   telegramAnswersSetting: env.VOICE_GW_TELEGRAM_ANSWERS ?? '',
   // Requests by Telegram (telegram.mjs, TelegramAnswers): any other message
@@ -271,6 +280,12 @@ export const config = {
   // not passed on.
   telegramRequests: telegramRequestsOn(env.VOICE_GW_TELEGRAM_REQUESTS),
   telegramRequestsSetting: env.VOICE_GW_TELEGRAM_REQUESTS ?? '',
+  // Push, merge, restart, delete and approvals by Telegram, with Telegram
+  // input on (telegramConfirmOn): 1, the default, they count there as by
+  // voice, and approval requests are answered there too; 0 and any other
+  // value: they take the driver's voice.
+  telegramConfirm: telegramConfirmOn(env.VOICE_GW_TELEGRAM_CONFIRM),
+  telegramConfirmSetting: env.VOICE_GW_TELEGRAM_CONFIRM ?? '',
 
   // The Tailscale Funnel (funnel.mjs): off by itself this many minutes after
   // the last voice call; 0 or empty, the default, leaves it on. On again with

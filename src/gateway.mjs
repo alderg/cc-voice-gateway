@@ -15,7 +15,7 @@
 // open, for checks and reviews, with fixes for review comments queued without
 // asking (VOICE_GW_AUTO_FIX_REVIEWS), and optionally Telegram, for questions and
 // approvals after the voice mode ended, for alarms, and for the driver's
-// answers and requests typed there (telegram.mjs). At the controller
+// answers, requests and approvals typed there (telegram.mjs). At the controller
 // levels clone-delete and unrestricted, also cloning and deleting in the
 // worker root (folders.mjs). Over all of it, the kill switch (killswitch.mjs).
 // And what is open, so that nothing is forgotten: decisions for the driver
@@ -612,7 +612,10 @@ if (telegram) {
   // their answers to questions, typed in the chat as a Reply or with the
   // question's code (VOICE_GW_TELEGRAM_ANSWERS), and their other messages as
   // requests (VOICE_GW_TELEGRAM_REQUESTS), to the controller like answers and
-  // requests by voice, never past a locked kill switch or a standby.
+  // requests by voice, never past a locked kill switch or a standby. Push,
+  // merge, restart and delete count there too, and with answers on, their
+  // yes or no to an approval request goes to Claude Code as one by voice
+  // does, unless VOICE_GW_TELEGRAM_CONFIRM=0 keeps them with the voice.
   const answers =
     config.telegramAnswers === 'off' && !config.telegramRequests
       ? null
@@ -621,6 +624,7 @@ if (telegram) {
           ledger,
           mode: config.telegramAnswers,
           requests: config.telegramRequests,
+          confirm: config.telegramConfirm,
           killswitch,
           presence,
           record,
@@ -628,6 +632,13 @@ if (telegram) {
             await channel.ready
             await channel.push(request, request.meta)
           },
+          // Without the permission relay, Claude Code sends no approval requests here.
+          verdict: config.permissionRelay
+            ? async (code, behavior) => {
+                await channel.ready
+                await channel.sendVerdict(code, behavior)
+              }
+            : null,
           say: reply,
           held: () => {
             const wait = limits.active('controller')
@@ -637,14 +648,15 @@ if (telegram) {
   // A value it does not know counts as off, so that a typo opens nothing.
   const answersSetting = config.telegramAnswersSetting.trim().toLowerCase()
   if (answersSetting === 'other') {
-    log('VOICE_GW_TELEGRAM_ANSWERS=other is the same as 1 now: push, merge, restart and delete take the voice either way')
+    log('VOICE_GW_TELEGRAM_ANSWERS=other is the same as 1 now; VOICE_GW_TELEGRAM_CONFIRM decides about push, merge, restart and delete')
   } else if (answersSetting && !['1', '0'].includes(answersSetting)) {
     log(`VOICE_GW_TELEGRAM_ANSWERS=${config.telegramAnswersSetting} is not 1 or 0; 0 (off) instead`)
   }
   log(
     config.telegramAnswers === 'on'
       ? 'telegram answers on (VOICE_GW_TELEGRAM_ANSWERS=1): a Reply to a question, or a message with its code, reaches the controller ' +
-          'as the driver\'s answer, except for push, merge, restart and delete decisions, which must be confirmed by voice'
+          'as the driver\'s answer' +
+          (config.telegramConfirm ? '' : ', except for push, merge, restart and delete decisions, which must be confirmed by voice')
       : 'telegram answers off (VOICE_GW_TELEGRAM_ANSWERS not 1, off by default): questions are answered by voice only',
   )
   if (config.telegramRequestsSetting.trim() && !['1', '0'].includes(config.telegramRequestsSetting.trim())) {
@@ -666,25 +678,43 @@ if (telegram) {
       : 'telegram: telegram_chat_id names no private chat (the id of a group or a channel is negative), so no message counts, ' +
           'not even /stop; choose your private chat with the bot in the setup',
   )
-  if (answers) log('telegram: push, merge, restart, delete and approvals take the driver\'s voice; words typed in Telegram settle none of them')
+  // A value it does not know keeps them with the voice, so that a typo lets nothing more through.
+  if (config.telegramConfirmSetting.trim() && !['1', '0'].includes(config.telegramConfirmSetting.trim())) {
+    log(`VOICE_GW_TELEGRAM_CONFIRM=${config.telegramConfirmSetting} is not 1 or 0; 0 (only by voice) instead`)
+  }
+  if (answers && !config.telegramConfirm) {
+    log('telegram: push, merge, restart, delete and approvals take the driver\'s voice (VOICE_GW_TELEGRAM_CONFIRM=0); words typed in Telegram settle none of them')
+  } else if (answers) {
+    log(
+      'telegram: push, merge, restart and delete count by Telegram as by voice (VOICE_GW_TELEGRAM_CONFIRM=1, the default)' +
+        (answers.approves()
+          ? '; approval requests are answered there too, with a yes or a no'
+          : config.telegramAnswers === 'off'
+            ? '; approval requests are answered by voice, as answers by Telegram are off'
+            : '; approval requests are answered by voice, as the permission relay is off'),
+    )
+  }
   // Paused in a standby, and in night mode, where Telegram carries alarms
   // only; what the night left, the morning summary names (night.mjs). The
   // controller's replies to an answer or a request typed there wait only in
-  // a standby.
+  // a standby, and so do approval requests while the driver writes there,
+  // where they may answer them.
   fallback = new TelegramFallback(store, {
     send: (text, options) => telegram.send(text, options),
     afterSeconds: config.telegramAfterSeconds,
     paused: () => standby.active || night.active(),
     held: () => standby.active,
     answerable: request => answers?.accepts(request) ?? false,
+    approvable: () => answers?.approves() ?? false,
+    chatMinutes: config.dispatchWindowMinutes,
   })
   log(`telegram fallback ready: questions and approvals after ${config.telegramAfterSeconds} s without a voice call`)
   // Inbound, only from the driver in the configured private chat: the kill
   // switch, the Funnel, night mode, the statistics, and with Telegram input
-  // on, answers to questions and requests. With requests, a Reply to a
-  // message that asks nothing, news or an alarm, is read like any message: a
-  // command is a command there too. A Reply to a message of the bot's that
-  // this gateway did not send is never quoted.
+  // on, answers to questions and approval requests, and requests. With
+  // requests, a Reply to a message that asks nothing, news or an alarm, is
+  // read like any message: a command is a command there too. A Reply to a
+  // message of the bot's that this gateway did not send is never quoted.
   telegramCommands = new TelegramCommands(telegram, {
     pollSeconds: config.telegramPollSeconds,
     answers: Boolean(answers),
@@ -774,7 +804,7 @@ async function lockdown(why) {
   // After an alarm the driver says again what may go on without them.
   orders.endAll(`the kill switch locked (${why})`)
   for (const permission of store.openPermissions()) {
-    store.resolvePermission(permission.code, 'deny')
+    store.resolvePermission(permission.code, 'deny', 'killswitch')
     channel.sendVerdict(permission.code, 'deny').catch(() => {})
   }
   for (const container of containers) {

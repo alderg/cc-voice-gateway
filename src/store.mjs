@@ -282,11 +282,14 @@ export class Store extends EventEmitter {
     return this.openPermissions().some(p => !p.announced)
   }
 
-  resolvePermission(code, behavior) {
+  // by: where the driver answered, 'voice' (voice.mjs) or 'telegram'
+  // (telegram.mjs); the kill switch denies with 'killswitch'.
+  resolvePermission(code, behavior, by = 'voice') {
     const permission = this.permissions.get(String(code).toLowerCase())
     if (!permission || permission.status !== 'open') return null
     permission.status = behavior
     permission.resolvedAt = Date.now()
+    permission.by = by
     this.emit('permission', permission)
     this.changed()
     return permission
@@ -313,10 +316,12 @@ export class Store extends EventEmitter {
     return closed
   }
 
-  // Approvals the voice client heard that were answered at the computer
-  // since: each once, so that it stops asking the driver about them.
+  // Approvals the voice client heard that were answered at the computer or
+  // in Telegram since: each once, so that it stops asking the driver about
+  // them.
   takeAnsweredElsewhere() {
-    const told = [...this.permissions.values()].filter(p => p.status === 'elsewhere' && p.announced && !p.toldElsewhere)
+    const elsewhere = p => p.status === 'elsewhere' || (p.status !== 'open' && p.by === 'telegram')
+    const told = [...this.permissions.values()].filter(p => elsewhere(p) && p.announced && !p.toldElsewhere)
     for (const permission of told) permission.toldElsewhere = true
     return told
   }

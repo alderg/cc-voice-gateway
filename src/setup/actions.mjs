@@ -121,9 +121,11 @@ export function fields(root) {
     VOICE_GW_KILLSWITCH: { default: 'auto', valid: ONE_OF(...KILLSWITCH_MODES) },
     VOICE_GW_TELEGRAM_AFTER: { default: '600', valid: INT(10, 3600) },
     // Telegram as input: off by default, both on when it is turned on
-    // (README 5.8); push, merge, restart and delete take the voice either way.
+    // (README 5.8); push, merge, restart, delete and approvals count there
+    // too, unless VOICE_GW_TELEGRAM_CONFIRM=0 keeps them with the voice.
     VOICE_GW_TELEGRAM_ANSWERS: { default: '0', valid: ONE_OF('0', '1') },
     VOICE_GW_TELEGRAM_REQUESTS: { default: '0', valid: ONE_OF('0', '1') },
+    VOICE_GW_TELEGRAM_CONFIRM: { default: '1', valid: ONE_OF('1', '0') },
     VOICE_GW_FUNNEL_IDLE: { default: '0', valid: INT(0, 1440) },
     VOICE_GW_FUNNEL_PORT: { default: '443', valid: ONE_OF(...FUNNEL_PORTS) },
     VOICE_GW_DOCKER: { default: '', valid: NAME },

@@ -422,11 +422,15 @@ test('the start: checks, current settings, repositories and the plugin, without 
   assert.match(html, /<input data-setting="VOICE_GW_AUTO_FIX_ROUNDS" inputmode="numeric">/)
   // Telegram as input: off by default, an option of its own.
   assert.equal(data.settings.VOICE_GW_TELEGRAM_ANSWERS, '0', 'no answers by Telegram, by default')
-  assert.match(html, /<select id="telegram-answers" data-setting="VOICE_GW_TELEGRAM_ANSWERS"><option value="0">off, only by voice \(default\)<\/option><option value="1">on, but push, merge, restart and delete only by voice<\/option><\/select>/)
+  assert.match(html, /<select id="telegram-answers" data-setting="VOICE_GW_TELEGRAM_ANSWERS"><option value="0">off, only by voice \(default\)<\/option><option value="1">on, for every question<\/option><\/select>/)
   assert.equal(data.settings.VOICE_GW_TELEGRAM_REQUESTS, '0', 'no requests by Telegram, by default')
   assert.match(html, /<select id="telegram-requests" data-setting="VOICE_GW_TELEGRAM_REQUESTS"><option value="0">off, only commands and answers \(default\)<\/option><option value="1">on, like a voice request<\/option><\/select>/)
   assert.match(html, /<label><input type="checkbox" id="telegram-input-on"> Take answers and requests from Telegram too<\/label>\s*<p class="guide">Off by default:/)
-  assert.match(html, /Push, merge, restart, delete and approvals still need your\s+voice/)
+  // With Telegram input on, push, merge, restart, delete and approvals count there too, unless kept with the voice.
+  assert.equal(data.settings.VOICE_GW_TELEGRAM_CONFIRM, '1', 'they count by Telegram as by voice, by default')
+  assert.match(html, /<select id="telegram-confirm" data-setting="VOICE_GW_TELEGRAM_CONFIRM"><option value="1">on, as by voice \(default\)<\/option><option value="0">off, only by voice<\/option><\/select>/)
+  assert.match(html, /Push, merge, restart and delete count there as by voice,\s+and approval requests can be answered there with a yes or a no, unless you keep them with your voice below\./)
+  assert.doesNotMatch(html, /still need your\s+voice/)
   assert.match(html, /<div id="telegram-input" class="grid" hidden>/)
   assert.equal(data.settings.VOICE_GW_SCRATCH, '0', 'work folders off, by default')
   assert.equal(data.settings.VOICE_GW_SCRATCH_DOCKER, '', 'and on this computer when turned on')
@@ -521,11 +525,12 @@ test('finishing: invalid input is refused before anything is written', async () 
       VOICE_GW_DISCONNECT_STANDBY: 'no',
       VOICE_GW_TELEGRAM_ANSWERS: 'yes',
       VOICE_GW_TELEGRAM_REQUESTS: 'other',
+      VOICE_GW_TELEGRAM_CONFIRM: 'all',
       NOPE: '1',
     },
   })
   assert.equal(refused.status, 400)
-  for (const name of ['VOICE_GW_AUTO_FIX_REVIEWS', 'VOICE_GW_AUTO_FIX_ROUNDS', 'VOICE_GW_NAME', 'VOICE_GW_STANDBY', 'VOICE_GW_DISCONNECT_STANDBY', 'VOICE_GW_TELEGRAM_ANSWERS', 'VOICE_GW_TELEGRAM_REQUESTS']) {
+  for (const name of ['VOICE_GW_AUTO_FIX_REVIEWS', 'VOICE_GW_AUTO_FIX_ROUNDS', 'VOICE_GW_NAME', 'VOICE_GW_STANDBY', 'VOICE_GW_DISCONNECT_STANDBY', 'VOICE_GW_TELEGRAM_ANSWERS', 'VOICE_GW_TELEGRAM_REQUESTS', 'VOICE_GW_TELEGRAM_CONFIRM']) {
     assert.match(refused.data.error, new RegExp(`${name}: not a valid value`))
   }
   assert.match(refused.data.error, /VOICE_GW_REMOTE_CONTROL: not a valid value/)
@@ -1065,7 +1070,7 @@ test('the Funnel port: 443 by default and never changed by itself, also with ano
   )
 })
 
-test('Telegram as input in the setup: off by default; ticked, answers and requests on; unticked, both off; written only when on, and "other" from before shows as on', async () => {
+test('Telegram as input in the setup: off by default; ticked, answers and requests on; unticked, both off; written only when on, and "other" from before shows as on; push, merge, restart, delete and approvals there written only when kept with the voice', async () => {
   const plugin = { mode: 'plugin', reason: '', allowlist: {} }
   const off = (await page({}, { noticeSeen: true }, plugin)).$
   assert.equal(off('#telegram-input-on').checked, false)
@@ -1086,10 +1091,16 @@ test('Telegram as input in the setup: off by default; ticked, answers and reques
 
   // Written: on, both in the file; off, the default, left out.
   const inputSetup = name => createSetup({ root: ROOT, secretsDir: join(TMP, `secrets-input-${name}`), env: setupEnv(), home: HOME, platform: 'linux', say })
-  const finish = async (setup, answers, requests) => {
+  const finish = async (setup, answers, requests, confirm = '1') => {
     const { job } = await setup.api['POST /api/finish']({
       body: {
-        settings: { VOICE_GW_PORT: '8787', VOICE_GW_DOCKER: '', VOICE_GW_TELEGRAM_ANSWERS: answers, VOICE_GW_TELEGRAM_REQUESTS: requests },
+        settings: {
+          VOICE_GW_PORT: '8787',
+          VOICE_GW_DOCKER: '',
+          VOICE_GW_TELEGRAM_ANSWERS: answers,
+          VOICE_GW_TELEGRAM_REQUESTS: requests,
+          VOICE_GW_TELEGRAM_CONFIRM: confirm,
+        },
         telegram: { enabled: false },
         docker: { enabled: false },
         watchdog: {},
@@ -1102,9 +1113,13 @@ test('Telegram as input in the setup: off by default; ticked, answers and reques
   await finish(inputSetup('on'), '1', '1')
   const written = readSettings(join(TMP, 'secrets-input-on', 'gateway.env'))
   assert.deepEqual([written.VOICE_GW_TELEGRAM_ANSWERS, written.VOICE_GW_TELEGRAM_REQUESTS], ['1', '1'])
+  assert.equal(written.VOICE_GW_TELEGRAM_CONFIRM, undefined, 'push, merge, restart, delete and approvals by Telegram, the default: left out')
+  // Kept with the voice: written as 0.
+  await finish(inputSetup('on'), '1', '1', '0')
+  assert.equal(readSettings(join(TMP, 'secrets-input-on', 'gateway.env')).VOICE_GW_TELEGRAM_CONFIRM, '0')
   await finish(inputSetup('on'), '0', '0')
   const cleared = readSettings(join(TMP, 'secrets-input-on', 'gateway.env'))
-  assert.deepEqual([cleared.VOICE_GW_TELEGRAM_ANSWERS, cleared.VOICE_GW_TELEGRAM_REQUESTS], [undefined, undefined], 'off, the default: left out')
+  assert.deepEqual([cleared.VOICE_GW_TELEGRAM_ANSWERS, cleared.VOICE_GW_TELEGRAM_REQUESTS, cleared.VOICE_GW_TELEGRAM_CONFIRM], [undefined, undefined, undefined], 'off, the default: left out')
   const refused = await inputSetup('other').api['POST /api/finish']({ body: { settings: { VOICE_GW_TELEGRAM_ANSWERS: 'other' } } }).catch(error => error)
   assert.match(refused.message, /VOICE_GW_TELEGRAM_ANSWERS: not a valid value/, 'the page offers 0 and 1 only')
   // A file from before with other: shown as on.

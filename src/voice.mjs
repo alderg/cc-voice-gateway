@@ -131,12 +131,16 @@ function describeNews(news) {
   return lines
 }
 
-// Approvals the voice client heard that were answered at the computer since,
-// each once.
+// Approvals the voice client heard that were answered at the computer or in
+// the user's Telegram chat since, each once.
 const answeredElsewhereLines = store =>
   store
     .takeAnsweredElsewhere()
-    .map(permission => `Approval ${permission.code} was answered at the computer and is settled; it needs nothing from the user.`)
+    .map(
+      permission =>
+        `Approval ${permission.code} was answered ${permission.status === 'elsewhere' ? 'at the computer' : 'in Telegram'} and is ` +
+        'settled; it needs nothing from the user.',
+    )
 
 // While the controller waits for the Claude usage limit (limits.mjs), what is
 // sent waits in the gateway and reaches it after the wait: a sentence that
@@ -647,6 +651,13 @@ function buildVoiceServer(
           return text(
             `[approval=elsewhere code=${known.code}] Already answered at the computer; nothing to do. Tell the user ` +
               'in a few words.',
+          )
+        }
+        // Answered in the user's Telegram chat (telegram.mjs).
+        if (known && known.status !== 'open' && known.by === 'telegram') {
+          return text(
+            `[approval=telegram code=${known.code}] Already ${known.status === 'allow' ? 'allowed' : 'denied'} in Telegram; ` +
+              'nothing to do. Tell the user in a few words.',
           )
         }
         if (killswitch?.locked && decision === 'allow') {

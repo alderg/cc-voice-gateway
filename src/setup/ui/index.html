@@ -193,19 +193,23 @@
     Ticked, a Reply to a question there answers it, and any other message you write to the bot reaches the controller as a
     request of yours, as one by voice does; its replies come back to the chat. Only messages from your own account, in your
     private chat with the bot, count: groups, other senders and bots are ignored, forwarded and edited messages refused, and
-    every message is kept in <code>.state/telegram-input.log</code>. Push, merge, restart, delete and approvals still need your
-    voice: an answer to such a question is not carried out, and the chat says it must be confirmed by voice. Whoever is
-    signed in to your Telegram account can then start work as your voice can: turn on two-step verification there, and end
+    every message is kept in <code>.state/telegram-input.log</code>. Push, merge, restart and delete count there as by voice,
+    and approval requests can be answered there with a yes or a no, unless you keep them with your voice below. Whoever is
+    signed in to your Telegram account can then do what your voice can: turn on two-step verification there, and end
     sessions you do not know (README 5.8).</p>
   <div id="telegram-input" class="grid" hidden>
     <label>Answers in Telegram
-      <select id="telegram-answers" data-setting="VOICE_GW_TELEGRAM_ANSWERS"><option value="0">off, only by voice (default)</option><option value="1">on, but push, merge, restart and delete only by voice</option></select>
+      <select id="telegram-answers" data-setting="VOICE_GW_TELEGRAM_ANSWERS"><option value="0">off, only by voice (default)</option><option value="1">on, for every question</option></select>
     </label>
     <p class="guide">A Reply to a question there, or a message that starts with its code, such as "8cep yes", reaches the controller as your answer, as one by voice does.</p>
     <label>Requests in Telegram
       <select id="telegram-requests" data-setting="VOICE_GW_TELEGRAM_REQUESTS"><option value="0">off, only commands and answers (default)</option><option value="1">on, like a voice request</option></select>
     </label>
     <p class="guide">Any other message you write to the bot reaches the controller as a request of yours, and its replies come back as replies to your message.</p>
+    <label>Push, merge, restart, delete and approvals in Telegram
+      <select id="telegram-confirm" data-setting="VOICE_GW_TELEGRAM_CONFIRM"><option value="1">on, as by voice (default)</option><option value="0">off, only by voice</option></select>
+    </label>
+    <p class="guide">On, an answer or a request there confirms these as the same words spoken do, and an approval request there is answered with a Reply, yes or no. Off, they take your voice: such an answer there is not carried out, and the chat says it must be confirmed by voice.</p>
   </div>
 </section>
 
