@@ -1784,6 +1784,8 @@ test("voice: unlock with a PIN sent to Telegram; the PIN only in the driver's ch
 
   // The PIN in nothing but its message.
   for (const out of [asked, wrong, done]) assert.doesNotMatch(out, FILLERS)
+  // Like an approval or an emergency stop, no line about the user's next request.
+  for (const out of [asked, wrong, done]) assert.doesNotMatch(out, /next request/)
   const places = {
     results: [asked, wrong, done].join('\n'),
     log: gw.log,

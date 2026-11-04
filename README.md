@@ -334,7 +334,8 @@ Every result that ends a request, the answer, a question back from Claude Code a
 to be read out: "For the user's next request (not to read out): before send or ask, say its subject
 in a few of their own words and that it goes to Claude Code, e.g. „Die Tests in alpha, geht an
 Claude Code“." Results while a request still runs, results that list an open approval, `status`'s
-included, `approve` and the emergency stop have none, as what you say next there is no new request.
+included, `approve`, the emergency stop and `unlock` have none, as what you say next there is no new
+request.
 The line is there because claude.ai fetches the connector's instructions and tool descriptions only
 when it connects, with `initialize` (a `voice initialize client=Anthropic/ClaudeAI/…` line in
 `.logs/gateway.log`, every two to four hours), not with each voice chat, while it follows a tool
