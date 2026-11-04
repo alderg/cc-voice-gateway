@@ -247,7 +247,7 @@ test('what the voice assistant says around a call: before send and ask a short l
   has(
     'Workflow: send (or ask) -> get_reply, repeated while state is "sent" or "working" (ask waits up to 1 second for a quick answer, each get_reply up to 2 seconds) -> read the answer. Before send or ask, acknowledge in one short line in the user\'s language that fits the request and names what it is about: a task is on its way, a question goes to Claude Code and its answer follows. Word it freshly each time. Claude Code does the work, you pass it on. Between polls tell the user in a few words that it is still running. Relay Claude Code\'s answers faithfully; you may shorten them but never invent results.',
   )
-  has('Approvals: read them out and call approve only after the user explicitly said yes or no to that action.')
+  has('Approvals: they may come with any result. Read them out and call approve only after the user explicitly said yes or no to that action.')
   has('News: results of work Claude Code finished in the background arrive with any call. Read them out too.')
   has(
     'Emergency: when the user says "emergency stop" or "kill switch", in any language, call emergency_stop at once, without asking back. An [ALARM] line in any result is read out first.',
@@ -534,9 +534,21 @@ test('permission relay: prompt -> get_reply -> approve -> verdict to Claude Code
   assert.match(pending, /Pending approvals: abcde \(Write\)/)
   withoutNext(pending)
 
+  // send lists it too, as does approve for the others still open.
+  const other = await voiceCall('send', { message: 'And then run the tests.' })
+  assert.match(other, /^\[state=sent id=\w+ approval=abcde\] Handed over\. /)
+  assert.match(other, /\nApproval needed \(code=abcde\): Write – Create playground\/hello\.txt\. Details: /)
+  assert.ok(other.endsWith('\nRead the approval to the user and ask: allow or deny? Call approve with the code only after their explicit yes or no.'), other)
+  await claudeCode.notification({
+    method: 'notifications/claude/channel/permission_request',
+    params: { request_id: 'bcdfg', tool_name: 'Bash', description: 'Run the tests', input_preview: '{}' },
+  })
+  await waitUntil(() => gatewayLog.includes('permission_request code=bcdfg'))
+
   const approved = await voiceCall('approve', { code: 'ABCDE', decision: 'allow' })
-  assert.match(approved, /^\[approval=allow code=abcde\]/)
+  assert.match(approved, /^\[approval=allow code=abcde pending=bcdfg\] Allowed\. Claude Code continues; call get_reply\.\nApproval needed \(code=bcdfg\): Bash – Run the tests\. Details: \{\}\nRead the approval/)
   withoutNext(approved)
+  assert.match(await voiceCall('approve', { code: 'bcdfg', decision: 'deny' }), /^\[approval=deny code=bcdfg\] Denied\.$/)
   const verdict = await waitUntil(() => verdicts.find(v => v.request_id === 'abcde'))
   assert.equal(verdict.behavior, 'allow')
 
@@ -558,7 +570,7 @@ test('permission relay: prompt -> get_reply -> approve -> verdict to Claude Code
   withoutNext(await voiceCall('approve', { code: 'fghjk', decision: 'deny' }))
 })
 
-test('an approval answered at the computer: the next tool call of the session closes it, a late approve sends no verdict', async () => {
+test('an approval answered at the computer: the next tool call of the session takes it off the lists, a late approve still sends the verdict', async () => {
   const id = idOf(await voiceCall('send', { message: 'Watch the build.' }))
   await waitUntil(() => channelEvents.find(e => e.meta?.request_id === id))
   const ask = request_id =>
@@ -580,17 +592,19 @@ test('an approval answered at the computer: the next tool call of the session cl
   assert.doesNotMatch(await voiceCall('get_reply', { id, wait_seconds: 1 }), /bdozq/, 'said once')
   assert.doesNotMatch(await voiceCall('status'), /Pending approvals/)
 
+  // Only a guess: the verdict goes all the same, and Claude Code drops it if it is stale.
   const late = await voiceCall('approve', { code: 'bdozq', decision: 'allow' })
-  assert.match(late, /^\[approval=elsewhere code=bdozq\] Already answered at the computer; nothing to do\./)
-  await new Promise(r => setTimeout(r, 200))
-  assert.ok(!verdicts.some(v => v.request_id === 'bdozq'), 'no verdict that would apply to nothing')
+  assert.match(late, /^\[approval=allow code=bdozq\] Allowed\. It looked answered at the computer already; if it was, that answer stands\. Claude Code continues; call get_reply\.$/)
+  assert.equal((await waitUntil(() => verdicts.find(v => v.request_id === 'bdozq'))).behavior, 'allow')
+  assert.match(await voiceCall('approve', { code: 'bdozq', decision: 'deny' }), /unknown or already answered/, 'once')
 
   // A prompt after the tool call waits as before, until a reply from the session.
   await ask('cdpqr')
   assert.match(await voiceCall('status'), /Pending approvals: cdpqr \(Monitor\)/)
   await controllerReply(id, 'done', 'The build is green.')
   assert.doesNotMatch(await voiceCall('status'), /Pending approvals/)
-  assert.match(await voiceCall('approve', { code: 'cdpqr', decision: 'deny' }), /^\[approval=elsewhere code=cdpqr\]/)
+  assert.match(await voiceCall('approve', { code: 'cdpqr', decision: 'deny' }), /^\[approval=deny code=cdpqr\] Denied\. It looked answered/)
+  await waitUntil(() => verdicts.find(v => v.request_id === 'cdpqr'))
 })
 
 test('night mode by voice: set_away on the driver\'s words, on and off; the controller hears the night begin and the summary', async () => {

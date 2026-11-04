@@ -134,16 +134,28 @@ test('a requests file that is not JSON is logged, and replaced at the next chang
 
 // --- approvals ---------------------------------------------------------------------
 
-test('answered approvals leave after the TTL, like open ones', async () => {
-  const s = new Store({ permissionTtlSeconds: 0.1 })
+test('an approval Claude Code may wait on is never dropped, open or guessed answered at the computer; an answered one leaves a while after its answer', async () => {
+  const s = new Store({ answeredKeptSeconds: 0.1 })
   s.addPermission({ request_id: 'abcde', tool_name: 'Bash', description: 'Run ls', input_preview: '' })
   s.addPermission({ request_id: 'fghjk', tool_name: 'Write', description: 'Write a file', input_preview: '' })
   assert.ok(s.resolvePermission('abcde', 'allow'))
   assert.equal(s.resolvePermission('abcde', 'deny'), null, 'answered once')
-  assert.equal(s.permissions.size, 2)
+  // As on 2026-11-04, when a subagent's two approvals waited 47 minutes: long past the old 15-minute TTL.
+  s.getPermission('fghjk').createdAt -= 47 * 60 * 1000
+  s.addPermission({ request_id: 'kmnpq', tool_name: 'Monitor', description: 'Watch the build log', input_preview: '' })
+  s.getPermission('kmnpq').createdAt -= 2 * 60 * 60 * 1000
+  assert.deepEqual(s.closePermissionsElsewhere().map(p => p.code), ['fghjk', 'kmnpq'])
+  s.addPermission({ request_id: 'rstuv', tool_name: 'Bash', description: 'Run pwd', input_preview: '' })
+  s.getPermission('rstuv').createdAt -= 3 * 60 * 60 * 1000
   await sleep(150)
-  assert.deepEqual(s.openPermissions(), [])
-  assert.equal(s.permissions.size, 0, 'neither the open nor the answered one is kept')
+  assert.deepEqual(s.openPermissions().map(p => p.code), ['rstuv'])
+  assert.deepEqual(s.pendingPermissions().map(p => p.code), ['fghjk', 'kmnpq', 'rstuv'])
+  assert.equal(s.getPermission('abcde'), null, 'the answered one is gone')
+  assert.equal(s.getPermission('fghjk').status, 'elsewhere')
+  // Still answerable, once.
+  assert.equal(s.resolvePermission('fghjk', 'deny').status, 'deny')
+  assert.equal(s.resolvePermission('rstuv', 'allow').by, 'voice')
+  assert.deepEqual(s.pendingPermissions().map(p => p.code), ['kmnpq'])
 })
 
 // --- the log file ------------------------------------------------------------------

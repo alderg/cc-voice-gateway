@@ -15,7 +15,7 @@ This README is the technical documentation. What it is for, in a two-minute vide
 | **Voice control** | Claude's voice mode, through a custom MCP connector, as the front end of Claude Code: in the car with CarPlay or Android Auto, on the phone, or at the desk next to mouse and keyboard. Answers are written to be heard; approvals by voice | [Overview](#1-overview), [voice commands](#84-voice-commands) |
 | **Three layers of AI** | The voice AI (Claude voice mode) hands each request to the controller, a Claude Code session on your computer reached through a channel. The controller keeps the context, dispatches workers (headless `claude -p` runs) and sums up their results. The gateway in between has no AI of its own | [Overview](#1-overview), [architecture](#41-architecture) |
 | **Parallel workers** | Several repositories at once, several runs per repository in git worktrees of their own, a queue that survives restarts, work folders for tasks without a repository; on this computer or in Docker | [Workers](#55-workers-on-this-computer-or-in-docker), [several runs](#several-runs-per-repository), [work folders](#work-folders) |
-| **It comes back to you** | Results as spoken news; questions and approvals on Telegram once the call has ended, and if you turn it on, questions and approvals answered there by Reply and requests written there as to the controller itself, with its replies in the chat; pull requests watched, review comments fixed automatically; open items and reminders; the controller in the Claude app with Remote Control | [Telegram](#58-the-telegram-fallback), [open items](#84-voice-commands), [review fixes](#automatic-fixes-for-review-comments), [Remote Control](#remote-control-from-the-claude-app) |
+| **It comes back to you** | Results as spoken news; approval requests on Telegram at once, questions once the call has ended, and if you turn it on, questions and approvals answered there by Reply and requests written there as to the controller itself, with its replies in the chat; pull requests watched, review comments fixed automatically; open items and reminders; the controller in the Claude app with Remote Control | [Telegram](#58-the-telegram-fallback), [open items](#84-voice-commands), [review fixes](#automatic-fixes-for-review-comments), [Remote Control](#remote-control-from-the-claude-app) |
 | **Safe by design** | Pull requests on `voice/` branches; a merge after your yes and an approval; workers only on your own words; Docker access levels set by the GitHub token; a confined controller; a kill switch in code; sign-in with a pairing code, `/mcp` only from Anthropic's addresses | [Security design](#5-security-design) |
 
 > [!WARNING]
@@ -211,7 +211,7 @@ What this project tries, and why:
 | A running Claude Code session (the controller) as the receiver, through a channel | It keeps context across requests, asks back and summarises. A fresh `claude -p` per request would forget everything |
 | Workers as separate headless runs | The controller stays responsive and confined; several repositories can be worked on at once; a run survives a controller restart |
 | Approvals relayed to the voice conversation | The channel's permission relay lets Claude Code's approval prompts be answered by voice |
-| Telegram as an optional fallback for what needs you | Voice assistants only poll. Once you hang up, a question or an approval would wait until the next conversation. Results can wait; they stay off Telegram |
+| Telegram as an optional fallback for what needs you | Voice assistants only poll. Once you hang up, a question or an approval would wait until the next conversation, and Claude Code waits on an approval. Results can wait; they stay off Telegram |
 | Docker with access levels derived from the GitHub token | Host workers run as you, with your logins. A container with a scoped token limits what a run can reach and publish |
 | Changes out of a read-only container as a git bundle into a clean clone | Fetching from the container's folder would run git with config that the container controls |
 | A kill switch in the gateway's code | A lock that does not depend on the controller following instructions |
@@ -265,8 +265,8 @@ What this project adds over the others:
 - **Approvals and merges by voice.** Claude Code's approval prompts reach the conversation. A merge
   needs your yes and then an approval ([confinement](#53-the-controllers-confinement)), by voice or,
   if you turn Telegram input on, in your Telegram chat.
-- **Telegram after the call**, optional, for questions, approvals and alerts, and if you turn it
-  on, for requests, answers and approvals you write there, push, merge, restart and delete
+- **Telegram**, optional: approval requests at once, questions after the call, and alerts, and if
+  you turn it on, requests, answers and approvals you write there, push, merge, restart and delete
   included, unless you keep those with your voice.
 - **Isolation as a choice.** Workers on the host, or in Docker at a level that the GitHub token
   decides, with a defined path out for read-only containers.
@@ -362,7 +362,7 @@ Requests and approvals have these states:
 | Variant | Turned on by | Effect |
 |---|---|---|
 | Voice only | default | News reaches you when the voice AI calls |
-| Voice + Telegram | `.secrets/telegram_token` and `.secrets/telegram_chat_id` | After 10 minutes without a voice call, questions and approvals also go to Telegram; results wait for the next call. With Telegram input on (off by default), a message there is a request or an answer, with the controller's replies back in the chat. `/stop` locks the kill switch |
+| Voice + Telegram | `.secrets/telegram_token` and `.secrets/telegram_chat_id` | Approval requests go to Telegram at once; after 10 minutes without a voice call, questions too; results wait for the next call. With Telegram input on (off by default), a message there is a request or an answer, with the controller's replies back in the chat. `/stop` locks the kill switch |
 | Workers on this computer | default (`VOICE_GW_DOCKER` empty) | Runs in your checkouts as you |
 | Workers in Docker | `VOICE_GW_DOCKER=<container>` | Runs in the container; the level per repository comes from its GitHub token, or from `VOICE_GW_ACCESS` |
 | Work folders | `VOICE_GW_SCRATCH=1`; off by default | Tasks without a repository run in a new empty folder each, on this computer as you ([work folders](#work-folders)) |
@@ -579,16 +579,23 @@ and fails closed.
 
 - **How it works.** The gateway declares `claude/channel/permission`, so Claude Code sends approval
   prompts to the channel as well as the terminal; the first answer wins. A prompt has a five-letter
-  code, covers one action and drops from the voice view after 15 minutes
-  (`VOICE_GW_PERMISSION_TTL`).
+  code and covers one action. It stays open as long as Claude Code may wait on it: no time limit,
+  and none outlives the controller session, as the gateway ends with it.
+- **In every result.** The open prompts come with whatever the voice AI calls next: `get_reply`,
+  `ask`, `status`, and also `send` and `approve`, the latter listing those still open after the one
+  it answered. The voice AI reads them out and asks you.
+- **At once on Telegram**, if it is set up: every prompt goes to your chat as soon as Claude Code
+  raises it, whether voice mode is on or not, and in the night too
+  ([5.8](#58-the-telegram-fallback)). Only a standby holds it until it is over; while the kill
+  switch is locked, every prompt is denied anyway.
 - **Whoever can call `approve` can approve.** The voice AI is told to approve only after an
   explicit yes; that is an instruction, not enforcement.
 - **Answered in Telegram.** With answers by Telegram on (`VOICE_GW_TELEGRAM_ANSWERS=1`), an
-  approval request the gateway sent to your chat is answered there too: a Reply with a plain yes
-  or no, a message with its code and yes or no, or a plain yes or no alone while it is the only one
-  open; "yes to all" allows every one open ([5.8](#58-the-telegram-fallback)). The verdict
-  goes to Claude Code as one by voice does; the first answer wins, and the voice AI hears that it
-  was answered in Telegram. `VOICE_GW_TELEGRAM_CONFIRM=0` keeps approvals with the voice and the
+  approval request in your chat is answered there too: a Reply with a plain yes or no, a message
+  with its code and yes or no, or a plain yes or no alone while it is the only one open; "yes to
+  all" allows every one open ([5.8](#58-the-telegram-fallback)). The verdict goes to Claude Code
+  as one by voice does; the first answer wins, and the voice AI hears that it was answered in
+  Telegram. `VOICE_GW_TELEGRAM_CONFIRM=0` keeps approvals with the voice and the
   terminal.
 - **What it guarantees:** the controller cannot merge on its own, for example because a pull
   request's text told it to.
@@ -596,8 +603,16 @@ and fails closed.
   at the terminal.
 - **Answered elsewhere.** With [Remote Control](#remote-control-from-the-claude-app) on, the Claude
   app shows the prompt too, as a third place. An answer at the terminal or in the app does not
-  reach the gateway: the car keeps the prompt until it drops after `VOICE_GW_PERMISSION_TTL`, and
-  an answer by voice then has no effect.
+  reach the gateway, so it guesses: below `unrestricted`, the next call of a gateway tool by the
+  controller means every prompt relayed before was answered, since the session waits on its
+  prompts and has no subagents there. Such a prompt leaves the lists, by voice and in Telegram,
+  and the voice AI hears once that it was answered at the computer. It is only a guess: an answer
+  to it by voice, or by Reply or code in Telegram, still goes to Claude Code, which drops a verdict
+  that comes too late, and the answer says so ("It looked answered at the computer already; if it
+  was, that answer stands."). At `unrestricted` the controller can run subagents, whose prompts
+  wait while the session goes on, and nothing in a prompt says whose it is, so there the gateway
+  guesses nothing: a prompt answered at the terminal or in the app stays listed until you answer
+  it by voice or in Telegram too, or the session restarts.
 - **Secrets in prompts:** Claude Code masks recognisable credentials in relayed prompts, but not
   every secret ([channels reference][ref]).
 
@@ -1044,26 +1059,32 @@ folder, `.git` included.
 ### 5.8 The Telegram fallback
 
 - **On only with both files:** `.secrets/telegram_token` and `.secrets/telegram_chat_id`.
-- **When:** after `VOICE_GW_TELEGRAM_AFTER` seconds (600) without a voice tool call, voice mode
-  counts as ended. Gaps of a few minutes between calls are normal while you talk, so the wait is
-  long.
-- **What:** only what needs you. Questions and approval requests that voice mode has not picked
-  up then also go to the chat, each once. Results, news and interim `working` updates never do;
-  they wait for the next voice call, apart from the controller's replies to an answer or a request
-  you gave in the chat (below). A question the controller settled in the meantime is not sent.
-- **Not waiting for that:** the kill switch alarm goes at once, whether voice mode is on or not, and
+- **Approval requests at once.** Every approval request of Claude Code's goes to the chat as soon
+  as it is raised, once: whether voice mode is on or not, whether the voice AI has read it out or
+  not, and in night mode too, by day as at night. Claude Code waits on it, and the next voice call
+  may be long in coming. Only a standby holds it, until the connector signs in again; while the kill
+  switch is locked, Claude Code's prompts are denied before they reach anyone. With answers by
+  Telegram on you answer it there (below); otherwise its last line says to answer it in voice mode
+  or at the terminal.
+- **Questions after the call:** after `VOICE_GW_TELEGRAM_AFTER` seconds (600) without a voice tool
+  call, voice mode counts as ended. Gaps of a few minutes between calls are normal while you talk,
+  so the wait is long. Questions that voice mode has not picked up then also go to the chat, each
+  once. A question the controller settled in the meantime is not sent.
+- **Never there:** results, news and interim `working` updates; they wait for the next voice call,
+  apart from the controller's replies to an answer or a request you gave in the chat (below).
+- **Not waiting either:** the kill switch alarm goes at once, whether voice mode is on or not, and
   so do the PIN to unlock it in voice mode and the notes about that unlock (below), the warning when
   a run's write outside goes to [quarantine](#quarantine), a note when the gateway ends because
   another process holds its port, the alerts about suspicious requests and sign-ins
   ([5.2](#52-the-voice-endpoint-and-oauth)), the Funnel's messages
   ([7.3](#73-publishing-the-endpoint)), the watchdog's around a restart ([8.2](#82-the-watchdog)),
   and the statistics when the gateway shuts down ([8.5](#85-statistics)).
-- **In night mode** ([night mode](#night-mode)) the fallback pauses: no questions, approvals or
-  news, only alarms (the kill switch, a standby, a wait for the usage limit, once each, and the
-  warning about a write that went to quarantine), the PIN when you ask to unlock in voice mode, and
-  the controller's replies to what you wrote in the chat yourself, with the approval requests that
-  follow while you write there (below). The morning summary names what the night left, instead of
-  one message each.
+- **In night mode** ([night mode](#night-mode)), also when you turn it on by day, the fallback
+  pauses for questions and news. What still comes: approval requests, at once as always; alarms
+  (the kill switch, a standby, a wait for the usage limit, once each, and the warning about a write
+  that went to quarantine); the PIN when you ask to unlock in voice mode; and the controller's
+  replies to what you wrote in the chat yourself. The morning summary names what the night left,
+  instead of one message each.
 - **Inbound, only from you:** your own account (`from.id`), in your private chat with the bot, the
   configured chat. In a private chat the chat id is your user id, so `.secrets/telegram_chat_id`
   is all it needs; the log names it at every start. Groups, supergroups, channels, other senders,
@@ -1148,10 +1169,8 @@ folder, `.git` included.
   `restart_controller` with `confirm` take words typed in Telegram ([5.4](#54-approvals-by-voice)).
 - **Approvals by Telegram.** A merge and a confirmed delete also need Claude Code's approval
   ([5.3](#53-the-controllers-confinement)), and with answers by Telegram on, you give it there too.
-  An approval request comes to the chat as before, once voice mode has ended, and also at once,
-  whether voice mode is on or not and in the night, while your latest request or answer came from
-  the chat, in the last `VOICE_GW_DISPATCH_WINDOW` minutes (30): a merge you confirmed there does
-  not wait for the voice. Its last line says how to answer it: Telegram's Reply on it with a plain
+  Every approval request comes to the chat at once (above), so a merge you confirmed there does not
+  wait for the voice. Its last line says how to answer it: Telegram's Reply on it with a plain
   yes or no ("ja", "ok", "allow"; "nein", "no", "deny"), or a message with its five-letter code and
   yes or no ("qwert yes"). Anything else, or both at once ("not ok"), leaves it open and the chat
   asks for a plain yes or no. A message that is nothing but a yes or a no ("yes", "Ja.", "ok", "👍";
@@ -1165,12 +1184,16 @@ folder, `.git` included.
   questions stay open, and with none open the chat says so. The verdict goes to Claude Code as one
   by voice does; the chat confirms it and names it ("Allowed: approval request qwert (Bash: gh pr
   merge 3 --repo driver/alpha --squash). Claude Code goes on."), the input log keeps it, and the
-  voice AI hears that it was answered in Telegram. The first answer wins: one answered by voice or
-  at the computer already is said to be settled, and a plain yes no longer counts for it. Every protection of Telegram input
-  holds: only your own account in your private chat, no forwarded or edited message, nothing older
-  than two minutes, nothing while the kill switch is locked (which denies every open approval
-  anyway) or the gateway is inactive. With answers by Telegram off, or without the permission relay,
-  approvals stay with the voice and the terminal.
+  voice AI hears that it was answered in Telegram. The first answer wins: one answered by voice
+  already is said to be settled, and a plain yes no longer counts for it. One the gateway only
+  guessed answered at the computer ([5.4](#54-approvals-by-voice)) is left out of a plain yes and
+  of "yes to all", but a Reply to it or its code still sends your verdict, and the chat adds that an
+  answer given at the computer stands; Claude Code drops a verdict that comes too late. Every
+  protection of Telegram input holds: only your own account in your private chat, no forwarded or
+  edited message, nothing older than two minutes, nothing while the kill switch is locked (which
+  denies every open approval anyway) or the gateway is inactive. With answers by Telegram off, or
+  with `VOICE_GW_TELEGRAM_CONFIRM=0`, approval requests still come to the chat at once, to answer
+  by voice or at the terminal; without the permission relay there are none.
 - **Keeping them with your voice** (`VOICE_GW_TELEGRAM_CONFIRM=0`, or any value but `1`, so that a
   typo lets nothing more through). Ordinary requests and answers still come by Telegram; push,
   merge, restart, delete and approvals do not. Their questions on Telegram say "Answer in voice
@@ -2512,10 +2535,12 @@ defers what needs you, goes on with other work meanwhile, and tells you in the m
     ends with "Assumptions:" and "Deferred questions:".
   - Questions and decisions that still come wait for the morning, holding only what they hold by
     day: their repository, or their worktree, never other work. No reminders.
-  - Telegram carries alarms only: the kill switch, a standby, a wait for the usage limit, once each,
-    and the warning when a run's write outside goes to [quarantine](#quarantine).
-    No questions, approvals or news; the PIN when you ask to unlock the kill switch in voice mode
-    still comes, and the controller's replies to what you write there yourself still come back.
+  - Telegram carries alarms: the kill switch, a standby, a wait for the usage limit, once each,
+    and the warning when a run's write outside goes to [quarantine](#quarantine). Approval
+    requests still go there at once, as by day ([5.8](#58-the-telegram-fallback)): Claude Code
+    waits on them, also at night. No questions or news; the PIN when you ask to unlock the kill
+    switch in voice mode still comes, and the controller's replies to what you write there
+    yourself still come back.
   - The controller hears that the night began (an event of the gateway), goes on with what is
     queued, and chains work within your [standing orders](#standing-orders).
   - `status` and `open_items` say so.
@@ -2668,7 +2693,6 @@ limits at once.
 | `VOICE_GW_OAUTH_HOSTS` | `claude.ai,claude.com` | Hosts allowed in redirect addresses and client ID metadata documents |
 | `VOICE_GW_MCP_ALLOW` | `160.79.104.0/21`, Anthropic's | Ranges (CIDR) or addresses that may call `/mcp` through the tunnel, comma-separated; `any`: no limit, for a tunnel without `X-Forwarded-For` ([5.2](#52-the-voice-endpoint-and-oauth)) |
 | `VOICE_GW_PERMISSION_RELAY` | on | `0`: approvals only at the terminal |
-| `VOICE_GW_PERMISSION_TTL` | `900` | Seconds before an open approval leaves the voice view |
 | `VOICE_GW_DEFAULT_WAIT` | `25` | Seconds `get_reply` waits by default |
 | `VOICE_GW_MAX_WAIT` | `40` | Upper limit for `get_reply` and `ask` |
 | `VOICE_GW_ASK_WAIT` | `8` | Seconds `ask` waits for a quick answer before it returns still running; at most `VOICE_GW_MAX_WAIT` |
@@ -2702,7 +2726,7 @@ limits at once.
 | `VOICE_GW_STANDBY` | `0` | `1`: inactive on purpose, a standby install: the connector answers, says it is inactive, and hands nothing over |
 | `VOICE_GW_DISCONNECT_STANDBY` | `1` | `1`: when the connector is disconnected, one message, then standby until a new sign-in; `0`: stays on |
 | `VOICE_GW_DISCONNECT_UNUSED`, `VOICE_GW_DISCONNECT_GRACE` | `10`, `15` | Minutes: calls without a token count only after the connector's sign-in went unused this long, and the standby follows only if this many more pass without a use or a new sign-in |
-| `VOICE_GW_TELEGRAM_AFTER` | `600` | Seconds without a voice call before questions and approvals also go to Telegram ([5.8](#58-the-telegram-fallback)) |
+| `VOICE_GW_TELEGRAM_AFTER` | `600` | Seconds without a voice call before questions also go to Telegram ([5.8](#58-the-telegram-fallback)); approval requests go there at once |
 | `VOICE_GW_TELEGRAM_ANSWERS` | `0` | Telegram input, off by default ([5.8](#58-the-telegram-fallback)). `1`: a Reply to a question on Telegram, or a message with its code, reaches the controller as your answer, and approval requests are answered there with yes or no; `0`: off, questions and approvals are answered by voice only. `other`, its earlier middle value, counts as `1`; any other value as `0`. The setup turns it on with requests |
 | `VOICE_GW_TELEGRAM_REQUESTS` | `0` | Telegram input, off by default ([5.8](#58-the-telegram-fallback)). `1`: any other message in your Telegram chat, no command and no answer, reaches the controller as a request of yours, as one by voice does, and its replies come back there; `0`: off, such a message is not passed on. Any other value counts as `0` |
 | `VOICE_GW_TELEGRAM_CONFIRM` | `1` | With Telegram input on ([5.8](#58-the-telegram-fallback)): `1`, push, merge, restart and delete count there as by voice (`resolve_decision`, the follow-up `dispatch`, `dispatch` with `direct`, a confirmed `delete_path`, `restart_controller` with `confirm`), and with answers on, approval requests are answered there with yes or no; `0`: they take your voice, as before, and an answer there to such a question is not carried out. Any other value counts as `0` |
@@ -2835,7 +2859,7 @@ gateway; do not set them.
 | Section 10 of the setup page says "not running yet" although the controller runs in tmux | Claude Code waits at the terminal, and the gateway starts only after the answer. `tmux attach -t voice`: at "Is this a project you created or one you trust?" (once for the folder) press the down arrow once to "Yes, I trust this folder", then Enter, since Enter alone picks "No, exit"; at the development channel's warning (every start without the allowlist) Enter. Leave with Ctrl-b, then d. |
 | The setup page cannot be reached from another computer | A firewall blocks the port, or `--host` names one address only. Or use the SSH tunnel the terminal shows. |
 | "Find my chat" finds nothing | Write to the bot after checking the token; Telegram keeps messages for 24 hours. A running gateway that polls the same bot takes them away: quit the controller first. |
-| No Telegram message | Questions and approvals go out only after `VOICE_GW_TELEGRAM_AFTER` seconds (600) without a voice call, and only if the voice assistant has not picked them up. Results never go to Telegram. `telegram fallback off` in the log: a file was missing or empty when the gateway started; fix it and restart the controller. `telegram send failed: 400 Bad Request: chat not found`: wrong chat ID, or you never wrote to the bot. `401 Unauthorized`: wrong token. |
+| No Telegram message | Approval requests go out at once, also while voice mode is on and at night; only a standby holds them. Questions go out only after `VOICE_GW_TELEGRAM_AFTER` seconds (600) without a voice call, and only if the voice assistant has not picked them up. Results never go to Telegram. `telegram fallback off` in the log: a file was missing or empty when the gateway started; fix it and restart the controller. `telegram send failed: 400 Bad Request: chat not found`: wrong chat ID, or you never wrote to the bot. `401 Unauthorized`: wrong token. |
 | `The worker container voice-workers does not answer` | The container is stopped or was removed: `docker start voice-workers`, or `scripts/start-workers-container.sh`. |
 | `access read-only (no GitHub token)` although there is one | It must be `.secrets/worker/github_token`, readable for the gateway. A new token counts at the next check, within ten minutes. |
 | `access read-only (the token cannot see the repository (404))` | The token's repository access does not include it, or the organisation has not approved the token yet. |
@@ -2861,6 +2885,7 @@ gateway; do not set them.
 | `/funnel on` answers "The Funnel did not come on: Access denied" | Run `sudo tailscale set --operator=$USER` once on the computer. |
 | The Funnel goes off while you still use voice mode | It goes off `VOICE_GW_FUNNEL_IDLE` minutes after the last voice call; a long silence counts. Raise the minutes, or send "keep alive". |
 | No approval by voice | Expected for Bash, Write and Edit: they run without asking. For other tools: the session runs in auto or bypass mode, an allow rule covers the tool, or it is a trust or consent dialog, which is not relayed. Start the session with `scripts/start-controller.sh`. |
+| The terminal shows an approval waiting, the car and Telegram nothing | Every open approval comes with any voice call's result, `send` and `approve` included, and goes to Telegram at once; none drops after a time. Below `unrestricted`, a tool call of the controller after the prompt makes the gateway guess it was answered at the computer and take it off the lists ([5.4](#54-approvals-by-voice)): if one still waits then, answer it at the terminal, or by voice or in Telegram with its code from its Telegram message, which still reaches Claude Code. In a standby nothing goes out until the connector signs in again. |
 | The controller still starts with the development flag after the admin step | The log line `channel: the development flag, since …` says why. The script reads Claude Code's local copy of the managed settings (`~/.claude/remote-settings.json`), which Claude Code updates when a session starts, so the first start after the admin step still sees the old copy: answer the warning or quit, and start again. `node scripts/channel-mode.mjs` shows what the next start will use; `claude doctor` shows whether the managed settings arrived. |
 | With `VOICE_GW_REMOTE_CONTROL=1`, "Voice controller" is missing in the Claude app | It counts from the next start of the session; the log line `watchdog: remote control: …` shows that it was passed. The controller's terminal (`tmux attach -t voice`) shows why it did not connect, and `claude doctor` which check failed: Claude Code signed in with an API key or a token instead of claude.ai, `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` or `DISABLE_GROWTHBOOK` set, or on Team and Enterprise Remote Control not turned on by an Owner ([7.4](#74-admin-steps-for-team-and-enterprise)). After a restart, take the newest session of that name. |
 | No worker shows up in the Claude app | Expected: only the controller connects. Worker runs are headless (`claude -p`), which Remote Control does not connect ([Remote Control](#remote-control-from-the-claude-app)); ask the controller what a worker does, or read `.state/tasks/<task>.jsonl`. |

@@ -421,31 +421,35 @@ test('Telegram: /night, "good night" and the like switch it on; /back, "I\'m bac
   for (const text of ['/back 09:00', '/morning soon', 'good night 9:00']) assert.equal(awayCommand(text), null, text)
 })
 
-test('the morning settles the night: its news read, its questions and approvals told by the summary', async () => {
+test('the morning settles the night: its news read, its questions told by the summary; approval requests go to Telegram at once in the night', async () => {
   const store = new Store()
   const night = store.createRequest('Worker alpha finished task t1ab.', { origin: 'worker' })
   store.addUpdate(night.id, 'done', 'The export is done.')
   const question = store.createRequest('Worker beta finished task t2cd.', { origin: 'worker' })
   store.addUpdate(question.id, 'question', 'Which colour?')
-  store.addPermission({ request_id: 'abcde', tool_name: 'Bash', description: 'Run ls', input_preview: '' })
   assert.equal(store.settleNews(night.createdAt), 1)
   assert.equal(store.hasUnread(night), false)
   assert.equal(store.hasUnread(question), true, 'questions stay')
   const sent = []
   let paused = true
-  const fallback = new TelegramFallback(store, { afterSeconds: 0.05, paused: () => paused, log: () => {}, send: async text => sent.push(text) })
+  // Paused in the night, held only in a standby, as gateway.mjs has it.
+  const fallback = new TelegramFallback(store, { afterSeconds: 0.05, paused: () => paused, held: () => false, log: () => {}, send: async text => sent.push(text) })
   await sleep(100)
   store.changed()
-  assert.deepEqual(sent, [], 'nothing in the night')
+  assert.deepEqual(sent, [], 'no question in the night')
+  // Claude Code waits on an approval request: it goes there at once, as the driver asked.
+  store.addPermission({ request_id: 'abcde', tool_name: 'Bash', description: 'Run ls', input_preview: '' })
+  await until(() => sent.length === 1)
+  assert.match(sent[0], /^Approval request abcde \(controller session\)\n\nBash: Run ls\n/)
   fallback.settle()
   paused = false
   store.changed()
   await sleep(100)
-  assert.deepEqual(sent, [], 'told by the summary')
+  assert.equal(sent.length, 1, 'the question is told by the summary, the approval request is not sent again')
   const later = store.createRequest('Worker gamma finished.', { origin: 'worker' })
   store.addUpdate(later.id, 'question', 'Push it?')
-  await until(() => sent.length === 1)
-  assert.match(sent[0], /^Question for request \w+ \("Worker gamma finished\."\)\n\nPush it\?/, 'by day as before')
+  await until(() => sent.length === 2)
+  assert.match(sent[1], /^Question for request \w+ \("Worker gamma finished\."\)\n\nPush it\?/, 'by day as before')
   fallback.close()
 })
 
@@ -487,7 +491,7 @@ async function freePort() {
   return port
 }
 
-test('the gateway: "good night" on Telegram; no questions there in the night; "/back": one summary, also to the controller', async () => {
+test('the gateway: "good night" on Telegram; no questions there in the night, but approval requests at once; "/back": one summary, also to the controller', async () => {
   const secrets = join(TMP, 'gateway')
   mkdirSync(secrets, { recursive: true, mode: 0o700 })
   writeFileSync(join(secrets, 'telegram_token'), `${TOKEN}\n`, { mode: 0o600 })
@@ -570,6 +574,15 @@ test('the gateway: "good night" on Telegram; no questions there in the night; "/
     await controller('reply', { request_id: id, state: 'question', text: 'Which login page, the old or the new one?' })
     await sleep(1800)
     assert.equal(api.messages.length, sent, 'no question on Telegram in the night')
+
+    // An approval request in the night, with the voice mode on: on Telegram at once, as the driver asked.
+    assert.match(await call('status'), /\nNight mode: /)
+    await claudeCode.notification({
+      method: 'notifications/claude/channel/permission_request',
+      params: { request_id: 'nghta', tool_name: 'Bash', description: 'gh pr merge 3 --repo driver/alpha --squash', input_preview: '{}' },
+    })
+    await until(() => api.messages.length === sent + 1)
+    assert.match(api.messages.at(-1), /^Approval request nghta \(controller session\)\n\nBash: gh pr merge 3 --repo driver\/alpha --squash\n/)
 
     // Back: one summary, with the decision waiting; the question does not follow on its own.
     fromDriver('/back')

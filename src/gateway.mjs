@@ -13,11 +13,11 @@
 // in a Docker container with its own clones, and with VOICE_GW_SCRATCH=1 in
 // work folders for tasks without a repository, a watch on the pull requests they
 // open, for checks and reviews, with fixes for review comments queued without
-// asking (VOICE_GW_AUTO_FIX_REVIEWS), and optionally Telegram, for questions and
-// approvals after the voice mode ended, for alarms, and for the driver's
-// answers, requests and approvals typed there (telegram.mjs). At the controller
-// levels clone-delete and unrestricted, also cloning and deleting in the
-// worker root (folders.mjs). Over all of it, the kill switch (killswitch.mjs).
+// asking (VOICE_GW_AUTO_FIX_REVIEWS), and optionally Telegram, for approval
+// requests at once, questions after the voice mode ended, alarms, and the
+// driver's answers, requests and approvals typed there (telegram.mjs). At the
+// controller levels clone-delete and unrestricted, also cloning and deleting
+// in the worker root (folders.mjs). Over all of it, the kill switch (killswitch.mjs).
 // And what is open, so that nothing is forgotten: decisions for the driver
 // (ledger.mjs), the queue (workers.mjs), the requests (store.mjs). And the
 // statistics of its running time and of all time (stats.mjs): for the
@@ -86,7 +86,7 @@ log(`cc-voice-gateway ${VERSION} starting, commit ${commit()}, pid ${process.pid
 
 // Open decisions keep their requests past the retention time.
 const ledger = new Ledger({ file: config.jobsFile, remindMinutes: config.remindMinutes })
-const store = new Store({ permissionTtlSeconds: config.permissionTtlSeconds, file: config.requestsFile, keep: id => ledger.needs(id) })
+const store = new Store({ file: config.requestsFile, keep: id => ledger.needs(id) })
 // The driver's answer to a question: the decisions of its request keep it.
 store.on('answer', request => {
   try {
@@ -555,8 +555,8 @@ pulls.on('news', async news => {
   }
 })
 
-// Telegram, if set up, reaches the driver with questions and approvals once the
-// voice mode has ended, and with alarms at once.
+// Telegram, if set up, reaches the driver with approval requests and alarms at
+// once, and with questions once the voice mode has ended.
 const telegram = loadTelegram({
   tokenFile: config.telegramTokenFile,
   chatIdFile: config.telegramChatIdFile,
@@ -693,11 +693,10 @@ if (telegram) {
             : '; approval requests are answered by voice, as the permission relay is off'),
     )
   }
-  // Paused in a standby, and in night mode, where Telegram carries alarms
-  // only; what the night left, the morning summary names (night.mjs). The
-  // controller's replies to an answer or a request typed there wait only in
-  // a standby, and so do approval requests while the driver writes there,
-  // where they may answer them.
+  // Questions paused in a standby, and in night mode, where Telegram carries
+  // alarms and approval requests only; what the night left, the morning
+  // summary names (night.mjs). Approval requests, and the controller's
+  // replies to an answer or a request typed there, wait only in a standby.
   fallback = new TelegramFallback(store, {
     send: (text, options) => telegram.send(text, options),
     afterSeconds: config.telegramAfterSeconds,
@@ -705,9 +704,8 @@ if (telegram) {
     held: () => standby.active,
     answerable: request => answers?.accepts(request) ?? false,
     approvable: () => answers?.approves() ?? false,
-    chatMinutes: config.dispatchWindowMinutes,
   })
-  log(`telegram fallback ready: questions and approvals after ${config.telegramAfterSeconds} s without a voice call`)
+  log(`telegram fallback ready: approval requests at once, questions after ${config.telegramAfterSeconds} s without a voice call`)
   // Inbound, only from the driver in the configured private chat: the kill
   // switch, the Funnel, night mode, the statistics, and with Telegram input
   // on, answers to questions and approval requests, and requests. With
@@ -786,9 +784,10 @@ log(`${ipGuard.describe()}; suspicious requests ${telegram ? 'reported on Telegr
 // --- the kill switch's effects, in code ---------------------------------------
 
 // No new tasks (Workers.dispatch and the voice tools check the switch), the
-// queue is emptied, every run and the worker container stop, open approvals
-// are denied. An error here is logged; the lock holds whatever happens, and
-// so does the gateway. Returns the tasks that were queued.
+// queue is emptied, every run and the worker container stop, the approvals
+// Claude Code may wait on are denied. An error here is logged; the lock holds
+// whatever happens, and so does the gateway. Returns the tasks that were
+// queued.
 async function lockdown(why) {
   const parked = workers.parkAll()
   if (parked.length) log('kill switch emptied the queue:', parked.map(entry => `${entry.worker} ${entry.id}`).join(', '))
@@ -802,7 +801,7 @@ async function lockdown(why) {
   folders?.stopAll()
   // After an alarm the driver says again what may go on without them.
   orders.endAll(`the kill switch locked (${why})`)
-  for (const permission of store.openPermissions()) {
+  for (const permission of store.pendingPermissions()) {
     store.resolvePermission(permission.code, 'deny', 'killswitch')
     channel.sendVerdict(permission.code, 'deny').catch(() => {})
   }
@@ -1171,7 +1170,8 @@ night.on('night', async ({ until, by }) => {
       `Night mode is on${by === 'quiet hours' ? ', for the quiet hours' : `, as the driver said (${by})`}` +
         `${until ? ` until ${clock(until)}` : ', until the driver says they are back'}. Workers decide what they can, ` +
         'conservatively, note their assumptions and defer what needs the driver; questions and decisions wait for the ' +
-        'morning, and Telegram carries alarms only. Go on with what is queued, and with what standing orders allow' +
+        'morning, and Telegram carries alarms and approval prompts only. Go on with what is queued, and with what ' +
+        'standing orders allow' +
         `${orders.active().length ? ` (${orders.active().map(order => `${order.id} for ${order.worker}`).join(', ')})` : ': none holds now'}. ` +
         'Reply "done"; the driver does not hear it.',
       { origin: 'gateway' },

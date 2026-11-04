@@ -14,12 +14,13 @@
 // such choice as an assumption, and skip what really needs the driver as a
 // deferred question instead of ending with a question; questions and
 // decisions that still come wait for the morning, holding only what they
-// hold by day; Telegram carries alarms only (the kill switch, a standby, a
-// wait for the usage limit, once each), no questions, approvals or news;
-// no reminders. The night's results are noted here (record). When it ends:
-// one summary, on Telegram and as an event to the controller, which tells
-// the driver: what was done, the assumptions, the deferred questions, the
-// decisions waiting. Kept in .state/night.json, so that a restart in the
+// hold by day; Telegram carries alarms (the kill switch, a standby, a wait
+// for the usage limit, once each) and Claude Code's approval requests, which
+// go there at once (telegram.mjs), but no questions or news; no reminders.
+// The night's results are noted here (record). When it ends: one summary,
+// on Telegram and as an event to the controller, which tells the driver:
+// what was done, the assumptions, the deferred questions, the decisions
+// waiting. Kept in .state/night.json, so that a restart in the
 // night keeps it, and a night that ended while the gateway was down still
 // gets its summary.
 
@@ -263,7 +264,7 @@ export class Night extends EventEmitter {
     return (
       `night mode is on ${why}, ${until ? `until ${clock(until, now)}` : 'until the driver says they are back'}: workers decide what they ` +
       'can, conservatively, note assumptions and defer what needs the driver; questions and decisions wait for the morning, ' +
-      'and Telegram carries alarms only'
+      'and Telegram carries alarms and approval requests only'
     )
   }
 

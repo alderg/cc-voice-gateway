@@ -30,6 +30,7 @@ import { log, preview } from './log.mjs'
 import { PIN_MINUTES, PIN_TRIES, alarmText, emergencyPhrase, offText } from './killswitch.mjs'
 import { IpGuard, accessLine } from './ipguard.mjs'
 import { clock } from './limits.mjs'
+import { pending } from './store.mjs'
 
 // What the voice AI says, asked for in the car: before send and ask, one
 // short line of its own that fits the request, worded freshly each time, and
@@ -52,7 +53,8 @@ const voiceLines = (askWait, replyWait) => [
     'and names what it is about: a task is on its way, a question goes to Claude Code and its answer follows. Word ' +
     'it freshly each time. Claude Code does the work, you pass it on. Between polls tell the user in a few words ' +
     "that it is still running. Relay Claude Code's answers faithfully; you may shorten them but never invent results.",
-  'Approvals: read them out and call approve only after the user explicitly said yes or no to that action.',
+  'Approvals: they may come with any result. Read them out and call approve only after the user explicitly said yes ' +
+    'or no to that action.',
   'News: results of work Claude Code finished in the background arrive with any call. Read them out too.',
   'Emergency: when the user says "emergency stop" or "kill switch", in any language, call emergency_stop at once, ' +
     'without asking back. An [ALARM] line in any result is read out first.',
@@ -163,6 +165,25 @@ function describePermission(permission) {
   )
 }
 
+const ASK_APPROVAL =
+  'Read the approval to the user and ask: allow or deny? Call approve with the code only after their explicit yes or no.'
+
+// The open approvals, in every result that can carry them (report, send,
+// approve), so that the voice AI reads them out with whatever it calls next:
+// heard from now on, their codes for the first line, and a line each.
+function openApprovals(store) {
+  const permissions = store.openPermissions()
+  for (const permission of permissions) permission.announced = true
+  return { codes: permissions.map(p => p.code), lines: permissions.map(describePermission) }
+}
+
+// The lines after the result of send or approve: the open approvals, those
+// answered elsewhere since, and what to do with them.
+function approvalLines(store) {
+  const { codes, lines } = openApprovals(store)
+  return { codes, lines: [...lines, ...answeredElsewhereLines(store), ...(codes.length ? [ASK_APPROVAL] : [])] }
+}
+
 // The last line of every result that ends a request (the answer, a question
 // back, status): what the voice AI says before the user's next send or ask.
 // claude.ai fetches the instructions and tool descriptions only when the
@@ -179,28 +200,23 @@ const NEXT_REQUEST =
 // depends on reading prose.
 function report(store, request, settings) {
   const fresh = store.takeUnread(request)
-  const permissions = store.openPermissions()
-  for (const permission of permissions) permission.announced = true
+  const approvals = openApprovals(store)
+  const permissions = approvals.codes
 
   const elapsed = Math.round((Date.now() - request.createdAt) / 1000)
   const head = [`state=${request.state}`, `id=${request.id}`, `elapsed=${elapsed}s`]
-  if (permissions.length) head.push(`approval=${permissions.map(p => p.code).join(',')}`)
+  if (permissions.length) head.push(`approval=${permissions.join(',')}`)
 
   const lines = [`[${head.join(' ')}]`]
   for (const update of fresh) lines.push(`Claude Code: ${update.text}`)
-  for (const permission of permissions) lines.push(describePermission(permission))
+  lines.push(...approvals.lines)
   lines.push(...answeredElsewhereLines(store))
   // After this, further answers to the request count as news.
   if (request.state === 'done') store.markClosed(request)
   const news = store.takeNews(request)
   if (news.length) lines.push(...describeNews(news))
 
-  if (permissions.length) {
-    lines.push(
-      'Read the approval to the user and ask: allow or deny? Call approve with the code only after their explicit ' +
-        'yes or no.',
-    )
-  }
+  if (permissions.length) lines.push(ASK_APPROVAL)
   const held = request.state === 'sent' ? heldText(settings) : ''
   if (held) lines.push(held)
 
@@ -555,12 +571,19 @@ function buildVoiceServer(
       // An acknowledgement before the call is enough: a second one right after
       // it sounds superfluous.
       const held = heldText(settings)
+      const approvals = approvalLines(store)
+      const head = ['state=sent', `id=${request.id}`]
+      if (held) head.push('held=usage')
+      if (approvals.codes.length) head.push(`approval=${approvals.codes.join(',')}`)
       return text(
-        `[state=sent id=${request.id}${held ? ' held=usage' : ''}] Handed over${question ? ` as the answer to ${question.id}` : ''}. ` +
-          (held
-            ? `${held} Then call get_reply with id=${request.id}.`
-            : `If you have acknowledged the request already, call get_reply with id=${request.id} now; otherwise ` +
-              'say a short okay in their language first.'),
+        [
+          `[${head.join(' ')}] Handed over${question ? ` as the answer to ${question.id}` : ''}. ` +
+            (held
+              ? `${held} Then call get_reply with id=${request.id}.`
+              : `If you have acknowledged the request already, call get_reply with id=${request.id} now; otherwise ` +
+                'say a short okay in their language first.'),
+          ...approvals.lines,
+        ].join('\n'),
       )
     })),
   )
@@ -637,24 +660,16 @@ function buildVoiceServer(
         inputSchema: {
           code: z
             .string()
-            .regex(/^[a-km-z]{5}$/i, 'five letters, as listed in get_reply')
-            .describe('The five-letter approval code from get_reply.'),
+            .regex(/^[a-km-z]{5}$/i, 'five letters, as a result listed it')
+            .describe('The five-letter approval code, as a result listed it.'),
           decision: z.enum(['allow', 'deny']).describe('allow if the user said yes, deny if they said no.'),
         },
         annotations: { destructiveHint: true },
       },
       withLine(withAlarm(async ({ code, decision }) => {
-        // Answered in the terminal or through Remote Control: a verdict now
-        // would apply to nothing.
         const known = store.getPermission(code)
-        if (known?.status === 'elsewhere') {
-          return text(
-            `[approval=elsewhere code=${known.code}] Already answered at the computer; nothing to do. Tell the user ` +
-              'in a few words.',
-          )
-        }
         // Answered in the user's Telegram chat (telegram.mjs).
-        if (known && known.status !== 'open' && known.by === 'telegram') {
+        if (known && !pending(known) && known.by === 'telegram') {
           return text(
             `[approval=telegram code=${known.code}] Already ${known.status === 'allow' ? 'allowed' : 'denied'} in Telegram; ` +
               'nothing to do. Tell the user in a few words.',
@@ -663,15 +678,24 @@ function buildVoiceServer(
         if (killswitch?.locked && decision === 'allow') {
           return text(`[approval=locked code=${code}] The kill switch is locked: nothing can be allowed now.`)
         }
+        // Guessed answered at the computer (channel.mjs): the verdict goes all
+        // the same, as the guess may be wrong; Claude Code drops a late one.
+        const guessed = known?.status === 'elsewhere'
         const permission = store.resolvePermission(code, decision)
         if (!permission) {
           return text(`[approval=unknown code=${code}] This approval is unknown or already answered.`)
         }
         await channel.sendVerdict(permission.code, decision)
+        const approvals = approvalLines(store)
+        const more = approvals.codes.length ? ` pending=${approvals.codes.join(',')}` : ''
+        const stands = guessed ? ' It looked answered at the computer already; if it was, that answer stands.' : ''
         return text(
-          decision === 'allow'
-            ? `[approval=allow code=${permission.code}] Allowed. Claude Code continues; call get_reply.`
-            : `[approval=deny code=${permission.code}] Denied.`,
+          [
+            decision === 'allow'
+              ? `[approval=allow code=${permission.code}${more}] Allowed.${stands} Claude Code continues; call get_reply.`
+              : `[approval=deny code=${permission.code}${more}] Denied.${stands}`,
+            ...approvals.lines,
+          ].join('\n'),
         )
       })),
     )

@@ -120,9 +120,6 @@ export const config = {
   // voice client gets a diagnostic hint (usually: channel flag missing).
   hintAfterSeconds: num(env.VOICE_GW_HINT_AFTER, 20),
 
-  // Unanswered permission prompts are dropped from the voice view after this.
-  permissionTtlSeconds: num(env.VOICE_GW_PERMISSION_TTL, 900),
-
   // Log file; set VOICE_GW_LOG_FILE= (empty) to log to stderr only.
   logFile: env.VOICE_GW_LOG_FILE ?? join(ROOT, '.logs', 'gateway.log'),
   // Past this size in MB the log moves to <file>.1, replacing the one before.
@@ -261,9 +258,9 @@ export const config = {
 
   // Telegram fallback, on when both of its files in the secrets folder are set:
   // after this many seconds without a voice tool call, the voice mode counts
-  // as ended, and questions and approvals also go to Telegram. Results wait
-  // for the next voice call. Long, because gaps of a few minutes between voice
-  // calls are normal while the driver talks.
+  // as ended, and questions also go to Telegram. Approval requests go there at
+  // once; results wait for the next voice call. Long, because gaps of a few
+  // minutes between voice calls are normal while the driver talks.
   telegramAfterSeconds: num(env.VOICE_GW_TELEGRAM_AFTER, 600),
   telegramApi: env.VOICE_GW_TELEGRAM_API || 'https://api.telegram.org',
   // Telegram as input, off by default (telegramAnswersMode). Answers by

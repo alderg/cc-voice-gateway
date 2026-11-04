@@ -260,10 +260,10 @@ Night mode: when the driver says good night, or that they are away until the mor
 their words, and with until when they name an end ("until tomorrow at 9"), also to extend it; when they say they are
 back, away=false. It also comes on by itself in the quiet hours. An event with
 kind="night" says it began: reply "done". While it is on, the driver is away: workers decide what they can and defer
-what needs the driver, and Telegram carries alarms only. Go on with what is queued; summarise results as usual. Ask
-questions as usual: they become open decisions that wait for the morning and hold only their repository, so other work
-goes on. When it ends, an event with kind="morning" brings the summary of the night: tell the driver from it as news,
-in at most three short sentences, and ask about the waiting decisions afterwards, one at a time.
+what needs the driver, and Telegram carries alarms and approval prompts only. Go on with what is queued; summarise
+results as usual. Ask questions as usual: they become open decisions that wait for the morning and hold only their
+repository, so other work goes on. When it ends, an event with kind="morning" brings the summary of the night: tell the
+driver from it as news, in at most three short sentences, and ask about the waiting decisions afterwards, one at a time.
 Standing orders: when the driver allows work to go on while they are away ("keep going with the milestones in alpha
 tonight"), make a standing order with standing_order: the repository, the scope in their words, and their words, as for
 dispatch. While it holds, dispatch the next tasks for that repository yourself, within that scope only, with
@@ -631,9 +631,9 @@ const AWAY_TOOL = {
     `end of the quiet hours, or ${AWAY_HOURS} hours; when the driver names an end ("until tomorrow morning at 9"), pass ` +
     'it as "until". Called again while it is on, it sets the new end, also to extend it. While it is on, workers decide ' +
     'what they can and defer what needs the driver, questions and decisions wait for the morning, and Telegram carries ' +
-    'alarms only; when it ends, one summary of the night arrives as an event with kind="morning". It also comes on by ' +
-    'itself in the quiet hours, if the driver set them. Changes nothing unless "words" come from a recent voice request ' +
-    'of the driver, as for dispatch.',
+    'alarms and approval prompts only; when it ends, one summary of the night arrives as an event with kind="morning". ' +
+    'It also comes on by itself in the quiet hours, if the driver set them. Changes nothing unless "words" come from a ' +
+    'recent voice request of the driver, as for dispatch.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -1615,9 +1615,14 @@ export async function startChannel(
   // dialog, and runs a tool of this server never next to another (they carry
   // no readOnlyHint), so a tool call from it means that every dialog relayed
   // before was answered. A new permission request does not: tools it runs in
-  // parallel ask at the same time. (A subagent's dialog, at the level that
-  // lets the controller start subagents, could still be waiting: then it is
-  // answered at the computer.)
+  // parallel ask at the same time. That holds only where the session has no
+  // subagents, below unrestricted, where the confine hook blocks them. At
+  // unrestricted a subagent's dialog waits while the session goes on, and
+  // nothing in the request tells the two apart, so there every dialog stays
+  // open until it is answered here. Either way only a guess: one it closes
+  // leaves the lists, but an answer to it by voice or Telegram still goes to
+  // Claude Code, which drops a verdict that comes too late.
+  const guesses = permissionRelay && level !== 'unrestricted'
   const answeredElsewhere = sign => {
     for (const permission of store.closePermissionsElsewhere()) {
       log('permission answered at the computer', `code=${permission.code}`, `tool=${permission.toolName}`, `(then ${sign})`)
@@ -1625,7 +1630,7 @@ export async function startChannel(
   }
 
   mcp.setRequestHandler(CallToolRequestSchema, async request => {
-    if (permissionRelay) answeredElsewhere(`${request.params.name} called`)
+    if (guesses) answeredElsewhere(`${request.params.name} called`)
     alive(request.params.name)
     if (killswitch && request.params.name === ALARM_TOOL.name) {
       const reason = String(request.params.arguments?.reason ?? '').trim() || 'no reason given'

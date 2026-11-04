@@ -79,7 +79,7 @@
     <label>Approvals by voice
       <select data-setting="VOICE_GW_PERMISSION_RELAY"><option value="1">on</option><option value="0">off, only at the terminal</option></select>
     </label>
-    <p class="guide">The rare approval the controller needs is read out in the car.</p>
+    <p class="guide">The rare approval the controller needs is read out in the car, and with Telegram set up (section 4) it goes to your chat at once too.</p>
     <label>Remote Control
       <select data-setting="VOICE_GW_REMOTE_CONTROL"><option value="0">off (default)</option><option value="1">on, for the controller</option></select>
     </label>
@@ -161,7 +161,7 @@
 <section id="s-telegram">
   <h2>4. Telegram <span class="opt">optional</span></h2>
   <p class="guide">
-    Results, questions and approvals reach your phone once voice mode has ended, and <code>/stop</code> locks
+    Approval requests reach your phone at once, also at night, questions once voice mode has ended, and <code>/stop</code> locks
     the kill switch. The PIN to unlock it in voice mode comes here too, so that you need not reach the computer
     from the car. Create a bot: in Telegram, write <code>/newbot</code> to
     <a href="https://t.me/BotFather" target="_blank" rel="noreferrer noopener">@BotFather</a>
@@ -185,8 +185,8 @@
   <div class="grid">
     <label><input type="checkbox" id="telegram-on"> Turn the Telegram fallback on</label>
     <p class="guide">Unticked, a saved bot token and chat ID are deleted when you write the setup.</p>
-    <label>Silence before Telegram (seconds) <input data-setting="VOICE_GW_TELEGRAM_AFTER" inputmode="numeric"></label>
-    <p class="guide">After this long without a voice call, voice mode counts as ended, and questions and approvals also go to Telegram. Results wait for the next voice call. Default 600: gaps of a few minutes are normal while you talk.</p>
+    <label>Silence before questions go to Telegram (seconds) <input data-setting="VOICE_GW_TELEGRAM_AFTER" inputmode="numeric"></label>
+    <p class="guide">After this long without a voice call, voice mode counts as ended, and questions also go to Telegram. Approval requests go there at once, as Claude Code waits on them. Results wait for the next voice call. Default 600: gaps of a few minutes are normal while you talk.</p>
   </div>
   <label><input type="checkbox" id="telegram-input-on"> Take answers and requests from Telegram too</label>
   <p class="guide">Off by default: Telegram then only carries messages to you, and takes commands such as <code>/stop</code>.

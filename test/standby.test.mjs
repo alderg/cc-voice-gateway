@@ -381,7 +381,7 @@ async function signIn(port, pairingCode) {
 const idOf = text => /id=([a-z0-9]+)/.exec(text)?.[1]
 const LINE = 'Gateway Standbybox (test)'
 
-test('gateway: the connector revoked at the computer: one message, then standby; runs stopped, the queue kept, no alerts, no reminders; a new sign-in wakes it up', async () => {
+test('gateway: the connector revoked at the computer: one message, then standby; runs stopped, the queue kept, no alerts, no reminders, approval requests held; a new sign-in wakes it up', async () => {
   const g = await startGateway('standby', { grants: [connector({ id: 'abc123', lastUsedAt: Date.now() - HOUR })] })
   try {
     assert.match(await g.voice('status'), new RegExp(`^${LINE.replace(/[()]/g, '\\$&')}: active\\n\\[gateway=ok `))
@@ -422,6 +422,11 @@ test('gateway: the connector revoked at the computer: one message, then standby;
       assert.equal(refused.status, 401)
     }
     const quiet = telegram.sent.length
+    // An approval request waits too, though approval requests go there at once otherwise.
+    await g.claudeCode.notification({
+      method: 'notifications/claude/channel/permission_request',
+      params: { request_id: 'stbyq', tool_name: 'Bash', description: 'gh pr merge 3 --repo driver/alpha --squash', input_preview: '{}' },
+    })
     await sleep(4500) // past the question's reminder time
     assert.equal(telegram.sent.length, quiet, 'no alerts, no messages in the standby')
     assert.ok(!g.events.some(e => e.meta?.kind === 'reminder'), 'no reminders')
@@ -433,6 +438,7 @@ test('gateway: the connector revoked at the computer: one message, then standby;
     const tokens = await signIn(g.port, code.replace(' ', ''))
     const back = await until(() => telegram.sent.slice(quiet).find(text => /I am back/.test(text)))
     assert.match(back, /: I am back: the connector is connected again \(a new sign-in \(Claude\)\)\. Queued tasks go on, and what waited reaches the controller\.$/)
+    assert.match(await until(() => telegram.sent.slice(quiet).find(text => /^Approval request stbyq /.test(text))), /\nBash: gh pr merge 3 --repo driver\/alpha --squash\n/)
     await until(() => g.events.find(e => e.meta?.kind === 'standby' && e.meta.state === 'off'))
     assert.match(await g.voice('status'), /^Gateway Standbybox \(test\): active\n/)
     await until(() => g.events.find(e => e.meta?.task && e.meta.outcome === 'stopped'))

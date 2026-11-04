@@ -4,11 +4,12 @@
 // hears everything itself. When no voice tool call has come for a while
 // (VOICE_GW_TELEGRAM_AFTER, 600 s by default), the voice mode counts as ended.
 // Gaps of a few minutes between calls are normal while the driver talks, so
-// the wait is long. From then on, only what needs the driver also goes to their
-// Telegram chat, each once: questions the voice client has not received, and
-// approval requests it has not announced. Results, news and interim "working"
-// updates never go there; they wait for the next voice call. The voice path
-// stays as it is.
+// the wait is long. From then on, questions the voice client has not received
+// also go to their Telegram chat, each once. Claude Code's approval requests
+// go there at once, each once, voice mode, night or not: Claude Code waits on
+// them, and the next voice call may be long in coming. Results, news and
+// interim "working" updates never go there; they wait for the next voice
+// call. The voice path stays as it is.
 //
 // The other messages to the chat come from elsewhere and go at once, voice
 // mode or not: the kill switch alarm, alerts about suspicious requests and
@@ -48,6 +49,7 @@ import { basename } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { emergencyPhrase } from './killswitch.mjs'
 import { log as defaultLog, fileLog, preview } from './log.mjs'
+import { pending } from './store.mjs'
 
 const MAX_TEXT = 4000 // Telegram takes up to 4096 characters
 const SEND_TIMEOUT_MS = 10000
@@ -603,16 +605,14 @@ function describePermission(permission, approvable = false) {
 
 export class TelegramFallback {
   // send(text, { replyTo }): resolves with the message Telegram took.
-  // paused: whether nothing goes out now, in a standby after the connector
-  // was disconnected (standby.mjs) or in night mode; what waits goes out
-  // after it. held: whether the controller's replies to the driver's own
-  // answers and requests by Telegram wait too, by default when paused; the
-  // gateway holds them only in a standby. answerable(request): whether the
-  // driver may answer that request's question here (TelegramAnswers.accepts).
-  // approvable(): whether they may answer approval requests here
-  // (TelegramAnswers.approves); then an approval request also goes here at
-  // once while their latest request or answer came from here, in the last
-  // chatMinutes (approvals).
+  // paused: whether no question goes out now, in a standby after the
+  // connector was disconnected (standby.mjs) or in night mode; what waits
+  // goes out after it. held: whether approval requests and the controller's
+  // replies to the driver's own answers and requests by Telegram wait too, by
+  // default when paused; the gateway holds them only in a standby.
+  // answerable(request): whether the driver may answer that request's
+  // question here (TelegramAnswers.accepts). approvable(): whether they may
+  // answer approval requests here (TelegramAnswers.approves).
   constructor(
     store,
     {
@@ -622,7 +622,6 @@ export class TelegramFallback {
       held = paused,
       answerable = () => false,
       approvable = () => false,
-      chatMinutes = 30,
       log = defaultLog,
     },
   ) {
@@ -634,16 +633,13 @@ export class TelegramFallback {
     this.held = held
     this.answerable = answerable
     this.approvable = approvable
-    this.chatMs = chatMinutes * 60 * 1000
     this.log = log
     this.voice = false // whether the voice mode was on at the last check
     this.timer = null
     this.queue = Promise.resolve() // keeps messages in order
     this.check = this.check.bind(this)
-    this.answered = this.answered.bind(this)
     store.on('change', this.check)
     store.on('voice', this.check)
-    store.on('permission', this.answered)
     this.check()
   }
 
@@ -651,20 +647,6 @@ export class TelegramFallback {
     clearTimeout(this.timer)
     this.store.off('change', this.check)
     this.store.off('voice', this.check)
-    this.store.off('permission', this.answered)
-  }
-
-  // An approval request sent here that was answered at the computer since
-  // (store.closePermissionsElsewhere): said once, whether the voice mode is
-  // on or not, so that nobody answers it again by voice.
-  answered(permission) {
-    try {
-      if (permission.status !== 'elsewhere' || !permission.telegram || permission.telegramClosed || this.paused()) return
-      permission.telegramClosed = true
-      this.deliver(`Approval request ${permission.code} was answered at the computer; nothing to do.`)
-    } catch (error) {
-      this.log('telegram fallback failed:', error.message)
-    }
   }
 
   // Runs on every change in the store and when the voice mode may have ended.
@@ -682,8 +664,8 @@ export class TelegramFallback {
         this.voice = active
         this.log(
           active
-            ? 'voice mode on: telegram fallback paused'
-            : `voice mode ended (no voice call for ${this.afterSeconds} s): telegram fallback on for questions and approvals`,
+            ? 'voice mode on: telegram fallback paused for questions'
+            : `voice mode ended (no voice call for ${this.afterSeconds} s): telegram fallback on for questions`,
         )
       }
       if (active) {
@@ -699,9 +681,8 @@ export class TelegramFallback {
     }
   }
 
-  // What needs the driver and has not reached them by voice: open questions
-  // and approval requests. Results, news and interim updates wait for the
-  // next voice call.
+  // What needs the driver and has not reached them by voice: open questions.
+  // Results, news and interim updates wait for the next voice call.
   flush() {
     let marked = false
     for (const request of this.store.requests.values()) {
@@ -718,38 +699,22 @@ export class TelegramFallback {
         this.deliver(() => describeQuestion(request, update, this.answerable(request)), { sent: id => (update.telegramMessage = id) })
       }
     }
-    for (const permission of this.store.openPermissions()) {
-      if (permission.announced || permission.telegram) continue
-      this.sendPermission(permission)
-    }
     // The marks go into the saved requests, so a restart sends nothing twice.
     if (marked) this.store.save?.()
   }
 
-  // An approval request, once; its message id, so that a Reply to it finds it.
-  sendPermission(permission) {
-    permission.telegram = true
-    this.deliver(() => describePermission(permission, this.approvable()), { sent: id => (permission.telegramMessage = id) })
-  }
-
-  // While the driver writes here, an approval request goes here at once,
-  // whether the voice mode is on or not, and in the night too, as the
-  // controller's replies to them do (relay): a merge or a deletion they
-  // confirmed here must not wait for the voice mode to end. Only where they
-  // may answer it here (approvable), and only while their latest request or
-  // answer, spoken or typed, came from here, in the last chatMinutes.
+  // Every approval request goes here as soon as Claude Code raises it, once:
+  // whether the voice mode is on or not, the voice client heard it or not,
+  // and in the night too, as the driver asked. Claude Code waits on it, and
+  // the next voice call may be long in coming. Only a standby holds it
+  // (held); while the kill switch is locked none is open, as the channel
+  // denies them (channel.mjs). Its message id, so that a Reply to it finds it.
   approvals() {
-    if (!this.approvable() || !this.inChat()) return
     for (const permission of this.store.openPermissions()) {
-      if (!permission.telegram) this.sendPermission(permission)
+      if (permission.telegram) continue
+      permission.telegram = true
+      this.deliver(() => describePermission(permission, this.approvable()), { sent: id => (permission.telegramMessage = id) })
     }
-  }
-
-  // Whether the driver's latest request or answer came from this chat, in
-  // the last chatMinutes.
-  inChat() {
-    const latest = [...this.store.requests.values()].findLast(request => request.origin === 'voice')
-    return latest?.via === 'telegram' && Date.now() - latest.createdAt <= this.chatMs
   }
 
   // The controller's replies to an answer or a request the driver gave here
@@ -771,13 +736,13 @@ export class TelegramFallback {
     }
   }
 
-  // The questions and approvals open now count as told: the morning summary
-  // names what the night left (night.mjs), instead of one message each.
+  // The questions open now count as told: the morning summary names what the
+  // night left (night.mjs), instead of one message each. Approval requests
+  // went here at once.
   settle() {
     for (const request of this.store.requests.values()) {
       for (const update of request.updates.slice(request.cursor)) if (update.state === 'question') update.telegram = true
     }
-    for (const permission of this.store.openPermissions()) permission.telegram = true
     this.store.save?.()
   }
 
@@ -1046,13 +1011,14 @@ export class TelegramAnswers {
     }
   }
 
-  // An approval request as the target of an answer, while it is open and
-  // the driver may answer it here; else why not.
+  // An approval request as the target of an answer, while Claude Code may
+  // wait on it and the driver may answer it here; else why not. One the
+  // gateway guessed answered at the computer is answered all the same: the
+  // guess may be wrong, and Claude Code drops a verdict that comes too late.
   approving(permission) {
     const { code } = permission
     if (!this.approves()) return { why: `approval request ${code} is answered in voice mode or at the computer; Telegram cannot approve.` }
-    if (permission.status === 'open') return { permission }
-    if (permission.status === 'elsewhere') return { why: `approval request ${code} was answered at the computer; nothing to do.` }
+    if (pending(permission)) return { permission }
     const how = permission.status === 'allow' ? 'allowed' : 'denied'
     return { why: `approval request ${code} was ${how} already${permission.by === 'telegram' ? ' here' : ' in voice mode'}; nothing to do.` }
   }
@@ -1139,7 +1105,7 @@ export class TelegramAnswers {
     // And the code of an approval request, where the driver may answer it
     // here: one answered already is said, never a request.
     const named = this.approves() ? approvalCodesIn(text).map(code => this.store.getPermission(code)).filter(Boolean) : []
-    const approvals = named.filter(permission => permission.status === 'open')
+    const approvals = named.filter(pending)
     if (open.size + approvals.length > 1) {
       const codes = listed([...open.keys(), ...approvals.map(permission => permission.code)])
       return approvals.length
@@ -1151,8 +1117,8 @@ export class TelegramAnswers {
     if (named.length) return this.approving(named[0])
     // A plain yes or no, without a Reply: the approval request open now.
     const bare = replyTo === null ? bareVerdict(text) : null
-    const pending = bare ? this.bare(bare) : null
-    if (pending) return pending
+    const plain = bare ? this.bare(bare) : null
+    if (plain) return plain
     // Anything else is a request of the driver's, where they allow it.
     if (this.requests) return text ? { request: true } : { why: 'it holds no text.' }
     if (closed.length) return { why: `${listed(closed)} ${closed.length === 1 ? 'has' : 'have'} no open question. ${this.openQuestions()}` }
@@ -1264,23 +1230,25 @@ export class TelegramAnswers {
   // The driver's verdict on an approval request, as by voice (voice.mjs,
   // approve): claimed in the store first, so that an answer elsewhere finds
   // it answered, then sent to Claude Code. One that does not reach Claude
-  // Code is open again, to be answered elsewhere.
+  // Code is open again, to be answered elsewhere. For one the gateway guessed
+  // answered at the computer, the chat hears that such an answer stands.
   async approve(permission, behavior, { messageId = null, record = () => {} } = {}) {
-    const { code, toolName } = permission
+    const { code, toolName, status, resolvedAt } = permission
     this.store.resolvePermission(code, behavior, 'telegram')
     try {
       await this.verdict(code, behavior)
     } catch (error) {
-      Object.assign(permission, { status: 'open', resolvedAt: undefined, by: undefined })
+      Object.assign(permission, { status, resolvedAt, by: undefined })
       this.store.changed()
       throw error
     }
     this.log('telegram approval', `code=${code}`, `behavior=${behavior}`, `tool=${toolName}`)
     record({ decision: 'accepted', as: behavior === 'allow' ? 'approval allowed' : 'approval denied', answers: code })
+    const guessed = status === 'elsewhere' ? ' It looked answered at the computer already; if it was, that answer stands.' : ''
     await this.say(
       behavior === 'allow'
-        ? `Allowed: approval request ${permissionBrief(permission)}. Claude Code goes on.`
-        : `Denied: approval request ${permissionBrief(permission)}. Claude Code does not run it.`,
+        ? `Allowed: approval request ${permissionBrief(permission)}. Claude Code goes on.${guessed}`
+        : `Denied: approval request ${permissionBrief(permission)}. Claude Code does not run it.${guessed}`,
       messageId,
     )
     return permission

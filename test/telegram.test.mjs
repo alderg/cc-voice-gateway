@@ -178,11 +178,13 @@ test('while the voice client polls, nothing goes to Telegram', async () => {
   telegram.close()
 })
 
-test('voice calls within the window keep everything off Telegram, however long the conversation', async () => {
+test('voice calls within the window keep questions off Telegram, however long the conversation; an approval request goes at once', async () => {
   const { store, sent, logged, telegram, voiceCall } = fallback()
   const request = voiceCall(() => store.createRequest('Run the tests.'))
   store.addUpdate(request.id, 'question', 'All of them, or only the unit tests?')
   store.addPermission({ request_id: 'qwert', tool_name: 'Bash', description: 'Run ls', input_preview: '' })
+  await waitFor(() => sent.length === 1)
+  assert.match(sent[0], /^Approval request qwert /, 'Claude Code waits on it: at once, voice mode or not')
 
   // Calls that read nothing of it (status, another request), each within the
   // window, for several windows in a row.
@@ -190,13 +192,12 @@ test('voice calls within the window keep everything off Telegram, however long t
     await sleep(AFTER * 500)
     voiceCall(() => {})
   }
-  assert.deepEqual(sent, [], 'nothing while the gaps stay below the window')
+  assert.equal(sent.length, 1, 'no question while the gaps stay below the window')
   assert.ok(!logged.some(line => /voice mode ended/.test(line)), 'the voice mode never ended')
 
-  // The calls stop: after the window, what needs the driver goes out.
+  // The calls stop: after the window, the question goes out too.
   await waitFor(() => sent.length === 2)
-  assert.match(sent[0], new RegExp(`^Question for request ${request.id} \\("Run the tests\\."\\)\n\nAll of them, or only the unit tests\\?\n\nAnswer in voice mode and mention ${request.id}\\.$`))
-  assert.match(sent[1], /^Approval request qwert /)
+  assert.match(sent[1], new RegExp(`^Question for request ${request.id} \\("Run the tests\\."\\)\n\nAll of them, or only the unit tests\\?\n\nAnswer in voice mode and mention ${request.id}\\.$`))
   telegram.close()
 })
 
@@ -207,7 +208,7 @@ test('after the silence, a result alone sends nothing', async () => {
 
   // Answered while the voice mode was still on, but never polled.
   store.addUpdate(request.id, 'done', 'There are three files.')
-  await waitFor(() => logged.some(line => /voice mode ended .*telegram fallback on for questions and approvals/.test(line)))
+  await waitFor(() => logged.some(line => /voice mode ended .*telegram fallback on for questions$/.test(line)))
   // Results after the switch, from the controller and from a worker, stay off Telegram too.
   const worker = store.createRequest('Worker alpha finished task t3cz: done after 2 minutes.', {
     origin: 'worker',
@@ -328,42 +329,50 @@ test('when polling resumes, Telegram stops until the voice mode ends again', asy
   telegram.close()
 })
 
-test('approvals the voice client has heard are not sent', async () => {
-  const { store, sent, telegram } = fallback()
+test('an approval request goes to Telegram as soon as Claude Code raises it: while a voice call runs, right after one, heard by the voice client or not; each once', async () => {
+  const { store, sent, telegram, voiceCall } = fallback()
+  // During a voice call, and heard by it, as get_reply marks it.
   store.voiceCallStarted()
   store.addPermission({ request_id: 'fghjk', tool_name: 'Bash', description: 'Run ls', input_preview: '' })
-  for (const permission of store.openPermissions()) permission.announced = true // what get_reply does
+  for (const permission of store.openPermissions()) permission.announced = true
+  await waitFor(() => sent.length === 1)
+  assert.match(sent[0], /^Approval request fghjk \(controller session\)\n\nBash: Run ls\n\nAnswer in voice mode or at the terminal; Telegram cannot approve\.$/)
   store.voiceCallEnded()
+  // Right after a voice call, well within the window.
+  voiceCall(() => {})
+  store.addPermission({ request_id: 'qwert', tool_name: 'Write', description: 'Create playground/a.md', input_preview: '' })
+  await waitFor(() => sent.length === 2)
+  assert.match(sent[1], /^Approval request qwert \(controller session\)\n\nWrite: Create playground\/a\.md\n/)
+  // Each once, however often the store changes or the voice mode ends.
+  store.changed()
   await sleep(AFTER * 1000 + 100)
   store.changed()
-  assert.deepEqual(sent, [])
+  assert.equal(sent.length, 2)
   telegram.close()
 })
 
-test('an approval sent here and answered at the computer since: said once, also while the voice mode is on; one never sent here, not at all', async () => {
+test('an approval guessed answered at the computer: off the lists, without a word in Telegram; an answer to it still counts as one, and the voice client hears of it once', async () => {
   const { store, sent, telegram } = fallback()
   store.addPermission({ request_id: 'bdozq', tool_name: 'Monitor', description: 'Watch the build log', input_preview: '' })
   await waitFor(() => sent.length === 1)
   assert.match(sent[0], /^Approval request bdozq \(controller session\)/)
+  for (const permission of store.openPermissions()) permission.announced = true // what get_reply does
 
-  store.voiceCallStarted()
   assert.deepEqual(store.closePermissionsElsewhere().map(p => p.code), ['bdozq'])
-  await waitFor(() => sent.length === 2)
-  assert.equal(sent[1], 'Approval request bdozq was answered at the computer; nothing to do.')
   assert.deepEqual(store.closePermissionsElsewhere(), [], 'closed already')
   assert.equal(store.getPermission('BDOZQ').status, 'elsewhere')
-  assert.equal(store.resolvePermission('bdozq', 'allow'), null, 'no verdict for it any more')
-
-  // Heard by voice only: closed without a word here.
-  store.addPermission({ request_id: 'fghjk', tool_name: 'Bash', description: 'Run ls', input_preview: '' })
-  for (const permission of store.openPermissions()) permission.announced = true // what get_reply does
-  store.voiceCallEnded()
-  store.closePermissionsElsewhere()
+  assert.deepEqual(store.openPermissions(), [], 'off the lists')
+  assert.deepEqual(store.pendingPermissions().map(p => p.code), ['bdozq'], 'Claude Code may still wait on it')
   await sleep(AFTER * 1000 + 100)
   store.changed()
-  assert.equal(sent.length, 2)
-  assert.deepEqual(store.takeAnsweredElsewhere().map(p => p.code), ['fghjk'], 'the voice client hears it, once')
+  assert.equal(sent.length, 1, 'nothing said here: it is only a guess')
+  assert.deepEqual(store.takeAnsweredElsewhere().map(p => p.code), ['bdozq'], 'the voice client hears it, once')
   assert.deepEqual(store.takeAnsweredElsewhere(), [])
+
+  // An answer to it is taken all the same, once.
+  assert.equal(store.resolvePermission('bdozq', 'allow').status, 'allow')
+  assert.equal(store.resolvePermission('bdozq', 'deny'), null, 'answered once')
+  assert.deepEqual(store.pendingPermissions(), [])
   telegram.close()
 })
 
@@ -1038,25 +1047,39 @@ test('Telegram approvals: a Reply with yes or no, or a message with the code, an
   assert.equal(unclear.status, 'open')
   assert.equal(t.verdicts.length, 2)
 
-  // Answered by voice, or at the computer, meanwhile: nothing to do, and no request.
+  // Answered by voice meanwhile: nothing to do, and no request.
   t.store.resolvePermission('hjkmn', 'deny')
   await t.answers.route({ text: 'yes', replyTo: 50, messageId: 52 })
   assert.equal(t.lastSaid(), 'Not passed on: approval request hjkmn was denied already in voice mode; nothing to do.')
-  t.approval('pqrst', { message: 60 })
-  t.store.closePermissionsElsewhere()
-  await t.answers.route({ text: 'pqrst yes', messageId: 61 })
-  assert.equal(t.lastSaid(), 'Not passed on: approval request pqrst was answered at the computer; nothing to do.')
   assert.equal(t.verdicts.length, 2)
+  // Only guessed answered at the computer, as a subagent's may be while the
+  // session goes on: answered all the same, by its code or by Reply, and the
+  // chat says that an answer given there stands.
+  t.approval('pqrst', { message: 60 })
+  t.approval('uvwxy', { tool: 'Monitor', description: 'Watch the build log', message: 61 })
+  t.store.closePermissionsElsewhere()
+  assert.equal(await t.answers.route({ text: 'pqrst yes', messageId: 62 }), t.store.getPermission('pqrst'))
+  assert.deepEqual(t.verdicts.at(-1), ['pqrst', 'allow'])
+  assert.equal(
+    t.lastSaid(),
+    'Allowed: approval request pqrst (Bash: gh pr merge 3 --repo driver/alpha --squash). Claude Code goes on. It looked ' +
+      'answered at the computer already; if it was, that answer stands.',
+  )
+  await t.answers.route({ text: 'nein', replyTo: 61, messageId: 63 })
+  assert.deepEqual(t.verdicts.at(-1), ['uvwxy', 'deny'])
+  assert.equal(t.store.getPermission('uvwxy').by, 'telegram')
+  assert.match(t.lastSaid(), /^Denied: approval request uvwxy \(Monitor: Watch the build log\)\. Claude Code does not run it\. It looked answered/)
+  assert.equal(t.verdicts.length, 4)
 
   // Two at once, or an approval and a question: which is meant is unclear.
   t.approval('bcdef')
   t.approval('ghijk')
-  await t.answers.route({ text: 'bcdef yes, ghijk no', messageId: 62 })
+  await t.answers.route({ text: 'bcdef yes, ghijk no', messageId: 64 })
   assert.equal(t.lastSaid(), 'Not passed on: it names 2 open questions and approval requests, bcdef and ghijk. Answer each in a message of its own.')
   const question = t.question('Squash it?')
-  await t.answers.route({ text: `${question.id} yes, bcdef yes`, messageId: 63 })
+  await t.answers.route({ text: `${question.id} yes, bcdef yes`, messageId: 65 })
   assert.equal(t.lastSaid(), `Not passed on: it names 2 open questions and approval requests, ${question.id} and bcdef. Answer each in a message of its own.`)
-  assert.equal(t.verdicts.length, 2)
+  assert.equal(t.verdicts.length, 4)
   assert.deepEqual(t.pushed, [])
 })
 
@@ -1094,6 +1117,11 @@ test('Telegram approvals: nothing past a locked kill switch or a standby; not wi
   assert.equal(open.status, 'open')
   assert.equal(open.by, undefined)
   assert.deepEqual(broken.store.openPermissions(), [open])
+  // One guessed answered at the computer keeps that mark.
+  broken.store.closePermissionsElsewhere()
+  assert.equal(await broken.answers.route({ text: 'no', replyTo: 40, messageId: 42 }), null)
+  assert.equal(open.status, 'elsewhere')
+  assert.deepEqual(broken.store.pendingPermissions(), [open])
 })
 
 // --- a plain yes or no, and "yes to all" -------------------------------------------------
@@ -1322,7 +1350,7 @@ test('a plain yes or no and "yes to all": nothing past a locked kill switch or a
   }
 })
 
-test('the fallback: an approval request says how to answer it there where the driver may; while they write in Telegram it goes there at once, voice mode, night or not; a standby holds it', async () => {
+test('the fallback: every approval request goes there at once, voice mode on, the latest request spoken, in the night or DND; it says how to answer it there where the driver may; a standby holds it', async () => {
   const store = new Store()
   const sent = []
   let approvable = true
@@ -1340,15 +1368,11 @@ test('the fallback: an approval request says how to answer it there where the dr
     },
   })
   const ask = code => store.addPermission({ request_id: code, tool_name: 'Bash', description: `gh pr merge 3 (${code})`, input_preview: '' })
-  // The voice mode is on, and the driver's latest request was spoken: the voice client has it.
+  // As on 2026-11-04: the voice mode is on, the driver's latest request was spoken, and the voice client heard it.
   store.voiceCallStarted()
   store.createRequest('Merge pull request 3 in alpha.')
   ask('abcde')
-  await sleep(100)
-  assert.deepEqual(sent, [], 'the voice client has it')
-
-  // The driver answers in Telegram: from now on, approval requests go there at once.
-  const typed = store.createRequest('(Answer to ab12) yes, merge it', { answers: 'ab12', via: 'telegram' })
+  store.getPermission('abcde').announced = true
   await waitFor(() => sent.length === 1)
   assert.equal(
     sent[0].text,
@@ -1356,9 +1380,12 @@ test('the fallback: an approval request says how to answer it there where the dr
       'to deny it; or write a message with abcde and yes or no, or just yes or no while it is the only one open ("yes to all" ' +
       'allows every one open). Or answer in voice mode or at the terminal.',
   )
+  assert.equal(sent[0].replyTo, null)
   await waitFor(() => store.getPermission('abcde').telegramMessage === 201)
-  // In the night too.
+  // In the night, or in DND, which is night mode by day: at once too, unlike questions.
   paused = true
+  const question = store.createRequest('Worker alpha finished.', { origin: 'worker' })
+  store.addUpdate(question.id, 'question', 'Push it?')
   ask('fghjk')
   await waitFor(() => sent.length === 2)
   assert.match(sent[1].text, /^Approval request fghjk /)
@@ -1375,19 +1402,37 @@ test('the fallback: an approval request says how to answer it there where the dr
   await sleep(100)
   assert.equal(sent.length, 3, 'each once')
 
-  // Not where they may not answer it there, nor after half an hour without a word there, nor once they speak again.
+  // Where the driver may not answer it there, it goes all the same, and says where to answer it.
   approvable = false
   ask('qrstu')
-  await sleep(100)
-  approvable = true
-  typed.createdAt = Date.now() - 31 * 60 * 1000
-  ask('vwxyz')
-  await sleep(100)
-  store.createRequest('What is going on?')
-  ask('zyxwv')
-  await sleep(100)
-  assert.equal(sent.length, 3)
+  await waitFor(() => sent.length === 4)
+  assert.match(sent[3].text, /^Approval request qrstu \(controller session\)\n\nBash: gh pr merge 3 \(qrstu\)\n\nAnswer in voice mode or at the terminal; Telegram cannot approve\.$/)
+  // The night's end settles its questions, and leaves the approvals as they were.
+  fallback.settle()
+  paused = false
   store.voiceCallEnded()
+  await sleep(AFTER * 1000 + 100)
+  store.changed()
+  assert.equal(sent.length, 4, 'the question is told by the summary; no approval twice')
+  fallback.close()
+})
+
+test('the fallback after a restart, which counts as a voice call: a new approval request goes there at once, a question waits for the window', async () => {
+  const file = join(TMP, 'restart-approval', 'requests.json')
+  const first = new Store({ file, log: () => {} })
+  first.createRequest('Run the tests in alpha.')
+  first.save()
+  const second = new Store({ file, log: () => {} })
+  assert.ok(second.voiceActive(AFTER * 1000), 'the restart counts as a voice call')
+  const sent = []
+  const fallback = new TelegramFallback(second, { afterSeconds: AFTER, log: () => {}, send: async text => sent.push(text) })
+  const worker = second.createRequest('Worker alpha finished task t5cd.', { origin: 'worker', worker: { repo: 'alpha', task: 't5cd' } })
+  second.addUpdate(worker.id, 'question', 'Open a pull request?')
+  second.addPermission({ request_id: 'rstuv', tool_name: 'Bash', description: 'gh pr merge 3', input_preview: '' })
+  await waitFor(() => sent.length === 1)
+  assert.match(sent[0], /^Approval request rstuv /)
+  await waitFor(() => sent.length === 2)
+  assert.match(sent[1], /^Question for request \w+ \(worker alpha, task t5cd\)/)
   fallback.close()
 })
 
@@ -1924,7 +1969,7 @@ test('gateway with Telegram: questions after the voice mode ended, results never
   api.messages.length = 0
   const gw = await startGateway('with', { telegram: true })
   try {
-    assert.match(gw.log, /telegram fallback ready: questions and approvals after 1 s without a voice call/)
+    assert.match(gw.log, /telegram fallback ready: approval requests at once, questions after 1 s without a voice call/)
 
     // While the voice client polls, the answer goes by voice only.
     const first = idOf(await gw.call('send', { message: 'Is the build green?' }))
@@ -2270,8 +2315,8 @@ test("gateway: a plain message on Telegram is a request of the driver's, as by v
     driverSays('yes, merge it', { replyTo: messageWith('Merge pull request 3, squashed?') })
     const mergeAnswer = (await waitFor(() => gw.events.find(e => e.content === `(Answer to ${merge}) yes, merge it`))).meta.request_id
     assert.match(await tool('resolve_decision', { id: mergeDecision, outcome: 'merge it, squashed', words: 'yes, merge it' }), /^\[decision=closed /)
-    // The controller runs gh pr merge; the confine hook asks, and Claude Code relays the approval prompt. The driver
-    // wrote here last, so it comes here at once, voice mode or not.
+    // The controller runs gh pr merge; the confine hook asks, and Claude Code relays the approval prompt. It comes
+    // here at once, as every approval request does.
     await gw.permission('mrgab', 'Bash', 'gh pr merge 3 --repo driver/alpha --squash')
     await waitFor(() => messageWith('Approval request mrgab'))
     assert.equal(
@@ -2456,7 +2501,7 @@ test('gateway with VOICE_GW_TELEGRAM_CONFIRM=0: push, merge, restart, delete and
     driverSays('yes, merge it', { replyTo: messageWith('Merge pull request 3, squashed?') })
     await waitFor(() => messageWith(`Not done: ${merge} is a merge decision, which must be confirmed by voice.`))
     assert.match(await tool('resolve_decision', { id: mergeDecision, outcome: 'merged', words: 'Merge pull request 3' }), voiceOnly('merge'))
-    // An approval request goes here only once the voice mode has ended, and cannot be answered here.
+    // An approval request goes here at once all the same, and cannot be answered here.
     await gw.permission('mrgab', 'Bash', 'gh pr merge 3 --repo driver/alpha --squash')
     await waitFor(() => messageWith('Approval request mrgab'))
     assert.match(sentWith('Approval request mrgab').text, /\n\nAnswer in voice mode or at the terminal; Telegram cannot approve\.$/)
@@ -2505,6 +2550,57 @@ test('gateway with VOICE_GW_TELEGRAM_CONFIRM=0: push, merge, restart, delete and
       /^\[dispatch=needs_driver worker=alpha\] Nothing started: the follow-up for an answer to a push decision must be confirmed by the driver's voice/,
     )
     assert.ok(!gw.log.includes(TOKEN))
+  } finally {
+    api.updates = null
+    await gw.close()
+  }
+})
+
+test("gateway: approval requests reach Telegram at once while the voice mode is on; send and approve list the open ones; at unrestricted a subagent's approval stays open while the session goes on, and is answered by voice and in Telegram", async () => {
+  api.mode = 'ok'
+  api.messages.length = 0
+  api.updates = []
+  const gw = await startGateway('at-once', {
+    telegram: true,
+    env: {
+      VOICE_GW_TELEGRAM_POLL: '1',
+      VOICE_GW_TELEGRAM_ANSWERS: '1',
+      VOICE_GW_TELEGRAM_AFTER: '3600', // the voice mode never ends here
+      VOICE_GW_CONTROLLER_LEVEL: 'unrestricted', // subagents
+    },
+  })
+  const messageWith = text => api.messages.findIndex(m => m.text.includes(text)) + 1
+  const tool = async (name, args) => (await gw.claudeCode.callTool({ name, arguments: args })).content[0].text
+  try {
+    assert.match(gw.log, /telegram fallback ready: approval requests at once, questions after 3600 s without a voice call/)
+    // As on 2026-11-04: the driver talks by voice, the controller hands research to a background subagent and answers.
+    const id = idOf(await gw.call('send', { message: 'Look into the drawio redesign discussions.' }))
+    await waitFor(() => gw.events.find(e => e.meta?.request_id === id))
+    await gw.permission('subab', 'WebFetch', 'Fetch github.com/jgraph/drawio/discussions/4953')
+    await waitFor(() => messageWith('Approval request subab'))
+    assert.match(api.messages[messageWith('Approval request subab') - 1].text, /\n\nTo allow it, reply to this message with yes/)
+    // The session goes on while the subagent waits: its tool calls close nothing.
+    assert.equal((await gw.reply(id, 'done', 'A subagent is on it.')).isError, false)
+    await tool('open_items', {})
+    await sleep(100)
+    assert.doesNotMatch(gw.log, /permission answered at the computer/)
+    assert.match(await gw.call('status'), /Pending approvals: subab \(WebFetch\)/)
+
+    // send lists it, whatever it hands over.
+    const sent = await gw.call('send', { message: 'And how are the tests in alpha?' })
+    assert.match(sent, /\n\[state=sent id=\w+ approval=subab\] Handed over\. /)
+    assert.match(sent, /\nApproval needed \(code=subab\): WebFetch – Fetch github\.com\/jgraph\/drawio\/discussions\/4953\. Details: \{\}\nRead the approval to the user and ask: allow or deny\?/)
+    await gw.permission('subcd', 'WebFetch', 'Fetch github.com/jgraph/drawio/discussions/4991')
+    await waitFor(() => messageWith('Approval request subcd'))
+
+    // "Ja, bitte alles erlauben": approve takes the first and lists the other; Telegram takes that one.
+    const approved = await gw.call('approve', { code: 'subab', decision: 'allow' })
+    assert.match(approved, /\n\[approval=allow code=subab pending=subcd\] Allowed\. Claude Code continues; call get_reply\.\nApproval needed \(code=subcd\): WebFetch – /)
+    await waitFor(() => gw.verdicts.some(v => v.request_id === 'subab'))
+    driverSays('ja', { replyTo: messageWith('Approval request subcd') })
+    await waitFor(() => messageWith('Allowed: approval request subcd'))
+    assert.deepEqual(gw.verdicts, [{ request_id: 'subab', behavior: 'allow' }, { request_id: 'subcd', behavior: 'allow' }])
+    assert.doesNotMatch(await gw.call('status'), /Pending approvals/)
   } finally {
     api.updates = null
     await gw.close()

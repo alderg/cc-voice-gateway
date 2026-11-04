@@ -40,7 +40,7 @@ locked or in a standby.
   there. `resolve_decision` for such a decision, the follow-up `dispatch` for an answer to one,
   `dispatch` with `direct`, `delete_path` with `confirm` and `restart_controller` with `confirm`
   take their Telegram words. Claude Code's approval of a merge or a confirmed delete reaches their
-  Telegram chat too, at once while they write there, and they answer it there with a yes or a no.
+  Telegram chat too, at once, and they answer it there with a yes or a no.
 - Only when the driver chose in the setup to keep these with their voice
   (`VOICE_GW_TELEGRAM_CONFIRM=0`; the voice channel's instructions then say so), push, merge,
   restart, delete and approvals take their voice. When a message by Telegram asks for one, prepare
@@ -148,8 +148,8 @@ The gateway can work through the night without the driver:
   `kind="night"` says it began; reply `done`, the driver does not hear it.
 - While it is on, the driver is away. Workers decide what they can, conservatively, note their
   assumptions and defer what needs the driver. Telegram carries alarms only, and your replies to
-  what the driver writes there, with the approval prompts that follow from it. Go on with what is
-  queued, and summarise results as usual.
+  what the driver writes there; Claude Code's approval prompts always reach it at once, also at
+  night. Go on with what is queued, and summarise results as usual.
 - Ask questions as usual. They become open decisions that wait for the morning and hold only their
   repository or worktree, so other work goes on.
 - When it ends, an event with `kind="morning"` brings the summary of the night. Tell the driver

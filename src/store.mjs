@@ -24,6 +24,10 @@ export const CONTROLLER_STATES = ['working', 'question', 'done']
 const REQUEST_RETENTION_MS = 6 * 60 * 60 * 1000
 const SAVE_DELAY_MS = 100
 
+// An approval Claude Code may still wait on: open, or answered at the
+// computer by the gateway's guess only (closePermissionsElsewhere).
+export const pending = permission => permission.status === 'open' || permission.status === 'elsewhere'
+
 // What a request that was not finished says after a restart of the session.
 export const RESTART_NOTE =
   'The controller restarted before it finished this request. Say it again if it is still needed.'
@@ -33,13 +37,14 @@ export class Store extends EventEmitter {
   // with every restart of the controller session. Approvals do not: they
   // belong to the session that asked. keep(id): whether a request must stay
   // past the retention time, because an open decision belongs to it
-  // (ledger.mjs).
-  constructor({ permissionTtlSeconds = 900, file = null, keep = () => false, log = defaultLog } = {}) {
+  // (ledger.mjs). answeredKeptSeconds: how long an answered approval stays
+  // known, so that a second answer hears it was answered.
+  constructor({ answeredKeptSeconds = 3600, file = null, keep = () => false, log = defaultLog } = {}) {
     super()
     this.setMaxListeners(0) // one listener per waiting long-poll
     this.log = log
     this.keep = keep
-    this.permissionTtlMs = permissionTtlSeconds * 1000
+    this.answeredKeptMs = answeredKeptSeconds * 1000
     this.requests = new Map()
     this.permissions = new Map()
     this.controllerLastReplyAt = null
@@ -255,7 +260,7 @@ export class Store extends EventEmitter {
       description,
       inputPreview: input_preview,
       createdAt: Date.now(),
-      status: 'open', // open | allow | deny | elsewhere (answered at the computer)
+      status: 'open', // open | allow | deny | elsewhere (answered at the computer, by a guess)
       announced: false, // reported to the voice client at least once
     })
     this.emit('permission', this.permissions.get(code)) // for the statistics
@@ -263,18 +268,26 @@ export class Store extends EventEmitter {
     return code
   }
 
+  // The approvals to list, by voice and in Telegram.
   openPermissions() {
     this.prunePermissions()
     return [...this.permissions.values()].filter(permission => permission.status === 'open')
   }
 
-  // Open approvals leave after the TTL; answered ones too, counted from the
-  // answer, so that a second answer still hears "already answered" for a while.
+  // The approvals Claude Code may still wait on, also those guessed answered.
+  pendingPermissions() {
+    this.prunePermissions()
+    return [...this.permissions.values()].filter(pending)
+  }
+
+  // Answered approvals leave answeredKeptMs after the answer. One Claude Code
+  // may still wait on never does: none outlives the session, as the gateway
+  // ends with it, and they are not saved.
   prunePermissions() {
     const now = Date.now()
     for (const [code, permission] of this.permissions) {
-      const since = permission.status === 'open' ? permission.createdAt : (permission.resolvedAt ?? permission.createdAt)
-      if (now - since > this.permissionTtlMs) this.permissions.delete(code)
+      if (pending(permission)) continue
+      if (now - (permission.resolvedAt ?? permission.createdAt) > this.answeredKeptMs) this.permissions.delete(code)
     }
   }
 
@@ -283,10 +296,12 @@ export class Store extends EventEmitter {
   }
 
   // by: where the driver answered, 'voice' (voice.mjs) or 'telegram'
-  // (telegram.mjs); the kill switch denies with 'killswitch'.
+  // (telegram.mjs); the kill switch denies with 'killswitch'. Also one guessed
+  // answered at the computer: the guess may be wrong, and Claude Code drops a
+  // verdict that comes too late.
   resolvePermission(code, behavior, by = 'voice') {
     const permission = this.permissions.get(String(code).toLowerCase())
-    if (!permission || permission.status !== 'open') return null
+    if (!permission || !pending(permission)) return null
     permission.status = behavior
     permission.resolvedAt = Date.now()
     permission.by = by
@@ -302,15 +317,15 @@ export class Store extends EventEmitter {
   }
 
   // The open approvals were answered at the computer, in the terminal or
-  // through Remote Control: the session that asked showed a sign of life
-  // since (channel.mjs). Off the voice client's list; a late answer to one
-  // hears so. Returns them.
+  // through Remote Control, as the gateway guesses: the session that asked
+  // showed a sign of life since (channel.mjs). Off the lists, by voice and in
+  // Telegram; an answer to one still goes to Claude Code (resolvePermission).
+  // Returns them.
   closePermissionsElsewhere() {
     const closed = this.openPermissions()
     for (const permission of closed) {
       permission.status = 'elsewhere'
       permission.resolvedAt = Date.now()
-      this.emit('permission', permission) // Telegram says so where it sent it
     }
     if (closed.length) this.changed()
     return closed
