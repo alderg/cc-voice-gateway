@@ -43,6 +43,7 @@ appendFileSync(process.env.FAKE_CLAUDE_LOG, JSON.stringify({
   socket: process.env.CLAUDE_CODE_MESSAGING_SOCKET ?? null,
   tmpdir: process.env.TMPDIR ?? null,
   runFolder: process.env.VOICE_GW_RUN_FOLDER ?? null,
+  guardNotes: process.env.VOICE_GW_GUARD_NOTES ?? null,
 }) + '\\n')
 const arg = name => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : null }
 const session_id = arg('--session-id') ?? arg('--resume')
@@ -304,6 +305,13 @@ test('dispatch runs claude -p in the checkout; the result reaches the controller
   assert.ok(!call.args.includes('--remote-control'))
   const deny = JSON.parse(arg(call, '--settings')).permissions.deny
   for (const rule of ['mcp__claude_ai_*', 'SendMessage', 'AskUserQuestion']) assert.ok(deny.includes(rule), rule)
+  // The kill switch's hooks (guard.mjs): each call's folder in the output, and
+  // the guard's notes for the worker, next to the run's output.
+  assert.ok(call.args.includes('--include-hook-events'))
+  const hooks = JSON.parse(arg(call, '--settings')).hooks
+  assert.deepEqual(Object.keys(hooks), ['PreToolUse', 'PostToolUse', 'PostToolUseFailure', 'Stop'])
+  assert.ok(hooks.PreToolUse[0].hooks[0].command.startsWith(`'${process.execPath}' -e '`), 'the node of this computer')
+  assert.equal(call.guardNotes, join(TMP, 'state', 'tasks', `${id}.notes`))
   assert.match(arg(call, '--append-system-prompt'), /voice\/<short-name>/)
   assert.match(call.input, /^Run the test suite and report the result\./)
   assert.match(call.input, /The driver's own words: "Lass die Tests in alpha laufen"/)
@@ -1145,5 +1153,37 @@ test('several runs per repository: the plan at a start, order_queue, a worktree 
     gw = await startGateway()
     rmSync(join(ROOT, 'eta'), { recursive: true, force: true })
     rmSync(join(ROOT, '.voice-worktrees'), { recursive: true, force: true })
+  }
+})
+
+test("the run's stream to the kill switch's rules: calls with the subagent they belong to, the guard hook's reports, the results", () => {
+  const workers = new Workers({ root: join(TMP, 'stream', 'Developer'), stateDir: join(TMP, 'stream', 'state') })
+  try {
+    const seen = []
+    workers.on('tool', (task, part, parent) => seen.push(['tool', part.id, parent]))
+    workers.on('toolStart', (task, report) => seen.push(['toolStart', report.id, report.cwd]))
+    workers.on('toolResult', (task, result) => seen.push(['toolResult', result.id, result.error, result.text]))
+    const task = { id: 'tstr', repo: 'alpha', dir: join(TMP, 'stream', 'Developer', 'alpha'), sessionId: 's', steps: [] }
+    const line = message => workers.handleLine(task, JSON.stringify({ session_id: 's', ...message }))
+    line({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'toolu_1', name: 'Bash', input: { command: 'cd sub' } }] } })
+    line({ type: 'system', subtype: 'hook_started', hook_event: 'PreToolUse' })
+    line({ type: 'system', subtype: 'hook_response', hook_event: 'PreToolUse', stdout: 'voice-gw-tool {"id":"toolu_1","cwd":"/r/alpha","agent":null,"at":1}\n' })
+    line({ type: 'system', subtype: 'hook_response', hook_event: 'PostToolUse', stdout: 'voice-gw-tool {"id":"toolu_x","cwd":"/elsewhere"}\n' })
+    line({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: [{ type: 'text', text: 'ok' }] }] } })
+    line({
+      type: 'assistant',
+      parent_tool_use_id: 'toolu_agent',
+      message: { content: [{ type: 'tool_use', id: 'toolu_2', name: 'Bash', input: { command: 'cd /tmp; ls' } }] },
+    })
+    line({ type: 'user', parent_tool_use_id: 'toolu_agent', message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_2', is_error: true, content: 'Exit code 1' }] } })
+    assert.deepEqual(seen, [
+      ['tool', 'toolu_1', null],
+      ['toolStart', 'toolu_1', '/r/alpha'],
+      ['toolResult', 'toolu_1', false, 'ok'],
+      ['tool', 'toolu_2', 'toolu_agent'],
+      ['toolResult', 'toolu_2', true, 'Exit code 1'],
+    ])
+  } finally {
+    workers.close()
   }
 })

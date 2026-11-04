@@ -73,6 +73,7 @@ import { log, preview } from './log.mjs'
 import { NIGHT_RULE } from './night.mjs'
 import { orderRule } from './orders.mjs'
 import { SUBAGENT_TOOLS, addResult } from './stats.mjs'
+import { CONTAINER_NOTES, GUARD_NOTES_ENV, guardHooks, toolStarts } from './guard.mjs'
 import { DockerRunner, HostRunner, MARK, MAX_FILES, alive, startOf } from './runners.mjs'
 import {
   HELPER_FOLDER,
@@ -202,8 +203,11 @@ summarise your result for them. Nobody can answer you during the run.
   temporary files, goes to your run folder outside it, named in the task and in $${RUN_FOLDER_ENV}, which is
   also your $TMPDIR; it stays a few days after your session's last run, for the driver to look at. Write
   nowhere else outside the repository, also where the task names another place: put such files in the run
-  folder and say so. The gateway counts both folders apart from your changes, and stops all work when a run
-  writes anywhere else.
+  folder and say so. After a cd, give every write an absolute path; keep backups and copies inside these
+  folders too; and never run commands from an old transcript or log again as they stand, as their folders
+  are not yours. The gateway counts both folders apart from your changes, and stops all work when a run
+  writes anywhere else: the first two new files elsewhere it moves to quarantine instead, and tells you in a
+  note that begins "The gateway's guard:", which is the gateway's own; the third stops all work.
 - Finish the job yourself: once the work is done and tested, commit, push and open the pull request as the
   Publish rule says, without asking first. Whatever you run near the end, a review, a subagent or a skill,
   carry on afterwards: its report is not your result. For a security review, read the diff yourself or give
@@ -766,6 +770,10 @@ export class Workers extends EventEmitter {
       if (old.state === 'running') continue
       rmSync(old.file, { force: true })
       rmSync(old.errFile, { force: true })
+      // The guard's notes for it (guard.mjs), on this computer.
+      if (typeof old.guardNotes === 'string' && old.guardNotes.startsWith(this.tasksDir + '/')) {
+        for (const file of [old.guardNotes, `${old.guardNotes}.wait`]) rmSync(file, { force: true })
+      }
     }
     this.state.tasks = this.state.tasks.filter((t, i, all) => t.state === 'running' || i >= all.length - KEEP_TASKS)
     // A removed worktree is kept in mind while a task of it is.
@@ -1397,23 +1405,33 @@ export class Workers extends EventEmitter {
     mkdirSync(this.tasksDir, { recursive: true, mode: 0o700 })
     const out = openSync(record.file, 'a', 0o600)
     const err = openSync(record.errFile, 'a', 0o600)
+    // The kill switch's hooks (guard.mjs, guardHooks): each Bash and Write
+    // call's folder in the output, and the guard's notes for the worker, in
+    // a file next to its output, or in the container.
+    record.guardHooks = true
+    record.guardNotes = runner.container ? posix.join(CONTAINER_NOTES, `${record.id}.notes`) : join(this.tasksDir, `${record.id}.notes`)
     const args = [
       '-p',
       '--output-format', 'stream-json',
       '--verbose',
+      '--include-hook-events',
       '--permission-mode', 'bypassPermissions',
       '--permission-prompts', 'none',
       '--strict-mcp-config',
-      '--settings', JSON.stringify({ permissions: { deny: WORKER_DENY } }),
+      '--settings', JSON.stringify({ permissions: { deny: WORKER_DENY }, hooks: guardHooks(runner.container ? 'node' : process.execPath) }),
       '--append-system-prompt', rules,
       ...(this.model ? ['--model', this.model] : []),
       ...(this.effort ? ['--effort', this.effort] : []),
       ...(record.resumed ? ['--resume', record.sessionId] : ['--session-id', record.sessionId]),
     ]
     const env = workerEnv({ [MARK.run]: record.mark, [MARK.task]: record.id, [MARK.repo]: record.dir })
-    // Its run folder, for the run itself (workspaces.mjs): in the container
-    // through docker exec, not for the docker client here.
-    const runEnv = record.runFolder ? { TMPDIR: record.runFolder, [RUN_FOLDER_ENV]: record.runFolder } : {}
+    // Its run folder, for the run itself (workspaces.mjs), and the guard's
+    // notes: in the container through docker exec, not for the docker client
+    // here.
+    const runEnv = {
+      ...(record.runFolder ? { TMPDIR: record.runFolder, [RUN_FOLDER_ENV]: record.runFolder } : {}),
+      [GUARD_NOTES_ENV]: record.guardNotes,
+    }
     let child
     try {
       child = runner.spawn(record.id, this.claudeBin, args, { cwd: record.dir, stdio: ['pipe', out, err], env, runEnv })
@@ -2252,7 +2270,9 @@ export class Workers extends EventEmitter {
           task.tools = (task.tools ?? 0) + 1
           if (SUBAGENT_TOOLS.has(part.name)) task.subagents = (task.subagents ?? 0) + 1
           task.steps = [...task.steps, describeStep(part.name, part.input, task.dir ?? this.dirOf(task.repo))].slice(-MAX_STEPS)
-          this.emit('tool', task, part) // for the kill switch's rules (guard.mjs)
+          // For the kill switch's rules (guard.mjs), with the subagent's call
+          // it belongs to, if any: a subagent's shell is not the main one's.
+          this.emit('tool', task, part, message.parent_tool_use_id ?? null)
         } else if (part.type === 'text' && part.text?.trim()) {
           task.lastText = preview(part.text, 300)
           this.notePulls(task, part.text)
@@ -2260,8 +2280,14 @@ export class Workers extends EventEmitter {
       }
     } else if (message.type === 'user') {
       for (const part of message.message?.content ?? []) {
-        if (part.type === 'tool_result') this.notePulls(task, resultContent(part.content))
+        if (part.type !== 'tool_result') continue
+        const text = resultContent(part.content)
+        this.notePulls(task, text)
+        this.emit('toolResult', task, { id: part.tool_use_id, error: Boolean(part.is_error), text })
       }
+    } else if (message.type === 'system' && message.subtype === 'hook_response' && message.hook_event === 'PreToolUse') {
+      // The guard's hook names the folder a call starts in (guardHooks).
+      for (const report of toolStarts(message.stdout)) this.emit('toolStart', task, report)
     } else if (message.type === 'result') {
       // The end of a turn, not of the run: the process may go on (check).
       task.results = (task.results ?? 0) + 1
@@ -2799,6 +2825,7 @@ export class Workers extends EventEmitter {
     if (task.runFolder) lines.push(runFolderLine(task))
     if (task.steps.length) lines.push(`Last steps: ${task.steps.join('; ')}`)
     if (task.audit) lines.push(this.checkText(task))
+    if (task.quarantined?.length) lines.push(quarantineLine(task))
     if (task.state === 'running' && task.lastText) lines.push(`Last message: ${task.lastText}`)
     if (task.result) lines.push(`Result: ${task.result}`)
     if (task.error && task.error !== task.result) lines.push(`Problem: ${task.error}`)
@@ -2865,6 +2892,7 @@ export class Workers extends EventEmitter {
       )
     }
     if (task.audit) lines.push(this.checkText(task))
+    if (task.quarantined?.length) lines.push(quarantineLine(task))
     lines.push(...this.worktreeText(task))
     if (task.runFiles?.count) lines.push(runFolderLine(task))
     if (kindOf(task) === 'scratch') {
@@ -2932,6 +2960,19 @@ function runFolderLine(task) {
   return (
     `Run folder of its session, outside the repository: ${task.runFolder}${where}${what}. The driver finds there what the ` +
     'run made for them, such as screenshots; it goes some days after the last run.'
+  )
+}
+
+// The invalid writes the kill switch's rule moved to quarantine instead of
+// locking (guard.mjs), for worker_status and the result: the gateway's own
+// look, as with the git check. The paths are the run's.
+function quarantineLine(task) {
+  const files = task.quarantined.map(entry => `${entry.path} (by ${preview(entry.command, 80)}, now ${entry.file})`)
+  return (
+    `Warning: the run wrote ${plural(files.length, 'new file')} outside its allowed folders, and the gateway's guard ` +
+    `moved ${files.length === 1 ? 'it' : 'them'} to quarantine as invalid writes: ${files.join('; ')}. The third invalid ` +
+    'write of a run locks the kill switch. Tell the driver in a sentence, as a warning; the files wait in the quarantine ' +
+    'folder at the computer, nothing to dispatch.'
   )
 }
 

@@ -269,8 +269,12 @@ summarise your result for them. Nobody can answer you during the run.
 - If you need a decision, stop and end with the question and the options. The answer comes back as a
   follow-up in this session.
 - Your work folder is the current directory, made empty for this task; a follow-up finds it as you left it.
-  Every file you make goes there, scripts included; only temporary files may also go to /tmp. Never write
-  to your home folder or anywhere else: the gateway stops all work when a run writes elsewhere.
+  Every file you make goes there, scripts, backups and copies included; only temporary files may also go to
+  /tmp. After a cd, give every write an absolute path, and never run commands from an old transcript or log
+  again as they stand, as their folders are not yours. Never write to your home folder or anywhere else:
+  the gateway stops all work when a run writes elsewhere. The first two new files elsewhere it moves to
+  quarantine instead, and tells you in a note that begins "The gateway's guard:", which is the gateway's
+  own; the third stops all work.
 - There is no repository here. Never push, never open pull requests or issues, and change nothing anywhere
   else: no installing software, no settings, no messages to anyone. Reading the web and running commands
   that only read are fine.

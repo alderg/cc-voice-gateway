@@ -373,3 +373,208 @@ test('parseShell: data stays data, commands in substitutions and a shell\'s here
   const events = parseShell('(cd / && ls) && touch here').map(e => e.type)
   assert.deepEqual(events, ['open', 'command', 'command', 'close', 'command'])
 })
+
+// --- the shell's folder, as Claude Code keeps it --------------------------------
+
+// One run of the rule, call by call as the run's stream shows them: a call's
+// tool_use (with the subagent's call it belongs to), the guard's hook's
+// report before it starts, and its result.
+function session({ task: more = {}, ...options } = {}) {
+  const workers = new EventEmitter()
+  const tripped = []
+  const logged = []
+  const guard = new RunGuard({
+    workers,
+    runner: { dir: name => `/work/${name}`, git: async () => null },
+    killswitch: { trip: event => tripped.push(event.reason) },
+    ghBin: '/bin/false',
+    mainCheckSeconds: 3600,
+    log: (...parts) => logged.push(parts.join(' ')),
+    ...options,
+  })
+  const task = { id: 'tabc', repo: 'alpha', dir: '/work/alpha', slug: null, defaultBranch: 'main', startedAt: Date.now(), ...more }
+  workers.emit('started', task)
+  let n = 0
+  const tool = (command, { parent = null, input = null } = {}) => {
+    const id = `toolu_${++n}`
+    workers.emit('tool', task, { type: 'tool_use', id, name: 'Bash', input: input ?? { command } }, parent)
+    return id
+  }
+  const report = (id, fields) => workers.emit('toolStart', task, { id, at: Date.now(), ...fields })
+  const result = (id, { error = false, text = '' } = {}) => workers.emit('toolResult', task, { id, error, text })
+  // A call and its result: what Claude Code says back, or an error.
+  const call = (command, { parent = null, error = false, text = '', input = null } = {}) => {
+    const id = tool(command, { parent, input })
+    result(id, { error, text })
+    return id
+  }
+  return { guard, task, tripped, logged, tool, report, result, call, close: () => guard.close() }
+}
+
+const UW83 = '/scratch/2026-10-31-uw83'
+
+test('3 November: a subagent\'s cd /tmp leaves the main shell in its folder, so the copy into the work folder writes nothing outside', () => {
+  // scratch/uw83, task tjvw: the main thread worked in sources/history/replay,
+  // a read-only survey subagent ran "cd /tmp; …" meanwhile, and the copy
+  // "../report-2026-10-31-end.md" went to sources/history, in the work folder.
+  const s = session({ task: { id: 'tjvw', repo: 'scratch/uw83', kind: 'scratch', dir: UW83 } })
+  const agent = 'toolu_survey'
+  s.call(`rm -f /tmp/uw83/users.txt; mkdir -p sources/history/replay && python3 -I sources/history/scan.py "$T" > sources/history/replay/scan.txt`)
+  s.call(`cd /tmp; G="git -C /work/drawio-dev"; $G rev-parse origin/simple-modern origin/simple-modern-batch-7`, { parent: agent })
+  s.call(`cd ${UW83}/sources/history/replay && cat > replay.py <<'EOF'\n# Replays the edits of report.md\nopen('ws/x', 'w')\nEOF`)
+  for (const command of [
+    'cd /tmp; gh pr list --repo jgraph/drawio-dev --state all --base simple-modern --limit 40 2>&1 | head -80',
+    'cd /tmp; G="git -C /work/drawio-dev"; for c in 5f1b195c40 afcaa886c6; do $G branch -r --contains $c | head -30; done',
+    'cd /tmp; G="git -C /work/drawio-dev"; R=origin/simple-modern; $G show $R:docs/claude/simple-modern-style-guide.md | wc -l',
+  ]) {
+    s.call(command, { parent: agent })
+  }
+  s.call('grep -c "SPECRESULT" ws/report.md; grep -n "^## " ws/report.md | cut -c1-120')
+  s.call(
+    "cp ws/report.md ../report-2026-10-31-end.md && cp ws/mockups.md ../mockups-2026-10-31-end.md && cat > replay-tools.py <<'EOF'\n# Replays the edits of the mockup tools\nEOF",
+  )
+  assert.deepEqual(s.tripped, [])
+  // From the folder Claude Code went back to, the same copy is a write outside.
+  s.call('cd /tmp; ls', { text: `x\nShell cwd was reset to ${UW83}` })
+  s.call('cp ws/report.md ../report-2026-10-31-end.md')
+  assert.equal(s.tripped.length, 1)
+  assert.match(s.tripped[0], /writes \/scratch\/report-2026-10-31-end\.md \(worker scratch\/uw83, task tjvw\)$/)
+  s.close()
+})
+
+test('Claude Code goes back to the workspace when a main-thread call ends outside it, with "Shell cwd was reset to …"', () => {
+  const s = session()
+  s.call('cd sub/dir')
+  s.call('cd /work/drawio-dev && git log -3', { text: 'abc first\nShell cwd was reset to /work/alpha' })
+  // Back in /work/alpha: one level up is outside.
+  s.call('echo x > ../a.txt')
+  assert.match(s.tripped[0], /writes \/work\/a\.txt \(/)
+  // Words that name another folder take the shell back to the workspace all the same: Claude Code knows no other.
+  const t = session()
+  t.call('cd sub/dir')
+  t.call('cat notes.txt', { text: 'Shell cwd was reset to /work/alpha/sub/dir/deeper/still' })
+  t.call('rm -rf ../x')
+  assert.match(t.tripped[0], /writes \/work\/x \(/)
+  s.close()
+  t.close()
+})
+
+test('a command that failed leaves the shell where it was, as Claude Code takes the new folder only from one that succeeded', () => {
+  const s = session()
+  s.call('cd sub')
+  s.call('cd /usr && false', { error: true, text: 'Exit code 1' })
+  s.call('echo x > ../a.txt') // from /work/alpha/sub: in the workspace
+  assert.deepEqual(s.tripped, [])
+  // make failed, so the shell is still in /work/alpha, and ../a.txt is outside.
+  const t = session()
+  t.call('cd sub && make', { error: true, text: 'Exit code 2\nmake: *** No targets.' })
+  t.call('echo x > ../a.txt')
+  assert.match(t.tripped[0], /writes \/work\/a\.txt \(/)
+  s.close()
+  t.close()
+})
+
+test('a real write above the workspace still trips, after subagent calls and from the folder the main thread kept', () => {
+  const s = session()
+  s.call('cd sub')
+  s.call('cd /tmp/elsewhere; ls', { parent: 'toolu_agent' })
+  s.call('cd deep && ls', { parent: 'toolu_agent' })
+  s.call('rm -rf ../../other')
+  assert.match(s.tripped[0], /writes \/work\/other \(/)
+  // A subagent's own relative write counts from the main thread's folder.
+  const t = session()
+  t.call('cd sub')
+  t.call('cp a.txt ../../outside.txt', { parent: 'toolu_agent' })
+  assert.match(t.tripped[0], /writes \/work\/outside\.txt \(/)
+  // Neither does a call in the background move the shell.
+  const u = session()
+  u.call('cd sub && npm run dev', { input: { command: 'cd sub && npm run dev', run_in_background: true } })
+  u.call('echo x > ../a.txt')
+  assert.match(u.tripped[0], /writes \/work\/a\.txt \(/)
+  for (const one of [s, t, u]) one.close()
+})
+
+test('31 October: the logs and the link went into the worktree, after a cd in an earlier call', () => {
+  const dir = '/work/.voice-worktrees/drawio-dev/t9y7'
+  // trvr: the log of the test run, in the worktree's own .voice-scratch.
+  const s = session({ task: { id: 'trvr', repo: 'drawio-dev', dir } })
+  s.call(`cd ${dir} && python3 - <<'EOF'\np='src/main/webapp/styles/grapheditor.css'\ns=open(p).read()\nopen(p,'w').write(s)\nEOF`)
+  s.call(
+    "python3 - <<'EOF'\np='test/simple-modern/run.js'\ns=open(p).read()\nopen(p,'w').write(s)\nEOF\n" +
+      'cd test/simple-modern && timeout 590 node run.js > ../../.voice-scratch/full-format.log 2>&1; echo exit $?; grep -E "FAIL|All checks|failed" ../../.voice-scratch/full-format.log | head -30',
+    { text: 'exit 1\nFAIL layout-by-width (13.3 s)' },
+  )
+  for (let i = 0; i < 2; i++) {
+    s.call(`python3 - <<'EOF'\np='run.js'\ns=open(p).read()\nopen(p,'w').write(s)\nEOF\ntimeout 300 node run.js --filter layout-by-width 2>&1 | grep -E "FAIL|PASS|All" | head`)
+  }
+  s.call('timeout 590 node run.js > ../../.voice-scratch/full-format.log 2>&1; echo exit $?; grep -E "FAIL|All checks|failed" ../../.voice-scratch/full-format.log | head -30', {
+    error: true,
+    text: 'Exit code 137',
+  })
+  assert.deepEqual(s.tripped, [])
+  // tca6: a link for one test run in a sibling test folder of the worktree.
+  const t = session({ task: { id: 'tca6', repo: 'drawio-dev', dir } })
+  t.call(`cd ${dir} && python3 - <<'EOF'\np='test/simple-modern/README.md'\nEOF\ncd test/simple-modern && timeout 590 node run.js > /tmp/smf/full-phone2.log 2>&1; echo exit $?`)
+  t.call(
+    "python3 - <<'EOF'\np='run.js'\nEOF\n" +
+      'ln -sf /work/drawio-dev/test/implicit-globals/node_modules ../implicit-globals/node_modules && (cd ../implicit-globals && timeout 120 node run.js 2>&1 | tail -2); rm ../implicit-globals/node_modules; rm -rf /tmp/smf/shots-phone',
+  )
+  assert.deepEqual(t.tripped, [])
+  s.close()
+  t.close()
+})
+
+test("with the guard's hook, the rule takes the folder Claude Code names, and waits for it before it checks a call", () => {
+  const s = session({ task: { guardHooks: true } })
+  // A cd the rule cannot follow, then the hook's report names the folder.
+  let id = s.tool('cd "$(git rev-parse --show-toplevel)/deep/er"')
+  s.report(id, { cwd: '/work/alpha' })
+  s.result(id)
+  id = s.tool('echo x > ../y.txt')
+  s.report(id, { cwd: '/work/alpha/deep/er' })
+  s.result(id)
+  assert.deepEqual(s.tripped, [])
+  assert.equal(s.guard.runs.get('tabc').cwdSure, true, 'the folder is certain again')
+  // Nothing is checked before the report; then at once.
+  id = s.tool('echo x > ../../../y.txt')
+  assert.deepEqual(s.tripped, [])
+  s.report(id, { cwd: '/work/alpha/deep/er' })
+  assert.match(s.tripped[0], /writes \/work\/y\.txt \(/)
+  // A subagent's report is its own folder, not the main thread's.
+  const t = session({ task: { guardHooks: true } })
+  id = t.tool('ls', { parent: 'toolu_agent' })
+  t.report(id, { cwd: '/work/alpha/.claude/worktrees/agent-1', agent: 'a1' })
+  t.result(id)
+  id = t.tool('echo x > ../a.txt')
+  t.result(id) // no report for this one: the folder the rule followed, /work/alpha
+  assert.match(t.tripped[0], /writes \/work\/a\.txt \(/)
+  s.close()
+  t.close()
+})
+
+test('without a report before its result, the hooks do not run in that Claude Code: the rule checks at once from then on', () => {
+  const s = session({ task: { guardHooks: true } })
+  const id = s.tool('cd sub')
+  assert.deepEqual(s.tripped, [])
+  s.result(id)
+  assert.equal(s.logged.filter(line => /no report of the guard's hook/.test(line)).length, 1)
+  s.tool('echo x > /etc/x') // checked at once now
+  assert.match(s.tripped[0], /writes \/etc\/x \(/)
+  s.close()
+})
+
+test('crontab: anything but a listing locks; a git hook locks wherever it is, also in the run\'s own repository', () => {
+  for (const command of ['crontab /tmp/jobs', 'echo "* * * * * x" | crontab -', 'crontab -e', 'crontab -r', 'crontab -u gaudenz /tmp/x']) {
+    assert.match(trips(command)[0] ?? '', /changes the crontab, which locks at once/, command)
+  }
+  for (const command of ['crontab -l', 'crontab -l | grep backup', 'crontab -u gaudenz -l']) assert.deepEqual(trips(command), [], command)
+  assert.match(trips('echo "#!/bin/sh" > .git/hooks/pre-commit')[0], /writes \/work\/alpha\/\.git\/hooks\/pre-commit: a git hook/)
+  assert.match(trips('/work/alpha/.git/hooks/post-checkout', 'Write')[0], /Write \/work\/alpha\/\.git\/hooks\/post-checkout: a git hook/)
+  assert.deepEqual(trips('git commit -m "hooks: fix the .git/hooks note" && echo x > .githooks-notes.txt'), [])
+})
+
+test('mv moves its sources away: a source outside the allowed folders is a write there', () => {
+  assert.match(trips('mv ~/Downloads/shot.png .voice-scratch/')[0], /writes .*\/Downloads\/shot\.png \(/)
+  assert.match(trips('mv -t build ../other/a.js')[0], /writes \/work\/other\/a\.js \(/)
+  assert.deepEqual(trips('mv /tmp/package.json package.json && mv a.txt b.txt'), [])
+})
