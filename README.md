@@ -1040,17 +1040,18 @@ folder, `.git` included.
   up then also go to the chat, each once. Results, news and interim `working` updates never do;
   they wait for the next voice call, apart from the controller's replies to an answer or a request
   you gave in the chat (below). A question the controller settled in the meantime is not sent.
-- **Not waiting for that:** the kill switch alarm goes at once, whether voice mode is on or not,
-  and so do the PIN to unlock it in voice mode and the notes about that unlock (below), a note
-  when the gateway ends because another process holds its port, the alerts
-  about suspicious requests and sign-ins ([5.2](#52-the-voice-endpoint-and-oauth)), the Funnel's
-  messages ([7.3](#73-publishing-the-endpoint)), the watchdog's around a restart
-  ([8.2](#82-the-watchdog)), and the statistics when the gateway shuts down
-  ([8.5](#85-statistics)).
+- **Not waiting for that:** the kill switch alarm goes at once, whether voice mode is on or not, and
+  so do the PIN to unlock it in voice mode and the notes about that unlock (below), the warning when
+  a run's write outside goes to [quarantine](#quarantine), a note when the gateway ends because
+  another process holds its port, the alerts about suspicious requests and sign-ins
+  ([5.2](#52-the-voice-endpoint-and-oauth)), the Funnel's messages
+  ([7.3](#73-publishing-the-endpoint)), the watchdog's around a restart ([8.2](#82-the-watchdog)),
+  and the statistics when the gateway shuts down ([8.5](#85-statistics)).
 - **In night mode** ([night mode](#night-mode)) the fallback pauses: no questions, approvals or
-  news, only alarms (the kill switch, a standby, a wait for the usage limit, once each), and the
-  controller's replies to what you wrote in the chat yourself. The morning summary names what the
-  night left, instead of one message each.
+  news, only alarms (the kill switch, a standby, a wait for the usage limit, once each, and the
+  warning about a write that went to quarantine), the PIN when you ask to unlock in voice mode, and
+  the controller's replies to what you wrote in the chat yourself. The morning summary names what
+  the night left, instead of one message each.
 - **Inbound, only from you:** your own account (`from.id`), in your private chat with the bot, the
   configured chat. In a private chat the chat id is your user id, so `.secrets/telegram_chat_id`
   is all it needs; the log names it at every start. Groups, supergroups, channels, other senders,
@@ -1361,6 +1362,8 @@ The third invalid write of the run locks. These lock at once, the first time, as
 Only at `VOICE_GW_KILLSWITCH=auto`: at `manual` and `off` the rule logs as before and moves nothing.
 Nothing is deleted; the files wait in `.state/quarantine` for you.
 
+#### Effects and unlocking
+
 **Effects**, at once:
 
 - **No new work:** `dispatch` answers `locked`, also a dispatch whose checks were still running
@@ -1514,6 +1517,10 @@ is guarded as follows:
   - writes by programs, such as `npm install` into `~/.npm`, and other ways to run something later
     than `crontab`, such as `systemctl --user enable` or `git config core.hooksPath`;
   - paths behind symlinks.
+
+  A worker that fetched someone else's push can look guilty. A push whose commit the worker did
+  not keep is missed. A merge that you approved through the controller while a worker in the same
+  repository fetches can also look like the worker's push.
 - **The folder of a command, without the hook.** Where the gateway's hook does not report a call's
   folder ([5.9](#the-folder-a-command-runs-in)), the rule follows the shell as Claude Code 2.1.312
   keeps it; another version may keep it otherwise, and calls side by side in one turn may start
@@ -1524,10 +1531,6 @@ is guarded as follows:
   file is new goes by its birth time against the call's start; where the file system keeps none,
   it locks. A file the call made and removed again, or one that a write by a script left, is not
   seen.
-
-  A worker that fetched someone else's push can look guilty. A push whose commit the worker did
-  not keep is missed. A merge that you approved through the controller while a worker in the same
-  repository fetches can also look like the worker's push.
 - **The count of changes goes by the repository's git.** It takes the commits by their committer
   date since the run's start, and the branches the run made by their reflogs. Merges count
   nothing of their own, and a force-push that only drops commits adds none to count. A remote
@@ -2505,8 +2508,8 @@ defers what needs you, goes on with other work meanwhile, and tells you in the m
     day: their repository, or their worktree, never other work. No reminders.
   - Telegram carries alarms only: the kill switch, a standby, a wait for the usage limit, once each,
     and the warning when a run's write outside goes to [quarantine](#quarantine).
-    No questions, approvals or news; the controller's replies to what you write there yourself
-    still come back.
+    No questions, approvals or news; the PIN when you ask to unlock the kill switch in voice mode
+    still comes, and the controller's replies to what you write there yourself still come back.
   - The controller hears that the night began (an event of the gateway), goes on with what is
     queued, and chains work within your [standing orders](#standing-orders).
   - `status` and `open_items` say so.
