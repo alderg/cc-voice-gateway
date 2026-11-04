@@ -145,6 +145,16 @@ function describePermission(permission) {
   )
 }
 
+// The last line of every result that ends a request (the answer, a question
+// back, status): what the voice AI says before the user's next send or ask.
+// claude.ai fetches the instructions and tool descriptions only when the
+// connector connects, every few hours, but follows a result at once and
+// almost word for word. Not while a request runs, nor with an approval or an
+// emergency stop, whose next words are no new request. Names no filler.
+const NEXT_REQUEST =
+  "For the user's next request (not to read out): before send or ask, say its subject in a few of their own words " +
+  'and that it goes to Claude Code, e.g. „Die Tests in alpha, geht an Claude Code“.'
+
 // Builds the text a voice client receives for one request.
 // The first line is machine-readable so the decision to poll again never
 // depends on reading prose.
@@ -200,6 +210,7 @@ function report(store, request, settings) {
       lines.push(`Still working. Tell the user briefly and call get_reply again with id=${request.id}.`)
     }
   }
+  if ((request.state === 'done' || request.state === 'question') && !permissions.length) lines.push(NEXT_REQUEST)
   return lines.join('\n')
 }
 
@@ -245,6 +256,7 @@ function statusText(store, settings, killswitch) {
   lines.push(...answeredElsewhereLines(store))
   const news = store.takeNews()
   if (news.length) lines.push(...describeNews(news))
+  if (!permissions.length) lines.push(NEXT_REQUEST)
   return lines.join('\n')
 }
 

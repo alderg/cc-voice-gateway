@@ -1389,6 +1389,8 @@ test('voice: "emergency stop" locks before anything reaches the controller; ever
 
   const out = await gw.voice.car('send', { message: 'Emergency stop!' })
   assert.match(out, /^\[state=locked\] Emergency stop\. Kill switch locked since .* UTC, by voice: "Emergency stop!" by voice\. The gateway takes no new tasks/)
+  // No line about the user's next request after an emergency stop.
+  assert.doesNotMatch(out, /next request/)
   assert.ok(!gw.events.some(e => e.content.includes('Emergency stop!') && e.meta?.kind !== 'killswitch'), 'the phrase never reached the controller as a request')
   const alarm = await waitUntil(() => gw.events.find(e => e.meta?.kind === 'killswitch'))
   assert.equal(alarm.meta.trigger, 'voice')
