@@ -29,7 +29,9 @@
 // question's message, or a message with the question's code, goes to the
 // controller as their answer, like one by voice. Any other message is a
 // request of theirs, as one by voice is (VOICE_GW_TELEGRAM_REQUESTS). The
-// controller's replies to either come back to the chat.
+// controller's replies to either come back to the chat. Nothing here unlocks
+// the kill switch: the PIN for the unlock in voice mode comes to the chat
+// (killswitch.mjs), and typed back here it counts for nothing, masked.
 //
 // On only when .secrets/telegram_token and .secrets/telegram_chat_id both
 // exist and are not empty. The token is part of every API address, so it must
@@ -122,12 +124,14 @@ export class Telegram {
 
   // Resolves with the message ({ message_id, … }) when Telegram accepted it.
   // replyTo: the id of a message in the chat that this one answers; sent
-  // all the same if that message is gone.
-  async send(text, { replyTo = null } = {}) {
+  // all the same if that message is gone. quote: false for a message that is
+  // never quoted to the controller, the unlock PIN (killswitch.mjs): its id
+  // is not kept, so a Reply to it comes without its text.
+  async send(text, { replyTo = null, quote = true } = {}) {
     const body = { chat_id: this.chatId, text: String(text).slice(0, MAX_TEXT) }
     if (replyTo !== null) body.reply_parameters = { message_id: replyTo, allow_sending_without_reply: true }
     const message = await this.call('sendMessage', body)
-    if (Number.isInteger(message?.message_id)) {
+    if (quote && Number.isInteger(message?.message_id)) {
       this.sentIds.add(message.message_id)
       if (this.sentIds.size > SENT_KEPT) this.sentIds.delete(this.sentIds.values().next().value)
     }
@@ -283,10 +287,23 @@ export const INPUT_OFF =
 // does not count: Telegram keeps messages for a day, and yesterday's /funnel
 // on must not open the endpoint today, nor yesterday's "yes" answer a
 // question. It emits 'stale' instead, so that the sender hears why.
+// masked(text): the text with the unlock PIN masked while one is valid
+// (VoiceUnlock in killswitch.mjs). A message that holds it is refused, as the
+// PIN counts only spoken in voice mode, and the input log, the log and every
+// event get it masked: it reaches neither a log nor the controller.
 export class TelegramCommands extends EventEmitter {
   constructor(
     telegram,
-    { pollSeconds = 25, maxAgeSeconds = 120, answers = false, asks = () => true, known = () => true, record = () => {}, log = defaultLog } = {},
+    {
+      pollSeconds = 25,
+      maxAgeSeconds = 120,
+      answers = false,
+      asks = () => true,
+      known = () => true,
+      record = () => {},
+      masked = text => text,
+      log = defaultLog,
+    } = {},
   ) {
     super()
     this.telegram = telegram
@@ -297,6 +314,7 @@ export class TelegramCommands extends EventEmitter {
     this.asks = asks
     this.known = known
     this.record = record
+    this.masked = masked
     this.log = log
     this.offset = undefined
     this.closed = false
@@ -365,7 +383,9 @@ export class TelegramCommands extends EventEmitter {
     const edited = !update.message && Boolean(update.edited_message)
     const message = update.message ?? update.edited_message
     if (!message) return // nothing else is asked for (getUpdates)
-    const text = typeof message.text === 'string' ? message.text : null
+    // The unlock PIN, typed here: masked in everything that follows.
+    const typed = typeof message.text === 'string' ? message.text : null
+    const text = typed === null ? null : this.masked(typed)
     // For the input log: who, where, and a few words of what.
     const seen = {
       from: message.from?.id ?? null,
@@ -402,6 +422,7 @@ export class TelegramCommands extends EventEmitter {
     // The kill switch first, always, whatever the message is besides: a stop
     // can only lock.
     if (text !== null && isStopCommand(text)) return accept('stop', 'stop', { text })
+    if (text !== typed) return refuse('it holds the unlock PIN, which counts only when you say it in voice mode. Say it there.')
     const own = notOwn(message, edited)
     if (own) return refuse(own)
     // A Reply to a question is an answer, unless it is a slash command: "good
@@ -778,8 +799,9 @@ export const quoteText = quoted => `(In reply to the gateway's message, quoted a
 // The controller's replies to either come back to the chat
 // (TelegramFallback.relay). Never an approval, and nothing while the kill
 // switch is locked or the gateway inactive (presence.mjs: in a standby, say,
-// or without a controller); the chat hears why, and unlocking stays at the
-// computer. Nor a forwarded message, which holds someone else's words.
+// or without a controller); the chat hears why, and that unlocking is at the
+// computer, or in voice mode with a PIN sent there (killswitch.mjs). Nor a
+// forwarded message, which holds someone else's words.
 //
 // Push, merge, restart and delete decisions are never answered here: an
 // answer to one is not passed on, nothing is done, the decision stays open,
@@ -915,7 +937,13 @@ export class TelegramAnswers {
   // { why } not, with the whole answer for the chat in text when it is not
   // the usual "Not passed on: <why>".
   check(text, replyTo, { forwarded = false } = {}) {
-    if (this.killswitch?.locked) return { why: 'the kill switch is locked. It is unlocked only at the computer.' }
+    if (this.killswitch?.locked) {
+      return {
+        why: this.killswitch.byVoice
+          ? 'the kill switch is locked. It is unlocked at the computer, or in voice mode with a PIN sent here.'
+          : 'the kill switch is locked. It is unlocked only at the computer.',
+      }
+    }
     const presence = this.presence?.state() ?? { active: true }
     if (!presence.active) return { why: `this gateway is inactive, ${presence.why}.` }
     if (forwarded) return { why: 'it is forwarded, so its words are not your own. Write what you want in a message of your own.' }

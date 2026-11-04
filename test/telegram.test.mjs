@@ -1129,12 +1129,26 @@ test('the token: its file and the secrets folder tightened to 0600 and 0700 with
   assert.deepEqual(env, { PATH: '/usr/bin', OTHER: '123456789:another-token' })
 })
 
-test('Telegram.send keeps the ids of the messages it sent, so that only those are quoted', async () => {
+test('Telegram.send keeps the ids of the messages it sent, so that only those are quoted; never the unlock PIN', async () => {
   api.mode = 'ok'
   const telegram = new Telegram({ token: TOKEN, chatId: CHAT_ID, apiBase: api.url })
   const message = await telegram.send('Hello')
   assert.equal(telegram.sent(message.message_id), true)
   assert.equal(telegram.sent(message.message_id + 1000), false)
+  // The unlock PIN (killswitch.mjs): a Reply to it comes without its text.
+  const pin = await telegram.send('Unlock PIN 4 7 1 9, valid 5 minutes', { quote: false })
+  assert.ok(Number.isInteger(pin.message_id))
+  assert.equal(telegram.sent(pin.message_id), false)
+  const commands = new TelegramCommands(telegram, { answers: true, known: id => telegram.sent(id), log: () => {} })
+  const heard = []
+  commands.on('answer', event => heard.push(event))
+  const original = { message_id: pin.message_id, from: { id: 1, is_bot: true }, chat: { id: Number(CHAT_ID), type: 'private' }, text: 'Unlock PIN 4 7 1 9, valid 5 minutes' }
+  commands.handle({
+    update_id: 1,
+    message: { message_id: 5000, date: Math.floor(Date.now() / 1000), chat: { id: Number(CHAT_ID), type: 'private' }, from: { id: Number(CHAT_ID), is_bot: false }, text: 'what is this?', reply_to_message: original },
+  })
+  assert.equal(heard.length, 1)
+  assert.equal(heard[0].quoted, null)
 })
 
 test("restart_controller with confirm takes the driver's spoken words: words typed in Telegram, none or others restart nothing", () => {
@@ -1599,15 +1613,19 @@ test('gateway with requests off: a Reply on Telegram, or a message with the code
     const coded = await waitFor(() => gw.events.find(e => e.content === `(Answer to ${second}) ${second} nein, behalten`))
     assert.equal(coded.meta.via, 'telegram')
 
-    // Locked: nothing passes, and unlocking stays at the computer.
+    // Locked: nothing passes, and unlocking is at the computer, or in voice mode with a PIN sent here.
     const third = idOf(await gw.call('send', { message: 'Rename the notes.' }))
     await gw.reply(third, 'question', 'To what name?')
     await waitFor(() => messageWith('To what name?'))
     driverSays('/stop')
     await waitFor(() => messageWith('KILL SWITCH'))
+    assert.match(api.messages[messageWith('KILL SWITCH') - 1].text, /Unlock at the server: node scripts\/unlock\.mjs, or in voice mode with a PIN sent here\.$/)
     driverSays('notes-2026', { replyTo: messageWith('To what name?') })
     await waitFor(() => messageWith('Not passed on: the kill switch is locked'))
-    assert.equal(api.messages[messageWith('Not passed on: the kill switch is locked') - 1].text, 'Not passed on: the kill switch is locked. It is unlocked only at the computer.')
+    assert.equal(
+      api.messages[messageWith('Not passed on: the kill switch is locked') - 1].text,
+      'Not passed on: the kill switch is locked. It is unlocked at the computer, or in voice mode with a PIN sent here.',
+    )
     assert.ok(!gw.events.some(e => e.content.startsWith(`(Answer to ${third})`)))
     assert.ok(!gw.log.includes(TOKEN))
   } finally {

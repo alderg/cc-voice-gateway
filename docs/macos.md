@@ -145,7 +145,8 @@ behave so, with `grep watchdog .logs/gateway.log | tail -20` and
 8. **The kill switch ends the whole run.** Start the same run again, then `send Emergency stop.`
    Expected: the answer says the kill switch is locked; within 10 seconds both `pgrep` commands
    print nothing; `node scripts/unlock.mjs --status` shows the lock. Unlock with
-   `node scripts/unlock.mjs`, typing `unlock`.
+   `node scripts/unlock.mjs`, typing `unlock`. With Telegram set up, unlock it in fake-voice instead:
+   `unlock` sends a PIN to the chat, and `unlock 4719`, with that PIN, unlocks it.
 9. **restart_controller through the watchdog.** `send Restart the controller.`, then `answer Yes.`
    Expected: the session ends and starts again at once; the log says
    `ended for a restart requested by voice … starting it again at once`. With the development flag,

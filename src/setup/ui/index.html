@@ -108,7 +108,10 @@
     </label>
     <p class="guide">What locks the gateway and stops every worker. Manual: "emergency stop" by voice,
       <code>/stop</code> on Telegram and the controller's alarm. Automatic: also fixed rules on the workers' runs,
-      such as a push to the default branch, a write outside the repository or unusually many changes.</p>
+      such as a push to the default branch, a write outside the repository or unusually many changes. You
+      unlock it at this computer with <code>node scripts/unlock.mjs</code>, or with Telegram set up (section 4)
+      in voice mode: say "unlock", and read out the PIN that comes to your Telegram chat. Three wrong PINs
+      leave only the computer for that lock.</p>
     <p id="killswitch-warning" class="notice wide" role="alert" hidden></p>
     <label><input type="checkbox" id="funnel-idle-on"> Turn Tailscale Funnel off when idle</label>
     <p class="guide">The public endpoint is then only up while you use it. The gateway says on Telegram when it
@@ -158,7 +161,8 @@
   <h2>4. Telegram <span class="opt">optional</span></h2>
   <p class="guide">
     Results, questions and approvals reach your phone once voice mode has ended, and <code>/stop</code> locks
-    the kill switch. Create a bot: in Telegram, write <code>/newbot</code> to
+    the kill switch. The PIN to unlock it in voice mode comes here too, so that you need not reach the computer
+    from the car. Create a bot: in Telegram, write <code>/newbot</code> to
     <a href="https://t.me/BotFather" target="_blank" rel="noreferrer noopener">@BotFather</a>
     (<a href="https://core.telegram.org/bots/features#botfather" target="_blank" rel="noreferrer noopener">how</a>)
     and copy the token it gives you.

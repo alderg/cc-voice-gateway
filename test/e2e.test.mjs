@@ -191,7 +191,7 @@ test('declares the channel and permission capabilities and the reply tool', asyn
 
 test('voice endpoint exposes the voice tools', async () => {
   const { tools } = await voice.listTools()
-  assert.deepEqual(tools.map(t => t.name).sort(), ['approve', 'ask', 'emergency_stop', 'get_reply', 'send', 'status'])
+  assert.deepEqual(tools.map(t => t.name).sort(), ['approve', 'ask', 'emergency_stop', 'get_reply', 'send', 'status', 'unlock'])
 })
 
 test('the connector names its gateway, for a driver with several: in the instructions, in every tool description, first in every answer', async () => {
@@ -724,4 +724,37 @@ test('get_reply on an unknown id and the hint when nothing happens', async () =>
   assert.match(out, /Hint: Claude Code has not picked up the request yet/)
   assert.match(out, /login expired/)
   assert.match(await voiceCall('status'), /controller=confirmed/)
+})
+
+// Last: it locks the kill switch for a moment. Without Telegram for the PIN,
+// the unlock in voice mode answers that it is at the computer.
+test('unlock: nothing to unlock while unlocked; locked, without Telegram for the PIN, only at the computer; no filler anywhere', async () => {
+  const { tools } = await voice.listTools()
+  const description = tools.find(t => t.name === 'unlock').description
+  assert.match(description, /^Unlock the kill switch with a PIN from Telegram, only when the user asks for it\. First call it without pin: /)
+  assert.match(
+    description,
+    /valid 5 minutes\. Then ask the user for the PIN and call unlock again with it\. Never guess a PIN: 3 wrong ones block unlocking by voice for this lock/,
+  )
+  // Without Telegram, no rule for it in the instructions, and the alarm and the line say: at the computer.
+  assert.doesNotMatch(voice.getInstructions(), /^Unlock:/m)
+  assert.match(tools.find(t => t.name === 'emergency_stop').description, /until someone unlocks it at the computer\./)
+
+  const none = await voiceCall('unlock', { pin: '1234' })
+  assert.equal(none, '[unlock=none] The kill switch is not locked; there is nothing to unlock. Tell the user.')
+  await voice.callTool({ name: 'emergency_stop', arguments: { words: 'Notstopp' } })
+  const results = [none]
+  for (const args of [{}, { pin: '1234' }]) {
+    const out = resultText(await voice.callTool({ name: 'unlock', arguments: args }))
+    assert.match(
+      out,
+      /^Gateway Testbox \(e2e\): inactive, kill switch locked; it can only be unlocked at the computer\n\[unlock=no-telegram\] Unlocking by voice needs Telegram for the PIN, and this gateway has no Telegram chat of the user's, so it is unlocked only at the computer\. Tell the user\./,
+    )
+    results.push(out)
+  }
+  assert.doesNotMatch(results[1], /\[ALARM\]/, 'emergency_stop told the alarm already')
+  for (const out of results) assert.doesNotMatch(out, FILLERS)
+  assert.match(gatewayLog, /kill switch: no unlock in voice mode, which needs Telegram for its PIN; only scripts\/unlock\.mjs unlocks/)
+  await adminRequest(join(SECRETS, 'admin.sock'), 'POST', '/unlock', { by: 'e2e' })
+  assert.match(await voiceCall('status'), /locked=no/)
 })
