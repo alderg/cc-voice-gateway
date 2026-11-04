@@ -10,7 +10,7 @@ import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync, spawn, spawnSync } from 'node:child_process'
 import { EventEmitter } from 'node:events'
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { createServer as createNetServer } from 'node:net'
 import { homedir, tmpdir } from 'node:os'
@@ -21,7 +21,7 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import { z } from 'zod'
 import { adminRequest } from '../src/admin.mjs'
-import { KillSwitch, emergencyPhrase } from '../src/killswitch.mjs'
+import { KillSwitch, VoiceUnlock, alarmText, emergencyPhrase } from '../src/killswitch.mjs'
 import { RunGuard } from '../src/guard.mjs'
 import { HostRunner } from '../src/runners.mjs'
 import { Workers } from '../src/workers.mjs'
@@ -250,6 +250,239 @@ test('the setting VOICE_GW_KILLSWITCH: auto locks on everything, manual not on t
   const auto = make('auto')
   assert.equal(auto.trip({ trigger: 'rule', reason: 'x' }).trigger, 'rule')
   auto.unlock({ by: 'test' })
+})
+
+// --- the unlock in voice mode, with a PIN from Telegram -------------------------------------
+
+// The PIN in a message to the chat, "Unlock PIN 4 7 1 9, valid 5 minutes".
+const pinIn = text => /PIN (\d) (\d) (\d) (\d),/.exec(text).slice(1).join('')
+const wrongOf = pin => String((Number(pin) + 1) % 10000).padStart(4, '0')
+// Whether a text holds the PIN: as it went out, digit by digit, or as four
+// digits of their own, not part of a longer number, a word, a hash, a date, a
+// time or a JSON number.
+const holdsPin = (text, pin) =>
+  text.includes([...pin].join(' ')) || new RegExp(`(?<![\\w:.,\\[-])${pin}(?![\\w:.,\\]-])`).test(text)
+
+// As in e2e.test.mjs: no filler named in what the voice assistant hears.
+const FILLERS =
+  /schau|nachseh|sehe mal|\bmoment|augenblick|let me (check|see|look)|have a look|look or check|look(ing)? (it up )?yourself|check (it )?yourself|weitergegeben|passed on/i
+
+// A kill switch with the unlock in voice mode, a clock the test sets, the
+// messages to the driver's chat and the log.
+function pinned(name, { send = true, paused = () => false } = {}) {
+  const file = join(TMP, 'pin', name, 'killswitch.json')
+  const logged = []
+  const log = (...parts) => logged.push(parts.join(' '))
+  const killswitch = new KillSwitch({ file, log })
+  const sent = []
+  const clock = { now: Date.parse('2026-11-03T08:00:00Z') }
+  const unlock = new VoiceUnlock({
+    killswitch,
+    send: send ? async text => void sent.push(text) : null,
+    paused,
+    host: 'testbox',
+    stopped: ['The worker container voice-workers stays stopped: start it again with scripts/start-workers-container.sh.'],
+    log,
+    now: () => clock.now,
+  })
+  return { file, killswitch, unlock, sent, logged, clock }
+}
+
+test('the unlock in voice mode: a PIN of four digits only to the chat, in no result and no log line; a new one replaces the one before; the right one unlocks once', async () => {
+  const { file, killswitch, unlock, sent, logged } = pinned('unlocks')
+  assert.equal((await unlock.request()).status, 'not-locked')
+  assert.equal(unlock.attempt('1234').status, 'not-locked')
+  assert.deepEqual(sent, [], 'nothing to unlock, no PIN')
+  assert.equal(killswitch.byVoice, false)
+
+  killswitch.trip({ trigger: 'voice', reason: 'emergency stop' })
+  assert.equal(killswitch.byVoice, true)
+  assert.match(alarmText(killswitch.state, { voice: killswitch.byVoice }), /It is unlocked at the server, with scripts\/unlock\.mjs, or in voice mode with a PIN sent to Telegram\.$/)
+  const german = await unlock.request({ german: true })
+  assert.equal(german.status, 'sent')
+  assert.equal(german.minutes, 5)
+  assert.equal(german.state, killswitch.state)
+  assert.match(sent[0], /^Entsperr-PIN \d \d \d \d, gültig 5 Minuten$/)
+  const first = pinIn(sent[0])
+  // A new one replaces it.
+  let second = first
+  while (second === first) {
+    await unlock.request()
+    second = pinIn(sent.at(-1))
+  }
+  assert.match(sent.at(-1), /^Unlock PIN \d \d \d \d, valid 5 minutes$/)
+  assert.deepEqual(unlock.attempt(first), { status: 'wrong', left: 2 })
+  assert.equal(killswitch.state.wrongPins, 1)
+  assert.equal(JSON.parse(readFileSync(file, 'utf8')).wrongPins, 1, 'counted with the lock, in its file')
+  // Not four digits: nothing tried, nothing counted.
+  for (const said of ['12', '12345', 'vier sieben eins neun', '']) assert.equal(unlock.attempt(said).status, 'invalid', said)
+  assert.equal(killswitch.state.wrongPins, 1)
+
+  // As read out, digit by digit.
+  const was = killswitch.state
+  const done = unlock.attempt([...second].join(' '))
+  assert.equal(done.status, 'unlocked')
+  assert.equal(done.was, was)
+  assert.equal(killswitch.locked, false)
+  assert.equal(existsSync(file), false)
+  assert.equal(sent.at(-1), `cc-voice-gateway on testbox: kill switch unlocked in voice mode, with the PIN sent here. It was locked since ${alarmText(was, { short: true }).match(/since (.*?), by/)[1]}, by voice: emergency stop. The gateway takes tasks again. The worker container voice-workers stays stopped: start it again with scripts/start-workers-container.sh.`)
+  assert.ok(logged.some(line => /^kill switch unlocked by the driver in voice mode, with a PIN from Telegram; it was locked since .* by voice$/.test(line)))
+  assert.equal(unlock.attempt(second).status, 'not-locked', 'once')
+  assert.equal(logged.filter(line => /an unlock PIN for voice mode went to the driver's Telegram chat, valid 5 minutes; 3 tries left for this lock/.test(line)).length, sent.length - 1)
+  assert.ok(logged.some(line => line === 'kill switch: a wrong PIN in voice mode; 2 tries left for this lock'))
+  for (const pin of [first, second]) {
+    assert.ok(!logged.some(line => holdsPin(line, pin)), 'no PIN in the log')
+    assert.ok(!holdsPin(JSON.stringify([german, done]), pin), 'nor in a result')
+  }
+})
+
+test('the unlock in voice mode: a PIN expires after five minutes and counts nothing then; a new trigger or an unlock at the server voids it', async () => {
+  const { killswitch, unlock, sent, clock } = pinned('expires')
+  killswitch.trip({ trigger: 'rule', reason: 'push to the default branch' })
+  await unlock.request()
+  clock.now += 5 * 60000
+  const late = pinIn(sent.at(-1))
+  clock.now += 1
+  assert.deepEqual(unlock.attempt(late), { status: 'expired' })
+  assert.deepEqual(unlock.attempt(late), { status: 'no-pin' })
+  assert.equal(killswitch.state.wrongPins, undefined, 'no try counted')
+
+  // Just within the five minutes it still unlocks.
+  await unlock.request()
+  clock.now += 5 * 60000
+  assert.equal(unlock.attempt(pinIn(sent.at(-1))).status, 'unlocked')
+
+  // A new trigger has a reason of its own: the PIN before it is void.
+  killswitch.trip({ trigger: 'rule', reason: 'writes outside the repository' })
+  await unlock.request()
+  const before = pinIn(sent.at(-1))
+  killswitch.trip({ trigger: 'controller', reason: 'the worker does what nobody asked for' })
+  assert.deepEqual(unlock.attempt(before), { status: 'no-pin' })
+  // So does an unlock at the server: the next lock needs a PIN of its own.
+  await unlock.request()
+  const old = pinIn(sent.at(-1))
+  killswitch.unlock({ by: 'scripts/unlock.mjs' })
+  killswitch.trip({ trigger: 'voice', reason: 'emergency stop' })
+  assert.deepEqual(unlock.attempt(old), { status: 'no-pin' })
+})
+
+test('the unlock in voice mode: three wrong PINs, across PINs, block it for the lock, also after a restart; the server still unlocks, and the next lock starts afresh', async () => {
+  const { file, killswitch, unlock, sent, logged } = pinned('blocks')
+  killswitch.trip({ trigger: 'controller', reason: 'a planted instruction' })
+  await unlock.request()
+  assert.deepEqual(unlock.attempt(wrongOf(pinIn(sent.at(-1)))), { status: 'wrong', left: 2 })
+  await unlock.request()
+  const pin = pinIn(sent.at(-1))
+  assert.deepEqual(unlock.attempt(wrongOf(pin)), { status: 'wrong', left: 1 })
+  assert.deepEqual(unlock.attempt(wrongOf(pin)), { status: 'blocked', now: true })
+  assert.equal(
+    sent.at(-1),
+    'cc-voice-gateway on testbox: 3 wrong PINs in voice mode, so unlocking by voice is blocked for this lock. Unlock at the server: node scripts/unlock.mjs',
+  )
+  assert.ok(logged.includes('kill switch: 3 wrong PINs in voice mode; for this lock only scripts/unlock.mjs unlocks it now'))
+  // The right one, and a new one, count for nothing now.
+  const count = sent.length
+  assert.deepEqual(unlock.attempt(pin), { status: 'blocked' })
+  assert.deepEqual(await unlock.request(), { status: 'blocked' })
+  assert.equal(sent.length, count, 'no new PIN')
+  assert.equal(killswitch.locked, true)
+  assert.equal(killswitch.byVoice, false)
+  assert.match(alarmText(killswitch.state, { voice: killswitch.byVoice }), /Only someone at the server can unlock it, with scripts\/unlock\.mjs\.$/)
+
+  // A restart keeps the count with the lock.
+  const restarted = new KillSwitch({ file, log: () => {} })
+  assert.equal(restarted.state.wrongPins, 3)
+  const again = new VoiceUnlock({ killswitch: restarted, send: async () => assert.fail('no PIN after a block'), log: () => {} })
+  assert.deepEqual(await again.request(), { status: 'blocked' })
+  // The server unlocks it as ever, and the next lock may be unlocked by voice again.
+  assert.equal(restarted.unlock({ by: 'scripts/unlock.mjs' }).wrongPins, 3)
+  assert.equal(existsSync(file), false)
+  killswitch.unlock({ by: 'scripts/unlock.mjs' })
+  killswitch.trip({ trigger: 'voice', reason: 'emergency stop' })
+  assert.equal(killswitch.state.wrongPins, undefined)
+  assert.equal((await unlock.request()).status, 'sent')
+  assert.equal(unlock.attempt(pinIn(sent.at(-1))).status, 'unlocked')
+})
+
+test('the unlock in voice mode: not without Telegram, not in a standby, not for a kill switch file that cannot be read; a PIN that did not go out is none', async () => {
+  const off = pinned('no-telegram', { send: false })
+  off.killswitch.trip({ trigger: 'voice', reason: 'emergency stop' })
+  assert.deepEqual(await off.unlock.request(), { status: 'no-telegram' })
+  assert.deepEqual(off.unlock.attempt('1234'), { status: 'no-telegram' })
+  assert.equal(off.killswitch.byVoice, false)
+
+  let standby = true
+  const paused = pinned('standby', { paused: () => standby })
+  paused.killswitch.trip({ trigger: 'voice', reason: 'emergency stop' })
+  assert.deepEqual(await paused.unlock.request(), { status: 'standby' })
+  assert.deepEqual(paused.sent, [])
+  standby = false
+  await paused.unlock.request()
+  standby = true
+  assert.deepEqual(paused.unlock.attempt(pinIn(paused.sent.at(-1))), { status: 'standby' })
+  assert.equal(paused.killswitch.locked, true)
+
+  const file = join(TMP, 'pin', 'unreadable', 'killswitch.json')
+  mkdirSync(join(TMP, 'pin', 'unreadable'), { recursive: true })
+  writeFileSync(file, '{ not json')
+  const damaged = new KillSwitch({ file, log: () => {} })
+  const sent = []
+  const unlock = new VoiceUnlock({ killswitch: damaged, send: async text => void sent.push(text), log: () => {} })
+  assert.deepEqual(await unlock.request(), { status: 'unreadable' })
+  assert.deepEqual(sent, [])
+  assert.equal(damaged.byVoice, false)
+
+  const logged = []
+  const failing = new KillSwitch({ file: join(TMP, 'pin', 'unsent', 'killswitch.json'), log: () => {} })
+  const broken = new VoiceUnlock({ killswitch: failing, send: async () => { throw new Error('502 Bad Gateway') }, log: (...parts) => logged.push(parts.join(' ')) })
+  failing.trip({ trigger: 'voice', reason: 'emergency stop' })
+  assert.deepEqual(await broken.request(), { status: 'unsent', why: '502 Bad Gateway' })
+  assert.equal(broken.pin, null)
+  assert.deepEqual(broken.attempt('1234'), { status: 'no-pin' })
+  assert.deepEqual(logged.slice(0, 1), ['kill switch: the unlock PIN was not sent by Telegram, so none is valid: 502 Bad Gateway'])
+})
+
+test('the unlock PIN typed on Telegram: masked in the input log, the log and every event, and not passed on; other digits stay', async () => {
+  const { killswitch, unlock, sent } = pinned('telegram')
+  assert.equal(unlock.masked('PIN 1234'), 'PIN 1234', 'no PIN, nothing masked')
+  killswitch.trip({ trigger: 'voice', reason: 'emergency stop' })
+  await unlock.request()
+  const pin = pinIn(sent.at(-1))
+  const spaced = [...pin].join(' ')
+  assert.equal(unlock.masked(`Der PIN ist ${pin}`), 'Der PIN ist ****')
+  assert.equal(unlock.masked(`PIN: ${spaced}.`), 'PIN: ****.')
+  assert.equal(unlock.masked(`${[...pin].join('-')} please`), '**** please')
+  assert.equal(unlock.masked(`7${pin}0`), '****', 'within more digits')
+  const other = wrongOf(pin)
+  assert.equal(unlock.masked(`pull request ${other}`), `pull request ${other}`)
+
+  const recorded = []
+  const logged = []
+  const heard = []
+  const commands = new TelegramCommands(
+    { chatId: '4242' },
+    { answers: true, record: entry => recorded.push(entry), masked: text => unlock.masked(text), log: line => logged.push(line) },
+  )
+  for (const name of ['stop', 'answer', 'refused', 'away']) commands.on(name, event => heard.push([name, event]))
+  let id = 900
+  const update = text =>
+    commands.handle({ update_id: id, message: { message_id: id++, date: Math.floor(Date.now() / 1000), chat: { id: 4242, type: 'private' }, from: { id: 4242, is_bot: false }, text } })
+  update(pin)
+  update(`/unlock ${spaced}`)
+  update(`Kill switch ${pin}`) // a stop, with the PIN masked in its reason
+  update(`Fix pull request ${other}`)
+  assert.deepEqual(
+    heard.map(([name, event]) => [name, event.why ?? event.text]),
+    [
+      ['refused', 'it holds the unlock PIN, which counts only when you say it in voice mode. Say it there.'],
+      ['refused', 'it holds the unlock PIN, which counts only when you say it in voice mode. Say it there.'],
+      ['stop', 'Kill switch ****'],
+      ['answer', `Fix pull request ${other}`],
+    ],
+  )
+  assert.deepEqual(recorded.slice(0, 3).map(entry => entry.text), ['****', '/unlock ****', 'Kill switch ****'])
+  for (const text of [JSON.stringify(recorded), JSON.stringify(heard), logged.join('\n')]) assert.ok(!holdsPin(text, pin), text)
+  assert.equal(killswitch.locked, true, 'Telegram never unlocks')
 })
 
 // --- the rules ---------------------------------------------------------------------------
@@ -1360,6 +1593,22 @@ async function startGateway({ secrets = SECRETS, state = join(TMP, 'state'), roo
 const killswitchState = async () => adminRequest(join(SECRETS, 'admin.sock'), 'GET', '/killswitch')
 const unlockByAdmin = () => adminRequest(join(SECRETS, 'admin.sock'), 'POST', '/unlock', { by: 'test' })
 
+// scripts/unlock.mjs, as at the server's terminal.
+const unlockScript = args =>
+  new Promise(resolve => {
+    const child = spawn(process.execPath, [UNLOCK, ...args], { env: { ...process.env, VOICE_GW_SECRETS_DIR: SECRETS }, stdio: ['ignore', 'pipe', 'pipe'] })
+    let out = ''
+    child.stdout.on('data', chunk => (out += chunk))
+    child.stderr.on('data', chunk => (out += chunk))
+    child.on('close', status => resolve({ status, out }))
+  })
+
+// Every file in a folder and below, for a text that must not be there.
+const filesIn = dir =>
+  readdirSync(dir, { recursive: true })
+    .map(name => join(dir, name))
+    .filter(path => statSync(path).isFile())
+
 before(async () => {
   repo('alpha')
   repo('beta')
@@ -1402,9 +1651,9 @@ test('voice: "emergency stop" locks before anything reaches the controller; ever
   assert.equal(statSync(LOCK).mode & 0o777, 0o600)
 
   // Inactive from the emergency stop on, and never "use another connector": that would carry the work past the stop.
-  assert.match(gw.lines.at(-1), /: inactive, kill switch locked; it can only be unlocked at the computer$/)
+  assert.match(gw.lines.at(-1), /: inactive, kill switch locked; it is unlocked at the computer, or with unlock and a PIN from Telegram$/)
   assert.match(await gw.voice.car('status'), /^\[gateway=ok .* locked=yes\]\n(?!\[ALARM\])/, 'the car heard it already')
-  assert.match(gw.lines.at(-1), /^Gateway \S.*: inactive, kill switch locked; it can only be unlocked at the computer$/)
+  assert.match(gw.lines.at(-1), /^Gateway \S.*: inactive, kill switch locked; it is unlocked at the computer, or with unlock and a PIN from Telegram$/)
   const phone = await gw.voice.phone('status')
   assert.match(phone, /^\[gateway=ok .* locked=yes\]\n\[ALARM\] Kill switch locked since .*, by voice: .* Read this to the user first\./)
   assert.doesNotMatch(await gw.voice.phone('status'), /\[ALARM\]/, 'once per voice chat')
@@ -1419,7 +1668,7 @@ test('voice: "emergency stop" locks before anything reaches the controller; ever
   const refused = await gw.voice.car('send', { message: 'Fix the typo.' })
   assert.match(refused, /^\[state=locked\] .* Nothing was handed over\./)
   assert.doesNotMatch(refused, /another connector/)
-  assert.match(gw.lines.at(-1), /: inactive, kill switch locked; it can only be unlocked at the computer$/)
+  assert.match(gw.lines.at(-1), /: inactive, kill switch locked; it is unlocked at the computer, or with unlock and a PIN from Telegram$/)
   assert.ok(!gw.events.some(e => e.content === 'Fix the typo.'))
   assert.match(await gw.voice.car('approve', { code: 'fghjk', decision: 'allow' }), /^\[approval=locked code=fghjk\]/)
 
@@ -1433,7 +1682,7 @@ test('voice: "emergency stop" locks before anything reaches the controller; ever
   assert.ok(!gw.log.includes(TOKEN), 'the Telegram token never reaches the log')
 })
 
-test('the lock survives a restart, and only the local script unlocks it', async () => {
+test('the lock survives a restart, and the local script unlocks it', async () => {
   await gw.close()
   gw = await startGateway()
   const dispatch = await gw.controller('dispatch', { worker: 'alpha', task: 'Fix it.', words: 'Fix it.' })
@@ -1441,13 +1690,7 @@ test('the lock survives a restart, and only the local script unlocks it', async 
   assert.match(await gw.voice.car('status'), /\[ALARM\] Kill switch locked since/, 'heard again after the restart')
   assert.match(gw.log, /kill switch is locked since .* by voice/)
 
-  const run = args => new Promise(resolve => {
-    const child = spawn(process.execPath, [UNLOCK, ...args], { env: { ...process.env, VOICE_GW_SECRETS_DIR: SECRETS }, stdio: ['ignore', 'pipe', 'pipe'] })
-    let out = ''
-    child.stdout.on('data', chunk => (out += chunk))
-    child.stderr.on('data', chunk => (out += chunk))
-    child.on('close', status => resolve({ status, out }))
-  })
+  const run = unlockScript
   const status = await run(['--status'])
   assert.equal(status.status, 0)
   assert.match(status.out, /^The kill switch is locked since .*, by voice: "Emergency stop!" by voice\n/)
@@ -1463,6 +1706,158 @@ test('the lock survives a restart, and only the local script unlocks it', async 
   const again = await gw.dispatch('alpha', 'Look at the README.')
   assert.match(again.text, /^\[dispatch=started worker=alpha/)
   assert.match((await run([])).out, /The kill switch is not locked\./)
+})
+
+test("voice: unlock with a PIN sent to Telegram; the PIN only in the driver's chat, never in a result, a log, a file or an event for the controller; typed on Telegram it counts for nothing, and the controller has no way", async () => {
+  assert.equal(await gw.voice.car('unlock'), '[unlock=none] The kill switch is not locked; there is nothing to unlock. Tell the user.')
+  const sentBefore = telegram.sent.length
+  const eventsBefore = gw.events.length
+  const after = pattern => telegram.sent.slice(sentBefore).find(message => pattern.test(message.text))
+  // The controller has no tool for it, and its instructions say it never unlocks.
+  const { tools } = await gw.claudeCode.listTools()
+  assert.deepEqual(tools.filter(tool => /unlock/i.test(tool.name)), [])
+  assert.match(gw.claudeCode.getInstructions(), /Only the driver can unlock it: at the computer, or in voice mode\nwith a PIN the gateway sends them; never you\./)
+  // The connector's rule for it, with Telegram set up for the PIN.
+  const instructions = gw.voice.carClient.getInstructions()
+  assert.ok(
+    instructions
+      .split('\n')
+      .includes(
+        'Unlock: when the user asks to unlock the kill switch, call unlock without a pin, read out the reason it gives, and ask for the PIN that went to their Telegram chat; then call unlock with it. Never guess a PIN.',
+      ),
+  )
+  assert.match(instructions, /A locked kill switch is unlocked at the computer, or with unlock and a PIN from Telegram: tell the user so\.$/)
+  const emergency = (await gw.voice.carClient.listTools()).tools.find(tool => tool.name === 'emergency_stop')
+  assert.match(emergency.description, /until it is unlocked at the computer, or with unlock\./)
+  assert.match(gw.log, /kill switch: the driver can unlock it in voice mode, with a PIN of 4 digits sent to their Telegram chat, valid 5 minutes; 3 wrong ones block that for the lock\. scripts\/unlock\.mjs always unlocks/)
+
+  await gw.voice.car('send', { message: 'Emergency stop!' })
+  const alarm = await waitUntil(() => after(/KILL SWITCH/))
+  assert.match(alarm.text, /Unlock at the server: node scripts\/unlock\.mjs, or in voice mode with a PIN sent here\.$/)
+  const controllerAlarm = await waitUntil(() => gw.events.slice(eventsBefore).find(e => e.meta?.kind === 'killswitch'))
+  assert.match(controllerAlarm.content, /It is unlocked at the server, with scripts\/unlock\.mjs, or in voice mode with a PIN sent to Telegram\. Do not try to get around it\./)
+
+  // A PIN to the driver's chat; the result gives the reason to read out, not the PIN.
+  const asked = await gw.voice.car('unlock', { language: 'de' })
+  assert.match(
+    asked,
+    /^\[unlock=pin-sent minutes=5\] Kill switch locked since .* UTC, by voice: "Emergency stop!" by voice\. A new PIN of four digits went to the user's Telegram chat, valid 5 minutes\. Read the reason to the user, then ask them for the PIN and call unlock with it\.$/,
+  )
+  const message = after(/PIN \d/)
+  assert.equal(message.chat_id, CHAT)
+  assert.match(message.text, /^Entsperr-PIN \d \d \d \d, gültig 5 Minuten$/)
+  assert.equal(message.reply_parameters, undefined)
+  const pin = pinIn(message.text)
+
+  // Typed on Telegram: not passed on, and masked in the input log.
+  telegramUpdate(CHAT, pin)
+  telegramUpdate(CHAT, `/unlock ${pin}`)
+  await waitUntil(() => telegram.sent.slice(sentBefore).filter(m => m.text.startsWith('Not passed on: it holds the unlock PIN')).length === 2)
+  assert.equal(after(/^Not passed on: it holds/).text, 'Not passed on: it holds the unlock PIN, which counts only when you say it in voice mode. Say it there.')
+  const inputLog = readFileSync(join(TMP, 'state', 'telegram-input.log'), 'utf8').trim().split('\n').slice(-2).map(line => JSON.parse(line))
+  assert.deepEqual(inputLog.map(entry => [entry.text, entry.decision]), [['****', 'refused'], ['/unlock ****', 'refused']])
+  assert.equal((await killswitchState()).locked, true)
+  // The controller cannot either: its tools answer locked, with how the driver can unlock it.
+  const dispatch = await gw.controller('dispatch', { worker: 'alpha', task: 'Fix it.', words: 'Fix it.' })
+  assert.match(dispatch.text, /^\[dispatch=locked worker=alpha\] .* or in voice mode with a PIN sent to Telegram\. Nothing started\./)
+
+  // A wrong one counts; the right one, as read out, from another voice chat, unlocks.
+  const wrong = await gw.voice.car('unlock', { pin: wrongOf(pin) })
+  assert.equal(wrong, '[unlock=wrong left=2] Wrong PIN, still locked; 2 tries left. Ask the user to read the PIN again, digit by digit.')
+  const done = await gw.voice.phone('unlock', { pin: [...pin].join(' ') })
+  assert.equal(done, '[unlock=done] Unlocked: the gateway takes tasks again. Tell the user.')
+  assert.match(gw.lines.at(-1), /: active$/)
+  assert.equal(existsSync(LOCK), false)
+  assert.equal((await killswitchState()).locked, false)
+  const notice = await waitUntil(() => after(/kill switch unlocked in voice mode/))
+  assert.match(
+    notice.text,
+    /^cc-voice-gateway on \S+: kill switch unlocked in voice mode, with the PIN sent here\. It was locked since .* UTC, by voice: "Emergency stop!" by voice\. The gateway takes tasks again\.$/,
+  )
+  assert.match(gw.log, /kill switch: a wrong PIN in voice mode; 2 tries left for this lock/)
+  assert.match(gw.log, /kill switch unlocked by the driver in voice mode, with a PIN from Telegram; it was locked since .* by voice/)
+  assert.match(await gw.voice.car('unlock', { pin }), /^\[unlock=none\]/, 'once')
+  const again = await gw.dispatch('alpha', 'Look at the README once more.')
+  assert.match(again.text, /^\[dispatch=started worker=alpha/)
+
+  // The PIN in nothing but its message.
+  for (const out of [asked, wrong, done]) assert.doesNotMatch(out, FILLERS)
+  const places = {
+    results: [asked, wrong, done].join('\n'),
+    log: gw.log,
+    'events for the controller': JSON.stringify(gw.events.slice(eventsBefore)),
+    'other Telegram messages': JSON.stringify(telegram.sent.slice(sentBefore).filter(m => m !== message)),
+    ...Object.fromEntries(filesIn(join(TMP, 'state')).map(file => [file, readFileSync(file, 'utf8')])),
+    ...Object.fromEntries(filesIn(SECRETS).filter(file => !/telegram_/.test(file)).map(file => [file, readFileSync(file, 'utf8')])),
+  }
+  for (const [where, text] of Object.entries(places)) assert.ok(!holdsPin(text, pin), `the PIN in ${where}`)
+})
+
+test('voice: three wrong PINs block the unlock by voice for the lock, also across a restart; the driver hears it on Telegram, and scripts/unlock.mjs still unlocks', async () => {
+  const sentBefore = telegram.sent.length
+  await gw.controller('raise_alarm', { reason: 'The worker in alpha writes to files nobody asked for.' })
+  assert.equal((await killswitchState()).locked, true)
+  const pinNow = async () => {
+    await gw.voice.car('unlock')
+    return pinIn(telegram.sent.slice(sentBefore).findLast(m => /^Unlock PIN/.test(m.text)).text)
+  }
+  const first = await pinNow()
+  assert.match(await gw.voice.car('unlock', { pin: wrongOf(first) }), /^\[unlock=wrong left=2\]/)
+  const second = await pinNow()
+  assert.match(await gw.voice.car('unlock', { pin: wrongOf(second) }), /^\[unlock=wrong left=1\] Wrong PIN, still locked; one try left\./)
+  const blocked = await gw.voice.car('unlock', { pin: wrongOf(second) })
+  assert.equal(
+    blocked,
+    '[unlock=blocked] Wrong PIN, and that was the last try: unlocking by voice is blocked for this lock; it is unlocked only at the computer now. Tell the user.',
+  )
+  const notice = await waitUntil(() => telegram.sent.slice(sentBefore).find(m => /3 wrong PINs/.test(m.text)))
+  assert.match(notice.text, /^cc-voice-gateway on \S+: 3 wrong PINs in voice mode, so unlocking by voice is blocked for this lock\. Unlock at the server: node scripts\/unlock\.mjs$/)
+  // The right one, and a new one, count for nothing now.
+  const after = '[unlock=blocked] After 3 wrong PINs, unlocking by voice is blocked for this lock; it is unlocked only at the computer now. Tell the user.'
+  assert.equal(await gw.voice.car('unlock', { pin: second }), after)
+  const count = telegram.sent.length
+  assert.equal(await gw.voice.car('unlock'), after)
+  assert.equal(telegram.sent.length, count, 'no PIN after the block')
+  assert.match(gw.lines.at(-1), /: inactive, kill switch locked; it can only be unlocked at the computer$/)
+  assert.equal(JSON.parse(readFileSync(LOCK, 'utf8')).wrongPins, 3)
+  for (const out of [blocked, after]) assert.doesNotMatch(out, FILLERS)
+  const log = gw.log
+
+  // A restart keeps the block with the lock.
+  await gw.close()
+  gw = await startGateway()
+  assert.match(await gw.voice.car('unlock'), /^\[unlock=blocked\] After 3 wrong PINs/)
+  assert.match(await gw.voice.car('status'), /^\[gateway=ok .* locked=yes\]/)
+  assert.ok(!telegram.sent.slice(count).some(m => /^(Unlock|Entsperr)-? ?PIN/.test(m.text)), 'no PIN after the restart either')
+
+  // The server unlocks it, as ever, and says why voice did not.
+  const status = await unlockScript(['--status'])
+  assert.match(status.out, /\nUnlocking in voice mode is blocked for this lock, after 3 wrong PINs; here it still unlocks\.\n$/)
+  const unlocked = await unlockScript(['--yes'])
+  assert.equal(unlocked.status, 0, unlocked.out)
+  assert.match(unlocked.out, /Unlocked: the gateway takes tasks again\./)
+  assert.equal((await killswitchState()).locked, false)
+  for (const pin of [first, second]) assert.ok(!holdsPin(log + gw.log, pin), 'no PIN in the log')
+})
+
+test('voice: no unlock in a standby, and no PIN', async () => {
+  const dir = join(TMP, 'standby-unlock')
+  const secrets = join(dir, 'secrets')
+  mkdirSync(secrets, { recursive: true, mode: 0o700 })
+  writeFileSync(join(secrets, 'telegram_token'), `${TOKEN}\n`)
+  writeFileSync(join(secrets, 'telegram_chat_id'), `${CHAT}\n`)
+  writeFileSync(join(secrets, 'killswitch.json'), JSON.stringify({ id: 'x1', trigger: 'voice', reason: 'test', at: new Date().toISOString(), events: [] }))
+  const count = telegram.sent.length
+  const g = await startGateway({ secrets, state: join(dir, 'state'), env: { VOICE_GW_STANDBY: '1' } })
+  try {
+    assert.match(await g.voice.car('unlock'), /^\[unlock=standby\] This gateway is in a standby: it unlocks nothing by voice until it is active again\. Tell the user\./)
+    assert.match(await g.voice.car('unlock', { pin: '1234' }), /^\[unlock=standby\]/)
+    assert.match(g.lines.at(-1), /: inactive, on standby by its settings; use another connector$/)
+    assert.ok(!telegram.sent.slice(count).some(m => /^(Unlock|Entsperr)-? ?PIN/.test(m.text)), 'no PIN')
+    assert.equal(JSON.parse(readFileSync(join(secrets, 'killswitch.json'), 'utf8')).wrongPins, undefined, 'no try')
+  } finally {
+    await g.close()
+  }
 })
 
 test('Telegram: /stop from the configured chat locks it; from any other chat nothing happens', async () => {

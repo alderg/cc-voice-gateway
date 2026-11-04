@@ -4,7 +4,8 @@
 // Claude Code starts this file as an MCP server (see controller/.mcp.json).
 // One process, two faces:
 //   stdio  -> Claude Code controller session (a channel: push events, reply tool, permission relay)
-//   HTTP   -> voice assistant in the car (MCP tools: status, send, ask, get_reply, approve),
+//   HTTP   -> voice assistant in the car (MCP tools: status, send, ask, get_reply, approve,
+//             emergency_stop, unlock),
 //             behind an OAuth sign-in, and through the tunnel only from Anthropic's
 //             addresses (ipguard.mjs)
 // plus a Unix socket for scripts/pair.mjs (pairing codes, connections), the
@@ -47,7 +48,7 @@ import {
   scrubEnv,
   secureSecrets,
 } from './telegram.mjs'
-import { KillSwitch, alarmText, offText } from './killswitch.mjs'
+import { KillSwitch, PIN_DIGITS, PIN_MINUTES, PIN_TRIES, VoiceUnlock, alarmText, offText } from './killswitch.mjs'
 import { RunGuard } from './guard.mjs'
 import { realpathSync } from 'node:fs'
 import { hostname } from 'node:os'
@@ -111,7 +112,7 @@ log(
 )
 if (killswitch.locked) {
   log(`kill switch is locked since ${killswitch.state.at} by ${killswitch.state.trigger}: ${killswitch.state.reason}`)
-  if (killswitch.mode !== 'auto') log('kill switch: the setting does not unlock it; only scripts/unlock.mjs does')
+  if (killswitch.mode !== 'auto') log('kill switch: the setting does not unlock it; only scripts/unlock.mjs or the driver in voice mode does')
 }
 const auth = new Auth({ stateFile: config.oauthStateFile, allowedHosts: config.oauthHosts })
 // The standby after the connector was disconnected (standby.mjs), and which
@@ -573,6 +574,28 @@ if (telegram) {
   // Every message the bot receives, accepted, refused or ignored.
   inputLog = new TelegramInputLog({ file: config.telegramInputLog, secrets: [telegram.token] })
 }
+// The unlock in voice mode (killswitch.mjs): a PIN to the driver's own
+// private chat with the bot, never quoted to the controller, taken back only
+// by the voice connector's tool unlock, and not in a standby. Without
+// Telegram, or with a chat that is no person's, only scripts/unlock.mjs
+// unlocks. The containers the lock stopped stay stopped, as after the script.
+const unlock = new VoiceUnlock({
+  killswitch,
+  send: telegram && driverId(telegram.chatId) ? text => telegram.send(text, { quote: false }) : null,
+  paused: () => Boolean(presence.state().standby),
+  host: hostname(),
+  stopped: containers.map(container =>
+    container === runner
+      ? `The worker container ${container.container} stays stopped: start it again with scripts/start-workers-container.sh.`
+      : `The work folder container ${container.container} stays stopped: start it again with scripts/start-workers-container.sh --scratch.`,
+  ),
+})
+log(
+  unlock.send
+    ? `kill switch: the driver can unlock it in voice mode, with a PIN of ${PIN_DIGITS} digits sent to their Telegram chat, ` +
+        `valid ${PIN_MINUTES} minutes; ${PIN_TRIES} wrong ones block that for the lock. scripts/unlock.mjs always unlocks`
+    : 'kill switch: no unlock in voice mode, which needs Telegram for its PIN; only scripts/unlock.mjs unlocks',
+)
 let telegramCommands = null
 // The Funnel on demand (funnel.mjs): from Telegram, and off by itself when idle.
 const say = text => telegram?.send(text).catch(error => log('telegram message not sent:', error.message)) ?? Promise.resolve()
@@ -665,6 +688,8 @@ if (telegram) {
     pollSeconds: config.telegramPollSeconds,
     answers: Boolean(answers),
     record,
+    // The unlock PIN, typed there: masked, and not passed on.
+    masked: text => unlock.masked(text),
     known: id => telegram.sent(id) || (answers?.asks(id) ?? false),
     ...(config.telegramRequests ? { asks: id => answers.asks(id) } : {}),
   }).start()
@@ -769,7 +794,9 @@ killswitch.on('tripped', async (state, event, first) => {
     ?.send(
       `cc-voice-gateway on ${hostname()}: ${first ? 'KILL SWITCH' : 'kill switch, again'} at ${when} UTC, ` +
         `by ${event.trigger}: ${event.reason}. No new tasks, workers stopped, repositories read-only for the ` +
-        'worker container. Unlock only at the server: node scripts/unlock.mjs',
+        (killswitch.byVoice
+          ? 'worker container. Unlock at the server: node scripts/unlock.mjs, or in voice mode with a PIN sent here.'
+          : 'worker container. Unlock only at the server: node scripts/unlock.mjs'),
     )
     .catch(error => log('kill switch alarm not sent by Telegram:', error.message))
   // The controller hears it too; its acknowledgement is not news.
@@ -783,8 +810,8 @@ killswitch.on('tripped', async (state, event, first) => {
         'now, which holds nothing. Tell the driver; after the unlock they can have them dispatched again.'
       : ''
     const request = store.createRequest(
-      `${first ? 'Kill switch locked' : 'Kill switch triggered again'}: ${alarmText(state)} Do not try to get ` +
-        `around it.${queue} Reply "done".`,
+      `${first ? 'Kill switch locked' : 'Kill switch triggered again'}: ${alarmText(state, { voice: killswitch.byVoice })} ` +
+        `Do not try to get around it.${queue} Reply "done".`,
       { origin: 'alarm' },
     )
     await channel.push(request, { kind: 'killswitch', trigger: event.trigger })
@@ -829,7 +856,7 @@ async function portBusy() {
 }
 
 admin = await startAdmin(auth, config.adminSocket, { killswitch })
-http = startVoiceHttp(store, channel, auth, config, { killswitch, onPortBusy: portBusy, guard: ipGuard, presence, standby, limits, night })
+http = startVoiceHttp(store, channel, auth, config, { killswitch, onPortBusy: portBusy, guard: ipGuard, presence, standby, limits, night, unlock })
 
 // Once the session is connected: first one event with everything open, so
 // that a restarted controller knows it without memory files; its answer is

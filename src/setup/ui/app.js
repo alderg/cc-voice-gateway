@@ -184,7 +184,7 @@ const KILLSWITCH_WARNINGS = {
   off:
     'Warning: nothing then locks the gateway, not even "emergency stop" by voice or /stop on Telegram; the ' +
     'gateway only logs them. Workers can be stopped one by one with stop_worker. A lock from before stays ' +
-    'until it is unlocked at the computer.',
+    'until it is unlocked, at the computer or in voice mode with a PIN from Telegram.',
 }
 
 function showKillSwitchWarning() {

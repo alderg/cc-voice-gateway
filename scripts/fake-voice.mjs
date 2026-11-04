@@ -14,6 +14,7 @@
 //   answer <text>          answer the last question (send with in_reply_to)
 //   allow <code>           approve a permission prompt
 //   deny <code>            reject a permission prompt
+//   unlock [pin]           unlock the kill switch: without a PIN, one goes to Telegram
 //   quit
 
 import { createInterface } from 'node:readline/promises'
@@ -34,7 +35,7 @@ try {
   console.error('Is the controller session running (scripts/start-controller.sh)?')
   process.exit(1)
 }
-console.log(`Connected to ${url.href}. Commands: status, ask, send, answer, follow, allow, deny, quit`)
+console.log(`Connected to ${url.href}. Commands: status, ask, send, answer, follow, allow, deny, unlock, quit`)
 
 let lastId = null
 let lastQuestionId = null
@@ -108,8 +109,13 @@ for await (const raw of rl) {
       case 'deny':
         console.log((await call('approve', { code: arg, decision: command })).text + '\n')
         break
+      case 'unlock':
+        console.log((await call('unlock', arg ? { pin: arg } : {})).text + '\n')
+        break
       default:
-        console.log('Commands: status, ask <text>, send <text>, answer <text>, follow [id], allow <code>, deny <code>, quit')
+        console.log(
+          'Commands: status, ask <text>, send <text>, answer <text>, follow [id], allow <code>, deny <code>, unlock [pin], quit',
+        )
     }
   } catch (error) {
     console.error(`Error: ${error.message}`)

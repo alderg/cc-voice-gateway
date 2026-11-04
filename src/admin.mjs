@@ -1,9 +1,11 @@
 // Local administration of the OAuth sign-in over a Unix socket in .secrets/:
 // pairing codes, the list of connections, revoking them, and tokens for local
-// tools such as fake-voice. Also the only way to unlock the kill switch
-// (scripts/unlock.mjs): the controller's shell cannot reach the socket, the
-// container does not have it, and voice and Telegram have no route to it. The folder is mode 0700, so only processes of the
-// same user reach the socket, and the tunnel never exposes it.
+// tools such as fake-voice. Also the way to unlock the kill switch that always
+// works (scripts/unlock.mjs): the controller's shell cannot reach the socket,
+// the container does not have it, and voice and Telegram have no route to it;
+// the driver's unlock in voice mode, with a PIN, is the gateway's own
+// (killswitch.mjs). The folder is mode 0700, so only processes of the same
+// user reach the socket, and the tunnel never exposes it.
 //
 // The server runs inside the gateway; scripts/pair.mjs, fake-voice and the
 // setup assistant's page (pairing codes) use adminRequest() as the client.

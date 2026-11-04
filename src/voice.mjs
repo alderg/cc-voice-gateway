@@ -8,6 +8,10 @@
 // (get_reply), because a single tool call has to finish before the client's
 // request deadline (commonly 60 s).
 //
+// While the kill switch is locked, the driver can unlock it here (unlock),
+// with a PIN that goes to their Telegram chat (VoiceUnlock in killswitch.mjs):
+// the PIN is in no result and no log line, and only this tool takes it.
+//
 // The driver may have several gateways, each a connector that looks alike
 // to the voice assistant: every answer starts with a line that names this one
 // and says whether it is active (presence.mjs), and the instructions and tool
@@ -23,7 +27,7 @@ import { z } from 'zod'
 import { VERSION } from './config.mjs'
 import { readBody } from './http.mjs'
 import { log, preview } from './log.mjs'
-import { alarmText, emergencyPhrase, offText } from './killswitch.mjs'
+import { PIN_MINUTES, PIN_TRIES, alarmText, emergencyPhrase, offText } from './killswitch.mjs'
 import { IpGuard, accessLine } from './ipguard.mjs'
 import { clock } from './limits.mjs'
 
@@ -54,17 +58,27 @@ const voiceLines = (askWait, replyWait) => [
     'without asking back. An [ALARM] line in any result is read out first.',
 ]
 
-// Which gateway this connector reaches, for a user with several: the name,
-// and a standby by the settings, which is known when the connector connects.
-function voiceInstructions(presence, askWait, replyWait) {
+// The unlock in voice mode, where Telegram is set up for its PIN (byPin): one
+// rule more. Which gateway this connector reaches, for a user with several:
+// the name, and a standby by the settings, which is known when the connector
+// connects.
+function voiceInstructions(presence, askWait, replyWait, byPin = false) {
   const lines = voiceLines(askWait, replyWait)
+  if (byPin) {
+    lines.push(
+      'Unlock: when the user asks to unlock the kill switch, call unlock without a pin, read out the reason it gives, ' +
+        'and ask for the PIN that went to their Telegram chat; then call unlock with it. Never guess a PIN.',
+    )
+  }
   if (!presence) return lines.join('\n')
   lines.push(
     `This connector is the gateway ${presence.label}. Every answer starts with a line that names it and says whether ` +
       'it is active; an inactive gateway hands nothing over. With several such connectors, one per computer, call ' +
       'status on each first and use the active one. Switch to another connector only when an answer says "use ' +
-      'another connector" (a gateway on standby). A locked kill switch is unlocked only at the computer: tell the ' +
-      'user so.',
+      'another connector" (a gateway on standby). ' +
+      (byPin
+        ? 'A locked kill switch is unlocked at the computer, or with unlock and a PIN from Telegram: tell the user so.'
+        : 'A locked kill switch is unlocked only at the computer: tell the user so.'),
   )
   if (presence.standbySetting) {
     lines.push('This gateway is on standby by its settings: it hands nothing over. Use another connector.')
@@ -217,6 +231,72 @@ async function waitAndReport(store, request, waitSeconds, signal, settings) {
   return text(report(store, request, settings))
 }
 
+// What unlock answers, by what VoiceUnlock made of the call (killswitch.mjs);
+// never the PIN. containers: whether workers run in a container, which stays
+// stopped after an unlock.
+function unlockText(result, containers = false) {
+  switch (result.status) {
+    case 'sent':
+      return (
+        `[unlock=pin-sent minutes=${result.minutes}] ${alarmText(result.state, { short: true })} A new PIN of four ` +
+        `digits went to the user's Telegram chat, valid ${result.minutes} minutes. Read the reason to the user, then ask ` +
+        'them for the PIN and call unlock with it.'
+      )
+    case 'unlocked':
+      return (
+        '[unlock=done] Unlocked: the gateway takes tasks again.' +
+        (containers ? ' Workers in a container wait until it is started again at the computer.' : '') +
+        ' Tell the user.'
+      )
+    case 'wrong':
+      return (
+        `[unlock=wrong left=${result.left}] Wrong PIN, still locked; ${result.left === 1 ? 'one try' : `${result.left} tries`} ` +
+        'left. Ask the user to read the PIN again, digit by digit.'
+      )
+    case 'blocked':
+      return (
+        (result.now
+          ? '[unlock=blocked] Wrong PIN, and that was the last try: '
+          : `[unlock=blocked] After ${PIN_TRIES} wrong PINs, `) +
+        'unlocking by voice is blocked for this lock; it is unlocked only at the computer now. Tell the user.'
+      )
+    case 'invalid':
+      return (
+        '[unlock=invalid] A PIN has four digits; nothing was tried. Ask the user for the four digits from Telegram and ' +
+        'call unlock with them.'
+      )
+    case 'no-pin':
+      return (
+        '[unlock=no-pin] No PIN is valid for this lock now. Call unlock without a pin, and a new one goes to the ' +
+        "user's Telegram chat."
+      )
+    case 'expired':
+      return (
+        `[unlock=expired] That PIN has expired, after ${PIN_MINUTES} minutes; still locked. Call unlock without a pin for a ` +
+        'new one, then ask the user for it.'
+      )
+    case 'unsent':
+      return (
+        `[unlock=unsent] The PIN could not be sent by Telegram (${preview(result.why, 120)}); still locked. Tell the user: ` +
+        'try again later, or unlock at the computer.'
+      )
+    case 'standby':
+      return (
+        '[unlock=standby] This gateway is in a standby: it unlocks nothing by voice until it is active again. Tell ' +
+        'the user.'
+      )
+    case 'no-telegram':
+      return (
+        '[unlock=no-telegram] Unlocking by voice needs Telegram for the PIN, and this gateway has no Telegram chat of the ' +
+        "user's, so it is unlocked only at the computer. Tell the user."
+      )
+    case 'unreadable':
+      return '[unlock=blocked] The kill switch file cannot be read, so it is unlocked only at the computer. Tell the user.'
+    default:
+      return '[unlock=none] The kill switch is not locked; there is nothing to unlock. Tell the user.'
+  }
+}
+
 function statusText(store, settings, killswitch) {
   const open = store.openRequests()
   const permissions = store.openPermissions()
@@ -252,15 +332,23 @@ function statusText(store, settings, killswitch) {
 const alarmed = new Map() // lock id -> Set of grant ids
 
 // One MCP server instance per HTTP request; cheap, and keeps the endpoint stateless.
-function buildVoiceServer(store, channel, config, { killswitch = null, grant = null, presence = null, limits = null, night = null } = {}) {
+// unlock: the unlock in voice mode (VoiceUnlock in killswitch.mjs), or null.
+function buildVoiceServer(
+  store,
+  channel,
+  config,
+  { killswitch = null, grant = null, presence = null, limits = null, night = null, unlock = null } = {},
+) {
   // The waits for the Claude usage limit (limits.mjs) and night mode
   // (night.mjs) go with the settings into the reports.
   const settings = limits || night ? { ...config, limits, night } : config
   const askWait = clamp(settings.askWaitSeconds, 1, settings.maxWaitSeconds)
   const replyWait = clamp(settings.defaultWaitSeconds, 1, settings.maxWaitSeconds)
+  // Whether Telegram is there for the unlock's PIN.
+  const byPin = Boolean(killswitch && unlock?.send)
   const mcp = new McpServer(
     { name: 'claude-code-voice', version: VERSION },
-    { instructions: voiceInstructions(presence, askWait, replyWait) },
+    { instructions: voiceInstructions(presence, askWait, replyWait, byPin) },
   )
   // The gateway in a tool's description, for a user with several.
   const named = description =>
@@ -291,7 +379,7 @@ function buildVoiceServer(store, channel, config, { killswitch = null, grant = n
     const state = killswitch?.state
     if (!state || heard(state)) return result
     const [head, ...rest] = result.content[0].text.split('\n')
-    const alarm = `[ALARM] ${alarmText(state)} Read this to the user first.`
+    const alarm = `[ALARM] ${alarmText(state, { voice: killswitch.byVoice })} Read this to the user first.`
     return { ...result, content: [{ type: 'text', text: [head, alarm, ...rest].join('\n') }, ...result.content.slice(1)] }
   }
 
@@ -301,7 +389,7 @@ function buildVoiceServer(store, channel, config, { killswitch = null, grant = n
     const state = killswitch.trip({ trigger: 'voice', reason }) ?? killswitch.state
     if (!state) return text(`[state=off] Emergency stop: ${offText()} Tell the user.`)
     heard(state)
-    return text(`[state=locked] Emergency stop. ${alarmText(state)} Tell the user it is done.`)
+    return text(`[state=locked] Emergency stop. ${alarmText(state, { voice: killswitch.byVoice })} Tell the user it is done.`)
   }
 
   // An emergency phrase locks the gateway before anything reaches Claude Code;
@@ -311,7 +399,7 @@ function buildVoiceServer(store, channel, config, { killswitch = null, grant = n
     if (killswitch && emergencyPhrase(message)) return emergency(`"${preview(message, 80)}" by voice`)
     if (killswitch?.locked) {
       heard(killswitch.state)
-      return text(`[state=locked] ${alarmText(killswitch.state)} Nothing was handed over. Tell the user.`)
+      return text(`[state=locked] ${alarmText(killswitch.state, { voice: killswitch.byVoice })} Nothing was handed over. Tell the user.`)
     }
     // Inactive otherwise: nothing waits here for a controller that is not
     // there. Only a standby sends the work to another connector.
@@ -360,7 +448,8 @@ function buildVoiceServer(store, channel, config, { killswitch = null, grant = n
         description: named(
           'Emergency stop (kill switch). Call it at once, without asking back, when the user says "emergency stop" ' +
             "or \"kill switch\", in any language. Locks the gateway: all work on the user's computer stops and " +
-            'nothing new starts, until someone unlocks it at the computer.',
+            'nothing new starts, until ' +
+            (byPin ? 'it is unlocked at the computer, or with unlock.' : 'someone unlocks it at the computer.'),
         ),
         inputSchema: {
           words: z.string().max(400).optional().describe("The user's words, if any."),
@@ -368,6 +457,47 @@ function buildVoiceServer(store, channel, config, { killswitch = null, grant = n
         annotations: { destructiveHint: true },
       },
       withLine(async ({ words }) => emergency(words ? `"${preview(words, 80)}" by voice` : 'emergency_stop by voice')),
+    )
+  }
+
+  // Only here, and only with the PIN that went to the user's Telegram chat.
+  // Without one, a new PIN goes there, and the result names the lock, whose
+  // alarm this voice chat has heard then.
+  if (killswitch && unlock) {
+    mcp.registerTool(
+      'unlock',
+      {
+        title: 'Unlock the kill switch',
+        description: named(
+          'Unlock the kill switch with a PIN from Telegram, only when the user asks for it. First call it without pin: ' +
+            'the result gives the reason it locked, which you read to the user, and a new PIN of four digits goes to the ' +
+            `user's Telegram chat, valid ${PIN_MINUTES} minutes. Then ask the user for the PIN and call unlock again with ` +
+            `it. Never guess a PIN: ${PIN_TRIES} wrong ones block unlocking by voice for this lock, and then it is ` +
+            'unlocked only at the computer.',
+        ),
+        inputSchema: {
+          pin: z
+            .string()
+            .max(40)
+            .optional()
+            .describe('The PIN as the user read it out, as digits. Leave it out to have a new one sent.'),
+          language: z
+            .string()
+            .max(20)
+            .optional()
+            .describe("The user's language, such as de or en, for the message with the PIN."),
+        },
+        annotations: { destructiveHint: true },
+      },
+      withLine(withAlarm(async ({ pin, language }) => {
+        const state = killswitch.state
+        if (!state) return text(unlockText({ status: 'not-locked' }))
+        const result = pin?.trim()
+          ? unlock.attempt(pin)
+          : await unlock.request({ german: /^(de|ger|deu)/i.test(String(language ?? '').trim()) })
+        if (result.status === 'sent') heard(state)
+        return text(unlockText(result, unlock.stopped.length > 0))
+      })),
     )
   }
 
@@ -568,13 +698,22 @@ function parseUrl(target) {
 // /mcp, and the alerts (ipguard.mjs). presence: which gateway this is, and
 // whether it is active (presence.mjs). standby: the standby after a
 // disconnect, which hears of every voice request without a valid token
-// (standby.mjs).
+// (standby.mjs). unlock: the unlock in voice mode (killswitch.mjs).
 export function startVoiceHttp(
   store,
   channel,
   auth,
   settings,
-  { killswitch = null, onPortBusy = null, guard = new IpGuard(), presence = null, standby = null, limits = null, night = null } = {},
+  {
+    killswitch = null,
+    onPortBusy = null,
+    guard = new IpGuard(),
+    presence = null,
+    standby = null,
+    limits = null,
+    night = null,
+    unlock = null,
+  } = {},
 ) {
   const server = createServer(async (req, res) => {
     const caller = guard.caller(req)
@@ -642,7 +781,7 @@ export function startVoiceHttp(
       res.on('close', () => store.voiceCallEnded())
     }
 
-    const mcp = buildVoiceServer(store, channel, settings, { killswitch, grant, presence, limits, night })
+    const mcp = buildVoiceServer(store, channel, settings, { killswitch, grant, presence, limits, night, unlock })
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
       enableJsonResponse: true,

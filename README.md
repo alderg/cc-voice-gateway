@@ -158,8 +158,8 @@ Claude app, and Claude Code on your computer. It is one Node.js process with two
 
 - **Towards the Claude app:** an MCP server over HTTPS. You add it in the Claude app as a custom
   connector. Claude's servers call its tools (`send`, `ask`, `get_reply`, `status`, `approve`,
-  `emergency_stop`) during a voice conversation, after an OAuth sign-in with a pairing code from
-  your computer.
+  `emergency_stop`, `unlock`) during a voice conversation, after an OAuth sign-in with a pairing
+  code from your computer.
 - **Towards Claude Code:** a [channel][channels], an MCP server that pushes each voice request into
   a running Claude Code session, the **controller**. The controller answers through the channel's
   `reply` tool. By default it may read its own folder and the status of pull requests, and does no
@@ -398,7 +398,7 @@ to a lost phone or a leaked token.
 | Actor | Can | Cannot |
 |---|---|---|
 | Anyone on the internet | Reach the sign-in page; get a line in the log, and for anything suspicious a message on Telegram | Reach `/mcp` from outside Anthropic's addresses; call a tool without a token; get a token without a pairing code from your computer |
-| A signed-in voice client | Send requests, read answers, answer approvals, lock the kill switch | Unlock the kill switch; reach the controller's tools directly |
+| A signed-in voice client | Send requests, read answers, answer approvals, lock the kill switch; with Telegram set up, unlock it with the PIN that comes to your Telegram chat ([5.9](#59-the-kill-switch)) | Unlock the kill switch without that PIN, after three wrong ones, in a standby or without Telegram; reach the controller's tools directly |
 | The controller, level `confined` (default) | Read `controller/`, write `controller/playground/`, read pull request and CI status, merge after an approval, dispatch workers with your words from a recent voice request, raise the alarm | Start a worker on words that only a worker result or a pull request brought in (see 5.4); anything else (see 5.3) |
 | The controller at `clone-delete` | As at `confined`; also clone GitHub repositories into the worker root and delete files and folders there, each deletion after its plan, your words and an approval | Delete outside the worker root, the gateway's own checkout, or in a repository while its worker runs |
 | The controller at `unrestricted` | Everything your user can: any command, any file, `.secrets/` included, the web, subagents; your MCP servers and connectors after an approval | Nothing is blocked; a merge in the strict form and a confirmed `delete_path` still ask (see 5.3) |
@@ -409,7 +409,7 @@ to a lost phone or a leaked token.
 | A run in a work folder on this computer | Everything your user can, without approvals; the rules allow writes only in its folder | Nothing is blocked; rules only observe, as for any worker |
 | A run in a work folder in its container | The work folders, Claude Code's token, the network | Your other files, SSH keys, `gh` login, the repositories, any GitHub token |
 | Others on GitHub | Comment on a watched pull request: the news names them; the text of the repository's owner, members and collaborators reaches the controller, marked `trusted="no"` | Get anyone else's text to the controller through the watch; have a fork or someone else's pull request watched (see 8.4) |
-| The Telegram chat | Receive questions, approval requests and alerts; send `/stop`; turn the Funnel on and off; with Telegram input on (off by default), answer an open question by Reply or with its code, and send the controller a request, which counts as one by voice and can start workers ([5.8](#58-the-telegram-fallback)) | Approve, unlock; settle or confirm a push, merge, restart or delete; pass anything on while the kill switch is locked or the gateway is inactive; groups, other senders, bots, forwarded and edited messages count for nothing |
+| The Telegram chat | Receive questions, approval requests, alerts and the PIN for unlocking in voice mode; send `/stop`; turn the Funnel on and off; with Telegram input on (off by default), answer an open question by Reply or with its code, and send the controller a request, which counts as one by voice and can start workers ([5.8](#58-the-telegram-fallback)) | Approve, unlock (a PIN typed there counts for nothing); settle or confirm a push, merge, restart or delete; pass anything on while the kill switch is locked or the gateway is inactive; groups, other senders, bots, forwarded and edited messages count for nothing |
 
 ### 5.2 The voice endpoint and OAuth
 
@@ -1018,7 +1018,8 @@ folder, `.git` included.
   they wait for the next voice call, apart from the controller's replies to an answer or a request
   you gave in the chat (below). A question the controller settled in the meantime is not sent.
 - **Not waiting for that:** the kill switch alarm goes at once, whether voice mode is on or not,
-  and so do a note when the gateway ends because another process holds its port, the alerts
+  and so do the PIN to unlock it in voice mode and the notes about that unlock (below), a note
+  when the gateway ends because another process holds its port, the alerts
   about suspicious requests and sign-ins ([5.2](#52-the-voice-endpoint-and-oauth)), the Funnel's
   messages ([7.3](#73-publishing-the-endpoint)), the watchdog's around a restart
   ([8.2](#82-the-watchdog)), and the statistics when the gateway shuts down
@@ -1080,10 +1081,20 @@ folder, `.git` included.
   to a question and no code of an open question (it lists the open ones); a message that names
   several open questions; a Reply to a question that is answered or settled already, or to an
   approval request, which never becomes a request either; a forwarded or edited message, or one
-  without text; and anything while the kill switch is locked ("It is unlocked only at the
-  computer.") or the gateway is inactive, in a standby or without a controller. While the
-  controller waits for the usage limit, the confirmation says until when. Telegram never
-  approves and never unlocks.
+  without text; and anything while the kill switch is locked ("It is unlocked at the computer, or
+  in voice mode with a PIN sent here.") or the gateway is inactive, in a standby or without a
+  controller. While the controller waits for the usage limit, the confirmation says until when.
+  Telegram never approves and never unlocks.
+- **The unlock PIN.** To unlock the kill switch in voice mode ([5.9](#59-the-kill-switch)), the
+  gateway sends a PIN to this chat, "Entsperr-PIN 4 7 1 9, gültig 5 Minuten" or "Unlock PIN 4 7 1
+  9, valid 5 minutes", digit by digit so that CarPlay reads it out as digits, and only when the
+  configured chat is your private chat with the bot. It counts only spoken in voice mode. Typed
+  here, also in a command such as `/unlock 4719`, it is refused ("Not passed on: it holds the
+  unlock PIN, which counts only when you say it in voice mode."), and it reaches neither the
+  controller nor a log: the input log, the gateway's log and every event have it masked as
+  `****`. The PIN's message is never quoted to the controller: a Reply to it comes without its
+  text. The gateway also says here when three wrong PINs blocked the unlock in voice mode, and when
+  you unlocked it there.
 - **Push, merge, restart, delete and approvals only by voice.** Ordinary requests and answers
   may come by Telegram; these never do, whatever the settings. Their questions on Telegram say
   "Answer in voice mode and mention 8cep". An answer there is not carried out: nothing reaches the
@@ -1133,7 +1144,9 @@ keeps what a stolen account could do small.
 - **A leaked bot token** lets someone read what you write to the bot, swallow your messages before
   the gateway reads them (then the log says that another program takes the bot's updates, and
   `/stop` would not reach the gateway), and send messages to you as the bot. It does not let them
-  write as you: the gateway takes only messages from your own account. A fake question from them
+  write as you: the gateway takes only messages from your own account. Nor does it show them the
+  unlock PIN, which the bot sends and which its updates do not contain, unless you reply to the
+  PIN's message or type the PIN yourself. A fake question from them
   that you reply to reaches the controller without its text, as the gateway quotes only messages it
   sent itself. If the token may have leaked, revoke it with @BotFather (`/revoke`) and enter the new
   one in the setup.
@@ -1144,7 +1157,8 @@ keeps what a stolen account could do small.
 - **What the hardening covers:** only your account in your private chat counts; groups, channels,
   other senders and bots are ignored without an answer; forwarded, inline-bot and edited messages
   and anything older than two minutes are refused; the kill switch comes first and Telegram never
-  approves or unlocks; nothing passes while the kill switch is locked or the gateway is inactive;
+  approves or unlocks: the PIN it carries unlocks only spoken, through your signed-in voice
+  connector; nothing passes while the kill switch is locked or the gateway is inactive;
   push, merge, restart, delete and approvals need your voice; the input log keeps every attempt.
 - **What it does not cover:** someone who has your account can still ask for ordinary work, which
   workers carry out as on your voice: read code, run tests, open pull requests. The kill switch's
@@ -1282,10 +1296,10 @@ The statistics count what the rule counted.
   folder, within `VOICE_GW_KILL_CHECK` seconds.
 - **Alarm:** to Telegram at once, to every voice chat with its next call (`[ALARM]`), and to the
   controller.
-- **State:** saved in `.secrets/killswitch.json`, mode 0600; it survives restarts. A file that
-  cannot be read counts as locked.
+- **State:** saved in `.secrets/killswitch.json`, mode 0600, with the count of wrong PINs in voice
+  mode (below); it survives restarts. A file that cannot be read counts as locked.
 
-**Unlocking**, only at the server's terminal:
+**Unlocking at the server's terminal**, which always works:
 
 ```bash
 node scripts/unlock.mjs --status   # what locked it
@@ -1294,8 +1308,47 @@ scripts/start-workers-container.sh # Docker: start the container again
 scripts/start-workers-container.sh --scratch # and the work folders' container, if you use one
 ```
 
-It unlocks the running gateway through the admin socket, or removes the file. There is no way to
-unlock by voice, Telegram or the controller.
+It unlocks the running gateway through the admin socket, or removes the file, also after three
+wrong PINs in voice mode, which `--status` then names.
+
+**Unlocking in voice mode**, with a PIN from Telegram (`VoiceUnlock` in `src/killswitch.mjs`), so
+that nobody has to reach the server by SSH from the car:
+
+1. Say "unlock the kill switch" ("Entsperre den Kill Switch"). The voice AI calls `unlock` without
+   a PIN and reads out why the switch locked, and the gateway sends a new PIN of four random
+   digits to your Telegram chat, valid five minutes: "Entsperr-PIN 4 7 1 9, gültig 5 Minuten" when
+   the voice AI names German as your language, else "Unlock PIN 4 7 1 9, valid 5 minutes". CarPlay
+   reads it out.
+2. Say the PIN. The voice AI calls `unlock` with it, and the gateway compares it itself, in
+   constant time. The right one unlocks exactly as `scripts/unlock.mjs` does; the log says so
+   (`kill switch unlocked by the driver in voice mode, with a PIN from Telegram; …`), and so does
+   Telegram, with the containers that stay stopped: with Docker, start them again at the computer,
+   as above.
+
+The rules:
+
+- **One PIN at a time.** A new one replaces the one before. A new trigger of the lock, which has a
+  reason of its own, and an unlock at the server void it. After five minutes it counts for
+  nothing, and neither does anything that is not four digits; neither counts as a try.
+- **Three wrong PINs per lock,** across PINs, block the unlock in voice mode for that lock: the
+  voice AI hears that it is unlocked only at the computer now, Telegram says so, and from then on
+  only `scripts/unlock.mjs` unlocks it. The count is kept with the lock in
+  `.secrets/killswitch.json`, so a restart does not reset it; the next lock starts again at zero.
+- **Only the voice connector's tool.** The controller has no tool for it, and the PIN never
+  reaches it; Telegram has no command for it, and a PIN typed there is refused and masked
+  ([5.8](#58-the-telegram-fallback)). Not in a standby
+  ([several gateways](#several-gateways-and-the-standby-after-a-disconnect)), and not for a kill
+  switch file that cannot be read.
+- **The PIN lives in the gateway's memory only,** as a salted SHA-256 hash: never in a file, a log
+  line, a tool's result or an event for the controller. A restart forgets it; ask for a new one.
+- **Without Telegram,** or with a configured chat that is no private chat, `unlock` answers that it
+  needs Telegram for the PIN and that the kill switch is unlocked only at the computer.
+
+While the unlock in voice mode is open for a lock, the alarm on Telegram ends "Unlock at the
+server: node scripts/unlock.mjs, or in voice mode with a PIN sent here.", and the alarm for the
+voice AI and the controller, the connector's line (`…: inactive, kill switch locked; it is unlocked
+at the computer, or with unlock and a PIN from Telegram`) and the refusal of a Telegram message say
+the same. Otherwise they say: only at the computer.
 
 ### 5.10 Secrets and files
 
@@ -1306,7 +1359,7 @@ unlock by voice, Telegram or the controller.
 | `.secrets/admin.sock` | Admin socket of the running gateway | socket in the 0700 folder |
 | `.secrets/gateway.env` | Settings from the setup assistant | 0600 |
 | `.secrets/telegram_token`, `.secrets/telegram_chat_id` | The Telegram bot, and your chat with it, whose id is your user id | 0600, tightened at every start |
-| `.secrets/killswitch.json` | Kill switch state, present while locked | 0600 |
+| `.secrets/killswitch.json` | Kill switch state, present while locked, with the count of wrong PINs in voice mode; never a PIN, which lives only in the gateway's memory | 0600 |
 | `.secrets/worker/claude_token`, `.secrets/worker/github_token` | The container's logins, mounted read-only into it; into the work folders' container only `claude_token` | 0600, folder 0700 |
 | `.state/` | Worker state, run output, open requests and decisions, watched pull requests, the watchdog's lock | 0700 when the gateway creates it |
 | `.state/tasks/`, `.state/workers.json` | Each run's output with every tool input and result; the workers' state, with the queue, the worktrees, the limit per repository the queue was planned for, and the work folders | 0600, folder 0700 |
@@ -1361,6 +1414,13 @@ is guarded as follows:
 
 - **Nothing is undone.** A push, a merged pull request or a deleted branch stays as it is. The kill
   switch stops what comes next.
+- **The unlock in voice mode rests on two accounts.** Whoever has both your claude.ai account,
+  with the voice connector signed in, and your Telegram account can unlock the kill switch from
+  anywhere. A guess has three tries in 10,000 per lock. The salted hash keeps the PIN out of files
+  and logs, not from a program that reads the gateway's memory, which only your own user can; a
+  controller at `unrestricted`, or a worker on this computer, could run `scripts/unlock.mjs` as
+  you anyway, though no worker runs while the switch is locked. If you do not want it, leave
+  Telegram out: without it only the server unlocks.
 - **The rules see a step only after it ran.** They read the commands Claude Code reports; the
   command that breaks a rule has usually run already. A `gh pr merge` into the default branch
   locks once GitHub has told its base ([5.9](#59-the-kill-switch)).
@@ -2049,6 +2109,7 @@ at most three short sentences, without code, paths or lists.
 | "Merge pull request 12 in alpha." | The controller asks back with the title and the method; after your yes, `gh pr merge` raises an approval; you confirm a second time |
 | "Push it straight to main." | Only in Docker at level `full`: `dispatch` with `direct`. Otherwise the controller says why it stays a pull request |
 | "Emergency stop!" | The kill switch locks before anything reaches the controller ([5.9](#59-the-kill-switch)) |
+| "Unlock the kill switch." / "Entsperre den Kill Switch." | With Telegram set up: `unlock`; the voice AI reads out why it locked, and a PIN of four digits comes to your Telegram chat, valid five minutes. Say it ("4 7 1 9"): `unlock` with the PIN unlocks it. Three wrong PINs leave only the server for that lock ([5.9](#59-the-kill-switch)) |
 | "Restart the controller." | Restart through the watchdog after your yes ([8.3](#83-restarting-the-controller-by-voice)) |
 | "Good night." / "I'm back." | `set_away`: [night mode](#night-mode) on until the end of the quiet hours, or off, with the summary of the night |
 | "Do not disturb until tomorrow morning at 9." | `set_away` with `until`: night mode on, or longer or shorter if it is on, until 09:00 |
@@ -2216,19 +2277,21 @@ all look alike to the voice assistant (`src/presence.mjs`):
     after the connector was disconnected (below): `…; use another connector`, the only case that
     sends the voice assistant elsewhere;
   - the kill switch locked: `Gateway sky (Mac): inactive, kill switch locked; it can only be
-    unlocked at the computer`, never another connector, which would carry the work past an
-    emergency stop;
+    unlocked at the computer`, or, while the [unlock in voice mode](#59-the-kill-switch) is open,
+    `…; it is unlocked at the computer, or with unlock and a PIN from Telegram`; never another
+    connector, which would carry the work past an emergency stop;
   - no controller connected, mostly while it starts or restarts: `…; it is starting or not
     running; try again in a minute`.
 - **While inactive, `send` and `ask` hand nothing over** and say so: with a locked kill switch as
   before (`[state=locked]`), otherwise `[state=inactive]`, with the same advice as the line. So no
   request waits for a controller that is not there; `status`, `get_reply` and `emergency_stop`
-  work in every state.
+  work in every state, and `unlock` in every state but a standby.
 - **The connector's instructions and every tool description** name the gateway, and a standby by the
   settings; the instructions and `status` tell the voice assistant to call `status` on its
   connectors first and to use an active one, and the instructions to switch connectors only when an
-  answer says so, and that a locked kill switch is unlocked only at the computer. They are fetched
-  when the connector connects, so the live state is only in the answers.
+  answer says so, and that a locked kill switch is unlocked only at the computer, or, with Telegram
+  set up, also with `unlock` and a PIN from Telegram, for which they have a rule of their own. They
+  are fetched when the connector connects, so the live state is only in the answers.
 
 **The standby after a disconnect** (`src/standby.mjs`, `VOICE_GW_DISCONNECT_STANDBY`, on by
 default). A connector removed in claude.ai goes on calling the address without a token when a
@@ -2448,7 +2511,7 @@ node scripts/pair.mjs                # pairing code for the sign-in page, valid 
 node scripts/pair.mjs --minutes 10   # the same, valid up to ten minutes
 node scripts/pair.mjs list           # connected clients and when they last called
 node scripts/pair.mjs revoke <id>    # disconnect one; "revoke all" disconnects every client
-node scripts/fake-voice.mjs          # play the voice AI against the local gateway
+node scripts/fake-voice.mjs          # play the voice AI against the local gateway; "unlock" and "unlock <PIN>" too
 npm test                             # both ends without Claude Code or a phone
 ```
 
@@ -2675,7 +2738,9 @@ gateway; do not set them.
 | `worker container …: /repos is a volume, not a host folder` or `… it runs as …` | The container was started without `-v <folder>:/repos` or without `--user "$(id -u):$(id -g)"`. Remove it (`docker rm -f voice-workers`) and start it with `scripts/start-workers-container.sh`. |
 | `fetch-from-container: the container could not bundle …` | The branch does not exist in the container's repository, or the container is not running. The worker names its branch at the end of each run. |
 | A worker in Docker fails at once | Claude Code is not logged in: `.secrets/worker/claude_token` is missing or expired; run `claude setup-token` again. Otherwise read `.state/tasks/<task>.err`. |
-| `dispatch=locked`, `[state=locked]` or an `[ALARM]` line | The kill switch is locked; the alarm names the trigger. `node scripts/unlock.mjs --status` shows it, `node scripts/unlock.mjs` at the server unlocks it. |
+| `dispatch=locked`, `[state=locked]` or an `[ALARM]` line | The kill switch is locked; the alarm names the trigger. `node scripts/unlock.mjs --status` shows it, `node scripts/unlock.mjs` at the server unlocks it. In the car, with Telegram set up: say "unlock the kill switch", then the PIN that comes to Telegram ([5.9](#59-the-kill-switch)). |
+| `[unlock=blocked]` | Three wrong PINs for this lock, or a kill switch file that cannot be read: only `node scripts/unlock.mjs` at the server unlocks it now. |
+| `[unlock=no-telegram]` or no PIN arrives | The unlock in voice mode needs Telegram, with your private chat with the bot as the configured chat. `[unlock=unsent]` names Telegram's error; `[unlock=standby]`: not in a standby. A PIN is valid five minutes (`[unlock=expired]`); ask for a new one. |
 | `dispatch=origin` | In the container, the repository's `origin` is no longer the GitHub repository the gateway saw first ([5.6](#56-access-levels-and-their-detection)). Check the clone at the desk; if the change is wanted, stop the controller and remove the repository's line under `origins` in `.state/workers.json`. |
 | The kill switch locked for no good reason | Read the reason. A rule that misfires: raise its `VOICE_GW_KILL_*` threshold, or add a folder to `VOICE_GW_KILL_ALLOW_PATHS`. |
 | The kill switch locked on `many changes` for code that was there already, such as review branches or a rebase | It counts nothing only on branches the run made ([5.9](#59-the-kill-switch), "What a run took over"). Such commits on a branch from before the run count in full, and so does everything after a `git push` to a URL, or when the repository keeps no reflogs (`core.logAllRefUpdates=false`). `kill switch rule on many changes` in the gateway's log names what was left out. |
@@ -2822,7 +2887,7 @@ src/
   digest.mjs         routine news about them, gathered into one event for the controller
   telegram.mjs       Telegram fallback; /stop, /funnel, answers and requests from your own chat (off by default), the input log
   funnel.mjs         the Funnel on and off from Telegram, and off by itself when idle
-  killswitch.mjs     the kill switch: state, emergency phrases, alarm
+  killswitch.mjs     the kill switch: state, emergency phrases, alarm, the unlock in voice mode with a PIN
   guard.mjs          the kill switch's rules on the workers' runs
   restart.mjs        restarting the controller by voice, through the watchdog
   plugin.mjs         the gateway as the MCP server of the plugin voice@cc-voice-gateway
@@ -2855,7 +2920,7 @@ scripts/
   settings.sh                  .secrets/gateway.env for the shell scripts
   start-workers-container.sh   the worker container, or with --scratch the work folders'; read-only while locked
   fetch-from-container.sh      a branch from the container into a clean clone, as a bundle
-  unlock.mjs                   unlock the kill switch, at the server only
+  unlock.mjs                   unlock the kill switch at the server, which always works
   pair.mjs                     pairing codes (also on the setup page), connections
   funnel.sh, check-public.mjs  Tailscale Funnel, and a check through its relays
   telegram-notify.mjs          one Telegram message, for the watchdog

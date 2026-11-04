@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-// Unlocks the kill switch, the only way there is: on the server, at its
-// terminal. Shows what locked it and asks you to type "unlock".
+// Unlocks the kill switch on the server, at its terminal, the way that always
+// works: also after three wrong PINs blocked the unlock in voice mode
+// (killswitch.mjs). Shows what locked it and asks you to type "unlock".
 //
 //   node scripts/unlock.mjs            show the lock, confirm, unlock
 //   node scripts/unlock.mjs --status   only show it
@@ -9,8 +10,8 @@
 // With the gateway running, it unlocks through the gateway's admin socket
 // (.secrets/admin.sock), so the running gateway takes tasks again at once.
 // Without it, it removes .secrets/killswitch.json. Neither the controller (its
-// shell runs no scripts), nor a worker container (no .secrets), nor voice or
-// Telegram can do this.
+// shell runs no scripts), nor a worker container (no .secrets), nor Telegram
+// can do this; voice only with the PIN, through the gateway itself.
 
 import { readFileSync, rmSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
@@ -18,6 +19,7 @@ import { createInterface } from 'node:readline/promises'
 import { fileURLToPath } from 'node:url'
 import { adminRequest } from '../src/admin.mjs'
 import { config } from '../src/config.mjs'
+import { PIN_TRIES } from '../src/killswitch.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const secrets = process.env.VOICE_GW_SECRETS_DIR || join(ROOT, '.secrets')
@@ -37,6 +39,10 @@ try {
 
 console.log(`The kill switch is locked since ${state.at}, by ${state.trigger}: ${state.reason}`)
 for (const event of (state.events ?? []).slice(1)) console.log(`  then, ${event.at}, by ${event.trigger}: ${event.reason}`)
+// The count of wrong PINs in voice mode (VoiceUnlock in killswitch.mjs); never a PIN.
+if ((state.wrongPins ?? 0) >= PIN_TRIES) {
+  console.log(`Unlocking in voice mode is blocked for this lock, after ${PIN_TRIES} wrong PINs; here it still unlocks.`)
+}
 if (args.includes('--status')) process.exit(0)
 
 if (!args.includes('--yes')) {

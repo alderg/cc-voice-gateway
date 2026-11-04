@@ -6,6 +6,7 @@
 //   Gateway sky (Mac): active
 //   Gateway sky (Mac): inactive, connector disconnected, in standby; use another connector
 //   Gateway sky (Mac): inactive, kill switch locked; it can only be unlocked at the computer
+//   Gateway sky (Mac): inactive, kill switch locked; it is unlocked at the computer, or with unlock and a PIN from Telegram
 //
 // The name is VOICE_GW_NAME, by default the computer's, as in the gateway's
 // Telegram messages ("cc-voice-gateway on sky"), with the kind of computer.
@@ -57,7 +58,13 @@ export class Presence {
     const standby = 'use another connector'
     if (this.standbySetting) return { active: false, why: 'on standby by its settings', next: standby, standby: true }
     if (this.standby?.active) return { active: false, why: 'connector disconnected, in standby', next: standby, standby: true }
-    if (this.killswitch?.locked) return { active: false, why: 'kill switch locked', next: 'it can only be unlocked at the computer' }
+    if (this.killswitch?.locked) {
+      // In voice mode too, with a PIN from Telegram, while that is open (killswitch.mjs).
+      const next = this.killswitch.byVoice
+        ? 'it is unlocked at the computer, or with unlock and a PIN from Telegram'
+        : 'it can only be unlocked at the computer'
+      return { active: false, why: 'kill switch locked', next }
+    }
     if (!this.connected) {
       return { active: false, why: 'no controller connected', next: 'it is starting or not running; try again in a minute' }
     }
