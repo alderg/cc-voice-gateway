@@ -110,7 +110,9 @@
       <code>/stop</code> on Telegram and the controller's alarm. Automatic: also fixed rules on the workers' runs:
       a write outside the repository or unusually many changes. The
       first two new files a run writes outside, in a place that is not sensitive, go to quarantine instead,
-      with a warning on Telegram. You unlock it at this computer with <code>node scripts/unlock.mjs</code>, or
+      with a warning on Telegram. A folder one repository's workers really use outside it, such as a
+      service's data folder, can be granted to that repository with <code>VOICE_GW_PATH_GRANTS</code> in
+      the settings file (README, path grants). You unlock it at this computer with <code>node scripts/unlock.mjs</code>, or
       with Telegram set up (section 4) in voice mode: say "unlock", and read out the PIN that comes to your
       Telegram chat. Three wrong PINs leave only the computer for that lock.</p>
     <p id="killswitch-warning" class="notice wide" role="alert" hidden></p>

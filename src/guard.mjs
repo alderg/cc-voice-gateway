@@ -43,6 +43,12 @@
 //                   other repositories, the gateway's checkout, places outside
 //                   the home and the repositories folder, and whatever the
 //                   guard cannot pin down.
+//                   Path grants (grants.mjs, VOICE_GW_PATH_GRANTS): folders
+//                   the driver granted to a repository count for its runs on
+//                   this computer as the repository does, apart from what is
+//                   sensitive in itself there too (hidden files and folders,
+//                   git hooks and repositories, links, a path that leads out
+//                   through one): one check for them (granted).
 //   many changes    more file edits in a run than maxEdits; at the end, more
 //                   files or lines changed than maxFiles or maxLines, counting
 //                   commits made during the run on any branch, each by its
@@ -533,11 +539,12 @@ const pathFolders = home =>
 
 // What the worker reads, through the guard's hook, about a write the guard
 // moved to quarantine (RunGuard.toQuarantine).
-function quarantineNote(run, entry) {
+function quarantineNote(run, entry, granted = []) {
   const by = entry.command.startsWith('"') ? `the command ${entry.command}` : `the ${entry.command.split(' ')[0]} tool`
   const own = run.scratch
     ? `your work folder ${run.dir}`
-    : `${run.worktree ? 'your worktree' : 'the repository'} ${run.dir}${run.runFolder ? `, your run folder ${run.runFolder}` : ''}`
+    : `${run.worktree ? 'your worktree' : 'the repository'} ${run.dir}${run.runFolder ? `, your run folder ${run.runFolder}` : ''}` +
+      (granted.length ? `, the folders granted to this repository (${granted.join(', ')})` : '')
   const next =
     entry.n >= QUARANTINE_FREE
       ? 'This was the second invalid write of this run: the next one locks the kill switch, which stops all work.'
@@ -590,6 +597,7 @@ export class RunGuard extends EventEmitter {
     ghBin = 'gh',
     limits = {},
     allowed = [],
+    grants = null,
     quarantine = null,
     gateway = GATEWAY,
     home = null,
@@ -617,6 +625,9 @@ export class RunGuard extends EventEmitter {
     this.maxHelperFiles = limits.maxHelperFiles ?? 10000 // in the helper folder: files at the end, and edits
     this.log = log
     this.allowedPaths = allowed // VOICE_GW_KILL_ALLOW_PATHS
+    // The folders granted to each repository (PathGrants, grants.mjs), for
+    // its runs on this computer; null: none.
+    this.grants = grants
     this.runs = new Map() // task id -> what the rules know about the run
     // repository \0 branch -> the task whose git push named it last: with
     // several runs in one repository, one run's branch is not another's.
@@ -798,10 +809,12 @@ export class RunGuard extends EventEmitter {
     const { part } = call
     if (FILE_TOOLS[part.name]) {
       const path = part.input?.[FILE_TOOLS[part.name]]
-      const target = typeof path === 'string' ? this.resolve(run, run.dir, path) : null
+      const raw = typeof path === 'string' ? this.expand(run, run.dir, path) : null
+      const target = raw === null ? null : posix.resolve(raw)
+      const op = part.name === 'Write' ? 'create' : 'edit'
       if (target) run.files.add(target)
-      if (target && (!this.allowed(run, target) || gitHook(target))) {
-        this.outside(run, call, { path: target, op: part.name === 'Write' ? 'create' : 'edit', detail: `${part.name} ${target}` })
+      if (target && (!this.allowed(run, target, op, raw) || gitHook(target))) {
+        this.outside(run, call, { path: target, raw, op, detail: `${part.name} ${target}` })
       }
       // A work folder is all the run's own; its edits count as edits.
       const helper = target && !run.scratch && (inHelperFolder(posix.relative(run.dir, target)) || within(target, run.helpers))
@@ -919,8 +932,11 @@ export class RunGuard extends EventEmitter {
         if (script) this.shell(run, script, cwd, call)
       }
       for (const { target, op } of ops) {
-        const path = this.resolve(run, cwd, target)
-        if (path && (!this.allowed(run, path) || gitHook(path))) this.outside(run, call, { path, op, detail: `${shown} writes ${path}`, shown })
+        const raw = this.expand(run, cwd, target)
+        const path = raw === null ? null : posix.resolve(raw)
+        if (path && (!this.allowed(run, path, op, raw) || gitHook(path))) {
+          this.outside(run, call, { path, raw, op, detail: `${shown} writes ${path}`, shown })
+        }
       }
     }
     return outer.length ? outer[0] : cwd
@@ -982,10 +998,13 @@ export class RunGuard extends EventEmitter {
   // (VOICE_GW_KILLSWITCH=auto); otherwise every one locks, as before. A
   // gateway that took the run over and reads its calls again finds what an
   // earlier one moved kept with the task, by the call and the path.
-  outside(run, call, { path, op, detail, shown = detail }) {
-    const why = this.sensitive(run, path, op)
+  // A write in a folder granted to the run's repository comes here only for
+  // what is sensitive in itself there too (granted), and locks at once.
+  outside(run, call, { path, raw = path, op, detail, shown = detail }) {
+    const refused = this.granted(run, path, op, raw)?.why ?? null
+    const why = refused ?? this.sensitive(run, path, op)
     const lets = Boolean(this.quarantine && call && run.runner.inspect && run.runner.quarantine) && this.killswitch.locks?.('rule') !== false
-    if (!lets) return this.violation(run, OUTSIDE, gitHook(path) ? `${detail}: ${why}` : detail)
+    if (!lets) return this.violation(run, OUTSIDE, refused || gitHook(path) ? `${detail}: ${why}` : detail)
     if (why) return this.violation(run, OUTSIDE, `${detail}: ${why}, which locks at once`)
     const earlier = call.id && (run.task.quarantined ?? []).find(entry => entry.tool === call.id && entry.path === path)
     if (earlier) {
@@ -1086,7 +1105,7 @@ export class RunGuard extends EventEmitter {
         `the run, by ${shown}; the ${n >= QUARANTINE_FREE ? 'next' : 'third'} locks the kill switch (worker ${run.repo}, task ${run.id})`,
     )
     this.emit('quarantined', run.task, entry)
-    await this.note(run, quarantineNote(run, entry))
+    await this.note(run, quarantineNote(run, entry, this.grantedFolders(run)))
   }
 
   // For the guard's hook, which hands it to the worker with its next tool
@@ -1129,18 +1148,48 @@ export class RunGuard extends EventEmitter {
   // the run's home, $TMPDIR and $VOICE_GW_RUN_FOLDER its run folder, which
   // the gateway set for it (workers.mjs).
   resolve(run, base, path) {
+    const raw = this.expand(run, base, path)
+    return raw === null ? null : posix.resolve(raw)
+  }
+
+  // The same with its .. and . as written, as the kernel gets it: after a
+  // link, .. goes up from where the link led (grants.mjs, physicalPath).
+  expand(run, base, path) {
     let expanded = String(path)
     if (expanded === '~' || expanded.startsWith('~/')) expanded = run.home + expanded.slice(1)
     expanded = expanded.replace(/^\$\{?HOME\}?(?=\/|$)/, run.home)
     if (run.runFolder) expanded = expanded.replace(/^\$(?:\{(TMPDIR|VOICE_GW_RUN_FOLDER)\}|(TMPDIR|VOICE_GW_RUN_FOLDER)\b)(?=\/|$)/, run.runFolder)
     if (/[$`]/.test(expanded)) return null
-    if (!expanded.startsWith('/') && base === null) return null
-    return posix.resolve(base ?? '/', expanded)
+    if (expanded.startsWith('/')) return expanded
+    return base === null ? null : `${base}/${expanded}`
   }
 
-  allowed(run, path) {
+  // Whether a write may go there without the rule: its workspace, its memory
+  // folders, the temporary folders, its run folder, VOICE_GW_KILL_ALLOW_PATHS,
+  // or a folder granted to its repository, for what is not sensitive in
+  // itself there (granted). op: what the write does (LOCKING_OPS, or
+  // create); raw: the path as expand gave it.
+  allowed(run, path, op = 'create', raw = path) {
     if (isDevice(path)) return true
-    return within(path, [run.dir, ...run.memories, ...run.roots])
+    if (within(path, [run.dir, ...run.memories, ...run.roots])) return true
+    const grant = this.granted(run, path, op, raw)
+    return Boolean(grant && !grant.why)
+  }
+
+  // The one check of a write against the path grants (grants.mjs): null
+  // where it lies in no folder granted to the run's repository, otherwise
+  // { folder, why }, why null where the grant lets it. Only for runs in a
+  // repository on this computer: a path of this computer means nothing in
+  // the container, and a work folder has no grants.
+  granted(run, path, op = 'create', raw = path) {
+    if (!this.grants || run.scratch || run.runner.container) return null
+    return this.grants.check(run.repo, path, op, raw, { task: run.id, at: Date.now() })
+  }
+
+  // The folders granted to the run's repository now, for the worker's note.
+  grantedFolders(run) {
+    if (!this.grants || run.scratch || run.runner.container) return []
+    return this.grants.folders(run.repo, { task: run.id, at: Date.now() })
   }
 
   // --- size ---------------------------------------------------------------------

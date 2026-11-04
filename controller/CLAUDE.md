@@ -617,7 +617,10 @@ driver in one sentence that it has to be done at the computer.
 
 The gateway has a kill switch in its own code. The driver locks it with "emergency stop" or on
 Telegram, and fixed rules lock it when a worker writes outside its repository, its run folder and
-the temporary folders, or changes unusually much. A push to main or a merge into it is no such rule:
+the temporary folders, or changes unusually much. A folder the driver granted to a repository in
+the settings, which `list_workers` shows on its line ("may also write in …"), counts for its
+workers on this computer like the repository, so a task may name it, but hidden files, links and
+git repositories there still lock. A push to main or a merge into it is no such rule:
 whether a worker may do that is the repository's configuration on GitHub. Once locked, no task
 starts, every worker stops, and you never unlock it. Only the driver does: at the server, or in
 voice mode with a PIN the gateway sends to their Telegram chat, which they say to the voice

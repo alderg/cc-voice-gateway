@@ -1,21 +1,25 @@
 // Settings that apply while the gateway runs: the worker limits,
-// VOICE_GW_MAX_WORKERS and VOICE_GW_MAX_WORKERS_PER_REPO (config.mjs). The
-// gateway watches its settings file, .secrets/gateway.env (settings.mjs),
-// which the setup assistant writes; once a change has settled, it reads the
-// file again and applies the limits (gateway.mjs, Workers.setLimits). Every
-// other setting counts from the next start of the controller, and the log
-// says so. As at the start, a value set in the environment from outside (for
-// example in controller/.mcp.json) wins over the file; one the watchdog's
-// start script exported from the file does not (settings.mjs).
+// VOICE_GW_MAX_WORKERS and VOICE_GW_MAX_WORKERS_PER_REPO (config.mjs), and
+// the path grants, VOICE_GW_PATH_GRANTS (grants.mjs). The gateway watches its
+// settings file, .secrets/gateway.env (settings.mjs), which the setup
+// assistant writes; once a change has settled, it reads the file again and
+// applies them (gateway.mjs, Workers.setLimits, PathGrants.set). Every other
+// setting counts from the next start of the controller, and the log says so.
+// As at the start, a value set in the environment from outside (for example
+// in controller/.mcp.json) wins over the file; one the watchdog's start
+// script exported from the file does not (settings.mjs).
 //
 // Robust on purpose: a file that cannot be read, is gone, or looks half
-// written (a last line without its end) keeps the limits as they are; a
-// value that is no whole number from 1 to MAX_LIMIT is ignored, with a log
-// line; a line taken out means the default again, as at a start.
+// written (a last line without its end) keeps the limits and the grants as
+// they are; a value that is no whole number from 1 to MAX_LIMIT is ignored,
+// with a log line; a line taken out means the default again, as at a start,
+// for the grants none. The grants' own entries are checked where they apply
+// (PathGrants.set).
 
 import { EventEmitter } from 'node:events'
 import { readFileSync, unwatchFile, watchFile } from 'node:fs'
 import { MAX_LIMIT, WORKER_LIMITS, limitValue } from './config.mjs'
+import { GRANTS_SETTING } from './grants.mjs'
 import { log as defaultLog } from './log.mjs'
 import { environmentWins, parseSettings } from './settings.mjs'
 
@@ -75,9 +79,10 @@ export class SettingsWatcher extends EventEmitter {
   }
 
   // Reads the file and applies what changed. Emits 'change' with { limits,
-  // changed, others }: the limits now, those that changed, and the names of
-  // other settings that changed, which count from the next start. Returns
-  // the same, or null when nothing was applied.
+  // changed, others, grants }: the limits now, those that changed, the names
+  // of other settings that changed, which count from the next start, and the
+  // path grants' new text where it changed (missing otherwise). Returns the
+  // same, or null when nothing was applied.
   reload() {
     const read = this.read()
     if (read.problem) {
@@ -86,7 +91,7 @@ export class SettingsWatcher extends EventEmitter {
         this.unfinished = read.text
         this.changed()
       }
-      this.log(`settings file ${this.file} changed, but ${read.problem}: the worker limits stay as they are`)
+      this.log(`settings file ${this.file} changed, but ${read.problem}: the worker limits and the path grants stay as they are`)
       return null
     }
     this.unfinished = null
@@ -107,15 +112,26 @@ export class SettingsWatcher extends EventEmitter {
       }
       if (value !== this.limits[name]) changed[name] = value
     }
+    // The path grants: their text, as the file has it now; taken out, none.
+    let grants
+    if (settings[GRANTS_SETTING] !== this.last[GRANTS_SETTING]) {
+      if (this.wins(GRANTS_SETTING)) {
+        this.log(`${GRANTS_SETTING} changed in the settings file, but the environment sets it, which wins: the path grants stay as they are`)
+      } else {
+        grants = settings[GRANTS_SETTING] ?? ''
+      }
+    }
     const names = new Set([...Object.keys(this.last), ...Object.keys(settings)])
-    const others = [...names].filter(name => !(name in WORKER_LIMITS) && this.last[name] !== settings[name]).sort()
+    const others = [...names]
+      .filter(name => !(name in WORKER_LIMITS) && name !== GRANTS_SETTING && this.last[name] !== settings[name])
+      .sort()
     this.last = settings
     if (others.length) {
       this.log(`settings file changed: ${others.join(', ')} take effect at the next start of the controller`)
     }
-    if (!Object.keys(changed).length && !others.length) return null
+    if (!Object.keys(changed).length && !others.length && grants === undefined) return null
     Object.assign(this.limits, changed)
-    const result = { limits: { ...this.limits }, changed, others }
+    const result = { limits: { ...this.limits }, changed, others, ...(grants === undefined ? {} : { grants }) }
     this.emit('change', result)
     return result
   }

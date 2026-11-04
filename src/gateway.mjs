@@ -50,8 +50,10 @@ import {
 } from './telegram.mjs'
 import { KillSwitch, PIN_DIGITS, PIN_MINUTES, PIN_TRIES, VoiceUnlock, alarmText, offText } from './killswitch.mjs'
 import { RunGuard } from './guard.mjs'
+import { GRANTS_SETTING, PathGrants } from './grants.mjs'
 import { realpathSync } from 'node:fs'
-import { hostname } from 'node:os'
+import { homedir, hostname } from 'node:os'
+import { join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { DockerRunner, HostRunner } from './runners.mjs'
 import { ACCESS_LEVELS, GitHubAccess } from './access.mjs'
@@ -219,6 +221,27 @@ if (scratch?.runner.container) {
 }
 // The containers the kill switch stops: the workers', and the work folders'.
 const containers = [config.docker ? runner : null, scratch?.runner.container ? scratch.runner : null].filter(Boolean)
+// Folders a repository's workers on this computer may write to as in the
+// repository (grants.mjs), checked strictly; an entry that is no such folder
+// is ignored with a log line. They also change with the settings file while
+// the gateway runs (below). In the container a path of this computer means
+// nothing: there they count for nothing.
+const grants = new PathGrants({
+  setting: config.pathGrants,
+  root: config.workerRoot,
+  gateway: ROOT,
+  guarded: [config.stateDir, config.secretsDir, config.scratchRoot, process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude')],
+  log,
+})
+function grantsLog(when) {
+  const text = grants.text()
+  if (!text && !when) return
+  log(
+    `path grants (${GRANTS_SETTING})${when ? `, ${when}` : ''}: ${text || 'none'}` +
+      (text && config.docker ? `; ignored, as workers run in the container ${config.docker}` : ''),
+  )
+}
+grantsLog()
 const workers = new Workers({
   runner,
   scratch,
@@ -241,6 +264,7 @@ const workers = new Workers({
   maxPerRepo: config.maxWorkersPerRepo,
   timeoutMinutes: config.workerTimeoutMinutes,
   runFolderDays: config.runFolderDays,
+  grants,
 })
 log(
   `run folders of the workers' runs: in ${RUN_FOLDERS} in the repositories folder${config.docker ? ` of the container ${config.docker}` : ''}, ` +
@@ -258,6 +282,7 @@ const guard = new RunGuard({
     maxHelperFiles: config.killMaxHelperFiles,
   },
   allowed: config.killAllowPaths,
+  grants,
   quarantine: config.quarantineDir,
 })
 for (const task of workers.running()) guard.started(task) // runs from before this gateway
@@ -934,8 +959,9 @@ async function deliverPlan(why, note) {
   }
 }
 
-// The worker limits while the gateway runs (live.mjs): a change in the
-// settings file applies at once. Runs going always run to the end.
+// The worker limits and the path grants while the gateway runs (live.mjs): a
+// change in the settings file applies at once. Runs going always run to the
+// end; the grants count for their next write.
 settings = new SettingsWatcher({
   file: config.settingsFile,
   limits: { VOICE_GW_MAX_WORKERS: workers.maxRuns, VOICE_GW_MAX_WORKERS_PER_REPO: workers.maxPerRepo },
@@ -947,7 +973,11 @@ if (process.env[FROM_FILE] === undefined && Object.keys(WORKER_LIMITS).some(name
       "scripts/settings.sh); a worker limit there counts as the file's while it equals the file's value at the start",
   )
 }
-settings.on('change', ({ limits, changed, others }) => {
+settings.on('change', ({ limits, changed, others, grants: grantsText }) => {
+  if (grantsText !== undefined) {
+    grants.set(grantsText)
+    grantsLog('from the settings file, at once')
+  }
   if (!Object.keys(changed).length) return
   const { was, plan } = workers.setLimits({
     maxRuns: limits.VOICE_GW_MAX_WORKERS,

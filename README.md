@@ -1297,7 +1297,7 @@ at every start.
 |---|---|---|
 | Voice | "emergency stop" or "kill switch"; or the tool `emergency_stop`, which the voice AI calls for the same words in any language | In `send` and `ask` before anything reaches the controller: the message starts with the phrase, or has at most six words |
 | Telegram | `/stop` or a phrase | See 5.8 |
-| Rule: outside | Writes outside the repository (for a run in a [worktree](#several-runs-per-repository), outside its worktree), its own [run folder](#55-workers-on-this-computer-or-in-docker) (never another run's, nor `.voice-runs` around it, nor `~/voice-scratch`), `/tmp`, `/var/tmp` (and the system's temp folder on this computer), the run's own Claude Code memory folder (`~/.claude/projects/<repository path with - for every other character>/memory`, where auto memory writes; another project's is outside) and `VOICE_GW_KILL_ALLOW_PATHS`; for a run in a [work folder](#work-folders), writes outside that folder, those temporary folders and its memory folder; writing to `/dev/null`, the standard streams, a terminal or `/dev/fd/N` is none. Also a git hook in any `.git`, the run's own too, and `crontab` other than `-l`. The first two invalid writes of a run that make a new file in a place that is not sensitive go to [quarantine](#quarantine) instead, with a warning; the third locks | The file tools by path. Shell commands by explicit targets: redirections, `tee`, `cp`, `mv` (also what it moves away), `rm`, `mkdir`, `touch`, `ln`, `chmod`, `chown`, `truncate`, `sed -i`, `dd of=`, also after `cd`, from the folder Claude Code names for each call in the gateway's hook, or else the folder the rule follows ([below](#the-folder-a-command-runs-in)); `$HOME` and `~` are expanded, and so are `$TMPDIR` and `$VOICE_GW_RUN_FOLDER` to the run folder. The command line is read as a shell reads it: quoted text, comments, here-strings and heredoc bodies are data, so a `>` or `;` in a pattern, a commit message or a script written to a file is none; the commands in `$(…)`, backticks, `<(…)`, `>(…)`, `sh -c`, `eval` and a heredoc a shell reads are checked like any other, and so is a script written from a heredoc that the same call runs |
+| Rule: outside | Writes outside the repository (for a run in a [worktree](#several-runs-per-repository), outside its worktree), its own [run folder](#55-workers-on-this-computer-or-in-docker) (never another run's, nor `.voice-runs` around it, nor `~/voice-scratch`), `/tmp`, `/var/tmp` (and the system's temp folder on this computer), the run's own Claude Code memory folder (`~/.claude/projects/<repository path with - for every other character>/memory`, where auto memory writes; another project's is outside), `VOICE_GW_KILL_ALLOW_PATHS` and, on this computer, the folders granted to its repository ([path grants](#path-grants)); for a run in a [work folder](#work-folders), writes outside that folder, those temporary folders and its memory folder; writing to `/dev/null`, the standard streams, a terminal or `/dev/fd/N` is none. Also a git hook in any `.git`, the run's own too, and `crontab` other than `-l`. The first two invalid writes of a run that make a new file in a place that is not sensitive go to [quarantine](#quarantine) instead, with a warning; the third locks | The file tools by path. Shell commands by explicit targets: redirections, `tee`, `cp`, `mv` (also what it moves away), `rm`, `mkdir`, `touch`, `ln`, `chmod`, `chown`, `truncate`, `sed -i`, `dd of=`, also after `cd`, from the folder Claude Code names for each call in the gateway's hook, or else the folder the rule follows ([below](#the-folder-a-command-runs-in)); `$HOME` and `~` are expanded, and so are `$TMPDIR` and `$VOICE_GW_RUN_FOLDER` to the run folder. The command line is read as a shell reads it: quoted text, comments, here-strings and heredoc bodies are data, so a `>` or `;` in a pattern, a commit message or a script written to a file is none; the commands in `$(…)`, backticks, `<(…)`, `>(…)`, `sh -c`, `eval` and a heredoc a shell reads are checked like any other, and so is a script written from a heredoc that the same call runs |
 | Rule: many changes | More than 500 file edits in a run; at its end more than 300 files or 30,000 lines changed; in a work folder, more than 300 files in it. Apart from these, the run's [helper folder](#55-workers-on-this-computer-or-in-docker) `.voice-scratch`, for its test reports, screenshots and logs: more than 10,000 file edits there, its run folder and the temporary folders together, or untracked files in the helper folder at the end | Edits as they happen; at the end the commits made during the run, each by its own changes, plus what is not committed, or the files in the work folder. What commits on branches the run made take over from before it counts nothing, on a branch from before the run everything counts (below). What is untracked in the helper folder counts only against its own limit, so the limit for real code stays as strict; what is committed or tracked there counts as any change. What is in the run folder and the temporary folders at the end is no change at all. `VOICE_GW_KILL_MAX_*` |
 | Controller | `raise_alarm` with a reason | One more signal, never the only one |
 
@@ -1395,6 +1395,52 @@ The third invalid write of the run locks. These lock at once, the first time, as
 
 Only at `VOICE_GW_KILLSWITCH=auto`: at `manual` and `off` the rule logs as before and moves nothing.
 Nothing is deleted; the files wait in `.state/quarantine` for you.
+
+#### Path grants
+
+Some repositories have a folder of their own outside every checkout, such as the data folder of a
+service the repository runs on this computer, where its workers test and deploy. A path grant lets
+one repository's workers write there as in the repository, without a lock or the quarantine:
+`VOICE_GW_PATH_GRANTS` in `.secrets/gateway.env`, `repository=folder`, entries separated by `;`,
+several folders of one repository by `,`:
+
+```bash
+VOICE_GW_PATH_GRANTS=hauswache=/srv/wyze-events;alpha=/data/a,/data/b
+```
+
+On 2026-11-04 at 18:30 UTC the switch locked when the hauswache worker removed its own empty test
+folders in its watcher's data folder, `rmdir /srv/wyze-events/live/2026-11-04 /srv/wyze-events/live`:
+removing anything outside locks at once. With the grant above, that run goes on.
+
+The grants apply from the gateway's start and, when the settings file changes, at once, as the
+[worker limits](#88-configuration) do. The gateway checks every folder strictly: an absolute path of
+a folder that is there, taken by its real path. Never `/` or a folder right below it, the home folder or a folder that
+holds it, a folder in or around the repositories folder, the gateway's checkout, its state and
+secrets, the work folders' root or Claude Code's folder, a hidden folder or one in it, a system
+folder (`/etc`, `/usr`, `/var/lib` and the like), macOS's `~/Library`, a folder in or around one on
+the `PATH`, or a git repository or a folder in one. An entry that is none, or a repository name
+that is none, is ignored, with a line in the log (`VOICE_GW_PATH_GRANTS: ignored, alpha=/home/you is
+the home folder or holds it`), so a typo never lets more through. The log names the grants at every
+start, `list_workers` on the repository's line (`may also write in /srv/wyze-events (path grant)`),
+and the worker's prompt says where it may write besides the repository.
+
+In a granted folder the worker may make, change, move and remove files and folders, `rmdir`
+included, and its file edits count against the rule on many changes as in its repository. What is
+sensitive in itself still locks at once, there too:
+
+- a hidden file or folder in it, and so a git hook;
+- a git repository in it, another repository's files;
+- making a link (`ln`), a path that leads out of the folder through a link, as the kernel resolves
+  it (also `link/..`), and a link that leads nowhere;
+- a file with more than one hard link, which is the same file somewhere else too;
+- removing the granted folder itself or changing its mode;
+- `crontab`, and everything outside the granted folders, as before.
+
+Only for workers on this computer: in the Docker container a path of this computer means nothing,
+so the grants count for nothing there, and the log says so. A work folder has none. One check in
+`src/grants.mjs` decides for every grant, so that grants for one path, one run and a while, which a
+worker would ask for and you would confirm by voice, can join the standing ones later. No tool lets
+a worker grant itself one ([limits](#512-limits)).
 
 #### Effects and unlocking
 
@@ -1549,7 +1595,13 @@ is guarded as follows:
   - targets in variables other than `$HOME`, and relative targets after a `cd` into one;
   - writes by programs, such as `npm install` into `~/.npm`, and other ways to run something later
     than `crontab`, such as `systemctl --user enable` or `git config core.hooksPath`;
-  - paths behind symlinks.
+  - paths behind symlinks, except in a [granted folder](#path-grants).
+- **A path grant opens its folder.** In a granted folder the rule on writes outside watches only
+  what is sensitive in itself; what the worker does to the service's data there is up to it, as in
+  its repository. The links in it are looked at when the rule reads the call: a link that the same
+  call makes with something other than `ln` (`cp -a`, `tar`) and writes through, or one made between
+  the look and the write, is not seen. Host workers could write the settings file by a script, and a
+  grant there applies at once.
 - **The folder of a command, without the hook.** Where the gateway's hook does not report a call's
   folder ([5.9](#the-folder-a-command-runs-in)), the rule follows the shell as Claude Code 2.1.312
   keeps it; another version may keep it otherwise, and calls side by side in one turn may start
@@ -2664,17 +2716,19 @@ gateway reads them at its start: restart the controller after a change. Under th
 start reads `.secrets/gateway.env` again, and the log line `watchdog: settings from …` shows each
 setting with where it came from.
 
-**The worker limits apply at once.** The gateway watches `.secrets/gateway.env` (`src/live.mjs`).
-Once a change has settled for a second or two, it reads the file again and applies
+**The worker limits and the path grants apply at once.** The gateway watches `.secrets/gateway.env`
+(`src/live.mjs`). Once a change has settled for a second or two, it reads the file again and applies
 `VOICE_GW_MAX_WORKERS` and `VOICE_GW_MAX_WORKERS_PER_REPO` without a restart, as it would at a
 start: raised per repository, the controller hears which queued tasks could now run next to
-others; lowered, runs going run to the end and nothing new starts above the limit. Every other
+others; lowered, runs going run to the end and nothing new starts above the limit. So does
+`VOICE_GW_PATH_GRANTS` ([path grants](#path-grants)), for the next write of every run, with a log
+line that names the grants now and one for each entry it ignored. Every other
 changed setting is logged as counting from the next start. A value set in the environment from
 outside still wins over the file, and the log says so; one the watchdog's start script exported
 from the file does not, as it lists those names in `VOICE_GW_SETTINGS_FROM_FILE`
 (`scripts/settings.sh`). Without that list, when Claude Code or you start the gateway yourself, a
 value in the environment that equals the file's at the start counts as the file's. A file that cannot be read, is gone or looks half written
-(its last line without an end) keeps the limits as they are; a value that is no whole number from
+(its last line without an end) keeps the limits and the grants as they are; a value that is no whole number from
 1 to 100 is ignored, with a log line. The setup assistant says when a running gateway takes its
 limits at once.
 
@@ -2749,6 +2803,7 @@ limits at once.
 | `VOICE_GW_KILL_MAX_LINES` | `30000` | Kill switch: lines changed in one run |
 | `VOICE_GW_KILL_MAX_SCRATCH_FILES` | `10000` | Kill switch: untracked files in a run's helper folder `.voice-scratch` at its end, and file edits there, in its run folder and in the temporary folders; they count for none of the three above |
 | `VOICE_GW_KILL_ALLOW_PATHS` | empty | More folders workers may write to, comma-separated |
+| `VOICE_GW_PATH_GRANTS` | empty | Folders one repository's workers on this computer may write to as in the repository ([path grants](#path-grants)): `repository=folder`, entries separated by `;`, folders by `,`, such as `hauswache=/srv/wyze-events`. Checked strictly; an entry that is no such folder is ignored with a log line. Hidden files, links and git repositories there still lock. Not in Docker. Applies at once when the settings file changes |
 | `VOICE_GW_KILL_CHECK` | `30` | Seconds between checks of the containers for a writable mount while the kill switch is locked |
 | `VOICE_GW_MCP_JSON` | `controller/.mcp.json` | Plugin mode: where `src/plugin.mjs` reads the env block |
 | `VOICE_GW_CHANNEL_SOURCE` | `voice`, or `plugin:voice:voice` as plugin | The channel's `source` in events |
@@ -2871,11 +2926,12 @@ gateway; do not set them.
 | `[unlock=blocked]` | Three wrong PINs for this lock, or a kill switch file that cannot be read: only `node scripts/unlock.mjs` at the server unlocks it now. |
 | `[unlock=no-telegram]` or no PIN arrives | The unlock in voice mode needs Telegram, with your private chat with the bot as the configured chat. `[unlock=unsent]` names Telegram's error; `[unlock=standby]`: not in a standby. A PIN is valid five minutes (`[unlock=expired]`); ask for a new one. |
 | `dispatch=origin` | In the container, the repository's `origin` is no longer the GitHub repository the gateway saw first ([5.6](#56-access-levels-and-their-detection)). Check the clone at the desk; if the change is wanted, stop the controller and remove the repository's line under `origins` in `.state/workers.json`. |
-| The kill switch locked for no good reason | Read the reason. A rule that misfires: raise its `VOICE_GW_KILL_*` threshold, or add a folder to `VOICE_GW_KILL_ALLOW_PATHS`. |
+| The kill switch locked for no good reason | Read the reason. A rule that misfires: raise its `VOICE_GW_KILL_*` threshold, grant a folder to one repository in `VOICE_GW_PATH_GRANTS` ([path grants](#path-grants)), or add one for all of them to `VOICE_GW_KILL_ALLOW_PATHS`. |
 | The kill switch locked on `many changes` for code that was there already, such as review branches or a rebase | It counts nothing only on branches the run made ([5.9](#59-the-kill-switch), "What a run took over"). Such commits on a branch from before the run count in full, and so does everything after a `git push` to a URL, or when the repository keeps no reflogs (`core.logAllRefUpdates=false`). `kill switch rule on many changes` in the gateway's log names what was left out. |
 | Telegram warns that a worker wrote a file outside its allowed folders and the guard moved it to quarantine | The run went on: the rule on writes outside moves the first two new files a run writes in a place that is not sensitive into `.state/quarantine/<task>/` instead of locking ([quarantine](#quarantine)), and the third locks. `quarantine.jsonl` there names where each was and the command. Put a file back where it was meant to go yourself if you want it; the gateway removes nothing there. If a task needs files in such a place, have the worker use its run folder, or add the folder to `VOICE_GW_KILL_ALLOW_PATHS`. |
 | The kill switch locked on `write outside the allowed folders` for a relative path such as `../report.md` that went into the workspace | The rule counts it from the folder each call starts in, as Claude Code names it in the gateway's hook ([5.9](#the-folder-a-command-runs-in)). A line `no report of the guard's hook in this run` in `.logs/gateway.log` means the hooks did not run (for example `disableAllHooks` in your Claude Code settings, or managed settings that allow only managed hooks), and the rule followed the shell itself; a run from before this version has no hook either. Before this version a subagent's `cd` counted for the main thread's shell (2026-11-03). |
 | The kill switch locked on `write outside the allowed folders` for screenshots or other helper files, such as in `~/voice-scratch/…` | The worker wrote outside its repository, its run folder and the temporary folders, often because a task named such a place. Its run folder (`.voice-runs/<repository>/…`, also `$TMPDIR`) is the place for them: its prompt and rules say so, and the controller's instructions say to ask for such files there and to name no other folder. A run from before this version has no run folder. A folder outside every repository that workers may really use goes into `VOICE_GW_KILL_ALLOW_PATHS`, never the work folders' root. |
+| The kill switch locked on `write outside the allowed folders` when a worker removed, changed or made files in a folder its repository uses outside the checkout, such as a service's data folder (`rmdir /srv/wyze-events/live/2026-11-04 /srv/wyze-events/live` on 2026-11-04) | Removing, changing or making folders outside locks at once. Grant that folder to the repository: `VOICE_GW_PATH_GRANTS=hauswache=/srv/wyze-events` in `.secrets/gateway.env` applies at once ([path grants](#path-grants)), and `list_workers` then shows it on the repository's line. Only for workers on this computer. If it still locks, read the reason: an entry the log says it ignored (`VOICE_GW_PATH_GRANTS: ignored, …`), or something that locks in a granted folder too, such as a hidden file, a link, a git repository or a path that leads out through a link. |
 | A run folder in `.voice-runs` is gone, with the screenshots in it | It is removed `VOICE_GW_RUN_FOLDER_DAYS` (7) after its session's last run; copy out what you want to keep, or set `0`. `worker_status` names the folder of the last run, and `.state/workers.json` lists them under `runFolders`. |
 | An answer or a request on Telegram is "not passed on" | The reason follows in the chat. "Telegram input is off": turn it on in the setup (section 4), or set `VOICE_GW_TELEGRAM_ANSWERS=1` and `VOICE_GW_TELEGRAM_REQUESTS=1`; it is off by default, also after an update. For an answer, reply to the question's own message, or name its code (the four characters after "Question for request"); a decision's code works too. Only questions still open count: one answered by voice is settled. With `VOICE_GW_TELEGRAM_CONFIRM=0`, a push, merge, restart or delete question, or an approval request, is never answered there ("must be confirmed by voice", "Telegram cannot approve"): say it in voice mode. An approval request takes a plain yes or no, as a Reply to it, with its code, or alone while it is the only one open; with several open, a plain yes gets a list of them and the question which one is meant, and "yes to all" allows them all. A forwarded or edited message, or one without text, is never passed on: write it yourself, as a new message. While the kill switch is locked or the gateway is inactive nothing goes through; try again once it is unlocked or active again. `telegram answers off` in the log: `VOICE_GW_TELEGRAM_ANSWERS` is not `1`; `telegram requests off`: `VOICE_GW_TELEGRAM_REQUESTS` is not `1`. `.state/telegram-input.log` says for every message what became of it. |
 | A message on Telegram became a request, not the answer you meant | Without a Reply to the question and without its code, a message is a new request. Reply to the question's own message, or start yours with its code. The controller sees the request all the same and may ask back. |
@@ -3009,7 +3065,7 @@ src/
   workers.mjs        workers: repositories, claude -p runs, the queue, the check after a run, results
   workspaces.mjs     where a run works: a repository, or a work folder, with its rules and check; run folders
   worktrees.mjs      the worktrees of further runs of a repository: made, with submodules, removed
-  live.mjs           the worker limits from the settings file while the gateway runs
+  live.mjs           the worker limits and path grants from the settings file while the gateway runs
   ledger.mjs         open decisions for the driver, and the open items
   stats.mjs          the statistics: this running time and all time, the texts
   runners.mjs        where workers run: this computer, or the Docker container; a run's processes
@@ -3020,6 +3076,7 @@ src/
   funnel.mjs         the Funnel on and off from Telegram, and off by itself when idle
   killswitch.mjs     the kill switch: state, emergency phrases, alarm, the unlock in voice mode with a PIN
   guard.mjs          the kill switch's rules on the workers' runs
+  grants.mjs         path grants: folders a repository's workers may write to, checked strictly
   restart.mjs        restarting the controller by voice, through the watchdog
   plugin.mjs         the gateway as the MCP server of the plugin voice@cc-voice-gateway
   store.mjs          requests and approvals, persisted across restarts

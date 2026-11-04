@@ -1287,7 +1287,7 @@ test('the settings file while the gateway runs: the limits change, the environme
   assert.ok(lines.some(line => /it cannot be read \(EISDIR\)/.test(line)))
   rmSync(file, { recursive: true })
   assert.equal(watcher.reload(), null)
-  assert.ok(lines.some(line => /but it is gone: the worker limits stay as they are/.test(line)))
+  assert.ok(lines.some(line => /but it is gone: the worker limits and the path grants stay as they are/.test(line)))
   assert.equal(watcher.limits.VOICE_GW_MAX_WORKERS_PER_REPO, 2)
 
   // Taken out: the default again; other settings count from the next start.

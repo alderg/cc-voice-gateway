@@ -212,7 +212,8 @@ commits on no remote, new uncommitted files, a checkout not back on its branch. 
 Every run in a repository has a run folder of its own outside the repository, for what belongs nowhere in it, such
 as screenshots or files for the driver; the worker's prompt names it, and a result names it when something is in it,
 so that you can tell the driver where to find it. Never ask a worker to write anywhere else outside its repository,
-not even a folder of your choosing: the kill switch locks on it. Ask for such files "in your run folder".
+not even a folder of your choosing: the kill switch locks on it. Ask for such files "in your run folder". A folder that
+list_workers shows granted to the repository ("may also write in ...", a path grant of the driver's) is the exception.
 A result that says the gateway's guard moved files to quarantine: the run wrote them outside its allowed folders, and
 the third such write of a run locks the kill switch. Tell the driver in a sentence, as a warning; nothing to dispatch.
 When the run opened or updated a pull request, the tag also has pull_request="<number>": say only briefly

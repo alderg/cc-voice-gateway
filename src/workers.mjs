@@ -638,11 +638,13 @@ export class Workers extends EventEmitter {
     maxPerRepo = 1,
     timeoutMinutes = 360, // 0: no time limit
     runFolderDays = 7, // run folders removed this long after their last run; 0: never
+    grants = null, // the path grants (grants.mjs): for list_workers and the prompts of runs on this computer
     resultGraceMs = RESULT_GRACE_MS,
     killAfterMs = KILL_AFTER_MS,
   }) {
     super()
     this.runFolderDays = runFolderDays
+    this.grants = grants
     this.runner = runner // the repositories'
     // The kinds of workspace, by name (workspaces.mjs); work folders only
     // when they are on.
@@ -1446,7 +1448,16 @@ export class Workers extends EventEmitter {
     child.stdin.end(
       (scratch
         ? scratchPrompt({ task, words, facts })
-        : prompt({ task, words, facts, direct, draft, prDraft: this.prDraft, review: record.review ?? null })) + runLines(record),
+        : prompt({
+            task,
+            words,
+            facts,
+            direct,
+            draft,
+            prDraft: this.prDraft,
+            review: record.review ?? null,
+            grants: this.grantedFolders(record.repo, runner),
+          })) + runLines(record),
     )
     child.unref()
   }
@@ -2756,13 +2767,21 @@ export class Workers extends EventEmitter {
       const access = f.access && !f.moved ? `, access ${f.access.level} (${f.access.reason})` : ''
       const direct = f.pushDirect && !f.access ? `, pull requests off: pushes to ${f.defaultBranch || 'the default branch'}` : ''
       const changes = f.dirty.length ? plural(f.dirty.length, 'uncommitted file') : 'clean'
-      lines.push(`${f.name}: ${where}${access}${direct}, branch ${f.branch || 'detached'}, ${changes}, ${this.stateText(f.name)}`)
+      const granted = this.grantedFolders(f.name)
+      const grant = granted.length ? `, may also write in ${granted.join(', ')} (path grant)` : ''
+      lines.push(`${f.name}: ${where}${access}${direct}${grant}, branch ${f.branch || 'detached'}, ${changes}, ${this.stateText(f.name)}`)
     }
     if (!names.length) {
       lines.push(`No git repositories in ${this.runner.root}${container ? ` in the container ${container}` : ''}.`)
     }
     if (this.scratch) lines.push(...this.scratchLines())
     return lines.join('\n')
+  }
+
+  // The folders granted to a repository's runs (grants.mjs), where they run
+  // on this computer: in the container a path of this computer means nothing.
+  grantedFolders(repo, runner = this.runner) {
+    return this.grants && !runner.container ? this.grants.folders(repo) : []
   }
 
   // A run as list_workers and open_items say it: running, ending, or
@@ -3012,7 +3031,7 @@ export function runLines(record) {
 // pull request as a draft (VOICE_GW_PR_DRAFT=1). review: a fix the gateway
 // queued by itself for review comments (reviewFix), which has no words of
 // the driver.
-export function prompt({ task, words, facts, direct = false, draft = false, prDraft = false, review = null }) {
+export function prompt({ task, words, facts, direct = false, draft = false, prDraft = false, review = null, grants = [] }) {
   const visibility = {
     public: 'public',
     private: 'private',
@@ -3054,6 +3073,14 @@ export function prompt({ task, words, facts, direct = false, draft = false, prDr
           '. Helper files that belong nowhere in the repository go there, as the Helper files rule says.'
       : `- Run folder: none this time, it could not be made; put helper files in ${HELPER_FOLDER} only.`,
   )
+  // grants: the folders the driver granted to the repository (grants.mjs).
+  if (grants.length) {
+    lines.push(
+      `- Granted folders: ${grants.join(', ')}, outside the repository. The driver lets this repository's runs write ` +
+        'there as in the repository: make, change and remove files and folders. Not hidden files or folders, links or ' +
+        'git repositories there, nor the granted folder itself: those stop all work, as anywhere else outside.',
+    )
+  }
   const target = facts.defaultBranch || 'the default branch'
   const asDraft = draft && !draftIgnored(facts, direct)
   if (facts.access) {

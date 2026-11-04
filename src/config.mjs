@@ -319,6 +319,11 @@ export const config = {
     .split(',')
     .map(path => path.trim())
     .filter(Boolean),
+  // Folders that one repository's workers on this computer may write to as
+  // in the repository (grants.mjs): repository=folder, entries separated by
+  // semicolons, folders by commas. Checked strictly at the start; also
+  // changes while the gateway runs, with the settings file (live.mjs).
+  pathGrants: env.VOICE_GW_PATH_GRANTS ?? '',
   // How often, while the kill switch is locked, the containers are checked
   // for a writable mount, in seconds.
   killCheckSeconds: num(env.VOICE_GW_KILL_CHECK, 30),
