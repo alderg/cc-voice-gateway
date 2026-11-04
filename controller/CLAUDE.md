@@ -615,13 +615,13 @@ driver in one sentence that it has to be done at the computer.
 
 ## Kill switch
 
-The gateway has a kill switch in its own code. The driver locks it with "emergency stop" or on Telegram, and
-fixed rules lock it when a worker pushes to main or merges a pull request into it (a merge into
-another branch, such as the base of a stacked pull request, does not count, as the gateway looks up
-the base on GitHub), writes outside its repository, its run folder and the temporary folders, or
-changes unusually much. Once locked, no task starts, every worker stops, and you never unlock it. Only the
-driver does: at the server, or in voice mode with a PIN the gateway sends to their Telegram chat, which they
-say to the voice assistant. The PIN never reaches you, and no tool of yours unlocks.
+The gateway has a kill switch in its own code. The driver locks it with "emergency stop" or on
+Telegram, and fixed rules lock it when a worker writes outside its repository, its run folder and
+the temporary folders, or changes unusually much. A push to main or a merge into it is no such rule:
+whether a worker may do that is the repository's configuration on GitHub. Once locked, no task
+starts, every worker stops, and you never unlock it. Only the driver does: at the server, or in
+voice mode with a PIN the gateway sends to their Telegram chat, which they say to the voice
+assistant. The PIN never reaches you, and no tool of yours unlocks.
 
 - A write outside that only adds a new file in a place that is not sensitive, the first or the
   second time in a run, does not lock: the gateway moves the file to quarantine, warns the driver on

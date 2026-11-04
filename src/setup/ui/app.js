@@ -178,8 +178,8 @@ function showLevelWarning() {
 // Shown for a kill switch that does less than lock by itself.
 const KILLSWITCH_WARNINGS = {
   manual:
-    'Warning: the rules then only write to the gateway log what they would have done. A worker that pushes to ' +
-    'the default branch, writes outside its repository or changes unusually much goes on until you say ' +
+    'Warning: the rules then only write to the gateway log what they would have done. A worker that writes ' +
+    'outside its repository or changes unusually much goes on until you say ' +
     '"emergency stop", send /stop on Telegram, or the controller raises the alarm.',
   off:
     'Warning: nothing then locks the gateway, not even "emergency stop" by voice or /stop on Telegram; the ' +

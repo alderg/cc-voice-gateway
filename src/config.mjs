@@ -322,8 +322,8 @@ export const config = {
     .split(',')
     .map(path => path.trim())
     .filter(Boolean),
-  // How often the default branch on GitHub, and while locked the container,
-  // are checked, in seconds.
+  // How often, while the kill switch is locked, the containers are checked
+  // for a writable mount, in seconds.
   killCheckSeconds: num(env.VOICE_GW_KILL_CHECK, 30),
   // How long one poll of the Telegram bot for commands waits, in seconds.
   telegramPollSeconds: num(env.VOICE_GW_TELEGRAM_POLL, 25),

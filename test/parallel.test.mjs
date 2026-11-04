@@ -865,7 +865,6 @@ test('the helper folder in the checkout: no push decision, no question about unc
     killswitch: { trip: event => tripped.push(event) },
     ghBin: join(BIN, 'gh'),
     limits: { maxFiles: 1, maxHelperFiles: 10 },
-    mainCheckSeconds: 3600,
     log: () => {},
   })
   guard.on('measured', (task, size) => measured.set(task.id, size))
@@ -1532,7 +1531,7 @@ test('the rules: a run in a worktree writes there and in its memory folders; the
   const workers = new EventEmitter()
   const tripped = []
   const runner = { dir: name => `/work/${name}`, git: async () => null }
-  const guard = new RunGuard({ workers, runner, killswitch: { trip: event => tripped.push(event) }, ghBin: join(BIN, 'gh'), mainCheckSeconds: 3600, log: () => {} })
+  const guard = new RunGuard({ workers, runner, killswitch: { trip: event => tripped.push(event) }, ghBin: join(BIN, 'gh'), log: () => {} })
   try {
     const task = {
       id: 'twtr',

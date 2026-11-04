@@ -259,7 +259,6 @@ const guard = new RunGuard({
   },
   allowed: config.killAllowPaths,
   quarantine: config.quarantineDir,
-  mainCheckSeconds: config.killCheckSeconds,
 })
 for (const task of workers.running()) guard.started(task) // runs from before this gateway
 

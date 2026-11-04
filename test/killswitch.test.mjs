@@ -60,21 +60,10 @@ import { appendFileSync, readFileSync } from 'node:fs'
 const args = process.argv.slice(2)
 const state = JSON.parse(readFileSync(process.env.FAKE_GH_STATE, 'utf8'))
 if (process.env.FAKE_GH_LOG) appendFileSync(process.env.FAKE_GH_LOG, JSON.stringify(args) + '\\n')
-// a GitHub that answers slowly
-if (state.delayMs) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, state.delayMs)
 const out = value => { process.stdout.write(JSON.stringify(value) + '\\n'); process.exit(0) }
 if (args[0] === 'repo' && args[1] === 'view') { process.stdout.write('PRIVATE\\n'); process.exit(0) }
 if (args[0] === 'api') {
-  // pull requests, by number and by their head (prs: "owner/name#number" -> the REST object)
-  const pull = /^repos\\/([^/]+\\/[^/]+)\\/pulls\\/(\\d+)$/.exec(args[1])
-  if (pull && state.prs?.[pull[1] + '#' + pull[2]]) out(state.prs[pull[1] + '#' + pull[2]])
-  const list = /^repos\\/([^/]+\\/[^/]+)\\/pulls\\?(.*)$/.exec(args[1])
-  if (list) {
-    const query = new URLSearchParams(list[2])
-    out(Object.entries(state.prs ?? {})
-      .filter(([key, pr]) => key.startsWith(list[1] + '#') && pr.state === query.get('state') && pr.head.label === query.get('head'))
-      .map(([, pr]) => pr))
-  }
+  // the head of a branch, as the gateway asked for it while it had a rule on the default branch
   const branch = /^repos\\/([^/]+\\/[^/]+)\\/branches\\/(.+)$/.exec(args[1])
   if (branch && state.heads?.[branch[1]]) out({ name: branch[2], commit: { sha: state.heads[branch[1]] } })
   // the pull requests a commit on the default branch merged
@@ -97,7 +86,7 @@ const session_id = arg('--session-id') ?? arg('--resume')
 const out = message => process.stdout.write(JSON.stringify({ ...message, session_id }) + '\\n')
 const bash = command => out({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Bash', input: { command } }] } })
 out({ type: 'system', subtype: 'init' })
-if (/PUSHMAIN/.test(input)) bash('git add -A && git commit -qm fix && git push origin main')
+if (/CRONTAB/.test(input)) bash('crontab -r')
 setTimeout(() => out({ type: 'result', subtype: 'success', is_error: false, result: 'Done.' }), /SLOW/.test(input) ? 15000 : 300)
 `
 
@@ -190,7 +179,7 @@ test('the state: locked, saved for this user only, survives a new instance, fail
   const events = []
   first.on('tripped', (state, event, isFirst) => events.push([event.trigger, isFirst]))
   first.trip({ trigger: 'voice', reason: 'emergency stop' })
-  first.trip({ trigger: 'rule', reason: 'push to the default branch' })
+  first.trip({ trigger: 'rule', reason: 'many changes' })
   assert.deepEqual(events, [['voice', true], ['rule', false]])
   assert.equal(statSync(file).mode & 0o777, 0o600)
 
@@ -338,7 +327,7 @@ test('the unlock in voice mode: a PIN of four digits only to the chat, in no res
 
 test('the unlock in voice mode: a PIN expires after five minutes and counts nothing then; a new trigger or an unlock at the server voids it', async () => {
   const { killswitch, unlock, sent, clock } = pinned('expires')
-  killswitch.trip({ trigger: 'rule', reason: 'push to the default branch' })
+  killswitch.trip({ trigger: 'rule', reason: 'many changes' })
   await unlock.request()
   clock.now += 5 * 60000
   const late = pinIn(sent.at(-1))
@@ -487,27 +476,12 @@ test('the unlock PIN typed on Telegram: masked in the input log, the log and eve
 
 // --- the rules ---------------------------------------------------------------------------
 
-function guarded({
-  git = {},
-  limits,
-  direct = false,
-  pushDirect = false,
-  runFolder = null,
-  docker = false,
-  repo = 'alpha',
-  slug = 'acme/alpha',
-  defaultBranch = 'main',
-  mergeLookupMs = 3000,
-  task: given = null,
-} = {}) {
+function guarded({ git = {}, limits, runFolder = null, repo = 'alpha', slug = 'acme/alpha', defaultBranch = 'main', task: given = null } = {}) {
   const workers = new EventEmitter()
   const tripped = []
   const logged = []
-  const gitCalls = [] // [dir, ...args]: git as the runner runs it, in the container for docker
-  let saves = 0
-  workers.save = () => saves++
+  const gitCalls = [] // [dir, ...args]: git as the runner runs it
   const runner = {
-    ...(docker ? { container: 'voice-workers' } : {}),
     dir: name => `/work/${name}`,
     git: async (dir, ...args) => {
       gitCalls.push([dir, ...args])
@@ -522,9 +496,6 @@ function guarded({
     killswitch: { trip: event => tripped.push(event) },
     ghBin: join(BIN, 'gh'),
     limits,
-    mainCheckSeconds: 3600,
-    mergeLookupMs,
-    mergeRecheckMs: 3600 * 1000,
     log: (...parts) => logged.push(parts.join(' ')),
   })
   const task = given ?? {
@@ -533,18 +504,13 @@ function guarded({
     dir: `/work/${repo}`,
     slug,
     defaultBranch,
-    direct,
-    pushDirect,
-    access: direct ? 'full' : null,
     startedAt: Date.now() - 1000,
     ...(runFolder ? { runFolder } : {}),
   }
   workers.emit('started', task)
   let calls = 0
   const tool = (name, input, id = `toolu_${++calls}`) => workers.emit('tool', task, { type: 'tool_use', id, name, input })
-  // The lookups of gh pr merge going, done.
-  const settled = () => guard.settled(guard.runs.get(task.id))
-  return { guard, tripped, logged, gitCalls, saves: () => saves, task, tool, settled, bash: (command, id) => tool('Bash', { command }, id) }
+  return { guard, tripped, logged, gitCalls, task, tool, bash: (command, id) => tool('Bash', { command }, id) }
 }
 
 test('rule: writes outside the repository and the temporary folders', () => {
@@ -629,430 +595,85 @@ test("rule: the run's own run folder is allowed, by path and as $TMPDIR or $VOIC
   none.guard.close()
 })
 
-test('rule: a push to the default branch, unless it was an explicit direct dispatch (gh pr merge: below)', () => {
-  for (const command of [
-    'git push origin main',
-    'git push origin HEAD:refs/heads/main',
-    'git push --force origin +voice/x:main',
-    'git -C . push --all origin',
-  ]) {
-    const { tripped, bash, guard } = guarded()
-    bash(command)
-    assert.equal(tripped.length, 1, command)
-    assert.match(tripped[0].reason, /^push to the default branch: /, command)
-    guard.close()
-  }
-  for (const command of ['git push -u origin voice/fix', 'git push origin HEAD:voice/fix', 'git pull origin main']) {
-    const { tripped, bash, guard } = guarded()
-    bash(command)
-    assert.deepEqual(tripped, [], command)
-    guard.close()
-  }
-  const direct = guarded({ direct: true })
-  direct.bash('git push origin main')
-  assert.deepEqual(direct.tripped, [], 'a direct dispatch at level full may push to main')
-  direct.guard.close()
-  const off = guarded({ pushDirect: true })
-  off.bash('git push origin main')
-  assert.deepEqual(off.tripped, [], 'with pull requests turned off, main is where workers push')
-  off.guard.close()
-})
+// --- no rule on the default branch -----------------------------------------------------
+//
+// The driver's decision of 2026-11-04: a push to the default branch is not
+// always a problem, and whether it is allowed is the repository's
+// configuration on GitHub, not the kill switch's.
 
-test('rule: the default branch moved on GitHub during the run, and the worker has the new head', async () => {
-  writeFileSync(GH_STATE, JSON.stringify({ heads: { 'acme/alpha': 'aaaaaaa1111' } }))
-  const own = guarded({ git: { 'cat-file -e bbbbbbb2222': '' } })
-  const other = guarded({ git: {} })
-  await own.guard.runs.get('tabc').ready
-  await other.guard.runs.get('tabc').ready
-  writeFileSync(GH_STATE, JSON.stringify({ heads: { 'acme/alpha': 'bbbbbbb2222' } }))
-  await own.guard.ended(own.task)
-  await other.guard.ended(other.task)
-  assert.equal(own.tripped.length, 1)
-  assert.match(own.tripped[0].reason, /^push to the default branch: main on GitHub moved from aaaaaaa to bbbbbbb during the run, and the worker's repository holds the new head/)
-  assert.deepEqual(other.tripped, [], 'someone else pushed: the worker does not have that commit')
-  own.guard.close()
-  other.guard.close()
-})
-
-test('rule: gh api calls that merge are merges, unless it was an explicit direct dispatch', () => {
-  // As strict as ever, whatever the base: only gh pr merge has its base looked up (below).
-  for (const command of [
-    'gh api -X PUT repos/acme/alpha/pulls/12/merge',
-    'gh api -XPUT /repos/{owner}/{repo}/pulls/12/merge -f merge_method=squash',
-    'gh api --method PUT https://api.github.com/repos/acme/alpha/pulls/12/merge',
-    'gh api repos/acme/alpha/pulls/12/merge --method=put',
-    'gh api repos/acme/alpha/merges -f base=main -f head=voice/fix',
-    `gh api graphql -f query='mutation { mergePullRequest(input: {pullRequestId: "PR_kw"}) { clientMutationId } }'`,
-    "gh api graphql -F id=PR_kw -f query='\nmutation($id: ID!) {\n  enablePullRequestAutoMerge(input: {pullRequestId: $id}) { clientMutationId }\n}'",
-  ]) {
-    const { tripped, bash, guard } = guarded()
-    bash(command)
-    assert.equal(tripped.length, 1, command)
-    assert.match(tripped[0].reason, /^push to the default branch: the command "gh api .*" merges /, command)
-    guard.close()
-  }
-  for (const command of [
-    'gh api repos/acme/alpha/pulls/12/merge', // GET: whether it is merged
-    'gh api repos/acme/alpha/pulls/12/reviews -f event=COMMENT -f body=Fine',
-    `gh api graphql -f query='{ repository(owner: "acme", name: "alpha") { pullRequest(number: 12) { reviewThreads(first: 50) { nodes { isResolved } } } } }'`,
-    'gh pr comment 12 --body "no mergePullRequest here"',
-  ]) {
-    const { tripped, bash, guard } = guarded()
-    bash(command)
-    assert.deepEqual(tripped, [], command)
-    guard.close()
-  }
-  const direct = guarded({ direct: true })
-  direct.bash('gh api -X PUT repos/acme/alpha/pulls/12/merge')
-  assert.deepEqual(direct.tripped, [], 'a direct dispatch at level full may merge, as with gh pr merge')
-  direct.guard.close()
-})
-
-// --- gh pr merge: its base, looked up on GitHub --------------------------------------
-
-// A pull request as GitHub's REST API has it, with its base and the repository's default branch.
-function pullRequest(number, base, { slug = 'acme/alpha', head = `voice/pr${number}`, state = 'open', merged = false, defaultBranch = 'main' } = {}) {
-  return {
-    number,
-    state,
-    merged,
-    merged_at: merged ? new Date().toISOString() : null,
-    base: { ref: base, repo: { full_name: slug, default_branch: defaultBranch } },
-    head: { ref: head, label: `${slug.split('/')[0]}:${head}` },
-  }
-}
-
-function github(prs, extra = {}) {
-  const byKey = Object.fromEntries(prs.map(pr => [`${pr.base.repo.full_name}#${pr.number}`, pr]))
-  writeFileSync(GH_STATE, JSON.stringify({ heads: {}, prs: byKey, ...extra }))
-}
-
-// The checkout's git as gh reads it: one remote, the worker's repository on
-// GitHub, and the current branch tracking its namesake there.
-function checkout({ slug = 'acme/alpha', branch = 'voice/pr12', remotes = null, config = '' } = {}) {
-  const url = `https://github.com/${slug}.git`
-  return {
-    'remote -v': remotes ?? `origin\t${url} (fetch)\norigin\t${url} (push)\n`,
-    'config --get-regexp':
-      `remote.origin.url ${url}\nremote.origin.fetch +refs/heads/*:refs/remotes/origin/*\n` +
-      (branch ? `branch.${branch}.remote origin\nbranch.${branch}.merge refs/heads/${branch}\n` : '') +
-      config,
-    'symbolic-ref': branch ? `${branch}\n` : null,
-  }
-}
-
-const LET_GO = /^kill switch rule on the default branch: let gh pr merge of pull request (\d+) in (\S+) go, into (\S+), not the default branch (\S+) \(worker (\S+), task tabc\)$/
-
-test('rule: gh pr merge into another branch than the default one goes, logged; into the default branch it locks, once GitHub has answered', async () => {
-  github([
-    pullRequest(12, 'simple-modern'),
-    pullRequest(13, 'main'),
-    pullRequest(14, 'dev', { defaultBranch: 'dev' }), // the default branch is dev now, on GitHub
-    pullRequest(1080, 'simple-modern', { slug: 'jgraph/drawio-dev', defaultBranch: 'dev' }),
-  ])
-  // The false alarm of 2026-11-02: a stacked pull request into simple-modern,
-  // in a repository whose default branch is dev.
-  const incident = guarded({ repo: 'drawio-dev', slug: 'jgraph/drawio-dev', defaultBranch: 'dev' })
-  incident.bash('gh pr merge 1080 --repo jgraph/drawio-dev --merge --delete-branch --match-head-commit dc534e0a9b8c')
-  assert.deepEqual(incident.tripped, [], 'nothing at once: the lookup goes')
-  await incident.settled()
-  assert.deepEqual(incident.tripped, [])
-  assert.ok(
-    incident.logged.includes(
-      'kill switch rule on the default branch: let gh pr merge of pull request 1080 in jgraph/drawio-dev go, into simple-modern, not the default branch dev (worker drawio-dev, task tabc)',
-    ),
-    incident.logged.join('\n'),
-  )
-  assert.deepEqual(incident.gitCalls, [], 'with --repo, the folder does not matter')
-  assert.deepEqual(incident.task.mergesLetGo, { toolu_1: { slug: 'jgraph/drawio-dev', numbers: [1080] } }, 'kept with the task')
-  assert.equal(incident.saves(), 1, "in the workers' state")
-  incident.guard.close()
-
-  // Every form gh reads: a number, a URL, a branch, none (the current
-  // branch's); the repository from --repo, a URL or the folder's remote.
-  for (const [command, folder] of [
-    ['gh pr merge 12 --squash', true],
-    ["gh pr merge '#12' --repo=acme/alpha --squash 2>&1", false],
-    ['gh pr merge https://github.com/acme/alpha/pull/12 -sd', false],
-    ['gh pr merge https://github.com/acme/alpha/pull/12/files --repo github.com/acme/alpha', false],
-    ['gh pr merge voice/pr12 -R acme/alpha --rebase', false],
-    ['gh pr merge voice/pr12 --merge', true],
-    ['gh pr merge acme:voice/pr12 --merge -R acme/alpha', false],
-    ['gh pr merge --squash --delete-branch', true],
-    ['gh pr merge -sdR Acme/Alpha', true], // the current branch's: the folder still says which branch
-    ['gh pr merge 12 -R https://github.com/acme/alpha.git -t "Merge the menu" -b "Stacked on simple-modern."', false],
-    ['gh pr merge --repo acme/alpha -- 12', false],
-  ]) {
-    const run = guarded({ git: checkout() })
-    run.bash(command)
-    await run.settled()
-    assert.deepEqual(run.tripped, [], command)
-    const line = run.logged.find(entry => LET_GO.test(entry))
-    assert.ok(line, `${command}: ${run.logged.join('\n')}`)
-    assert.deepEqual(LET_GO.exec(line).slice(1), ['12', 'acme/alpha', 'simple-modern', 'main', 'alpha'], command)
-    assert.equal(run.gitCalls.length > 0, folder, `${command}: ${JSON.stringify(run.gitCalls)}`)
-    run.guard.close()
-  }
-  // The folder gh reads is the one the shell is in, after a cd.
-  const sub = guarded({ git: checkout() })
-  sub.bash('cd src')
-  sub.bash('gh pr merge 12')
-  await sub.settled()
-  assert.deepEqual(sub.tripped, [])
-  assert.deepEqual(sub.gitCalls.map(call => call.slice(0, 2)), [['/work/alpha/src', 'remote'], ['/work/alpha/src', 'config']])
-  sub.guard.close()
-
-  // Into the default branch: as the run knew it, or as GitHub has it now.
-  for (const [command, git, into] of [
-    ['gh pr merge 13 --squash', checkout(), '13 in acme/alpha into main'],
-    ['gh pr merge 13 -R acme/alpha', {}, '13 in acme/alpha into main'],
-    ['gh pr merge https://github.com/acme/alpha/pull/13', {}, '13 in acme/alpha into main'],
-    ['gh pr merge voice/pr13 --repo acme/alpha --squash', {}, '13 in acme/alpha into main'],
-    ['gh pr merge --squash', checkout({ branch: 'voice/pr13' }), '13 in acme/alpha into main'],
-    ['gh pr merge 14 --repo acme/alpha', {}, '14 in acme/alpha into dev'],
-  ]) {
-    const run = guarded({ git })
-    run.bash(command)
-    await run.settled()
-    assert.equal(run.tripped.length, 1, command)
-    assert.equal(
-      run.tripped[0].reason,
-      `push to the default branch: the command "${command}" merges pull request ${into}, the default branch (worker alpha, task tabc)`,
-    )
-    assert.ok(!run.logged.some(entry => LET_GO.test(entry)), command)
-    assert.equal(run.task.mergesLetGo, undefined)
-    run.guard.close()
-  }
-  // A direct dispatch at level full may merge into it, as before: nothing to look up.
-  const direct = guarded({ direct: true })
-  direct.bash('gh pr merge 13 --repo acme/alpha && echo merged')
-  await direct.settled()
-  assert.deepEqual(direct.tripped, [])
-  direct.guard.close()
-})
-
-test('rule: gh pr merge locks as before whenever the rule cannot be sure where it merges', async () => {
-  github([pullRequest(12, 'simple-modern')])
-  const lock = async (command, reason, options = {}, before = []) => {
-    const run = guarded({ git: checkout(), ...options })
-    for (const earlier of before) run.bash(earlier)
-    run.bash(command)
-    await run.settled()
-    assert.equal(run.tripped.length, 1, command)
-    assert.match(run.tripped[0].reason, /^push to the default branch: the command ".*" merges a pull request, .* \(worker alpha, task tabc\)$/, command)
-    assert.match(run.tripped[0].reason, reason, `${command}: ${run.tripped[0].reason}`)
-    assert.ok(!run.logged.some(entry => LET_GO.test(entry)), command)
-    run.guard.close()
-  }
-  // Not alone on its line: another command could change the base meanwhile.
-  for (const command of [
-    'gh pr edit 12 --base main & gh pr merge 12 --repo acme/alpha',
-    'gh pr merge 12 --repo acme/alpha && echo merged',
-    'gh pr merge 12 --repo acme/alpha; gh pr edit 12 --base main',
-    'gh pr merge 12 --repo acme/alpha &',
-    'gh pr merge 12 --repo acme/alpha | tee /tmp/merge.log',
-    '(gh pr merge 12 --repo acme/alpha)',
-    'gh pr merge $(gh pr list --head voice/pr12 --json number -q ".[0].number") --repo acme/alpha',
-    'sh -c "gh pr merge 12 --repo acme/alpha"',
-    'GH_REPO=acme/beta gh pr merge 12',
-    'env gh pr merge 12 --repo acme/alpha',
-    'gh pr merge 12 --repo acme/alpha # the stack',
-    'gh pr merge 12 --repo acme/alpha <<EOF\nbody\nEOF',
-  ]) {
-    await lock(command, /, not alone on its line, so its base is not looked up/)
-  }
-  // Words the shell still expands.
-  for (const command of ['gh pr merge $PR --repo acme/alpha', 'gh pr merge 12 --repo acme/{alpha,beta}', 'gh pr merge 12 --repo acme/alpha -b *']) {
-    await lock(command, /, with a variable, a pattern or braces in it/)
-  }
-  // Flags: --auto merges later, --admin past the protection, and what the rule does not read.
-  await lock('gh pr merge 12 --repo acme/alpha --auto --squash', /, with --auto, which merges later/)
-  await lock('gh pr merge 12 --repo acme/alpha --auto=false', /, with --auto/)
-  await lock('gh pr merge 12 --repo acme/alpha --admin --squash', /, with --admin \(worker/)
-  await lock('gh pr merge 12 --repo acme/alpha --disable-auto', /, with --disable-auto, which the rule does not read/)
-  await lock('gh pr merge 12 --repo acme/alpha -sx', /, with -sx, which the rule does not read/)
-  await lock('gh pr merge 12 13 --repo acme/alpha', /, with 12 13, which the rule does not read/)
-  await lock('gh pr merge 12 --repo', /, with --repo, which the rule does not read/)
-  // Which pull request, in which repository.
-  await lock('gh pr merge https://github.com/acme/alpha/pulls/12', /, and the rule cannot tell which pull request https:\/\/github\.com\/acme\/alpha\/pulls\/12 is/)
-  for (const command of [
-    'gh pr merge 12 --repo acme/beta',
-    'gh pr merge https://github.com/acme/beta/pull/12',
-    'gh pr merge https://github.com/acme/beta/pull/12 --repo acme/alpha',
-    'gh pr merge 12 --repo ghe.example.com/acme/alpha',
-    "gh pr merge 12 --repo ''",
-  ]) {
-    await lock(command, /, in another repository than acme\/alpha/)
-  }
-  await lock('gh pr merge 12 --repo acme/alpha', /, and the worker's repository is not on GitHub/, { slug: null })
-  // GitHub's answer.
-  await lock('gh pr merge 99 --repo acme/alpha', /, and gh could not look up its base on GitHub/)
-  await lock('gh pr merge voice/none --repo acme/alpha', /, and GitHub has no open pull request from acme:voice\/none/)
-  // The folder gh takes the repository and the branch from.
-  const twoRemotes =
-    'origin\thttps://github.com/acme/alpha.git (fetch)\norigin\thttps://github.com/acme/alpha.git (push)\n' +
-    'upstream\thttps://github.com/jgraph/alpha.git (fetch)\nupstream\thttps://github.com/jgraph/alpha.git (push)\n'
-  await lock('gh pr merge 12', /, and the folder it runs in has 2 git remotes/, { git: checkout({ remotes: twoRemotes }) })
-  await lock('gh pr merge 12', /, and the folder it runs in has 0 git remotes/, { git: { ...checkout(), 'remote -v': '' } })
-  await lock('gh pr merge 12', /, and the remote origin of the folder it runs in is not acme\/alpha on GitHub/, { git: checkout({ slug: 'acme/beta' }) })
-  await lock('gh pr merge 12', /, and git could not tell the remotes of the folder it runs in/, { git: {} })
-  await lock('gh pr merge 12', /, and the folder it runs in has another repository set as gh's default/, {
-    git: checkout({ config: 'remote.origin.gh-resolved jgraph/alpha\n' }),
-  })
-  await lock('gh pr merge --squash', /, and the folder it runs in is on no branch/, { git: checkout({ branch: null }) })
-  for (const config of ['branch.voice/pr12.merge refs/heads/voice/other\n', 'branch.voice/pr12.pushremote fork\n', 'remote.pushdefault fork\n']) {
-    await lock('gh pr merge --squash', /, and the branch voice\/pr12 tracks or pushes to another branch or remote/, { git: checkout({ config }) })
-  }
-  // After a cd the rule could not follow, or a script run in the shell, it
-  // no longer knows the folder; --repo and a number need none.
-  await lock('gh pr merge 12', /, and the folder gh takes the repository from is not certain/, {}, ['cd "$WORKDIR"'])
-  await lock('gh pr merge --squash --repo acme/alpha', /, and the folder gh takes the repository from is not certain/, {}, ['cd "$WORKDIR"'])
-  await lock('gh pr merge 12', /, and the folder gh takes the repository from is not certain/, {}, ['source .venv/bin/activate && npm test'])
-  const named = guarded({ git: checkout() })
-  named.bash('cd "$WORKDIR"')
-  named.bash('gh pr merge 12 --repo acme/alpha')
-  await named.settled()
-  assert.deepEqual(named.tripped, [])
-  named.guard.close()
-  // GH_REPO in the environment the run inherits chooses the repository.
-  process.env.GH_REPO = 'acme/beta'
-  try {
-    await lock('gh pr merge 12', /, and GH_REPO chooses the repository/)
-  } finally {
-    delete process.env.GH_REPO
-  }
-  // A lookup that takes too long.
-  github([pullRequest(12, 'simple-modern')], { delayMs: 1500 })
-  await lock('gh pr merge 12 --repo acme/alpha', /, and the lookup of its base took longer than 0\.3 seconds/, { mergeLookupMs: 300 })
-  github([pullRequest(12, 'simple-modern')])
-})
-
-test("rule: gh pr merge of a worker in the container: git in the container, the lookup with the gateway's gh on this computer", async () => {
-  github([pullRequest(12, 'simple-modern'), pullRequest(13, 'main')])
+// What the gateway's gh was asked while the given runs went on and ended.
+async function ghAsked(act) {
   const calls = join(TMP, 'gh-calls.jsonl')
   rmSync(calls, { force: true })
   process.env.FAKE_GH_LOG = calls
-  process.env.GH_REPO = 'acme/beta' // the gateway's environment is not the container's
   try {
-    const run = guarded({ docker: true, git: checkout() })
-    run.bash('cd src')
-    run.bash('gh pr merge 12 --squash')
-    await run.settled()
-    assert.deepEqual(run.tripped, [])
-    assert.ok(run.logged.some(entry => LET_GO.test(entry)))
-    // git through the runner, which runs it in the container, in the run's folder there
-    assert.deepEqual(run.gitCalls.map(call => call.slice(0, 2)), [['/work/alpha/src', 'remote'], ['/work/alpha/src', 'config']])
-    const gh = readFileSync(calls, 'utf8').trim().split('\n').map(line => JSON.parse(line))
-    assert.ok(gh.some(args => args.join(' ') === 'api repos/acme/alpha/pulls/12'), 'gh here looked it up')
-    run.guard.close()
-
-    const main = guarded({ docker: true, git: checkout({ branch: 'voice/pr13' }) })
-    main.bash('gh pr merge --squash')
-    await main.settled()
-    assert.match(main.tripped[0]?.reason ?? '', /merges pull request 13 in acme\/alpha into main, the default branch/)
-    main.guard.close()
+    await act()
   } finally {
     delete process.env.FAKE_GH_LOG
-    delete process.env.GH_REPO
   }
-})
+  return existsSync(calls) ? readFileSync(calls, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line).join(' ')) : []
+}
 
-test('rule: a gh pr merge the rule let go is looked at again; merged into the default branch after all, its base changed after the lookup, it locks', async () => {
-  github([pullRequest(15, 'simple-modern')])
-  const run = guarded()
-  run.bash('gh pr merge 15 --repo acme/alpha --squash')
-  await run.settled()
-  assert.deepEqual(run.tripped, [])
-  github([pullRequest(15, 'main', { state: 'closed', merged: true })]) // retargeted to main just before it merged
-  await run.guard.ended(run.task)
-  assert.equal(run.tripped.length, 1)
-  assert.equal(
-    run.tripped[0].reason,
-    'push to the default branch: pull request 15 in acme/alpha, whose gh pr merge the rule let go into simple-modern, was merged into main, ' +
-      'the default branch: its base changed after the lookup (worker alpha, task tabc)',
-  )
-  run.guard.close()
-
-  // Merged where it was looked up, or not merged at all: nothing.
-  for (const after of [pullRequest(16, 'simple-modern', { state: 'closed', merged: true }), pullRequest(16, 'main')]) {
-    github([pullRequest(16, 'simple-modern')])
-    const fine = guarded()
-    fine.bash('gh pr merge 16 --repo acme/alpha --squash')
-    await fine.settled()
-    github([after])
-    await fine.guard.ended(fine.task)
-    assert.deepEqual(fine.tripped, [], `${after.state} into ${after.base.ref}`)
-    fine.guard.close()
-  }
-})
-
-test('rule: a gateway that takes a run over reads its gh pr merge again, and goes by the pull requests let go before, not by the branch as it is now', async () => {
-  github([pullRequest(12, 'simple-modern')])
-  const first = guarded({ git: checkout() })
-  first.bash('gh pr merge --squash --delete-branch', 'toolu_merge')
-  await first.settled()
-  assert.deepEqual(first.tripped, [])
-  assert.deepEqual(first.task.mergesLetGo, { toolu_merge: { slug: 'acme/alpha', numbers: [12] } })
-  first.guard.close()
-  // Merged; gh switched the checkout to simple-modern, whose own pull request into main is open.
-  github([pullRequest(12, 'simple-modern', { state: 'closed', merged: true }), pullRequest(20, 'main', { head: 'simple-modern' })])
-  const taken = guarded({ git: checkout({ branch: 'simple-modern' }), task: first.task })
-  taken.bash('gh pr merge --squash --delete-branch', 'toolu_merge')
-  await taken.settled()
-  assert.deepEqual(taken.tripped, [], 'pull request 12, into simple-modern, as before')
-  assert.ok(taken.logged.some(entry => LET_GO.test(entry)))
-  taken.guard.close()
-  // Without what the earlier gateway kept: the branch as it is now.
-  const blind = guarded({ git: checkout({ branch: 'simple-modern' }) })
-  blind.bash('gh pr merge --squash --delete-branch', 'toolu_merge')
-  await blind.settled()
-  assert.match(blind.tripped[0]?.reason ?? '', /merges pull request 20 in acme\/alpha into main, the default branch/)
-  blind.guard.close()
-})
-
-test("rule: a merge on GitHub of the run's pull request; not someone else's, such as the driver's at the desk", async () => {
-  const now = new Date().toISOString()
-  const yesterday = new Date(Date.now() - 24 * 3600 * 1000).toISOString()
-  const pull = (number, ref, created, extra = {}) => ({
-    number,
-    merged_at: now,
-    created_at: created,
-    base: { ref: 'main' },
-    head: { ref, repo: { full_name: 'acme/alpha' } },
-    ...extra,
-  })
-  const seconds = Math.floor(Date.now() / 1000)
-  const cases = [
-    ['opened during the run from a voice/ branch', pull(12, 'voice/fix', now), {}, null,
-      /: it merged pull request 12 from voice\/fix, opened during the run/],
-    ['an older pull request whose branch the run pushed by name', pull(13, 'feature/x', yesterday), {}, 'git push -u origin feature/x',
-      /: it merged pull request 13 from feature\/x, which the run pushed/],
-    ["an older pull request whose branch the worker's repository pushed during the run", pull(14, 'voice/older', yesterday),
-      { git: { 'reflog show': `origin/voice/older@{${seconds}} update by push\norigin/voice/older@{1700000000} update by push\n` } }, null,
-      /: it merged pull request 14 from voice\/older, which the run pushed/],
-    ["an earlier worker's pull request, merged at the desk", pull(15, 'voice/earlier', yesterday),
-      { git: { 'reflog show': 'origin/voice/earlier@{1700000000} update by push\n' } }, null, null],
-    ['a pull request into another branch', pull(16, 'voice/fix', now, { base: { ref: 'dev' } }), {}, null, null],
-    ['a pull request from a fork', pull(17, 'voice/fix', now, { head: { ref: 'voice/fix', repo: { full_name: 'someone/alpha' } } }), {}, null, null],
-    ['a direct dispatch', pull(18, 'voice/fix', now), { direct: true }, null, null],
-  ]
-  for (const [i, [what, merged, options, command, expected]] of cases.entries()) {
-    writeFileSync(GH_STATE, JSON.stringify({ heads: { 'acme/alpha': 'aaaaaaa1111' } }))
-    const run = guarded(options)
-    await run.guard.runs.get('tabc').ready
-    if (command) run.bash(command)
-    const sha = `c${i}c${i}c${i}c${i}9999`
-    writeFileSync(GH_STATE, JSON.stringify({ heads: { 'acme/alpha': sha }, pulls: { [sha]: [merged] } }))
-    await run.guard.ended(run.task)
-    if (expected) {
-      assert.equal(run.tripped.length, 1, what)
-      assert.match(run.tripped[0].reason, /^push to the default branch: main on GitHub moved from aaaaaaa to c\dc\dc\dc during the run: /, what)
-      assert.match(run.tripped[0].reason, expected, what)
-    } else {
-      assert.deepEqual(run.tripped, [], what)
+test('no rule on the default branch: a push to it or a merge into it locks nothing, whatever the command, and gh is not asked', async () => {
+  const asked = await ghAsked(async () => {
+    for (const command of [
+      'git push origin main',
+      'git push origin HEAD:refs/heads/main',
+      'git push --force origin +voice/x:main',
+      'git -C . push --all origin',
+      'git push --mirror origin',
+      'gh pr merge 13 --repo acme/alpha --squash --delete-branch',
+      'gh pr merge --auto --admin --squash && echo merged',
+      'gh api -X PUT repos/acme/alpha/pulls/12/merge',
+      'gh api repos/acme/alpha/merges -f base=main -f head=voice/fix',
+      `gh api graphql -f query='mutation { mergePullRequest(input: {pullRequestId: "PR_kw"}) { clientMutationId } }'`,
+    ]) {
+      const run = guarded()
+      run.bash(command)
+      await run.guard.ended(run.task)
+      assert.deepEqual(run.tripped, [], command)
+      run.guard.close()
     }
-    run.guard.close()
+  })
+  assert.deepEqual(asked, [], 'no look at GitHub: no head, no pull request, no base')
+
+  // What the size check takes from a push stays: the branches it named.
+  const pushed = guarded()
+  pushed.bash('git push -u origin main voice/fix')
+  assert.deepEqual([...pushed.guard.runs.get('tabc').pushed], ['main', 'voice/fix'])
+  pushed.guard.close()
+})
+
+test("no rule on the default branch: main moving on GitHub during a run locks nothing, as on 2026-11-04, when the controller's merge was taken for the run's push", async () => {
+  // 13:40 UTC: the controller squash-merged hauswache's pull request 5 into
+  // main and pulled the shared checkout, while task tu9t ran in a worktree of
+  // it. The new head was in the worker's repository, so the rule locked.
+  const now = new Date().toISOString()
+  const task = {
+    id: 'tu9t',
+    repo: 'hauswache',
+    dir: '/work/.voice-worktrees/hauswache/tu9t',
+    checkout: '/work/hauswache',
+    worktree: 'tu9t',
+    slug: 'acme/hauswache',
+    defaultBranch: 'main',
+    startedAt: Date.now() - 1000,
   }
+  writeFileSync(GH_STATE, JSON.stringify({ heads: { 'acme/hauswache': 'aaaaaaa1111' } }))
+  let run
+  const asked = await ghAsked(async () => {
+    run = guarded({ task, git: { 'cat-file -e': '' } }) // the worker's repository holds every head
+    await run.guard.runs.get('tu9t').ready
+    run.bash('git push -u origin voice/fix')
+    // main moved: a merge of a pull request the run pushed and opened, which the old rule took for the run's own.
+    const merged = { number: 5, merged_at: now, created_at: now, base: { ref: 'main' }, head: { ref: 'voice/fix', repo: { full_name: 'acme/hauswache' } } }
+    writeFileSync(GH_STATE, JSON.stringify({ heads: { 'acme/hauswache': 'bbbbbbb2222' }, pulls: { bbbbbbb2222: [merged] } }))
+    await run.guard.ended(run.task)
+  })
+  assert.deepEqual(run.tripped, [])
+  assert.deepEqual(asked, [], 'the gateway no longer asks GitHub for the head of the default branch, during the run or at its end')
+  assert.ok(!run.gitCalls.some(call => call[1] === 'cat-file'), 'nor the worker\'s repository whether it holds it')
+  run.guard.close()
 })
 
 test('rule: unusually many changes, in edits during the run and in git at its end', async () => {
@@ -1243,7 +864,6 @@ async function sizeCheck(repo, act, { limits = { maxFiles: 100, maxLines: 1000 }
     runner,
     killswitch: { trip: event => tripped.push(event.reason) },
     limits,
-    mainCheckSeconds: 3600,
     log: (...parts) => logged.push(parts.join(' ')),
   })
   guard.on('measured', (task, size) => measured.push(size))
@@ -1882,17 +1502,17 @@ test("the controller's alarm locks it", async () => {
   await unlockByAdmin()
 })
 
-test('a rule: a push to main in a run locks it, and every running worker stops', async () => {
+test('a rule: a run that changes the crontab locks it, and every running worker stops', async () => {
   const slow = await gw.dispatch('beta', 'SLOW: a long task.')
   const slowId = /task=(t[a-z0-9]{3})/.exec(slow.text)[1]
   await waitUntil(() => existsSync(join(TMP, 'claude-calls.jsonl')) && readFileSync(join(TMP, 'claude-calls.jsonl'), 'utf8').includes('SLOW'))
   const slowPid = JSON.parse(readFileSync(join(TMP, 'claude-calls.jsonl'), 'utf8').trim().split('\n').findLast(l => l.includes('SLOW'))).pid
   const queued = /queued=(q[a-z0-9]{3})/.exec((await gw.dispatch('beta', 'Then tidy up the docs.')).text)[1]
-  await gw.dispatch('alpha', 'PUSHMAIN: push it.')
+  await gw.dispatch('alpha', 'CRONTAB: clean up the cron jobs.')
 
   const state = await waitUntil(async () => (await killswitchState()).state)
   assert.equal(state.trigger, 'rule')
-  assert.match(state.reason, /^push to the default branch: the command "git push origin main" \(worker alpha, task t[a-z0-9]{3}\)$/)
+  assert.match(state.reason, /^write outside the allowed folders: "crontab -r" changes the crontab, which locks at once \(worker alpha, task t[a-z0-9]{3}\)$/)
   // Ending until every process of it is gone, then stopped.
   const status = await waitUntil(async () => {
     const out = await gw.controller('worker_status', { worker: 'beta' })
@@ -1970,9 +1590,9 @@ async function gatewayAt(mode) {
   mkdirSync(secrets, { recursive: true, mode: 0o700 })
   const g = await startGateway({ secrets, state: join(TMP, `mode-${mode}`, 'state'), root, env: { VOICE_GW_KILLSWITCH: mode } })
   g.lock = async () => adminRequest(join(secrets, 'admin.sock'), 'GET', '/killswitch')
-  // A run that pushes to main: the rule's verdict is in the log, and the run ends as usual.
-  g.pushToMain = async () => {
-    const id = /task=(t[a-z0-9]{3})/.exec((await g.dispatch('alpha', 'PUSHMAIN: push it.')).text)[1]
+  // A run that changes the crontab: the rule's verdict is in the log, and the run ends as usual.
+  g.changeCrontab = async () => {
+    const id = /task=(t[a-z0-9]{3})/.exec((await g.dispatch('alpha', 'CRONTAB: clean up the cron jobs.')).text)[1]
     await waitUntil(() => g.events.find(e => e.meta?.task === id))
   }
   return g
@@ -1982,8 +1602,8 @@ test('VOICE_GW_KILLSWITCH=manual: a rule only logs; "emergency stop" by voice st
   const g = await gatewayAt('manual')
   try {
     assert.match(g.log, /kill switch manual: only the manual triggers lock it \(voice, Telegram, raise_alarm\); the rules only log/)
-    await g.pushToMain()
-    assert.match(g.log, /kill switch not locked, VOICE_GW_KILLSWITCH=manual; rule would have locked it: push to the default branch: the command "git push origin main"/)
+    await g.changeCrontab()
+    assert.match(g.log, /kill switch not locked, VOICE_GW_KILLSWITCH=manual; rule would have locked it: write outside the allowed folders: "crontab -r" changes the crontab/)
     assert.equal((await g.lock()).locked, false)
     assert.match(await g.voice.car('status'), /^\[gateway=ok .* killswitch=manual locked=no\]/)
     assert.match(await g.voice.car('send', { message: 'Emergency stop!' }), /^\[state=locked\] Emergency stop\./)
@@ -2004,7 +1624,7 @@ test('VOICE_GW_KILLSWITCH=off: nothing locks; voice, emergency_stop and raise_al
     assert.match(tool.content[0].text, /^Gateway \S.*: active\n\[state=off\] Emergency stop: The kill switch is turned off/, 'still active: nothing locked')
     const alarm = await g.controller('raise_alarm', { reason: 'The worker writes to files nobody asked for.' })
     assert.match(alarm.text, /^\[killswitch=off\] The kill switch is turned off .* Tell the driver in one sentence what looks wrong/)
-    await g.pushToMain()
+    await g.changeCrontab()
     for (const trigger of ['voice', 'controller', 'rule']) {
       assert.match(g.log, new RegExp(`kill switch not locked, VOICE_GW_KILLSWITCH=off; ${trigger} would have locked it`), trigger)
     }

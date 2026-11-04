@@ -233,7 +233,6 @@ test('the rules see what a run does after an early result', async () => {
     runner: workers.runner,
     killswitch: { trip: event => tripped.push(event) },
     ghBin: join(BIN, 'gh'),
-    mainCheckSeconds: 3600,
     log: () => {},
   })
   try {

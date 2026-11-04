@@ -60,7 +60,6 @@ function session({ runner: given = null, killswitch = null, quarantine = true, t
     temp: ['/nowhere/tmp'], // the test's folders are in the temporary folder
     gateway: join(where.root, 'cc-voice-gateway'),
     ghBin: '/bin/false',
-    mainCheckSeconds: 3600,
     log: (...parts) => logged.push(parts.join(' ')),
   })
   guard.on('quarantined', (task, entry) => warned.push(entry))

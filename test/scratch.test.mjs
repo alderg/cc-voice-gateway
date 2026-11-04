@@ -384,7 +384,6 @@ test('the rules: a run in a work folder writes only there, in the temporary fold
     ghBin: join(BIN, 'gh'),
     allowed: ['/opt/allowed'],
     limits: { maxFiles: 1 },
-    mainCheckSeconds: 3600,
     log: () => {},
   })
   try {
@@ -399,7 +398,7 @@ test('the rules: a run in a work folder writes only there, in the temporary fold
     // In a repository's run /tmp is fine as well.
     const plain = new EventEmitter()
     const repoTripped = []
-    const repoGuard = new RunGuard({ workers: plain, runner: workers.runner, killswitch: { trip: e => repoTripped.push(e) }, mainCheckSeconds: 3600, log: () => {} })
+    const repoGuard = new RunGuard({ workers: plain, runner: workers.runner, killswitch: { trip: e => repoTripped.push(e) }, log: () => {} })
     const repoTask = { id: 'trep', repo: 'alpha', dir: '/work/alpha', startedAt: Date.now() }
     plain.emit('started', repoTask)
     plain.emit('tool', repoTask, { type: 'tool_use', name: 'Bash', input: { command: 'echo x > /tmp/voice-gw-scratch-outside' } })
@@ -410,7 +409,7 @@ test('the rules: a run in a work folder writes only there, in the temporary fold
     const scratchTask = { id: 'tscr', kind: 'scratch', repo: 'scratch/abcd', dir: '/scratch/2026-01-01-abcd', startedAt: Date.now() }
     const third = new EventEmitter()
     const thirdTripped = []
-    const scratchGuard = new RunGuard({ workers: third, runner: workers.runner, killswitch: { trip: e => thirdTripped.push(e.reason) }, allowed: ['/opt/allowed'], mainCheckSeconds: 3600, log: () => {} })
+    const scratchGuard = new RunGuard({ workers: third, runner: workers.runner, killswitch: { trip: e => thirdTripped.push(e.reason) }, allowed: ['/opt/allowed'], log: () => {} })
     third.emit('started', scratchTask)
     third.emit('tool', scratchTask, { type: 'tool_use', name: 'Write', input: { file_path: `${homedir()}/.claude/projects/-scratch-2026-01-01-abcd/memory/note.md` } })
     third.emit('tool', scratchTask, { type: 'tool_use', name: 'Write', input: { file_path: 'notes/a.md' } })

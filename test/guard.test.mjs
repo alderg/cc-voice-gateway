@@ -288,7 +288,6 @@ function tripsAll(commands, tool = 'Bash') {
     runner: { dir: name => `/work/${name}`, git: async () => null },
     killswitch: { trip: event => tripped.push(event.reason) },
     ghBin: '/bin/false',
-    mainCheckSeconds: 3600,
     log: () => {},
   })
   const task = { id: 'tabc', repo: 'alpha', dir: '/work/alpha', slug: null, defaultBranch: 'main', startedAt: Date.now() }
@@ -388,7 +387,6 @@ function session({ task: more = {}, ...options } = {}) {
     runner: { dir: name => `/work/${name}`, git: async () => null },
     killswitch: { trip: event => tripped.push(event.reason) },
     ghBin: '/bin/false',
-    mainCheckSeconds: 3600,
     log: (...parts) => logged.push(parts.join(' ')),
     ...options,
   })
@@ -534,7 +532,7 @@ test("with the guard's hook, the rule takes the folder Claude Code names, and wa
   s.report(id, { cwd: '/work/alpha/deep/er' })
   s.result(id)
   assert.deepEqual(s.tripped, [])
-  assert.equal(s.guard.runs.get('tabc').cwdSure, true, 'the folder is certain again')
+  assert.equal(s.guard.runs.get('tabc').cwd, '/work/alpha/deep/er', 'the folder the report named')
   // Nothing is checked before the report; then at once.
   id = s.tool('echo x > ../../../y.txt')
   assert.deepEqual(s.tripped, [])
