@@ -108,7 +108,9 @@
     </label>
     <p class="guide">What locks the gateway and stops every worker. Manual: "emergency stop" by voice,
       <code>/stop</code> on Telegram and the controller's alarm. Automatic: also fixed rules on the workers' runs,
-      such as a push to the default branch, a write outside the repository or unusually many changes.</p>
+      such as a push to the default branch, a write outside the repository or unusually many changes. The
+      first two new files a run writes outside, in a place that is not sensitive, go to quarantine instead,
+      with a warning on Telegram.</p>
     <p id="killswitch-warning" class="notice wide" role="alert" hidden></p>
     <label><input type="checkbox" id="funnel-idle-on"> Turn Tailscale Funnel off when idle</label>
     <p class="guide">The public endpoint is then only up while you use it. The gateway says on Telegram when it

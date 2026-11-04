@@ -91,10 +91,14 @@ if (verb === 'inspect') {
 }
 if (verb !== 'exec') process.exit(2)
 let cwd = process.cwd()
-while (argv[0]?.startsWith('-')) if (argv.shift() === '-w') cwd = argv.shift()
+const env = { ...process.env, CONTAINER_SIDE: '1' }
+while (argv[0]?.startsWith('-')) {
+  const flag = argv.shift()
+  if (flag === '-w') cwd = argv.shift()
+  else if (flag === '-e') { const [name, ...value] = argv.shift().split('='); env[name] = value.join('=') }
+}
 argv.shift() // the container
 const [command, ...args] = argv
-const env = { ...process.env, CONTAINER_SIDE: '1' }
 const runs = process.env.FAKE_DOCKER_RUNS
 if (command === 'voice-run') {
   const [task, run, ...rest] = args
@@ -208,7 +212,9 @@ test('scratch/new: a new empty folder, the run in it with rules of its own; afte
     const rules = arg(call, '--append-system-prompt')
     assert.match(rules, /^You are a worker\./)
     assert.match(rules, /Your work folder is the current directory/)
-    assert.match(rules, /Every file you make goes there, scripts included; only temporary files may also go to \/tmp/)
+    assert.match(rules, /Every file you make goes there, scripts, backups and copies included; only temporary files may also go to\n  \/tmp\. After a cd, give every write an absolute path, and never run commands from an old transcript or log\n  again as they stand/)
+    // The quarantine of the rule on writes outside (guard.mjs), and its notes.
+    assert.match(rules, /The first two new files elsewhere it moves to\n  quarantine instead, and tells you in a note that begins "The gateway's guard:", which is the gateway's\n  own; the third stops all work\./)
     assert.doesNotMatch(rules, /voice\/<short-name>|gh pr create/)
     assert.match(call.input, /^MAKE: sum up the quarter in a report\.\n\nThe driver's own words: "the words"\n/)
     assert.match(call.input, new RegExp(`^- Work folder: ${task.repo}, new and empty$`, 'm'))
@@ -780,7 +786,8 @@ test('VOICE_GW_SCRATCH_DOCKER: made, run and looked at through docker exec in th
     const calls = dockerCalls()
     assert.ok(calls.some(call => call.join(' ') === `exec voice-scratch mkdir -m 700 ${dir}`), 'made in the container')
     const run = calls.find(call => call.includes('voice-run'))
-    assert.deepEqual(run.slice(0, 8), ['exec', '-i', '-w', dir, 'voice-scratch', 'voice-run', id, join(BIN, 'claude')])
+    // The guard's notes for the run (guard.mjs) in the container, handed to the run inside.
+    assert.deepEqual(run.slice(0, 10), ['exec', '-i', '-w', dir, '-e', `VOICE_GW_GUARD_NOTES=/tmp/voice-gw/${id}.notes`, 'voice-scratch', 'voice-run', id, join(BIN, 'claude')])
     assert.ok(!run.includes('--remote-control'), 'a headless run, which Remote Control does not connect')
     assert.ok(calls.some(call => call[1] === 'voice-scratch' && call[2] === 'sh' && call.includes(dir)), 'looked at in the container')
     const call = await until(() => callOf('MAKE: compute the travel costs.'))

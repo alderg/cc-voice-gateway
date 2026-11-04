@@ -12,7 +12,7 @@
 // clone here as a bundle (scripts/fetch-from-container.sh).
 
 import { execFile, execFileSync, spawn } from 'node:child_process'
-import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs'
+import { constants, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync } from 'node:fs'
 import { dirname, join, posix } from 'node:path'
 import { ROOT, config } from './config.mjs'
 import { log } from './log.mjs'
@@ -394,7 +394,53 @@ export class HostRunner {
     rmSync(dir, { recursive: true, force: true })
     return true
   }
+
+  // --- a write outside the allowed folders (guard.mjs) -------------------------
+
+  // What is at a path, never followed: { kind (file, dir, link, other or
+  // missing), born (ms, or null where the file system keeps no birth time),
+  // links, repo (a folder above it holds .git) }.
+  async inspect(path) {
+    const stat = lstatSync(path, { throwIfNoEntry: false })
+    const kind = !stat ? 'missing' : stat.isSymbolicLink() ? 'link' : stat.isFile() ? 'file' : stat.isDirectory() ? 'dir' : 'other'
+    return { kind, born: stat?.birthtimeMs > 0 ? stat.birthtimeMs : null, links: stat?.nlink ?? 0, repo: inRepository(path) }
+  }
+
+  // Moves a file into the quarantine folder on this computer, dest being its
+  // new path there; true once it is there and gone where it was.
+  async quarantine(path, dest) {
+    mkdirSync(dirname(dest), { recursive: true, mode: 0o700 })
+    try {
+      renameSync(path, dest)
+    } catch (error) {
+      if (error.code !== 'EXDEV') return false
+      copyFileSync(path, dest, constants.COPYFILE_EXCL) // another file system
+      rmSync(path, { force: true })
+    }
+    return true
+  }
 }
+
+// Whether a folder above the path holds .git: the path is in a git
+// repository or a worktree.
+function inRepository(path) {
+  for (let dir = dirname(path); ; dir = dirname(dir)) {
+    if (existsSync(join(dir, '.git'))) return true
+    if (dir === dirname(dir)) return false
+  }
+}
+
+// As HostRunner.inspect, with sh and GNU stat in the container: kind, birth
+// time in seconds (0: unknown), links, and whether a folder above holds .git.
+const INSPECT = [
+  'f=$1',
+  'if [ -L "$f" ]; then k=link; elif [ -f "$f" ]; then k=file; elif [ -d "$f" ]; then k=dir; elif [ -e "$f" ]; then k=other; else k=missing; fi',
+  'b=$(stat -c %W -- "$f" 2>/dev/null) || b=0',
+  'n=$(stat -c %h -- "$f" 2>/dev/null) || n=0',
+  'r=no; d=$(dirname -- "$f")',
+  'while :; do [ -e "$d/.git" ] && { r=yes; break; }; [ "$d" = / ] && break; d=$(dirname -- "$d"); done',
+  'echo "$k $b $n $r"',
+].join('\n')
 
 // Repository folders directly in $1 with a .git, one name per line.
 const LIST_REPOS = 'for d in "$1"/*/; do [ -e "$d.git" ] && basename "$d"; done; true'
@@ -589,5 +635,24 @@ export class DockerRunner {
 
   async remove(dir) {
     return (await this.exec(['rm', '-rf', '--', dir], 60000)).ok
+  }
+
+  // --- a write outside the allowed folders (guard.mjs) -------------------------
+
+  // As HostRunner.inspect, in the container; null when it does not answer.
+  async inspect(path) {
+    const { ok, stdout } = await this.exec(['sh', '-c', INSPECT, 'sh', path])
+    const [kind, born, links, repo] = ok ? stdout.trim().split(' ') : []
+    if (!kind) return null
+    return { kind, born: Number(born) > 0 ? Number(born) * 1000 : null, links: Number(links) || 0, repo: repo === 'yes' }
+  }
+
+  // Out of the container into the quarantine folder on this computer, with
+  // docker cp, which copies a link as a link; then removed in the container.
+  async quarantine(path, dest) {
+    mkdirSync(dirname(dest), { recursive: true, mode: 0o700 })
+    const copied = await run(this.dockerBin, ['cp', `${this.container}:${path}`, dest], 60000)
+    if (!copied.ok) return false
+    return (await this.exec(['rm', '-f', '--', path])).ok
   }
 }

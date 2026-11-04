@@ -257,6 +257,7 @@ const guard = new RunGuard({
     maxHelperFiles: config.killMaxHelperFiles,
   },
   allowed: config.killAllowPaths,
+  quarantine: config.quarantineDir,
   mainCheckSeconds: config.killCheckSeconds,
 })
 for (const task of workers.running()) guard.started(task) // runs from before this gateway
@@ -760,6 +761,19 @@ async function lockdown(why) {
 }
 
 const lockdownFailed = error => log('kill switch: lockdown incomplete, still locked:', error.message)
+
+// A write outside that the kill switch's rule moved to quarantine instead of
+// locking (guard.mjs): a warning on Telegram at once; the controller hears it
+// with the run's result.
+guard.on('quarantined', (task, entry) => {
+  telegram
+    ?.send(
+      `cc-voice-gateway on ${hostname()}: warning, worker ${task.repo} (task ${task.id}) wrote ${entry.path} outside its ` +
+        `allowed folders. The guard moved it to quarantine: ${entry.file}. Invalid write ${entry.n} of the run; the ` +
+        `${entry.n >= 2 ? 'next one' : 'third'} locks the kill switch.`,
+    )
+    .catch(error => log('quarantine warning not sent by Telegram:', error.message))
+})
 
 killswitch.on('tripped', async (state, event, first) => {
   const parked = (await lockdown(event.trigger).catch(lockdownFailed)) ?? []

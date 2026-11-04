@@ -341,6 +341,9 @@ config.nightFile = join(config.stateDir, 'night.json')
 config.ordersFile = join(config.stateDir, 'orders.json')
 // The statistics of this running time and of all time (stats.mjs).
 config.statsFile = join(config.stateDir, 'stats.json')
+// The files the kill switch's rule on writes outside moved out of the way,
+// one folder per task (guard.mjs).
+config.quarantineDir = join(config.stateDir, 'quarantine')
 config.telegramTokenFile = join(config.secretsDir, 'telegram_token')
 config.telegramChatIdFile = join(config.secretsDir, 'telegram_chat_id')
 // Every message the bot received, the driver's and anyone else's, with what

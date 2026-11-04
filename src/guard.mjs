@@ -32,15 +32,36 @@
 //                   the temporary folders and
 //                   the run's own Claude Code memory folder (memoryFolder):
 //                   the file tools by their path, shell commands by explicit
-//                   targets (redirections, tee, cp, mv, rm, mkdir, touch, ln,
-//                   chmod, chown, truncate, sed -i, dd of=), after cd. The
-//                   command line is read as a shell reads it (parseShell):
-//                   quoted text, comments and heredocs are data; commands in
-//                   $(…), `…`, <(…), >(…), sh -c, eval, a shell's heredoc and
-//                   a script written from a heredoc that the same call runs
-//                   are commands. Devices such as /dev/null are no write. A
-//                   run in a work folder (workspaces.mjs) may write only
-//                   there and in its memory folder.
+//                   targets (redirections, tee, cp, mv and what it moves away,
+//                   rm, mkdir, touch, ln, chmod, chown, truncate, sed -i, dd
+//                   of=), after cd; crontab; and a git hook in any .git, also
+//                   the run's own. The command line is read as a shell reads
+//                   it (parseShell): quoted text, comments and heredocs are
+//                   data; commands in $(…), `…`, <(…), >(…), sh -c, eval, a
+//                   shell's heredoc and a script written from a heredoc that
+//                   the same call runs are commands. Devices such as /dev/null
+//                   are no write. A run in a work folder (workspaces.mjs) may
+//                   write only there and in its memory folder. The folder a
+//                   Bash call starts in is the one Claude Code names in the
+//                   guard's hook (guardHooks), or else the one the rule
+//                   followed: Claude Code keeps the shell's folder from one
+//                   call of the main thread to the next, also after a cd,
+//                   keeps it as it was after a command that failed, and goes
+//                   back to the workspace when a call ends outside it, with
+//                   "Shell cwd was reset to …" in the result; a subagent's
+//                   calls start in the main thread's folder and change it
+//                   never, and neither does a call in the background.
+//                   Quarantine (QUARANTINE_FREE): the first two invalid writes
+//                   of a run that make a new plain file in a place that is not
+//                   sensitive (sensitive) are moved into the quarantine
+//                   folder once the call has ended (decide), logged, kept with
+//                   the task for its result and Telegram, and the worker is
+//                   told by the hook; the third locks. Everything else locks
+//                   at once, as before: changing, appending to, removing or
+//                   moving files, folders and links, hidden files and folders,
+//                   other repositories, the gateway's checkout, places outside
+//                   the home and the repositories folder, and whatever the
+//                   guard cannot pin down.
 //   many changes    more file edits in a run than maxEdits; at the end, more
 //                   files or lines changed than maxFiles or maxLines, counting
 //                   commits made during the run on any branch, each by its
@@ -77,8 +98,10 @@
 
 import { execFile } from 'node:child_process'
 import { EventEmitter } from 'node:events'
+import { appendFileSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { posix } from 'node:path'
+import { dirname, join, posix, resolve as resolvePath } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { log as defaultLog, preview } from './log.mjs'
 import { tempFolders } from './platform.mjs'
 import { HELPER_FOLDER, inHelperFolder } from './workspaces.mjs'
@@ -92,7 +115,103 @@ export function memoryFolder(config, dir) {
   return `${config}/projects/${dir.replace(/[^A-Za-z0-9]/g, '-')}/memory`
 }
 
+// --- the guard's hooks in a worker's run ---------------------------------------
+//
+// In the worker's settings (workers.mjs, --settings with --include-hook-events,
+// which puts every hook's output into the run's stream-json). Before a Bash or
+// Write call, PreToolUse prints the call's id, the folder Claude Code starts
+// it in and when, as one line after TOOL_START; Claude Code shows the model
+// nothing of it. After a call, PostToolUse and PostToolUseFailure hand the
+// model what the guard left for it in the file that GUARD_NOTES_ENV names (a
+// write it moved to quarantine), as additional context, and empty the file.
+// Before the run's turn ends, Stop waits while the guard still decides about
+// a write (the file .wait next to it), and hands over what is left with
+// decision block, so that the worker reads it before it ends. One script for
+// all, run by node: this computer's for a run here, the container's there.
+// It holds no single quote, as it goes into one.
+
+export const GUARD_NOTES_ENV = 'VOICE_GW_GUARD_NOTES'
+export const TOOL_START = 'voice-gw-tool '
+// The folder of the notes in the container, which the gateway writes with
+// docker exec; on this computer they are next to the run's output.
+export const CONTAINER_NOTES = '/tmp/voice-gw'
+const STOP_WAIT_MS = 30 * 1000
+const HOOK_SCRIPT =
+  'const fs=require("fs");let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{' +
+  'let i={};try{i=JSON.parse(s)}catch{}' +
+  `const e=i.hook_event_name,n=process.env.${GUARD_NOTES_ENV};` +
+  'if(e==="PreToolUse"){process.stdout.write(' +
+  `"${TOOL_START}"+JSON.stringify({id:i.tool_use_id,cwd:i.cwd,agent:i.agent_id||null,at:Date.now()})+"\\n");return}` +
+  'if(!n)return;' +
+  'const take=()=>{const t=n+".taken"+process.pid;try{fs.renameSync(n,t)}catch{return""}' +
+  'try{return fs.readFileSync(t,"utf8").trim()}catch{return""}finally{try{fs.unlinkSync(t)}catch{}}};' +
+  `if(e==="Stop"){const end=Date.now()+${STOP_WAIT_MS};const go=()=>{` +
+  'if(fs.existsSync(n+".wait")&&Date.now()<end)return setTimeout(go,250);' +
+  'const x=take();if(x)process.stdout.write(JSON.stringify({decision:"block",reason:x}))};return go()}' +
+  'const x=take();if(x)process.stdout.write(JSON.stringify({hookSpecificOutput:{hookEventName:e,additionalContext:x}}))})'
+
+const shellQuote = text => `'${String(text).replace(/'/g, `'\\''`)}'`
+
+// The hooks for the worker's settings; node: the node that runs the script.
+export function guardHooks(node) {
+  const hook = { type: 'command', command: `${shellQuote(node)} -e ${shellQuote(HOOK_SCRIPT)}` }
+  return {
+    PreToolUse: [{ matcher: 'Bash|Write', hooks: [hook] }],
+    PostToolUse: [{ matcher: '*', hooks: [hook] }],
+    PostToolUseFailure: [{ matcher: '*', hooks: [hook] }],
+    Stop: [{ hooks: [{ ...hook, timeout: STOP_WAIT_MS / 1000 + 30 }] }],
+  }
+}
+
+// The calls' reports in a PreToolUse hook's output: [{ id, cwd, agent, at }].
+export function toolStarts(stdout) {
+  const found = []
+  for (const line of String(stdout ?? '').split('\n')) {
+    if (!line.startsWith(TOOL_START)) continue
+    try {
+      const report = JSON.parse(line.slice(TOOL_START.length))
+      if (typeof report?.id === 'string' && report.id) found.push(report)
+    } catch {
+      // not the guard's
+    }
+  }
+  return found
+}
+
 const FILE_TOOLS = { Write: 'file_path', Edit: 'file_path', MultiEdit: 'file_path', NotebookEdit: 'notebook_path' }
+// The calls the guard's hook reports before they start (guardHooks).
+const REPORTED = new Set(['Bash', 'Write'])
+// How long the rule waits for a call's report before it goes by the folder
+// it followed: the hooks may not run, as with disableAllHooks.
+const REPORT_WAIT_MS = 10 * 1000
+// Claude Code's own words when it takes the shell back to the workspace.
+const RESET = /(?:^|\n)Shell cwd was reset to (.+)$/
+const OUTSIDE = 'write outside the allowed folders'
+// Invalid writes of a run that go to quarantine before the next one locks.
+const QUARANTINE_FREE = 2
+// A file a call made is born after the call started: as its report says,
+// or without one up to this long before the rule saw the call; a second
+// less, for birth times in whole seconds.
+const START_SLACK_MS = 5000
+// What locks at once whatever the place: everything but making a new file.
+const LOCKING_OPS = {
+  append: 'it appends to a file',
+  edit: 'it changes a file in place',
+  remove: 'it removes or moves files away',
+  move: 'it moves files there',
+  mode: 'it changes a mode or an owner',
+  truncate: 'it truncates a file',
+  mkdir: 'it makes a folder',
+  link: 'it makes a link',
+}
+// Shell profiles and rc files, also without their dot.
+const SHELL_FILES = /^\.?(bash_profile|bash_login|bash_logout|bashrc|profile|zshrc|zshenv|zprofile|zlogin|zlogout|kshrc|cshrc|tcshrc|login|logout|inputrc|xprofile|xinitrc|xsessionrc|envrc)$/
+// CI workflow files that live outside a hidden folder.
+const CI_FILES = new Set(['Jenkinsfile', 'azure-pipelines.yml', 'azure-pipelines.yaml', 'bitbucket-pipelines.yml', 'appveyor.yml', 'cloudbuild.yaml', 'cloudbuild.yml', 'buildspec.yml', 'codemagic.yaml'])
+// The gateway's own checkout.
+const GATEWAY = resolvePath(dirname(fileURLToPath(import.meta.url)), '..')
+// A git hook, in any .git: also the run's own repository's.
+const gitHook = path => /(?:^|\/)\.git\/hooks(?:\/|$)/.test(path)
 const WRAPPERS = new Set(['sudo', 'command', 'exec', 'nohup', 'time', 'env', 'nice'])
 // Words of compound commands before the command itself, or after it.
 const KEYWORDS = new Set(['if', 'then', 'else', 'elif', 'fi', 'do', 'done', 'while', 'until', '!', '{', '}', 'esac'])
@@ -175,7 +294,7 @@ class ShellParser {
     const pending = [] // heredocs, whose bodies begin with the next line
     let command = null
     let depth = 0 // subshells opened here
-    const current = at => (command ??= { type: 'command', words: [], writes: [], heredocs: [], start: at, end: at })
+    const current = at => (command ??= { type: 'command', words: [], writes: [], redirects: [], heredocs: [], start: at, end: at })
     const finish = () => {
       if (!command) return
       command.text = src.slice(command.start, command.end).trim()
@@ -257,7 +376,10 @@ class ShellParser {
       pending.push({ delimiter: target.text, strip: op === '<<-', quoted: target.quoted, command })
     } else if (WRITES.has(op) || (op === '>&' && !fd && !/^(\d+-?|-)$/.test(target.text))) {
       // >&word with a word that is no file descriptor writes to that file
-      if (target.text) command.writes.push(target.text)
+      if (target.text) {
+        command.writes.push(target.text)
+        command.redirects.push({ target: target.text, op: op.endsWith('>>') ? 'append' : op === '<>' ? 'edit' : 'create' })
+      }
     }
     return target.end
   }
@@ -432,6 +554,32 @@ const basename = name => String(name ?? '').split('/').pop()
 // Whether a path is one of the folders, or inside one.
 const within = (path, roots) => roots.some(root => path === root || path.startsWith(root.replace(/\/$/, '') + '/'))
 
+// The folders on this computer's PATH, but / and the home folder itself.
+const pathFolders = home =>
+  String(process.env.PATH ?? '')
+    .split(':')
+    .map(dir => dir.replace(/(.)\/+$/, '$1'))
+    .filter(dir => dir.startsWith('/') && dir !== '/' && dir !== home)
+
+// What the worker reads, through the guard's hook, about a write the guard
+// moved to quarantine (RunGuard.toQuarantine).
+function quarantineNote(run, entry) {
+  const by = entry.command.startsWith('"') ? `the command ${entry.command}` : `the ${entry.command.split(' ')[0]} tool`
+  const own = run.scratch
+    ? `your work folder ${run.dir}`
+    : `${run.worktree ? 'your worktree' : 'the repository'} ${run.dir}${run.runFolder ? `, your run folder ${run.runFolder}` : ''}`
+  const next =
+    entry.n >= QUARANTINE_FREE
+      ? 'This was the second invalid write of this run: the next one locks the kill switch, which stops all work.'
+      : 'The third invalid write of a run locks the kill switch, which stops all work.'
+  return (
+    `The gateway's guard: ${by} wrote ${entry.path}, outside your allowed folders. The gateway moved the file to ` +
+    `quarantine as an invalid write, so it is no longer there. Write only in ${own} and the temporary folders; after a ` +
+    `cd, give writes absolute paths, and keep backups and copies inside these folders too. ${next} Say in your result ` +
+    'what you wrote there.'
+  )
+}
+
 // The command of a simple command's words: past keywords (if, do, …),
 // wrappers (sudo, env, …) and variable assignments. { name, args }.
 function commandOf(words) {
@@ -601,6 +749,10 @@ export class RunGuard extends EventEmitter {
     ghBin = 'gh',
     limits = {},
     allowed = [],
+    quarantine = null,
+    gateway = GATEWAY,
+    home = null,
+    temp = null,
     mainCheckSeconds = 30,
     mergeLookupMs = 10000,
     mergeRecheckMs = 30000,
@@ -611,6 +763,15 @@ export class RunGuard extends EventEmitter {
     this.runner = runner
     this.killswitch = killswitch
     this.ghBin = ghBin
+    // The rule on writes outside: the folder on this computer where the
+    // invalid writes it lets off go, one folder per task (null: none, every
+    // invalid write locks), and the gateway's own checkout.
+    this.quarantine = quarantine
+    this.gateway = gateway
+    // The home folder and the temporary folders on this computer: homedir()
+    // and tempFolders(), unless a test names others.
+    this.home = home
+    this.temp = temp
     // gh pr merge: how long the lookup of its base may take before the rule
     // locks, and when a merge it let go is looked at again (prMerge).
     this.mergeLookupMs = mergeLookupMs
@@ -628,7 +789,9 @@ export class RunGuard extends EventEmitter {
     this.pushedBy = new Map()
     this.ghWarned = false
     workers.on('started', task => this.started(task))
-    workers.on('tool', (task, part) => this.tool(task, part))
+    workers.on('tool', (task, part, parent) => this.tool(task, part, parent))
+    workers.on('toolStart', (task, report) => this.toolStart(task, report))
+    workers.on('toolResult', (task, result) => this.toolResult(task, result))
     workers.on('ended', task => this.ended(task))
     this.timer = setInterval(() => this.checkAll(), mainCheckSeconds * 1000)
     this.timer.unref()
@@ -664,8 +827,8 @@ export class RunGuard extends EventEmitter {
   // VOICE_GW_KILL_ALLOW_PATHS.
   places(runner) {
     const docker = Boolean(runner.container)
-    const home = docker ? '/home/worker' : homedir()
-    const temp = docker ? ['/tmp', '/var/tmp'] : tempFolders()
+    const home = docker ? '/home/worker' : (this.home ?? homedir())
+    const temp = this.temp ?? (docker ? ['/tmp', '/var/tmp'] : tempFolders())
     return {
       home,
       claudeConfig: (!docker && process.env.CLAUDE_CONFIG_DIR) || `${home}/.claude`,
@@ -717,8 +880,19 @@ export class RunGuard extends EventEmitter {
       lookups: new Set(), // gh pr merge: the lookups of a base going (prMerge)
       merges: [], // gh pr merge: the merges let go, for the look again (recheckMerges)
       // Whether run.cwd is where the shell really is: not after a cd the
-      // rules could not follow, nor after a script run with source.
+      // rules could not follow, nor after a script run with source, until a
+      // call's report names it again.
       cwdSure: true,
+      // Its Bash and file tool calls until their results, by Claude Code's id.
+      calls: new Map(),
+      // Whether its Claude Code reports each Bash and Write call before it
+      // starts (guardHooks), and whether a report came yet.
+      hooks: Boolean(task.guardHooks),
+      reported: false,
+      notes: typeof task.guardNotes === 'string' && task.guardNotes ? task.guardNotes : null, // for the hook (guardHooks)
+      invalid: 0, // invalid writes that went or go to quarantine
+      pending: 0, // of those, the ones still to decide
+      deciding: new Set(), // the decisions going (decide)
     }
     // Claude Code may key the memory of a worktree by the repository it
     // belongs to: both are the run's own.
@@ -746,14 +920,76 @@ export class RunGuard extends EventEmitter {
     return branch?.commit?.sha ?? null
   }
 
-  tool(task, part) {
+  // A tool call as the run's stream shows it, before it runs. parent: the
+  // subagent's call (Agent) it belongs to, null for the main thread. With the
+  // guard's hooks, the rule waits for the call's report (toolStart), which
+  // comes right after, before the call runs, or else for its result.
+  tool(task, part, parent = null) {
     const run = this.runs.get(task.id)
     if (!run) return
+    const bash = part.name === 'Bash' && typeof part.input?.command === 'string'
+    if (!FILE_TOOLS[part.name] && !bash) return
+    const id = typeof part.id === 'string' && part.id ? part.id : null // Claude Code's id of the tool call
+    const call = { id, part, parent: typeof parent === 'string' && parent ? parent : null, seenAt: Date.now(), at: null, checked: false, candidates: [] }
+    if (id) run.calls.set(id, call)
+    if (run.hooks && id && REPORTED.has(part.name)) {
+      this.later(REPORT_WAIT_MS, () => this.runs.get(run.id) === run && this.check(run, call))
+      return
+    }
+    this.check(run, call)
+  }
+
+  // A call's report from the guard's hook: the folder Claude Code starts it
+  // in, exactly, and when.
+  toolStart(task, { id, cwd = null, agent = null, at = null } = {}) {
+    const run = this.runs.get(task.id)
+    const call = run?.calls.get(id)
+    if (!call) return
+    run.reported = true
+    this.check(run, call, { cwd: typeof cwd === 'string' && cwd.startsWith('/') ? posix.normalize(cwd) : null, at, agent })
+  }
+
+  // A call's result: the folder the main thread's shell is in afterwards, as
+  // Claude Code keeps it, and the decision on the writes that may go to
+  // quarantine, now that the call has ended. Without a report before, the
+  // hooks do not run in this Claude Code: the rule goes by the folder it
+  // followed from then on, without waiting.
+  toolResult(task, { id, error = false, text = '' } = {}) {
+    const run = this.runs.get(task.id)
+    const call = run?.calls.get(id)
+    if (!call) return
+    if (!call.checked && run.hooks && !run.reported) {
+      run.hooks = false
+      this.log(`kill switch rule on writes outside: no report of the guard's hook in this run, so the rule follows the shell's folder itself (worker ${run.repo}, task ${run.id})`)
+    }
+    this.check(run, call)
+    run.calls.delete(id)
+    const { part } = call
+    // Claude Code takes the shell's new folder only from a command that
+    // succeeded, and goes back to the workspace from one outside it with
+    // these words; never from a subagent's call, or one in the background.
+    if (part.name === 'Bash' && !call.parent && !part.input.run_in_background) {
+      if (RESET.test(String(text).trimEnd())) run.cwd = run.dir // back to where it started, the workspace, whatever the words name
+      else if (error) run.cwd = call.before
+      else if (call.after) run.cwd = call.after
+    }
+    if (call.candidates.length) this.decide(run, call)
+  }
+
+  // What a call writes, checked once: from the folder its report names, or
+  // the one the rule followed. A file tool's path is absolute.
+  check(run, call, { cwd = null, at = null, agent = null } = {}) {
+    if (call.checked) return
+    call.checked = true
+    if (Number.isFinite(at)) call.at = at
+    const { part } = call
     if (FILE_TOOLS[part.name]) {
       const path = part.input?.[FILE_TOOLS[part.name]]
       const target = typeof path === 'string' ? this.resolve(run, run.dir, path) : null
       if (target) run.files.add(target)
-      if (target && !this.allowed(run, target)) this.violation(run, 'write outside the allowed folders', `${part.name} ${target}`)
+      if (target && (!this.allowed(run, target) || gitHook(target))) {
+        this.outside(run, call, { path: target, op: part.name === 'Write' ? 'create' : 'edit', detail: `${part.name} ${target}` })
+      }
       // A work folder is all the run's own; its edits count as edits.
       const helper = target && !run.scratch && (inHelperFolder(posix.relative(run.dir, target)) || within(target, run.helpers))
       if (helper) run.helperEdits++
@@ -768,15 +1004,29 @@ export class RunGuard extends EventEmitter {
           `more than ${this.maxHelperFiles} file edits in the helper folder ${HELPER_FOLDER}, the run folder and the temporary folders in one run`,
         )
       }
-    } else if (part.name === 'Bash' && typeof part.input?.command === 'string') {
-      // Claude Code keeps the shell's folder from one Bash call to the next
-      // while it stays in the workspace, and goes back to the workspace when
-      // a call leaves it. After a cd it cannot follow, the workspace, as
-      // before: a relative path is checked rather than let through.
-      run.toolId = typeof part.id === 'string' && part.id ? part.id : null // Claude Code's id of the tool call
-      const cwd = this.shell(run, part.input.command, run.cwd, true)
-      if (cwd === null) run.cwdSure = false // for the rest of the run
-      run.cwd = cwd && (cwd === run.dir || cwd.startsWith(run.dir.replace(/\/$/, '') + '/')) ? cwd : run.dir
+    } else {
+      // The main thread's shell keeps its folder from one call to the next;
+      // a subagent's call starts there and leaves it as it was (toolResult).
+      // A report names the folder exactly: for the main thread, it is the
+      // shell's, also after a cd the rule could not follow.
+      const main = !call.parent && !agent
+      if (cwd && main) {
+        run.cwd = cwd
+        run.cwdSure = true
+      }
+      call.before = cwd ?? run.cwd
+      run.toolId = call.id
+      const after = this.shell(run, part.input.command, call.before, true, call)
+      if (after === null) run.cwdSure = false
+      call.after = after
+      // Until the result says more: a folder in the workspace stays, as
+      // Claude Code keeps it; one outside it, or one the rule cannot tell,
+      // leaves the folder as it was.
+      if (main && !part.input.run_in_background && after && within(after, [run.dir])) run.cwd = after
+    }
+    if (call.candidates.length) {
+      if (!run.pending) this.waiting(run, true)
+      run.pending += call.candidates.length
     }
   }
 
@@ -784,8 +1034,16 @@ export class RunGuard extends EventEmitter {
     const run = this.runs.get(task.id)
     if (!run) return
     this.runs.delete(task.id)
+    // The calls without a result, such as the one a stop ended: what they
+    // wrote is there now.
+    for (const call of run.calls.values()) {
+      this.check(run, call)
+      if (call.candidates.length) this.decide(run, call)
+    }
+    run.calls.clear()
     await run.ready
     await this.settled(run)
+    while (run.deciding.size) await Promise.all([...run.deciding])
     await this.recheckMerges(run)
     await this.checkHead(run)
     const size = await this.checkSize(run)
@@ -1101,7 +1359,8 @@ export class RunGuard extends EventEmitter {
   // Returns the folder the call leaves its shell in, null where it cannot
   // tell. top: the Bash call's own command line, not one it runs (sh -c,
   // eval, a script); only there may a gh pr merge stand alone (prMerge).
-  shell(run, command, cwd = run.dir, top = false) {
+  // call: the tool call, whose writes may go to quarantine (outside).
+  shell(run, command, cwd = run.dir, top = false, call = null) {
     const outer = []
     const scripts = new Map() // path -> script written from a heredoc in this call
     const events = parseShell(command)
@@ -1119,7 +1378,7 @@ export class RunGuard extends EventEmitter {
       }
       const shown = `"${preview(event.text, 120)}"`
       const { name, args } = commandOf(event.words)
-      const targets = [...event.writes]
+      const ops = [...event.redirects]
       if (name && !CLAUSES.has(name)) {
         if (name === 'cd' || name === 'pushd') {
           const dir = args.find(arg => !arg.startsWith('-') || arg === '-')
@@ -1148,25 +1407,31 @@ export class RunGuard extends EventEmitter {
         }
         // A script run in this shell may cd anywhere.
         if (['source', '.'].includes(name)) run.cwdSure = false
-        targets.push(...this.targets(name, args))
+        // A cron job runs whatever it says, later: only a listing is no write.
+        if (name === 'crontab') {
+          const listing =
+            args.some(arg => /^-[a-zA-Z]*l/.test(arg)) &&
+            !args.some(arg => /^-[a-zA-Z]*[er]/.test(arg)) &&
+            args.filter(arg => !arg.startsWith('-')).length <= (args.includes('-u') ? 1 : 0)
+          if (!listing) this.violation(run, OUTSIDE, `${shown} changes the crontab, which locks at once`)
+        }
+        ops.push(...this.operations(name, args))
         const c = SHELLS.has(basename(name)) ? args.findIndex(arg => /^-[a-zA-Z]*c[a-zA-Z]*$/.test(arg)) : -1
-        if (c >= 0 && args[c + 1] !== undefined) this.shell(run, args[c + 1], cwd)
-        if (name === 'eval' && args.length) this.shell(run, args.join(' '), cwd)
+        if (c >= 0 && args[c + 1] !== undefined) this.shell(run, args[c + 1], cwd, false, call)
+        if (name === 'eval' && args.length) this.shell(run, args.join(' '), cwd, false, call)
         if (event.heredocs.length && ['cat', 'tee'].includes(name)) {
-          for (const target of targets) {
+          for (const { target } of ops) {
             const path = this.resolve(run, cwd, target)
             if (path) scripts.set(path, event.heredocs.join(''))
           }
         }
         const file = SHELLS.has(basename(name)) || ['source', '.'].includes(name) ? args.find(arg => !arg.startsWith('-')) : name
         const script = file !== undefined && scripts.get(this.resolve(run, cwd, file))
-        if (script) this.shell(run, script, cwd)
+        if (script) this.shell(run, script, cwd, false, call)
       }
-      for (const target of targets) {
+      for (const { target, op } of ops) {
         const path = this.resolve(run, cwd, target)
-        if (path && !this.allowed(run, path)) {
-          this.violation(run, 'write outside the allowed folders', `${shown} writes ${path}`)
-        }
+        if (path && (!this.allowed(run, path) || gitHook(path))) this.outside(run, call, { path, op, detail: `${shown} writes ${path}`, shown })
       }
     }
     return outer.length ? outer[0] : cwd
@@ -1174,9 +1439,11 @@ export class RunGuard extends EventEmitter {
 
   // --- writes -------------------------------------------------------------------
 
-  // What a command writes by its operands: the files and folders of the
-  // commands that make, change or remove them.
-  targets(name, args) {
+  // What a command writes by its operands, [{ target, op }]: the files and
+  // folders of the commands that make, change or remove them, with what it
+  // does to them (LOCKING_OPS, or create for a new file). mv also removes
+  // what it moves.
+  operations(name, args) {
     const operands = []
     const valued = { cp: ['-t', '-S'], mv: ['-t', '-S'], install: ['-t', '-m', '-o', '-g', '-S'], ln: ['-t', '-S'], rsync: [] }[name] ?? []
     let into = null // -t / --target-directory
@@ -1191,12 +1458,19 @@ export class RunGuard extends EventEmitter {
       else if (valued.includes(arg)) i++
       else if (!arg.startsWith('-') || arg === '-') operands.push(arg)
     }
-    if (['tee', 'rm', 'rmdir', 'mkdir', 'touch', 'truncate', 'shred', 'unlink'].includes(name)) return operands
-    if (['chmod', 'chown', 'chgrp'].includes(name)) return operands.slice(1)
+    const as = (op, targets) => targets.map(target => ({ target, op }))
+    if (name === 'tee') return as(args.some(arg => arg === '--append' || /^-[a-zA-Z]*a/.test(arg)) ? 'append' : 'create', operands)
+    if (['rm', 'rmdir', 'shred', 'unlink'].includes(name)) return as('remove', operands)
+    if (name === 'mkdir') return as('mkdir', operands)
+    if (name === 'touch') return as('create', operands)
+    if (name === 'truncate') return as('truncate', operands)
+    if (['chmod', 'chown', 'chgrp'].includes(name)) return as('mode', operands.slice(1))
     if (['cp', 'mv', 'install', 'ln', 'rsync'].includes(name)) {
-      if (into !== null) return [into]
-      if (name === 'install' && args.includes('-d')) return operands
-      return operands.length > 1 ? [operands.at(-1)] : []
+      const op = { mv: 'move', ln: 'link' }[name] ?? 'create'
+      if (name === 'install' && args.includes('-d') && into === null) return as('mkdir', operands)
+      const [target, sources] = into !== null ? [into, operands] : operands.length > 1 ? [operands.at(-1), operands.slice(0, -1)] : [null, []]
+      if (target === null) return []
+      return [{ target, op }, ...(name === 'mv' ? as('remove', sources) : [])]
     }
     if (name === 'sed' && args.some(arg => /^-[a-zA-Z]*i/.test(arg) || arg.startsWith('--in-place'))) {
       // The script is the first operand, unless -e or -f gave it.
@@ -1206,10 +1480,160 @@ export class RunGuard extends EventEmitter {
         if (/^-[a-zA-Z]*[ef]$/.test(args[i]) || ['--expression', '--file'].includes(args[i])) i++
         else if (!args[i].startsWith('-')) files.push(args[i])
       }
-      return scripts ? files : files.slice(1)
+      return as('edit', scripts ? files : files.slice(1))
     }
-    if (name === 'dd') return args.filter(arg => arg.startsWith('of=')).map(arg => arg.slice(3))
+    if (name === 'dd') return as('create', args.filter(arg => arg.startsWith('of=')).map(arg => arg.slice(3)))
     return []
+  }
+
+  // An invalid write: it locks, or goes to quarantine once the call has
+  // ended (decide), as the first or second of the run that makes a new plain
+  // file in a place that is not sensitive. Only where the gateway has a
+  // quarantine folder, the runner can look and move, and the rules lock
+  // (VOICE_GW_KILLSWITCH=auto); otherwise every one locks, as before. A
+  // gateway that took the run over and reads its calls again finds what an
+  // earlier one moved kept with the task, by the call and the path.
+  outside(run, call, { path, op, detail, shown = detail }) {
+    const why = this.sensitive(run, path, op)
+    const lets = Boolean(this.quarantine && call && run.runner.inspect && run.runner.quarantine) && this.killswitch.locks?.('rule') !== false
+    if (!lets) return this.violation(run, OUTSIDE, gitHook(path) ? `${detail}: ${why}` : detail)
+    if (why) return this.violation(run, OUTSIDE, `${detail}: ${why}, which locks at once`)
+    const earlier = call.id && (run.task.quarantined ?? []).find(entry => entry.tool === call.id && entry.path === path)
+    if (earlier) {
+      run.invalid = Math.max(run.invalid, earlier.n)
+      return
+    }
+    if (run.invalid >= QUARANTINE_FREE) {
+      return this.violation(run, OUTSIDE, `${detail}: the third invalid write in one run, after ${QUARANTINE_FREE} went to quarantine`)
+    }
+    run.invalid++
+    call.candidates.push({ path, detail, shown, n: run.invalid })
+  }
+
+  // Why an invalid write locks at once, or null for a new file in a place
+  // that is not sensitive: in the home folder or the repositories folder (the
+  // run's runner's, also the work folders'), outside every hidden file and
+  // folder (shell profiles and rc files, ~/.ssh, ~/.claude, ~/.config with
+  // autostart and systemd, .git, .github with the CI workflows), not a shell
+  // profile, a hooks folder, a CI file, ~/Library on macOS, the gateway's
+  // own checkout or a folder on the PATH. Whether it is in a git repository
+  // only a look tells (decide).
+  sensitive(run, path, op) {
+    if (gitHook(path)) return 'a git hook'
+    if (LOCKING_OPS[op]) return LOCKING_OPS[op]
+    const sameSide = this.runner !== run.runner && Boolean(this.runner.container) === Boolean(run.runner.container)
+    const places = [run.runner.root, sameSide ? this.runner.root : null, run.home]
+      .filter(root => typeof root === 'string' && root.startsWith('/'))
+      .sort((a, b) => b.length - a.length)
+    const place = places.find(root => within(path, [root]))
+    if (!place) return 'outside the home folder and the repositories folder'
+    const parts = posix.relative(place, path).split('/')
+    const name = parts.at(-1)
+    if (parts.some(part => part.startsWith('.'))) return 'a hidden file or folder, where settings, keys and configuration live'
+    if (SHELL_FILES.test(name)) return 'a shell profile or rc file'
+    if (parts.includes('hooks')) return 'a hooks folder'
+    if (CI_FILES.has(name)) return 'a CI workflow file'
+    if (place === run.home && parts[0] === 'Library') return "macOS's Library folder, with the settings and launch agents of its apps"
+    if (!run.runner.container && within(path, [this.gateway])) return "the gateway's own checkout"
+    if (!run.runner.container && pathFolders(run.home).includes(posix.dirname(path))) return 'a folder on the PATH'
+    return null
+  }
+
+  // The invalid writes of a call that may go to quarantine, now that it has
+  // ended: each a new plain file, born after the call started, in no git
+  // repository, moved into the quarantine folder; otherwise it locks.
+  decide(run, call) {
+    const candidates = call.candidates.splice(0)
+    const deciding = (async () => {
+      for (const candidate of candidates) await this.toQuarantine(run, call, candidate)
+    })()
+      .catch(error => this.violation(run, OUTSIDE, `${candidates[0].detail}, and the guard could not quarantine it (${preview(error?.message ?? error, 60)})`))
+      .finally(() => {
+        run.pending -= candidates.length
+        if (run.pending <= 0) this.waiting(run, false)
+        run.deciding.delete(deciding)
+      })
+    run.deciding.add(deciding)
+  }
+
+  async toQuarantine(run, call, { path, detail, shown, n }) {
+    const found = await Promise.resolve()
+      .then(() => run.runner.inspect(path))
+      .catch(() => null)
+    const since = (call.at ?? call.seenAt - START_SLACK_MS) - 1000
+    const why = !found
+      ? 'which the guard could not look at afterwards'
+      : found.repo
+        ? 'in a git repository'
+        : found.kind === 'missing'
+          ? 'which is not there afterwards, so the guard cannot tell what it wrote'
+          : found.kind !== 'file' || found.links > 1
+            ? 'which is no plain file'
+            : found.born === null
+              ? 'whose age the file system does not tell'
+              : found.born < since
+                ? 'which was there before: the command changed an existing file'
+                : null
+    if (why) return this.violation(run, OUTSIDE, `${detail}, ${why}, which locks at once`)
+    const file = join(this.quarantine, run.id, `${n}-${posix.basename(path)}`)
+    const moved = await Promise.resolve()
+      .then(() => run.runner.quarantine(path, file))
+      .catch(() => false)
+    if (!moved) return this.violation(run, OUTSIDE, `${detail}, and the guard could not move it to quarantine`)
+    const entry = { n, tool: call.id, path, file, command: shown, at: Date.now() }
+    run.task.quarantined = [...(run.task.quarantined ?? []), entry]
+    try {
+      this.workers.save?.()
+    } catch (error) {
+      this.log('worker state not saved:', error.message)
+    }
+    try {
+      appendFileSync(join(this.quarantine, run.id, 'quarantine.jsonl'), JSON.stringify({ ...entry, worker: run.repo, task: run.id }) + '\n', { mode: 0o600 })
+    } catch (error) {
+      this.log('quarantine record not written:', error.message)
+    }
+    this.log(
+      `kill switch rule on writes outside the allowed folders: moved ${path} to quarantine (${file}), invalid write ${n} of ` +
+        `the run, by ${shown}; the ${n >= QUARANTINE_FREE ? 'next' : 'third'} locks the kill switch (worker ${run.repo}, task ${run.id})`,
+    )
+    this.emit('quarantined', run.task, entry)
+    await this.note(run, quarantineNote(run, entry))
+  }
+
+  // For the guard's hook, which hands it to the worker with its next tool
+  // call, or before it ends its turn (guardHooks): through docker exec into
+  // the container, on this computer next to the run's output.
+  // One after the other, in the order the guard gives them, so that the
+  // hook never finds the wait cleared before the note is there.
+  note(run, text) {
+    return this.mailbox(run, 'note for the worker not written', () => {
+      if (run.runner.container) return run.runner.sh('mkdir -p "$(dirname "$1")" && printf "%s\\n\\n" "$2" >> "$1"', [run.notes, text])
+      mkdirSync(dirname(run.notes), { recursive: true, mode: 0o700 })
+      appendFileSync(run.notes, `${text}\n\n`, { mode: 0o600 })
+    })
+  }
+
+  // While the guard decides about a write, the hook lets the turn end only
+  // after it (guardHooks): a file .wait next to the notes.
+  waiting(run, on) {
+    const file = `${run.notes}.wait`
+    return this.mailbox(run, `wait for the guard not ${on ? 'set' : 'cleared'}`, () => {
+      if (run.runner.container) return run.runner.sh(on ? 'mkdir -p "$(dirname "$1")" && : > "$1"' : 'rm -f "$1"', [file])
+      if (!on) return rmSync(file, { force: true })
+      mkdirSync(dirname(file), { recursive: true, mode: 0o700 })
+      writeFileSync(file, '', { mode: 0o600 })
+    })
+  }
+
+  mailbox(run, failed, write) {
+    if (!run.notes) return Promise.resolve()
+    run.mailbox = (run.mailbox ?? Promise.resolve())
+      .then(write)
+      .then(result => {
+        if (result && result.ok === false) throw new Error('docker exec failed')
+      })
+      .catch(error => this.log(`${failed} (worker ${run.repo}, task ${run.id}):`, error.message))
+    return run.mailbox
   }
 
   // An absolute path, or null where a variable hides it; ~ and $HOME are
