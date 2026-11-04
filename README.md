@@ -329,6 +329,21 @@ connector names a phrase to avoid, in any language, and the tests check that: a 
 voice assistant's instructions or in its memory on claude.ai, even as a prohibition, makes it more
 likely to say it.
 
+Every result that ends a request, the answer, a question back from Claude Code and the answer of
+`status` with any news it brings, ends with one line for the voice AI about your next request, not
+to be read out: "For the user's next request (not to read out): before send or ask, say its subject
+in a few of their own words and that it goes to Claude Code, e.g. „Die Tests in alpha, geht an
+Claude Code“." Results while a request still runs, results that list an open approval, `status`'s
+included, `approve` and the emergency stop have none, as what you say next there is no new request.
+The line is there because claude.ai fetches the connector's instructions and tool descriptions only
+when it connects, with `initialize` (a `voice initialize client=Anthropic/ClaudeAI/…` line in
+`.logs/gateway.log`, every two to four hours), not with each voice chat, while it follows a tool
+result at once and almost word for word: a fixed phrase in `send`'s result on 1 November was heard
+right away. So try a change to what the voice AI says in the results first, which the next call in
+the car shows; one in the instructions or descriptions shows only after the next connect. The
+instructions and descriptions stayed as they were with this line, so that its effect can be told
+apart in the car.
+
 Every result starts with a machine-readable line, for example `[state=working id=k7f3 elapsed=34s]`.
 Requests and approvals have these states:
 

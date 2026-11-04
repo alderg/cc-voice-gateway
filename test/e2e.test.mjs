@@ -223,6 +223,15 @@ test('the connector names its gateway, for a driver with several: in the instruc
 const FILLERS =
   /schau|nachseh|sehe mal|\bmoment|augenblick|let me (check|see|look)|have a look|look or check|look(ing)? (it up )?yourself|check (it )?yourself|weitergegeben|passed on/i
 
+// The last line of every result that ends a request (the answer, a question
+// back, status): the voice assistant follows a result at once, while it
+// fetches the instructions and descriptions only when the connector connects.
+// None while a request runs or with an approval.
+const NEXT_REQUEST =
+  "For the user's next request (not to read out): before send or ask, say its subject in a few of their own words and that it goes to Claude Code, e.g. „Die Tests in alpha, geht an Claude Code“."
+const endsWith = (out, last) => assert.ok(out.endsWith(`\n${last}`), out)
+const withoutNext = out => assert.ok(!out.includes(NEXT_REQUEST), out)
+
 test('what the voice assistant says around a call: before send and ask a short line of its own that fits the request; no filler named anywhere', async () => {
   const instructions = voice.getInstructions()
   const lines = instructions.split('\n')
@@ -315,6 +324,7 @@ test('the filler check catches a named filler in German and English, and lets th
     'Never leave the user in silence',
     'ask back instead of staying quiet',
     'Check the terminal of the controller session',
+    NEXT_REQUEST,
   ]) {
     assert.doesNotMatch(fine, FILLERS, fine)
   }
@@ -377,6 +387,7 @@ test('without a valid token: 401 pointing to the sign-in, other paths 404', asyn
 test('status and the hint work before the controller ever answered', async () => {
   const out = await voiceCall('status')
   assert.match(out, /^\[gateway=ok controller=unconfirmed/)
+  endsWith(out, NEXT_REQUEST)
 
   // Seen with a real session: the event arrived, but the turn failed with
   // "Login expired", so the hint must not only blame the channel flag.
@@ -388,6 +399,7 @@ test('status and the hint work before the controller ever answered', async () =>
   assert.match(hint, /login expired/)
   assert.match(hint, new RegExp(`\\nStill working\\. Tell the user briefly and call get_reply again with id=${id}\\.$`))
   assert.doesNotMatch(hint, FILLERS)
+  withoutNext(hint)
 })
 
 test('send -> channel event -> reply(working, done) -> get_reply', async () => {
@@ -401,6 +413,7 @@ test('send -> channel event -> reply(working, done) -> get_reply', async () => {
     new RegExp(`\\] Handed over\\. If you have acknowledged the request already, call get_reply with id=${id} now; otherwise say a short okay in their language first\\.$`),
   )
   assert.doesNotMatch(sent, FILLERS)
+  withoutNext(sent)
 
   const event = await waitUntil(() => channelEvents.find(e => e.meta?.request_id === id))
   assert.equal(event.content, 'How many files are in the playground?')
@@ -410,6 +423,7 @@ test('send -> channel event -> reply(working, done) -> get_reply', async () => {
   assert.match(first, new RegExp(`^\\[state=working id=${id} `))
   assert.match(first, /Claude Code: Looking\./)
   assert.match(first, /\nStill working\. Tell the user briefly and call get_reply again/)
+  withoutNext(first)
 
   // The long poll returns as soon as the answer arrives, not after the full wait.
   const started = Date.now()
@@ -419,9 +433,12 @@ test('send -> channel event -> reply(working, done) -> get_reply', async () => {
   assert.match(second, /^\[state=done /)
   assert.match(second, /There are three files\./)
   assert.doesNotMatch(second, /Looking/, 'already delivered updates are not repeated')
+  // The answer ends the request: the line about the next one follows it.
+  endsWith(second, `Done. Read the answer to the user.\n${NEXT_REQUEST}`)
+  assert.doesNotMatch(second, FILLERS)
 
   const third = await voiceCall('get_reply', { id })
-  assert.match(third, /Done, no new messages/)
+  endsWith(third, `Done, no new messages.\n${NEXT_REQUEST}`)
 })
 
 test('ask waits in one call', async () => {
@@ -431,6 +448,7 @@ test('ask waits in one call', async () => {
   const out = await pending
   assert.match(out, /^\[state=done /)
   assert.match(out, /Yes, green\./)
+  endsWith(out, `Done. Read the answer to the user.\n${NEXT_REQUEST}`)
 })
 
 // ask waits only briefly, here 1 s (VOICE_GW_ASK_WAIT) rather than get_reply's
@@ -442,8 +460,10 @@ test('ask still running: back after its own short wait, then on with get_reply',
   assert.match(out, /^\[state=sent id=\w+ elapsed=[12]s\]/)
   assert.match(out, new RegExp(`\\nStill working\\. Tell the user briefly and call get_reply again with id=${id}\\.$`))
   assert.doesNotMatch(out, FILLERS)
+  withoutNext(out)
   const poll = await voiceCall('get_reply', { id, wait_seconds: 1 })
   assert.match(poll, /\nStill working\. Tell the user briefly and call get_reply again/)
+  withoutNext(poll)
   await controllerReply(id, 'done', 'Synced.')
 })
 
@@ -453,10 +473,14 @@ test('a question round-trip carries in_reply_to', async () => {
   await controllerReply(id, 'question', 'Should I delete the branches too, yes or no?')
   const out = await voiceCall('get_reply', { id })
   assert.match(out, /^\[state=question /)
-  assert.match(out, new RegExp(`in_reply_to=${id}`))
+  endsWith(
+    out,
+    `Claude Code is waiting for a decision. Read the question to the user and send their answer with send (in_reply_to=${id}).\n${NEXT_REQUEST}`,
+  )
 
   const answered = await voiceCall('send', { message: 'No, only the files.', in_reply_to: id.toUpperCase() })
   assert.match(answered, new RegExp(`^\\[state=sent id=[a-z0-9]{4}\\] Handed over as the answer to ${id}\\.`))
+  withoutNext(answered)
   const answerId = idOf(answered)
   const event = await waitUntil(() => channelEvents.find(e => e.meta?.request_id === answerId))
   assert.equal(event.content, `(Answer to ${id}) No, only the files.`)
@@ -504,17 +528,34 @@ test('permission relay: prompt -> get_reply -> approve -> verdict to Claude Code
   assert.match(out, /"content": "Grüezi"/)
   assert.match(out, /\nRead the approval to the user and ask: allow or deny\? Call approve with the code only after their explicit yes or no\.\n/)
   assert.doesNotMatch(out, FILLERS)
+  withoutNext(out)
 
-  assert.match(await voiceCall('status'), /Pending approvals: abcde \(Write\)/)
+  const pending = await voiceCall('status')
+  assert.match(pending, /Pending approvals: abcde \(Write\)/)
+  withoutNext(pending)
 
   const approved = await voiceCall('approve', { code: 'ABCDE', decision: 'allow' })
   assert.match(approved, /^\[approval=allow code=abcde\]/)
+  withoutNext(approved)
   const verdict = await waitUntil(() => verdicts.find(v => v.request_id === 'abcde'))
   assert.equal(verdict.behavior, 'allow')
 
   const again = await voiceCall('approve', { code: 'abcde', decision: 'deny' })
   assert.match(again, /unknown or already answered/)
   assert.equal(verdicts.filter(v => v.request_id === 'abcde').length, 1)
+
+  // An approval with the answer: what the user says next answers the
+  // approval, so no line about their next request.
+  await controllerReply(id, 'done', 'Created.')
+  await claudeCode.notification({
+    method: 'notifications/claude/channel/permission_request',
+    params: { request_id: 'fghjk', tool_name: 'Write', description: 'Create playground/bye.txt', input_preview: '{}' },
+  })
+  await waitUntil(() => gatewayLog.includes('permission_request code=fghjk'))
+  const done = await voiceCall('get_reply', { id, wait_seconds: 1 })
+  assert.match(done, /^\[state=done id=\w+ elapsed=\d+s approval=fghjk\]/)
+  withoutNext(done)
+  withoutNext(await voiceCall('approve', { code: 'fghjk', decision: 'deny' }))
 })
 
 test('an approval answered at the computer: the next tool call of the session closes it, a late approve sends no verdict', async () => {
@@ -576,7 +617,9 @@ test('night mode by voice: set_away on the driver\'s words, on and off; the cont
   assert.match(await controller('set_away', { away: false, words: "I'm back" }), /^\[night=off\] Night mode was not on/)
   assert.doesNotMatch(await controller('open_items', {}), /Night mode/)
   // The controller's answer to the summary is news for the voice assistant.
-  assert.match(await voiceCall('status'), /News from Claude Code \(id=\w+\): You were away; nothing happened\./)
+  const news = await voiceCall('status')
+  assert.match(news, /News from Claude Code \(id=\w+\): You were away; nothing happened\./)
+  endsWith(news, `Read the news to the user.\n${NEXT_REQUEST}`)
 })
 
 test('night mode until a time the driver names: set_away with until; past, unreadable or too far changes nothing; again while on, the new end', async () => {
