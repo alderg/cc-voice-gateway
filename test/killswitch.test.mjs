@@ -29,6 +29,27 @@ import { Telegram, TelegramCommands, isStopCommand } from '../src/telegram.mjs'
 
 const GATEWAY = fileURLToPath(new URL('../src/gateway.mjs', import.meta.url))
 const UNLOCK = fileURLToPath(new URL('../scripts/unlock.mjs', import.meta.url))
+const APPROVAL_HOOK = fileURLToPath(new URL('../controller/.claude/hooks/approval.mjs', import.meta.url))
+
+// The controller's PermissionRequest hook for a teammate's prompt, as Claude
+// Code runs it; resolves with its decision, or null for none.
+function teammateHook(tool_name) {
+  const child = spawn(process.execPath, [APPROVAL_HOOK], { env: { ...process.env, VOICE_GW_SECRETS_DIR: SECRETS }, stdio: ['pipe', 'pipe', 'ignore'] })
+  let stdout = ''
+  child.stdout.on('data', chunk => (stdout += chunk))
+  child.stdin.end(
+    JSON.stringify({
+      session_id: 's',
+      transcript_path: '',
+      agent_id: 'aprobe-tm-2c8e2040eb4580c9',
+      agent_type: 'probe-tm',
+      hook_event_name: 'PermissionRequest',
+      tool_name,
+      tool_input: { command: 'date' },
+    }),
+  )
+  return new Promise(resolve => child.on('close', () => resolve(stdout ? JSON.parse(stdout).hookSpecificOutput.decision : null)))
+}
 const TMP = mkdtempSync(join(tmpdir(), 'voice-gw-kill-'))
 const BIN = join(TMP, 'bin')
 const ROOT = join(TMP, 'Developer')
@@ -1253,6 +1274,9 @@ test('voice: "emergency stop" locks before anything reaches the controller; ever
     method: 'notifications/claude/channel/permission_request',
     params: { request_id: 'abcde', tool_name: 'Write', description: 'Create a file', input_preview: '{}' },
   })
+  // So does a teammate's, which waits in the controller's hook.
+  const waiting = teammateHook('Bash')
+  await waitUntil(() => /permission_request code=[a-km-z]{5} tool=Bash subagent=probe-tm/.test(gw.log))
   await sleep(100)
   const sentBefore = telegram.sent.length
 
@@ -1265,6 +1289,8 @@ test('voice: "emergency stop" locks before anything reaches the controller; ever
   assert.equal(alarm.meta.trigger, 'voice')
   await waitUntil(() => gw.verdicts.find(v => v.request_id === 'abcde'))
   assert.equal(gw.verdicts.find(v => v.request_id === 'abcde').behavior, 'deny')
+  assert.deepEqual(await waiting, { behavior: 'deny', message: 'Denied: the kill switch of the voice gateway locked.' })
+  assert.equal(gw.verdicts.length, 1, "the teammate's verdict went to its hook, not to the channel")
 
   await waitUntil(() => telegram.sent.length > sentBefore)
   const message = telegram.sent.at(-1)
@@ -1301,6 +1327,9 @@ test('voice: "emergency stop" locks before anything reaches the controller; ever
   })
   await waitUntil(() => gw.verdicts.find(v => v.request_id === 'mnpqr'))
   assert.equal(gw.verdicts.find(v => v.request_id === 'mnpqr').behavior, 'deny')
+  // And a teammate's, by its hook.
+  assert.deepEqual(await teammateHook('Write'), { behavior: 'deny', message: 'Denied: the kill switch of the voice gateway is locked.' })
+  assert.match(gw.log, /permission_request denied, kill switch locked tool=Write \(subagent probe-tm\)/)
   assert.ok(!gw.log.includes(TOKEN), 'the Telegram token never reaches the log')
 })
 

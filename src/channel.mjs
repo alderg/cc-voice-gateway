@@ -1585,6 +1585,7 @@ export async function startChannel(
     notes = () => [],
     night = null,
     orders = null,
+    hookApprovals = null,
   } = {},
 ) {
   const experimental = { 'claude/channel': {} }
@@ -1622,7 +1623,8 @@ export async function startChannel(
   // nothing in the request tells the two apart, so there every dialog stays
   // open until it is answered here. Either way only a guess: one it closes
   // leaves the lists, but an answer to it by voice or Telegram still goes to
-  // Claude Code, which drops a verdict that comes too late.
+  // Claude Code, which drops a verdict that comes too late. A teammate's
+  // approval from the controller's hook is never guessed (approvals.mjs).
   const guesses = permissionRelay && level !== 'unrestricted'
   const answeredElsewhere = sign => {
     for (const permission of store.closePermissionsElsewhere()) {
@@ -1740,7 +1742,13 @@ export async function startChannel(
       log('push', `id=${request.id}`, preview(request.text))
     },
 
+    // A subagent's approval from the controller's hook goes back to the hook
+    // that waits on it (approvals.mjs), never to the channel.
     async sendVerdict(code, behavior) {
+      if (store.getPermission(code)?.source === 'hook') {
+        if (!hookApprovals) throw new Error('the subagent that asked stopped waiting for it')
+        return hookApprovals.verdict(code, behavior)
+      }
       await mcp.notification({
         method: 'notifications/claude/channel/permission',
         params: { request_id: code, behavior },

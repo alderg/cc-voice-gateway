@@ -10,6 +10,7 @@
 
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
@@ -22,6 +23,7 @@ import { z } from 'zod'
 import { adminRequest } from '../src/admin.mjs'
 
 const GATEWAY = fileURLToPath(new URL('../src/gateway.mjs', import.meta.url))
+const APPROVAL_HOOK = fileURLToPath(new URL('../controller/.claude/hooks/approval.mjs', import.meta.url))
 const SECRETS = mkdtempSync(join(tmpdir(), 'voice-gw-e2e-'))
 
 let port
@@ -605,6 +607,62 @@ test('an approval answered at the computer: the next tool call of the session ta
   assert.doesNotMatch(await voiceCall('status'), /Pending approvals/)
   assert.match(await voiceCall('approve', { code: 'cdpqr', decision: 'deny' }), /^\[approval=deny code=cdpqr\] Denied\. It looked answered/)
   await waitUntil(() => verdicts.find(v => v.request_id === 'cdpqr'))
+})
+
+// The controller's PermissionRequest hook, as Claude Code runs it for a
+// teammate's prompt (an agent spawned with a name, which the channel never
+// relays): its input on stdin, its decision on stdout.
+function teammateHook(tool_name, tool_input, { agent_id = 'astandorte-drive-b0d52828dcc05b49', agent_type = 'standorte-drive', mcp_server } = {}) {
+  const child = spawn(process.execPath, [APPROVAL_HOOK], { env: { ...process.env, VOICE_GW_SECRETS_DIR: SECRETS }, stdio: ['pipe', 'pipe', 'pipe'] })
+  const hook = { child, stdout: '' }
+  child.stdout.on('data', chunk => (hook.stdout += chunk))
+  hook.done = new Promise(resolve => child.on('close', () => resolve(hook.stdout)))
+  const input = { session_id: 's', transcript_path: '', cwd: '/', permission_mode: 'manual', agent_id, agent_type }
+  child.stdin.end(JSON.stringify({ ...input, hook_event_name: 'PermissionRequest', tool_name, tool_input, ...(mcp_server ? { mcp_server } : {}) }))
+  return hook
+}
+
+test("a teammate's approval through the controller's hook: read out with its name, answered by voice, the verdict back to the hook", async () => {
+  const id = idOf(await voiceCall('send', { message: 'Look up the floor plans in Drive.' }))
+  await waitUntil(() => channelEvents.find(e => e.meta?.request_id === id))
+  const hook = teammateHook('mcp__claude_ai_Google_Drive__search_files', { query: "title contains 'Bedigliora'" }, { mcp_server: 'claude.ai Google Drive' })
+  const code = (await waitUntil(() => /permission_request code=([a-km-z]{5}) tool=mcp__claude_ai_Google_Drive__search_files subagent=standorte-drive/.exec(gatewayLog)))[1]
+
+  const out = await voiceCall('get_reply', { id, wait_seconds: 3 })
+  assert.match(out, new RegExp(`approval=${code}`))
+  assert.ok(
+    out.includes(
+      `\nApproval needed (code=${code}) for the subagent standorte-drive: mcp__claude_ai_Google_Drive__search_files – search files ` +
+        `(claude.ai Google Drive). Details: {"query":"title contains 'Bedigliora'"}\n`,
+    ),
+    out,
+  )
+  // The session going on says nothing about a teammate's prompt: no guess.
+  assert.equal((await claudeCode.callTool({ name: 'list_workers', arguments: {} })).isError, false)
+  assert.match(await voiceCall('status'), new RegExp(`Pending approvals: ${code} \\(mcp__claude_ai_Google_Drive__search_files\\)`))
+
+  const approved = await voiceCall('approve', { code, decision: 'allow' })
+  assert.match(approved, new RegExp(`^\\[approval=allow code=${code}\\] Allowed\\. Claude Code continues; call get_reply\\.$`))
+  assert.deepEqual(JSON.parse(await hook.done).hookSpecificOutput, { hookEventName: 'PermissionRequest', decision: { behavior: 'allow' } })
+  assert.ok(!verdicts.some(v => v.request_id === code), 'nothing to the channel for it')
+  assert.match(await voiceCall('approve', { code, decision: 'deny' }), /unknown or already answered/)
+
+  // One whose hook stops waiting, its time run out: off the lists, heard once.
+  const second = teammateHook('Write', { file_path: '/home/u/.claude/projects/-home-u-hauswache/memory/engelberg.md', content: 'x' })
+  const other = (await waitUntil(() => /permission_request code=([a-km-z]{5}) tool=Write subagent=standorte-drive Write \/home\/u\/\.claude/.exec(gatewayLog)))[1]
+  assert.match(await voiceCall('get_reply', { id, wait_seconds: 3 }), new RegExp(`for the subagent standorte-drive: Write – Write /home/u/\\.claude/projects/-home-u-hauswache/memory/engelberg\\.md\\. Details: `))
+  second.child.kill('SIGTERM')
+  await second.done
+  await waitUntil(() => gatewayLog.includes(`permission withdrawn: the hook stopped waiting code=${other}`))
+  const after = await voiceCall('get_reply', { id, wait_seconds: 1 })
+  assert.doesNotMatch(after, new RegExp(`approval=${other}|Approval needed \\(code=${other}`))
+  assert.match(after, new RegExp(`^Approval ${other} is not open any more: the subagent that asked stopped waiting for it\\. It needs nothing from the user\\.$`, 'm'))
+  assert.doesNotMatch(await voiceCall('get_reply', { id, wait_seconds: 1 }), new RegExp(other), 'said once')
+  assert.match(
+    await voiceCall('approve', { code: other, decision: 'allow' }),
+    new RegExp(`^\\[approval=withdrawn code=${other}\\] Not open any more: the subagent that asked stopped waiting for it`),
+  )
+  await controllerReply(id, 'done', 'Found them.')
 })
 
 test('night mode by voice: set_away on the driver\'s words, on and off; the controller hears the night begin and the summary', async () => {

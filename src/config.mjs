@@ -9,7 +9,7 @@
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { SETTINGS_FILE_NAME, environmentWins, mcpEnvNames, readSettings } from './settings.mjs'
+import { APPROVAL_SOCKET_NAME, SETTINGS_FILE_NAME, environmentWins, mcpEnvNames, readSettings } from './settings.mjs'
 
 export const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 export const VERSION = '0.1.0'
@@ -386,6 +386,9 @@ config.requestsFile = join(config.stateDir, 'requests.json')
 // Open decisions (ledger.mjs), for the same reason.
 config.jobsFile = join(config.stateDir, 'jobs.json')
 config.adminSocket = join(config.secretsDir, 'admin.sock')
+// Where the controller's PermissionRequest hook hands its subagents' approval
+// requests to the gateway (approvals.mjs, controller/.claude/hooks/approval.mjs).
+config.approvalSocket = join(config.secretsDir, APPROVAL_SOCKET_NAME)
 config.pullsStateFile = join(config.stateDir, 'pulls.json')
 // The routine news that waits for its digest (digest.mjs), so that none is lost in a restart.
 config.digestFile = join(config.stateDir, 'digest.json')

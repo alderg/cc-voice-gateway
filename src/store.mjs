@@ -25,8 +25,10 @@ const REQUEST_RETENTION_MS = 6 * 60 * 60 * 1000
 const SAVE_DELAY_MS = 100
 
 // An approval Claude Code may still wait on: open, or answered at the
-// computer by the gateway's guess only (closePermissionsElsewhere).
-export const pending = permission => permission.status === 'open' || permission.status === 'elsewhere'
+// computer by the gateway's guess only (closePermissionsElsewhere). Not one
+// withdrawn: the hook that relayed it stopped waiting (approvals.mjs), which
+// also holds when an answer that failed to reach it set its status back.
+export const pending = permission => (permission.status === 'open' || permission.status === 'elsewhere') && !permission.withdrawn
 
 // What a request that was not finished says after a restart of the session.
 export const RESTART_NOTE =
@@ -251,7 +253,10 @@ export class Store extends EventEmitter {
 
   // --- permission prompts relayed by Claude Code --------------------------
 
-  addPermission({ request_id, tool_name, description, input_preview }) {
+  // From the channel's permission relay, or with source 'hook' and the
+  // subagent's name in agent from the controller's PermissionRequest hook
+  // (approvals.mjs), for a subagent whose prompts the channel never gets.
+  addPermission({ request_id, tool_name, description, input_preview }, { source = 'channel', agent = null } = {}) {
     this.prunePermissions()
     const code = String(request_id).toLowerCase()
     this.permissions.set(code, {
@@ -260,8 +265,11 @@ export class Store extends EventEmitter {
       description,
       inputPreview: input_preview,
       createdAt: Date.now(),
-      status: 'open', // open | allow | deny | elsewhere (answered at the computer, by a guess)
+      // open | allow | deny | elsewhere (answered at the computer, by a guess)
+      // | withdrawn (the hook that relayed it stopped waiting)
+      status: 'open',
       announced: false, // reported to the voice client at least once
+      ...(source === 'hook' ? { source, agent } : {}),
     })
     this.emit('permission', this.permissions.get(code)) // for the statistics
     this.changed()
@@ -271,7 +279,24 @@ export class Store extends EventEmitter {
   // The approvals to list, by voice and in Telegram.
   openPermissions() {
     this.prunePermissions()
-    return [...this.permissions.values()].filter(permission => permission.status === 'open')
+    return [...this.permissions.values()].filter(permission => permission.status === 'open' && !permission.withdrawn)
+  }
+
+  // A subagent's approval whose hook stopped waiting (approvals.mjs): the
+  // hook's time ran out, or the session or the gateway ended. Off the
+  // lists, and no answer reaches anyone any more; the voice client hears it
+  // once (takeAnsweredElsewhere). Returns it, or null.
+  withdrawPermission(code) {
+    const permission = this.permissions.get(String(code).toLowerCase())
+    if (!permission || permission.withdrawn) return null
+    permission.withdrawn = true
+    // One claimed by an answer on its way keeps that answer's status.
+    if (permission.status === 'open' || permission.status === 'elsewhere') {
+      permission.status = 'withdrawn'
+      permission.resolvedAt = Date.now()
+    }
+    this.changed()
+    return permission
   }
 
   // The approvals Claude Code may still wait on, also those guessed answered.
@@ -320,9 +345,11 @@ export class Store extends EventEmitter {
   // through Remote Control, as the gateway guesses: the session that asked
   // showed a sign of life since (channel.mjs). Off the lists, by voice and in
   // Telegram; an answer to one still goes to Claude Code (resolvePermission).
-  // Returns them.
+  // Returns them. Never a subagent's from the hook: the terminal shows none
+  // while the hook waits, and its own end says when it is gone
+  // (withdrawPermission).
   closePermissionsElsewhere() {
-    const closed = this.openPermissions()
+    const closed = this.openPermissions().filter(permission => permission.source !== 'hook')
     for (const permission of closed) {
       permission.status = 'elsewhere'
       permission.resolvedAt = Date.now()
@@ -332,10 +359,11 @@ export class Store extends EventEmitter {
   }
 
   // Approvals the voice client heard that were answered at the computer or
-  // in Telegram since: each once, so that it stops asking the driver about
-  // them.
+  // in Telegram since, or withdrawn: each once, so that it stops asking the
+  // driver about them.
   takeAnsweredElsewhere() {
-    const elsewhere = p => p.status === 'elsewhere' || (p.status !== 'open' && p.by === 'telegram')
+    const elsewhere = p =>
+      p.status === 'elsewhere' || p.status === 'withdrawn' || (p.status !== 'open' && p.by === 'telegram')
     const told = [...this.permissions.values()].filter(p => elsewhere(p) && p.announced && !p.toldElsewhere)
     for (const permission of told) permission.toldElsewhere = true
     return told

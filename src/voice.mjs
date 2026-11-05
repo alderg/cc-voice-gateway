@@ -134,14 +134,17 @@ function describeNews(news) {
 }
 
 // Approvals the voice client heard that were answered at the computer or in
-// the user's Telegram chat since, each once.
+// the user's Telegram chat since, or withdrawn by the subagent's hook
+// (approvals.mjs), each once.
 const answeredElsewhereLines = store =>
   store
     .takeAnsweredElsewhere()
-    .map(
-      permission =>
-        `Approval ${permission.code} was answered ${permission.status === 'elsewhere' ? 'at the computer' : 'in Telegram'} and is ` +
-        'settled; it needs nothing from the user.',
+    .map(permission =>
+      permission.status === 'withdrawn'
+        ? `Approval ${permission.code} is not open any more: the subagent that asked stopped waiting for it. It needs ` +
+          'nothing from the user.'
+        : `Approval ${permission.code} was answered ${permission.status === 'elsewhere' ? 'at the computer' : 'in Telegram'} and is ` +
+          'settled; it needs nothing from the user.',
     )
 
 // While the controller waits for the Claude usage limit (limits.mjs), what is
@@ -159,8 +162,10 @@ function describePermission(permission) {
   const details = preview(permission.inputPreview || '', 200)
   // Claude Code's descriptions often end with a full stop already.
   const description = String(permission.description).replace(/[\s.]+$/, '')
+  // A subagent's, relayed by the hook (approvals.mjs): whose it is.
+  const whose = permission.agent ? ` for the subagent ${permission.agent}` : ''
   return (
-    `Approval needed (code=${permission.code}): ${permission.toolName} – ${description}` +
+    `Approval needed (code=${permission.code})${whose}: ${permission.toolName} – ${description}` +
     (details ? `. Details: ${details}` : '')
   )
 }
@@ -678,6 +683,9 @@ function buildVoiceServer(
         if (killswitch?.locked && decision === 'allow') {
           return text(`[approval=locked code=${code}] The kill switch is locked: nothing can be allowed now.`)
         }
+        // A subagent's whose hook stopped waiting (approvals.mjs).
+        const gone = `[approval=withdrawn code=${known?.code}] Not open any more: the subagent that asked stopped waiting for it, so the answer reaches nobody. Tell the user in a few words.`
+        if (known?.withdrawn) return text(gone)
         // Guessed answered at the computer (channel.mjs): the verdict goes all
         // the same, as the guess may be wrong; Claude Code drops a late one.
         const guessed = known?.status === 'elsewhere'
@@ -685,7 +693,12 @@ function buildVoiceServer(
         if (!permission) {
           return text(`[approval=unknown code=${code}] This approval is unknown or already answered.`)
         }
-        await channel.sendVerdict(permission.code, decision)
+        try {
+          await channel.sendVerdict(permission.code, decision)
+        } catch (error) {
+          if (permission.withdrawn) return text(gone)
+          throw error
+        }
         const approvals = approvalLines(store)
         const more = approvals.codes.length ? ` pending=${approvals.codes.join(',')}` : ''
         const stands = guessed ? ' It looked answered at the computer already; if it was, that answer stands.' : ''

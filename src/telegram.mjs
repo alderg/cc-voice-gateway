@@ -588,17 +588,21 @@ export const permissionBrief = permission => `${permission.code} (${permission.t
 
 // An approval request. approvable: whether the driver may answer it here
 // (TelegramAnswers.approves).
+// A subagent's, relayed by the controller's hook (approvals.mjs), is not
+// shown at the terminal while the gateway holds it: voice mode and here only.
 function describePermission(permission, approvable = false) {
   const details = preview(permission.inputPreview || '', 300)
-  const lines = [`Approval request ${permission.code} (controller session)`, '', `${permission.toolName}: ${descriptionOf(permission)}`]
+  const whose = permission.agent ? `subagent ${permission.agent} of the controller session` : 'controller session'
+  const lines = [`Approval request ${permission.code} (${whose})`, '', `${permission.toolName}: ${descriptionOf(permission)}`]
   if (details) lines.push(`Details: ${details}`)
+  const elsewhere = permission.source === 'hook' ? 'in voice mode' : 'in voice mode or at the terminal'
   lines.push(
     '',
     approvable
       ? `To allow it, reply to this message with yes, or with no to deny it; or write a message with ${permission.code} ` +
           'and yes or no, or just yes or no while it is the only one open ("yes to all" allows every one open). Or answer ' +
-          'in voice mode or at the terminal.'
-      : 'Answer in voice mode or at the terminal; Telegram cannot approve.',
+          `${elsewhere}.`
+      : `Answer ${elsewhere}; Telegram cannot approve.`,
   )
   return lines.join('\n')
 }
@@ -1017,8 +1021,11 @@ export class TelegramAnswers {
   // guess may be wrong, and Claude Code drops a verdict that comes too late.
   approving(permission) {
     const { code } = permission
-    if (!this.approves()) return { why: `approval request ${code} is answered in voice mode or at the computer; Telegram cannot approve.` }
+    // A subagent's from the controller's hook is not shown at the computer.
+    const where = permission.source === 'hook' ? 'in voice mode' : 'in voice mode or at the computer'
+    if (!this.approves()) return { why: `approval request ${code} is answered ${where}; Telegram cannot approve.` }
     if (pending(permission)) return { permission }
+    if (permission.withdrawn) return { why: `approval request ${code} is not open any more: the subagent that asked stopped waiting for it.` }
     const how = permission.status === 'allow' ? 'allowed' : 'denied'
     return { why: `approval request ${code} was ${how} already${permission.by === 'telegram' ? ' here' : ' in voice mode'}; nothing to do.` }
   }

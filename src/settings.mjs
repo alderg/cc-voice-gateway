@@ -33,6 +33,34 @@ export function environmentWins(env, file, pinned = []) {
   }
 }
 
+// The socket in the secrets folder where the controller's PermissionRequest
+// hook hands its subagents' approval requests to the gateway (approvals.mjs).
+export const APPROVAL_SOCKET_NAME = 'approval.sock'
+
+// ${VAR} and ${VAR:-default}, as in .mcp.json files.
+export const expandEnv = (value, env = process.env) =>
+  String(value).replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}/g, (_, name, fallback) => env[name] ?? fallback ?? '')
+
+// The environment controller/.mcp.json gives the gateway's server, expanded
+// as Claude Code would: for the plugin's server (plugin.mjs) and the
+// controller's approval hook, which Claude Code starts without it. {} when
+// the file is not there; throws when it cannot be read.
+export function mcpEnv(file, env = process.env) {
+  let text
+  try {
+    text = readFileSync(file, 'utf8')
+  } catch (error) {
+    if (error.code === 'ENOENT') return {}
+    throw error
+  }
+  // In order, each seeing those before it, as when they are set one by one.
+  const result = {}
+  for (const [name, value] of Object.entries(JSON.parse(text).mcpServers?.voice?.env ?? {})) {
+    result[name] = expandEnv(value, { ...env, ...result })
+  }
+  return result
+}
+
 // The names controller/.mcp.json sets for the gateway; none when it cannot
 // be read.
 export function mcpEnvNames(file) {

@@ -578,7 +578,8 @@ and fails closed.
 ### 5.4 Approvals by voice
 
 - **How it works.** The gateway declares `claude/channel/permission`, so Claude Code sends approval
-  prompts to the channel as well as the terminal; the first answer wins. A prompt has a five-letter
+  prompts to the channel as well as the terminal; the first answer wins. Those of the controller's
+  teammates come through its approval hook instead (below). A prompt has a five-letter
   code and covers one action. It stays open as long as Claude Code may wait on it: no time limit,
   and none outlives the controller session, as the gateway ends with it.
 - **In every result.** The open prompts come with whatever the voice AI calls next: `get_reply`,
@@ -612,9 +613,42 @@ and fails closed.
   was, that answer stands."). At `unrestricted` the controller can run subagents, whose prompts
   wait while the session goes on, and nothing in a prompt says whose it is, so there the gateway
   guesses nothing: a prompt answered at the terminal or in the app stays listed until you answer
-  it by voice or in Telegram too, or the session restarts.
+  it by voice or in Telegram too, or the session restarts. A teammate's prompt from the hook
+  (below) is never guessed: it is not at the terminal while the gateway holds it.
 - **Secrets in prompts:** Claude Code masks recognisable credentials in relayed prompts, but not
   every secret ([channels reference][ref]).
+
+**The controller's teammates.** With agent teams on (`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` in
+your Claude Code settings), an agent the controller spawns with a name runs as an in-process
+*teammate*. Claude Code shows a teammate's approval prompts only at the controller's terminal ("from
+the standorte-drive agent"): it never relays them to a channel, nor to Remote Control. Seen with
+Claude Code 2.1.312, in its code and with a real session; on 2026-11-04 a teammate waited twelve
+hours on a Google Drive search, and on 2026-11-05 another one on a write into a project's memory
+folder in `~/.claude`, which asks even with an allow rule for `Write`. An ordinary subagent, spawned
+without a name, is not affected: its prompts reach the channel like the main session's.
+
+- **The hook.** Before a teammate's dialog opens, Claude Code runs the `PermissionRequest` hooks and
+  waits for them; a hook's allow or deny decides, and no dialog opens. The controller's hook,
+  `controller/.claude/hooks/approval.mjs` (in `controller/.claude/settings.json`, so in plugin mode
+  too), hands every teammate prompt to the gateway over `.secrets/approval.sock` and waits for the
+  verdict (`src/approvals.mjs`). The main session's and an ordinary subagent's prompts it leaves to
+  the channel, at once.
+- **Like the main session's.** The prompt gets a code, is read out with any voice result ("for the
+  subagent standorte-drive"), goes to Telegram at once, and is answered by voice or in Telegram as
+  above; the verdict goes back to the hook, which gives it to Claude Code. The kill switch denies
+  it while locked and when it locks, a standby holds its Telegram message, and
+  `VOICE_GW_TELEGRAM_CONFIRM=0` keeps its answer with the voice.
+- **Not at the terminal.** While the hook waits, the terminal shows no dialog, so the prompt cannot
+  be answered twice, and the gateway makes no guess about it: it stays listed until it is answered.
+  The hook waits up to a week (its `timeout`, Claude Code's default being ten minutes). When it stops
+  waiting, its time run out or the session ended, the gateway withdraws the prompt, and the voice AI
+  hears once that it is not open any more.
+- **Stopping the teammate does not end the wait** (Claude Code 2.1.312): its call still runs on a
+  yes, so deny a prompt you no longer want.
+- **Fails open to the terminal.** Without the gateway, with `VOICE_GW_PERMISSION_RELAY=0` or when
+  anything goes wrong, the hook decides nothing, and the dialog opens at the terminal as before.
+- **Who can reach the socket:** like the admin socket, it is mode 0600 in the 0700 secrets folder,
+  for processes of your user; a verdict goes back only on the connection that asked.
 
 **Dispatch needs your words.** The controller also reads text nobody here wrote: worker results,
 which carry whatever a run read, and news about pull requests. Both arrive with `trusted="no"`,
@@ -1091,7 +1125,9 @@ folder, `.git` included.
   may be long in coming. Only a standby holds it, until the connector signs in again; while the kill
   switch is locked, Claude Code's prompts are denied before they reach anyone. With answers by
   Telegram on you answer it there (below); otherwise its last line says to answer it in voice mode
-  or at the terminal.
+  or at the terminal. Those of the controller's teammates come too, through its approval hook
+  ([5.4](#54-approvals-by-voice)): "Approval request qwert (subagent standorte-drive of the
+  controller session)", answered there or in voice mode, as the terminal does not show them.
 - **Questions after the call:** after `VOICE_GW_TELEGRAM_AFTER` seconds (600) without a voice tool
   call, voice mode counts as ended. Gaps of a few minutes between calls are normal while you talk,
   so the wait is long. Questions that voice mode has not picked up then also go to the chat, each
@@ -1547,6 +1583,7 @@ the same. Otherwise they say: only at the computer.
 | `.secrets/` | Folder for everything below | 0700 |
 | `.secrets/oauth.json` | Clients and grants, hashes only | 0600 |
 | `.secrets/admin.sock` | Admin socket of the running gateway | socket in the 0700 folder |
+| `.secrets/approval.sock` | Where the controller's approval hook hands its teammates' approval prompts to the running gateway and waits for the verdict ([5.4](#54-approvals-by-voice)) | 0600, in the 0700 folder |
 | `.secrets/gateway.env` | Settings from the setup assistant | 0600 |
 | `.secrets/telegram_token`, `.secrets/telegram_chat_id` | The Telegram bot, and your chat with it, whose id is your user id | 0600, tightened at every start |
 | `.secrets/killswitch.json` | Kill switch state, present while locked, with the count of wrong PINs in voice mode; never a PIN, which lives only in the gateway's memory | 0600 |
@@ -2785,7 +2822,7 @@ limits at once.
 | `VOICE_GW_LOG_MAX_MB` | `10` | Past this size the log moves to `gateway.log.1`, replacing the one before |
 | `VOICE_GW_OAUTH_HOSTS` | `claude.ai,claude.com` | Hosts allowed in redirect addresses and client ID metadata documents |
 | `VOICE_GW_MCP_ALLOW` | `160.79.104.0/21`, Anthropic's | Ranges (CIDR) or addresses that may call `/mcp` through the tunnel, comma-separated; `any`: no limit, for a tunnel without `X-Forwarded-For` ([5.2](#52-the-voice-endpoint-and-oauth)) |
-| `VOICE_GW_PERMISSION_RELAY` | on | `0`: approvals only at the terminal |
+| `VOICE_GW_PERMISSION_RELAY` | on | `0`: approvals only at the terminal, the controller's teammates' too (its approval hook then decides nothing) |
 | `VOICE_GW_DEFAULT_WAIT` | `25` | Seconds `get_reply` waits by default |
 | `VOICE_GW_MAX_WAIT` | `40` | Upper limit for `get_reply` and `ask` |
 | `VOICE_GW_ASK_WAIT` | `8` | Seconds `ask` waits for a quick answer before it returns still running; at most `VOICE_GW_MAX_WAIT` |
@@ -2984,7 +3021,8 @@ gateway; do not set them.
 | `/funnel on` answers "The Funnel did not come on: Access denied" | Run `sudo tailscale set --operator=$USER` once on the computer. |
 | The Funnel goes off while you still use voice mode | It goes off `VOICE_GW_FUNNEL_IDLE` minutes after the last voice call; a long silence counts. Raise the minutes, or send "keep alive". |
 | No approval by voice | Expected for Bash, Write and Edit: they run without asking. For other tools: the session runs in auto or bypass mode, an allow rule covers the tool, or it is a trust or consent dialog, which is not relayed. Start the session with `scripts/start-controller.sh`. |
-| The terminal shows an approval waiting, the car and Telegram nothing | Every open approval comes with any voice call's result, `send` and `approve` included, and goes to Telegram at once; none drops after a time. Below `unrestricted`, a tool call of the controller after the prompt makes the gateway guess it was answered at the computer and take it off the lists ([5.4](#54-approvals-by-voice)): if one still waits then, answer it at the terminal, or by voice or in Telegram with its code from its Telegram message, which still reaches Claude Code. In a standby nothing goes out until the connector signs in again. |
+| The terminal shows an approval waiting, the car and Telegram nothing | Every open approval comes with any voice call's result, `send` and `approve` included, and goes to Telegram at once; none drops after a time. Below `unrestricted`, a tool call of the controller after the prompt makes the gateway guess it was answered at the computer and take it off the lists ([5.4](#54-approvals-by-voice)): if one still waits then, answer it at the terminal, or by voice or in Telegram with its code from its Telegram message, which still reaches Claude Code. In a standby nothing goes out until the connector signs in again. A prompt "from the … agent" is a teammate's: the controller's approval hook hands those over ([5.4](#54-approvals-by-voice)); if one shows at the terminal, the hook could not reach the gateway (the log has no `approval socket ready`), the relay is off, or the controller was started before the hook was in `controller/.claude/settings.json`: restart it. |
+| A helper agent of the controller waits and nothing asks | A teammate's prompt waits in the approval hook, with no dialog at the terminal, until it is answered by voice or in Telegram: `status` by voice lists it ("for the subagent …"), the gateway's log has `permission_request … subagent=…`. Stopping the agent does not end the wait; deny the prompt. |
 | The controller still starts with the development flag after the admin step | The log line `channel: the development flag, since …` says why. The script reads Claude Code's local copy of the managed settings (`~/.claude/remote-settings.json`), which Claude Code updates when a session starts, so the first start after the admin step still sees the old copy: answer the warning or quit, and start again. `node scripts/channel-mode.mjs` shows what the next start will use; `claude doctor` shows whether the managed settings arrived. |
 | With `VOICE_GW_REMOTE_CONTROL=1`, "Voice controller" is missing in the Claude app | It counts from the next start of the session; the log line `watchdog: remote control: …` shows that it was passed. The controller's terminal (`tmux attach -t voice`) shows why it did not connect, and `claude doctor` which check failed: Claude Code signed in with an API key or a token instead of claude.ai, `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` or `DISABLE_GROWTHBOOK` set, or on Team and Enterprise Remote Control not turned on by an Owner ([7.4](#74-admin-steps-for-team-and-enterprise)). After a restart, take the newest session of that name. |
 | No worker shows up in the Claude app | Expected: only the controller connects. Worker runs are headless (`claude -p`), which Remote Control does not connect ([Remote Control](#remote-control-from-the-claude-app)); ask the controller what a worker does, or read `.state/tasks/<task>.jsonl`. |
@@ -3091,6 +3129,17 @@ The setup never changes that other server, and never moves the Funnel off 443: F
 publicly, but claude.ai's connector did not connect to it in our test ("no server answered at this
 URL", and no request from Anthropic's addresses in the log).
 
+**A teammate's approval prompt reaches the car only through the controller's hook.** With agent
+teams on, Claude Code (2.1.312) relays no prompt of an in-process teammate to a channel or to Remote
+Control, only to the terminal ([5.4](#54-approvals-by-voice)). The hook relies on what that version
+does: it runs the `PermissionRequest` hooks before a teammate's dialog and waits for them, gives
+them the agent's `agent_id` and `agent_type`, and keeps a record of the agent with its kind next to
+the session's transcript (`subagents/agent-<id>.meta.json`, `taskKind: in_process_teammate`). The
+hook falls back to the id's form (`a<name>-<16 hex digits>`) when the record is missing. If a later
+version changes this, a teammate's prompts open at the terminal again, as before the hook. Stopping
+a teammate while it waits on a prompt does not end the wait in 2.1.312: a later yes still runs the
+call.
+
 ## 9. Repository layout
 
 ```text
@@ -3125,6 +3174,7 @@ src/
   store.mjs          requests and approvals, persisted across restarts
   folders.mjs        cloning and deleting in the worker root, above the level confined
   admin.mjs          Unix socket for pair.mjs, unlock.mjs, fake-voice and the setup's pairing codes
+  approvals.mjs      Unix socket for the controller's approval hook: its teammates' prompts, the verdicts back
   config.mjs         settings from the environment and .secrets/gateway.env
   settings.mjs       reads and writes .secrets/gateway.env
   platform.mjs       what differs on macOS: temporary folders, the autostart's PATH and names
@@ -3133,8 +3183,9 @@ src/
   http.mjs, log.mjs  small HTTP helpers; log to stderr and file, never stdout
 controller/
   .mcp.json          starts the gateway as the server "voice"
-  .claude/settings.json        allow and deny rules, the hook
+  .claude/settings.json        allow and deny rules, the hooks
   .claude/hooks/confine.mjs    the controller's confinement
+  .claude/hooks/approval.mjs   its teammates' approval prompts to the gateway, the verdict back
   CLAUDE.md          the controller's instructions
   playground/        the one folder the controller writes to
 .claude-plugin/      this repository as the marketplace cc-voice-gateway, with the plugin voice

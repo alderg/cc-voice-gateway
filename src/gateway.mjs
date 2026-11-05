@@ -43,6 +43,7 @@ import { execFileSync } from 'node:child_process'
 import { Store } from './store.mjs'
 import { Auth } from './oauth.mjs'
 import { startAdmin } from './admin.mjs'
+import { HookApprovals } from './approvals.mjs'
 import { startChannel } from './channel.mjs'
 import { startVoiceHttp } from './voice.mjs'
 import { Workers, auditSummary, duration, gitState, hostGit, parkedText, planText, queueList } from './workers.mjs'
@@ -384,6 +385,7 @@ function shutdown(reason, code = process.exitCode ?? 0, { planned = true } = {})
   log('shutting down:', reason)
   http?.close()
   admin?.close()
+  hookApprovals.close() // the hooks waiting now let their prompts open at the terminal
   workers.close() // runs go on; the next gateway picks them up
   settings?.close()
   guard.close()
@@ -452,7 +454,21 @@ async function selfCheck() {
   )
 }
 
+// The approval requests of the controller's teammates, which the channel
+// never gets: its PermissionRequest hook hands them over this socket
+// (approvals.mjs). Listed and answered like the channel's, and the verdict
+// goes back to the hook.
+const hookApprovals = new HookApprovals({ store, killswitch, relay: config.permissionRelay })
+if (await hookApprovals.listen(config.approvalSocket)) {
+  log(
+    config.permissionRelay
+      ? "approval socket ready: the approval requests of the controller's teammates (agents spawned with a name) reach the driver too, through its PermissionRequest hook"
+      : "approval socket ready, but the permission relay is off: the controller's hook leaves its teammates' approval requests at the terminal",
+  )
+}
+
 const channel = await startChannel(store, {
+  hookApprovals,
   permissionRelay: config.permissionRelay,
   workers,
   restarter,

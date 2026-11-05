@@ -29,7 +29,12 @@ function socketInUse(path) {
   })
 }
 
-export async function startAdmin(auth, socketPath, { killswitch = null } = {}) {
+// Listens with server on a Unix socket in the secrets folder, mode 0600, and
+// removes it when the server closes. Resolves with the server, or null when
+// the socket cannot be had: its path too long, or in use by another gateway;
+// the log says why, naming it as what and what does not work without it
+// (missing). Also for the approval socket (approvals.mjs).
+export async function listenSocket(server, socketPath, { what = 'admin socket', missing = '' } = {}) {
   // A longer path may be cut short (platform.mjs): the socket would listen
   // under the shortened name, perhaps outside the secrets folder, until the
   // gateway ended on the chmod below. So not at all: without the socket it
@@ -37,8 +42,8 @@ export async function startAdmin(auth, socketPath, { killswitch = null } = {}) {
   const bytes = Buffer.byteLength(socketPath)
   if (bytes > socketPathMax()) {
     log(
-      `admin socket not started: its path has ${bytes} bytes, more than this system allows (${socketPathMax()}), so pairing, ` +
-        'local tokens and unlocking the kill switch do not work. Move the checkout, or set VOICE_GW_SECRETS_DIR to a shorter folder:',
+      `${what} not started: its path has ${bytes} bytes, more than this system allows (${socketPathMax()}), so ${missing}. ` +
+        'Move the checkout, or set VOICE_GW_SECRETS_DIR to a shorter folder:',
       socketPath,
     )
     return null
@@ -46,12 +51,27 @@ export async function startAdmin(auth, socketPath, { killswitch = null } = {}) {
   mkdirSync(dirname(socketPath), { recursive: true, mode: 0o700 })
   if (existsSync(socketPath)) {
     if (await socketInUse(socketPath)) {
-      log('admin socket in use (is another gateway running?):', socketPath)
+      log(`${what} in use (is another gateway running?):`, socketPath)
       return null
     }
     unlinkSync(socketPath) // left over from a gateway that was killed
   }
+  await new Promise((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(socketPath, resolve)
+  })
+  chmodSync(socketPath, 0o600)
+  server.on('close', () => {
+    try {
+      unlinkSync(socketPath)
+    } catch {
+      // already gone
+    }
+  })
+  return server
+}
 
+export async function startAdmin(auth, socketPath, { killswitch = null } = {}) {
   const server = createServer(async (req, res) => {
     try {
       const body = req.method === 'POST' ? JSON.parse((await readBody(req, 4096)) || '{}') : {}
@@ -71,19 +91,10 @@ export async function startAdmin(auth, socketPath, { killswitch = null } = {}) {
       sendJson(res, 400, { error: error.message })
     }
   })
-  await new Promise((resolve, reject) => {
-    server.once('error', reject)
-    server.listen(socketPath, resolve)
+  return listenSocket(server, socketPath, {
+    what: 'admin socket',
+    missing: 'pairing, local tokens and unlocking the kill switch do not work',
   })
-  chmodSync(socketPath, 0o600)
-  server.on('close', () => {
-    try {
-      unlinkSync(socketPath)
-    } catch {
-      // already gone
-    }
-  })
-  return server
 }
 
 // timeoutMs: give up on a gateway that takes the connection but does not answer.
