@@ -38,7 +38,8 @@
 // login only where GitHub says it is a bot account), get a fix
 // that the watcher queues itself (Workers.reviewFix): a task in the
 // gateway's words, naming the pull request and its branch, never what the
-// reviews say, as a follow-up of the run that pushed the pull request.
+// reviews say, as a follow-up of the run that pushed the pull request. Only
+// the worker's prompt quotes the comments that asked (asking), as data.
 // Anyone else's text starts nothing. The fix pushes, the reviews run again,
 // and new comments start the next round, at most autoFix.rounds per pull
 // request until a run the driver dispatched works on it again. The news says
@@ -396,8 +397,9 @@ export class PullWatcher extends EventEmitter {
       }
     }
     // Review comments fixed without asking: a fix queued, or why not.
-    const asking = this.autoFix ? await this.asking(entry, newReviews, inline, newComments) : []
-    const fix = asking.length ? await this.fix(entry, pr, asking) : null
+    const asked = this.autoFix ? await this.asking(entry, newReviews, inline, newComments) : []
+    const asking = [...new Set(asked.map(item => item.author))]
+    const fix = asking.length ? await this.fix(entry, pr, asking, asked) : null
     if (fix) lines.push(fix.line)
     if (fix?.brief) brief.push(fix.brief)
 
@@ -434,9 +436,11 @@ export class PullWatcher extends EventEmitter {
   // Who asks for a fix, of the new reviews and comments: inline comments,
   // reviews that request changes or say something, and comments with a
   // text, of a collaborator or a review bot, made since the run that started
-  // the watch began. Their logins, once each. gh names the authors of
-  // reviews and comments without saying whether they are bots; for a login
-  // on the list, the REST API says it (authors).
+  // the watch began. Each as { author, kind, where, state, text }, for the
+  // fix's prompt (Workers.reviewComments): the words the worker would act on
+  // anyway, of nobody else. gh names the authors of reviews and comments
+  // without saying whether they are bots; for a login on the list, the REST
+  // API says it (authors).
   async asking(entry, reviews, inline, comments) {
     const untyped = item => !collaborator(item.authorAssociation) && this.listed(item.author) && !typed(item.author)
     const rest = {
@@ -446,15 +450,19 @@ export class PullWatcher extends EventEmitter {
     const author = (item, found) => (untyped(item) ? (found.get(item.id) ?? null) : item.author)
     const counts = (author, association, time) => (collaborator(association) || this.isBot(author)) && since(entry.since, time)
     const said = text => String(text ?? '').trim() !== ''
-    const who = [
+    const items = [
       ...reviews
         .filter(r => r.state === 'CHANGES_REQUESTED' || (r.state === 'COMMENTED' && said(r.body)))
         .filter(r => counts(author(r, rest.reviews), r.authorAssociation, r.submittedAt))
-        .map(r => r.author?.login),
-      ...inline.filter(c => counts(c.user, c.author_association, c.created_at)).map(c => c.user?.login),
-      ...comments.filter(c => said(c.body) && counts(author(c, rest.comments), c.authorAssociation, c.createdAt)).map(c => c.author?.login),
+        .map(r => ({ name: r.author?.login, kind: 'review', state: REVIEW_STATE[r.state], text: r.body })),
+      ...inline
+        .filter(c => counts(c.user, c.author_association, c.created_at))
+        .map(c => ({ name: c.user?.login, kind: 'inline', where: `${c.path}${c.line ? `:${c.line}` : ''}`, text: c.body })),
+      ...comments
+        .filter(c => said(c.body) && counts(author(c, rest.comments), c.authorAssociation, c.createdAt))
+        .map(c => ({ name: c.author?.login, kind: 'comment', text: c.body })),
     ]
-    return [...new Set(who.map(name => login(name) || 'someone'))]
+    return items.map(({ name, text, ...item }) => ({ author: login(name) || 'someone', ...item, text: String(text ?? '').trim() }))
   }
 
   // A login on the list of review bots.
@@ -480,8 +488,9 @@ export class PullWatcher extends EventEmitter {
 
   // A fix for those who ask (autoFix.queue, Workers.reviewFix), or why there
   // is none: { line, queued }, the line for the news and the queued task.
-  // Each fix queued is one of the pull request's automatic rounds.
-  async fix(entry, pr, asking) {
+  // Each fix queued is one of the pull request's automatic rounds. asking:
+  // their logins; asked: what they said (asking), for the fix's prompt.
+  async fix(entry, pr, asking, asked = []) {
     const { rounds, queue } = this.autoFix
     const done = entry.fixes ?? 0
     const head = `Automatic fixing: new review comments from ${asking.join(', ')} ask for changes`
@@ -504,6 +513,7 @@ export class PullWatcher extends EventEmitter {
         task: entry.task ?? null,
         round: done + 1,
         rounds,
+        comments: asked,
       })
     } catch (error) {
       result = { status: 'failed', why: `it could not be queued: ${error.message}` }

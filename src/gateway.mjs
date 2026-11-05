@@ -24,7 +24,19 @@
 // controller's tool stats, /stats on Telegram, and the message when it shuts
 // down.
 
-import { CONTROLLER_LEVELS, EFFORTS, KILLSWITCH_MODES, ROOT, VERSION, WORKER_LIMITS, config, environmentWinsOver, limitValue } from './config.mjs'
+import {
+  CONTROLLER_LEVELS,
+  EFFORTS,
+  KILLSWITCH_MODES,
+  ROOT,
+  VERSION,
+  WORKER_LIMITS,
+  autoCompactValue,
+  cacheTtlValue,
+  config,
+  environmentWinsOver,
+  limitValue,
+} from './config.mjs'
 import { FROM_FILE } from './settings.mjs'
 import { log, preview } from './log.mjs'
 import { execFileSync } from 'node:child_process'
@@ -160,6 +172,20 @@ if (config.workerEffort && !EFFORTS.includes(config.workerEffort)) {
 if (config.workerModel || config.workerEffort) {
   log(`workers run with model ${config.workerModel || 'default'}, effort ${config.workerEffort || 'default'}`)
 }
+if (cacheTtlValue(config.workerCacheTtlSetting) === null) {
+  log(`VOICE_GW_WORKER_CACHE_TTL=${config.workerCacheTtlSetting} is not 1h, 5m or auto; 1h instead`)
+}
+if (autoCompactValue(config.workerAutoCompactSetting) === null) {
+  log(`VOICE_GW_WORKER_AUTOCOMPACT=${config.workerAutoCompactSetting} is no size from 100k to 1m tokens, nor auto; 300k instead`)
+}
+// What the workers' runs cost: their prompt cache, and when their sessions
+// are compacted (config.mjs).
+log(
+  `worker sessions: prompt cache ${config.workerCacheTtl || "Claude Code's own (5m on usage credits)"} ` +
+    `(VOICE_GW_WORKER_CACHE_TTL), compacted at ` +
+    `${config.workerAutoCompact ? `${config.workerAutoCompact / 1000}k tokens` : "Claude Code's own window"} ` +
+    '(VOICE_GW_WORKER_AUTOCOMPACT)',
+)
 if (config.prDraft) log('workers open their pull requests as drafts (VOICE_GW_PR_DRAFT=1)')
 if (limitValue('VOICE_GW_MAX_WORKERS_PER_REPO', config.maxWorkersPerRepoSetting) === null) {
   log(`VOICE_GW_MAX_WORKERS_PER_REPO=${config.maxWorkersPerRepoSetting} is no whole number from 1 to 100; 1 instead`)
@@ -259,6 +285,9 @@ const workers = new Workers({
   ghBin: config.ghBin,
   model: config.workerModel,
   effort: EFFORTS.includes(config.workerEffort) ? config.workerEffort : '',
+  cacheTtl: config.workerCacheTtl,
+  autoCompact: config.workerAutoCompact,
+  freshFixes: config.autoFixFresh,
   prDraft: config.prDraft,
   maxRuns: config.maxWorkers,
   maxPerRepo: config.maxWorkersPerRepo,
@@ -332,7 +361,10 @@ log(
 log(
   config.autoFixReviews
     ? `review comments on workers' pull requests: fixed without asking, at most ${config.autoFixRounds} automatic ` +
-        `rounds per pull request, for collaborators and the review bots ${config.reviewBots.join(', ')} (VOICE_GW_AUTO_FIX_REVIEWS)`
+        `rounds per pull request, for collaborators and the review bots ${config.reviewBots.join(', ')} (VOICE_GW_AUTO_FIX_REVIEWS), ` +
+        (config.autoFixFresh
+          ? 'each in a new session (VOICE_GW_AUTO_FIX_FRESH)'
+          : 'each in the session of the run that pushed (VOICE_GW_AUTO_FIX_FRESH=0)')
     : "review comments on workers' pull requests: fixed only on the driver's word (VOICE_GW_AUTO_FIX_REVIEWS=0)",
 )
 

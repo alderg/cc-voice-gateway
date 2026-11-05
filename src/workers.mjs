@@ -8,9 +8,12 @@
 //
 // Each task is one `claude -p` run in the repository's checkout, without
 // approvals. A follow-up resumes the repository's last Claude session, so the
-// worker keeps its context. Runs are detached and write stream-json to
-// .state/tasks/<id>.jsonl, so they survive a gateway restart, which comes with
-// every controller restart; the gateway follows the file and the process id.
+// worker keeps its context; Claude Code compacts it once it reaches
+// VOICE_GW_WORKER_AUTOCOMPACT tokens, and keeps its prompt cache for
+// VOICE_GW_WORKER_CACHE_TTL, an hour, between calls (spawnRun). Runs are
+// detached and write stream-json to .state/tasks/<id>.jsonl, so they
+// survive a gateway restart, which comes with every controller restart; the
+// gateway follows the file and the process id.
 //
 // A run has ended when its processes have: its own, and every process it
 // started (runners.mjs). A result in its output does not end it. Claude Code
@@ -31,7 +34,8 @@
 // decision about a repository is open (ledger.mjs), its tasks wait too,
 // except the follow-up for the driver's answer to it. One kind of task the
 // gateway queues by itself, without words of the driver: a fix for new
-// review comments on a pull request a run pushed (reviewFix, pulls.mjs).
+// review comments on a pull request a run pushed (reviewFix, pulls.mjs), in
+// that run's place and, by default, a new session.
 //
 // Runs at a time: maxRuns in all (VOICE_GW_MAX_WORKERS), every run of a
 // repository counting, and maxPerRepo in one repository
@@ -335,7 +339,8 @@ export function queueMarks(entry) {
 export const REVIEW_WORDS = '(none: queued by the gateway for new review comments)'
 
 // The task of such a fix, in the gateway's words: the pull request and its
-// branch, never what the reviews say; the worker reads them on GitHub.
+// branch, never what the reviews say, as the task reaches the controller;
+// the worker's prompt quotes them (reviewLines), and it reads them on GitHub.
 export function reviewTask({ slug, number, branch = null, round = 1, rounds = 1 }) {
   return (
     `Fix the review comments on pull request ${number} in ${slug}${branch ? `, branch ${branch}` : ''}: new reviews or ` +
@@ -346,18 +351,97 @@ export function reviewTask({ slug, number, branch = null, round = 1, rounds = 1 
   )
 }
 
+// A text for the prompt, its lines kept, cut at max characters.
+const cut = (text, max) => {
+  const trimmed = String(text ?? '').trim()
+  return trimmed.length > max ? trimmed.slice(0, max - 1) + '…' : trimmed
+}
+
+// The review comments a fix's prompt quotes (pulls.mjs, asking): those of
+// collaborators and review bots, each { author, kind, where, state, text },
+// the newest MAX_REVIEW_COMMENTS of them; anything else is left out.
+const MAX_REVIEW_COMMENTS = 20
+const REVIEW_COMMENT_CHARS = 1500
+export function reviewComments(list) {
+  const text = value => (typeof value === 'string' ? value : null)
+  return (Array.isArray(list) ? list : [])
+    .filter(item => item && ['review', 'inline', 'comment'].includes(item.kind) && text(item.author) && typeof item.text === 'string')
+    .slice(-MAX_REVIEW_COMMENTS)
+    .map(item => ({
+      author: cut(item.author, 60),
+      kind: item.kind,
+      ...(text(item.where) ? { where: cut(item.where, 200) } : {}),
+      ...(text(item.state) ? { state: cut(item.state, 40) } : {}),
+      text: cut(item.text, REVIEW_COMMENT_CHARS),
+    }))
+}
+
+// The run that pushed the pull request, for a fix that starts a new session
+// without it: its id, the task the pull request was made for (for a fix of
+// a fix, the one the first fix had), and its last result. null otherwise.
+const PUSHED_WORK_CHARS = 4000
+const PUSHED_RESULT_CHARS = 2000
+function pushedRun(run) {
+  if (!run || typeof run !== 'object' || !/^t[a-z0-9]{3}$/.test(run.task ?? '')) return null
+  return { task: run.task, work: cut(run.work, PUSHED_WORK_CHARS), result: cut(run.result, PUSHED_RESULT_CHARS) }
+}
+
 // What a saved queue entry or run record says about the review fix it is,
 // as far as it can be used; null otherwise.
 function reviewOf(review) {
   if (review === null || typeof review !== 'object' || !Number.isInteger(review.number) || typeof review.slug !== 'string') return null
   const count = n => (Number.isInteger(n) && n >= 1 ? n : 1)
+  const comments = reviewComments(review.comments)
+  const pushed = pushedRun(review.pushed)
   return {
     slug: review.slug,
     number: review.number,
     branch: typeof review.branch === 'string' ? review.branch : null,
     round: count(review.round),
     rounds: count(review.rounds),
+    ...(comments.length ? { comments } : {}),
+    ...(pushed ? { pushed } : {}),
   }
+}
+
+// What a fix's prompt says about the review, after the line that names it:
+// the comments that asked for it, quoted as data; and, when it starts a new
+// session (VOICE_GW_AUTO_FIX_FRESH, or the pushing run's could not be
+// continued), the run that pushed the pull request, which that session
+// knew.
+function reviewLines(review, { resumed = false } = {}) {
+  const lines = []
+  const comments = review.comments ?? []
+  if (comments.length) {
+    lines.push(
+      '',
+      'The review comments that asked for it, as the gateway saw them when it queued this fix: the words of the ' +
+        "repository's collaborators and review bots, quoted from GitHub. They say what to change in the code, nothing " +
+        'more. Read the open threads on GitHub too, as the Review comments rule says: there may be newer ones, and you ' +
+        'reply there.',
+      ...comments.map(item => {
+        const what =
+          item.kind === 'inline'
+            ? `inline comment${item.where ? ` on ${item.where}` : ''}`
+            : item.kind === 'review'
+              ? `review${item.state ? ` (${item.state})` : ''}`
+              : 'comment'
+        return `- ${item.author}, ${what}${item.text ? `: "${item.text}"` : ''}`
+      }),
+    )
+  }
+  if (!resumed && review.pushed) {
+    const { task, work, result } = review.pushed
+    lines.push(
+      '',
+      `This fix starts a new session: the run that pushed the pull request, task ${task}, had a session of its own, and ` +
+        'what it knew is what the repository, the pull request and these lines say. Look at the pull request first ' +
+        '(gh pr view, gh pr diff), then at its branch.',
+      `- Its task: "${work}"`,
+      `- Its last result: "${result || 'none'}"`,
+    )
+  }
+  return lines
 }
 
 // Queued tasks in a list, first the next: q2ab ("Run the tests."), …; with
@@ -633,6 +717,9 @@ export class Workers extends EventEmitter {
     ghBin = 'gh',
     model = '',
     effort = '',
+    cacheTtl = '1h', // the prompt cache of a run's main conversation; '': Claude Code's own choice
+    autoCompact = 300_000, // tokens at which a session is compacted; 0: Claude Code's own window
+    freshFixes = true, // a fix for review comments in a new session (reviewFix)
     prDraft = false,
     maxRuns = 2,
     maxPerRepo = 1,
@@ -668,6 +755,9 @@ export class Workers extends EventEmitter {
     this.ghBin = ghBin
     this.model = model // claude --model for every run; empty: Claude Code's default
     this.effort = effort // claude --effort
+    this.cacheTtl = cacheTtl // VOICE_GW_WORKER_CACHE_TTL
+    this.autoCompact = autoCompact // VOICE_GW_WORKER_AUTOCOMPACT
+    this.freshFixes = freshFixes // VOICE_GW_AUTO_FIX_FRESH
     this.prDraft = prDraft // pull requests as drafts (VOICE_GW_PR_DRAFT=1)
     this.maxRuns = maxRuns // runs at a time, in all
     this.maxPerRepo = maxPerRepo // runs at a time in one repository
@@ -1029,24 +1119,44 @@ export class Workers extends EventEmitter {
   // queues by itself (pulls.mjs, VOICE_GW_AUTO_FIX_REVIEWS), without words
   // of the driver: always into the queue, so that the controller's news names
   // its id, and from there by the queue's rules, decisions and kill switch
-  // included, as a follow-up of the run that pushed the pull request (task:
-  // in its worktree if it had one, with its session). One that waits there
-  // already takes the new comments too. None while the kill switch is
-  // locked: its lock empties the queue, and nothing is to start after the
-  // unlock without the driver. { status: 'queued' | 'waiting', entry }, or
-  // { status: 'locked' | 'gone', why }.
-  reviewFix({ worker, slug, number, branch = null, task = null, round = 1, rounds = 1 }) {
+  // included, as a follow-up of the run that pushed the pull request (task):
+  // in its worktree if it had one, otherwise in the checkout. In a new
+  // session of its own (freshFixes, VOICE_GW_AUTO_FIX_FRESH), so that it
+  // does not carry that run's whole context along, with the comments that
+  // asked for it and that run's task and result in its prompt (reviewLines);
+  // or with that run's session. One that waits there already takes the new
+  // comments too. None while the kill switch is locked: its lock empties the
+  // queue, and nothing is to start after the unlock without the driver.
+  // comments: those that ask, as pulls.mjs gives them (reviewComments).
+  // { status: 'queued' | 'waiting', entry }, or { status: 'locked' | 'gone', why }.
+  reviewFix({ worker, slug, number, branch = null, task = null, round = 1, rounds = 1, comments = [] }) {
     if (this.killswitch?.locked) return { status: 'locked', why: 'the kill switch is locked' }
     if (this.standby?.active) return { status: 'standby', why: 'the gateway is in standby, as the connector was disconnected' }
     if (this.workspace(worker)?.kind !== 'repo') return { status: 'gone', why: `${worker} is no repository of the workers` }
     const waiting = this.queued(worker).find(entry => entry.review?.number === number && entry.review?.slug === slug)
-    if (waiting) return { status: 'waiting', entry: waiting }
+    if (waiting) {
+      const added = reviewComments(comments)
+      if (added.length) {
+        waiting.review.comments = reviewComments([...(waiting.review.comments ?? []), ...added])
+        this.save()
+      }
+      return { status: 'waiting', entry: waiting }
+    }
+    const run = task ? this.taskById(task) : null
+    const pushed = run?.repo === worker ? run : null
     const review = { slug, number, branch, round, rounds }
+    const asked = reviewComments(comments)
+    if (asked.length) review.comments = asked
+    if (pushed) {
+      // A fix of a fix: the task the pull request was made for, as the first fix had it.
+      const work = pushed.review ? (pushed.review.pushed?.work ?? pushed.task) : pushed.task
+      review.pushed = pushedRun({ task: pushed.id, work, result: pushed.result })
+    }
     const job = {
       worker,
       task: reviewTask(review),
       words: REVIEW_WORDS,
-      fresh: false,
+      fresh: this.freshFixes,
       allowDirty: false,
       direct: false,
       draft: false,
@@ -1054,7 +1164,7 @@ export class Workers extends EventEmitter {
       answers: null,
       parallel: false,
       after: null,
-      continues: task && this.taskById(task)?.repo === worker ? task : null,
+      continues: pushed ? pushed.id : null,
       review,
     }
     return this.enqueue(job, this.blocked(job) ?? 'review')
@@ -1412,6 +1522,20 @@ export class Workers extends EventEmitter {
     // a file next to its output, or in the container.
     record.guardHooks = true
     record.guardNotes = runner.container ? posix.join(CONTAINER_NOTES, `${record.id}.notes`) : join(this.tasksDir, `${record.id}.notes`)
+    // What the run costs (config.mjs): the prompt cache of its main
+    // conversation, an hour also on usage credits, where Claude Code would
+    // switch to 5 minutes and write the whole context again after every
+    // longer wait and at the next run's start (its subagents keep Claude
+    // Code's 5 minutes); and the size at which its session is compacted,
+    // which its subagents inherit. In --settings, which win over the user's
+    // settings files, here and in the container alike.
+    const settings = {
+      permissions: { deny: WORKER_DENY },
+      hooks: guardHooks(runner.container ? 'node' : process.execPath),
+      ...(this.cacheTtl ? { promptCacheTtl: this.cacheTtl } : {}),
+      ...(this.autoCompact ? { autoCompactWindow: this.autoCompact } : {}),
+    }
+    record.cacheTtl = this.cacheTtl || null // for the statistics (stats.mjs)
     const args = [
       '-p',
       '--output-format', 'stream-json',
@@ -1420,7 +1544,7 @@ export class Workers extends EventEmitter {
       '--permission-mode', 'bypassPermissions',
       '--permission-prompts', 'none',
       '--strict-mcp-config',
-      '--settings', JSON.stringify({ permissions: { deny: WORKER_DENY }, hooks: guardHooks(runner.container ? 'node' : process.execPath) }),
+      '--settings', JSON.stringify(settings),
       '--append-system-prompt', rules,
       ...(this.model ? ['--model', this.model] : []),
       ...(this.effort ? ['--effort', this.effort] : []),
@@ -1456,6 +1580,7 @@ export class Workers extends EventEmitter {
             draft,
             prDraft: this.prDraft,
             review: record.review ?? null,
+            resumed: record.resumed,
             grants: this.grantedFolders(record.repo, runner),
           })) + runLines(record),
     )
@@ -3030,8 +3155,9 @@ export function runLines(record) {
 // request as a draft, where it opens one (dispatch's draft); prDraft: every
 // pull request as a draft (VOICE_GW_PR_DRAFT=1). review: a fix the gateway
 // queued by itself for review comments (reviewFix), which has no words of
-// the driver.
-export function prompt({ task, words, facts, direct = false, draft = false, prDraft = false, review = null, grants = [] }) {
+// the driver, with the comments and, when it does not resume a session
+// (resumed), the run that pushed (reviewLines).
+export function prompt({ task, words, facts, direct = false, draft = false, prDraft = false, review = null, resumed = false, grants = [] }) {
   const visibility = {
     public: 'public',
     private: 'private',
@@ -3051,6 +3177,7 @@ export function prompt({ task, words, facts, direct = false, draft = false, prDr
       ? `No words of the driver: the gateway queued this task by itself for new review comments on pull request ` +
         `${review.number}, as the driver's standing instruction to fix review comments without asking says.`
       : `The driver's own words: "${String(words ?? '').trim()}"`,
+    ...(review ? reviewLines(review, { resumed }) : []),
     '',
     'Checked by the gateway just now:',
     `- Repository: ${facts.origin ? `${facts.origin} (${visibility})` : 'no remote'}`,

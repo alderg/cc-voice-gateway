@@ -19,6 +19,7 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 import { z } from 'zod'
 import { adminRequest } from '../src/admin.mjs'
 import { normalise, spokenByDriver } from '../src/channel.mjs'
+import { autoCompactValue, cacheTtlValue } from '../src/config.mjs'
 import { Store } from '../src/store.mjs'
 import { Workers, auditSummary, auditText } from '../src/workers.mjs'
 
@@ -305,6 +306,10 @@ test('dispatch runs claude -p in the checkout; the result reaches the controller
   assert.ok(!call.args.includes('--remote-control'))
   const deny = JSON.parse(arg(call, '--settings')).permissions.deny
   for (const rule of ['mcp__claude_ai_*', 'SendMessage', 'AskUserQuestion']) assert.ok(deny.includes(rule), rule)
+  // What the run costs, by default: the prompt cache an hour, also on usage
+  // credits, and the session compacted at 300k tokens.
+  assert.equal(JSON.parse(arg(call, '--settings')).promptCacheTtl, '1h')
+  assert.equal(JSON.parse(arg(call, '--settings')).autoCompactWindow, 300000)
   // The kill switch's hooks (guard.mjs): each call's folder in the output, and
   // the guard's notes for the worker, next to the run's output.
   assert.ok(call.args.includes('--include-hook-events'))
@@ -1184,6 +1189,36 @@ test("the run's stream to the kill switch's rules: calls with the subagent they 
       ['toolResult', 'toolu_2', true, 'Exit code 1'],
     ])
   } finally {
+    workers.close()
+  }
+})
+
+test('what a run costs: VOICE_GW_WORKER_CACHE_TTL and VOICE_GW_WORKER_AUTOCOMPACT as they may be written; with auto, nothing in its --settings, Claude Code decides', async () => {
+  // config.mjs: the default for empty, null for a value it does not know.
+  assert.deepEqual(
+    ['', '1h', ' 1H ', '5m', 'auto', '0', '2h', '1 h', '60m'].map(cacheTtlValue),
+    ['1h', '1h', '1h', '5m', '', '', null, null, null],
+  )
+  assert.deepEqual(
+    ['', '300k', '400K', '1m', '250000', '0.5m', 'auto', '0', '50k', '2m', '300', 'lots', '-300k'].map(autoCompactValue),
+    [300000, 300000, 400000, 1000000, 250000, 500000, 0, 0, null, null, null, null, null],
+  )
+
+  const root = join(TMP, 'costs', 'Developer')
+  repo('alpha', { dir: join(root, 'alpha') })
+  const log = join(TMP, 'costs-calls.jsonl')
+  process.env.FAKE_CLAUDE_LOG = log
+  const workers = new Workers({ root, stateDir: join(TMP, 'costs', 'state'), claudeBin: join(BIN, 'claude'), ghBin: join(BIN, 'gh'), cacheTtl: '', autoCompact: 0 })
+  try {
+    const started = await workers.dispatch({ worker: 'alpha', task: 'Run the tests.', words: 'run the tests' })
+    assert.equal(started.status, 'started')
+    const call = await eventually(() => existsSync(log) && JSON.parse(readFileSync(log, 'utf8').trim().split('\n')[0]))
+    const settings = JSON.parse(arg(call, '--settings'))
+    assert.deepEqual(Object.keys(settings), ['permissions', 'hooks'])
+    assert.equal(started.task.cacheTtl, null, 'for the statistics: Claude Code chose')
+    await eventually(() => started.task.state !== 'running')
+  } finally {
+    delete process.env.FAKE_CLAUDE_LOG
     workers.close()
   }
 })

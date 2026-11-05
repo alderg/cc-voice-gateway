@@ -30,7 +30,7 @@ const GATEWAY = fileURLToPath(new URL('../src/gateway.mjs', import.meta.url))
 process.env.VOICE_GW_LOG_FILE = ''
 process.env.VOICE_GW_SECRETS_DIR = join(TMP, 'no-secrets')
 const { PullWatcher } = await import('../src/pulls.mjs')
-const { REVIEW_WORDS, WORKER_RULES, Workers } = await import('../src/workers.mjs')
+const { REVIEW_WORDS, WORKER_RULES, Workers, reviewComments } = await import('../src/workers.mjs')
 const { Ledger, openItems } = await import('../src/ledger.mjs')
 const { adminRequest } = await import('../src/admin.mjs')
 
@@ -174,7 +174,19 @@ test('a fix is queued for new comments of a collaborator or a review bot, as the
       })
     })
     await until(() => news.length === 2)
-    assert.deepEqual(asked, [{ worker: 'alpha', slug: 'acme/alpha', number: 31, branch: 'voice/fix-typo', task: 'tpsh', round: 1, rounds: 3 }])
+    // What the review said goes to the fix's prompt only (Workers.reviewComments), of those who count.
+    assert.deepEqual(asked, [
+      {
+        worker: 'alpha',
+        slug: 'acme/alpha',
+        number: 31,
+        branch: 'voice/fix-typo',
+        task: 'tpsh',
+        round: 1,
+        rounds: 3,
+        comments: [{ author: 'copilot-pull-request-reviewer', kind: 'review', state: 'commented', text: 'Two findings: rename x, check y.' }],
+      },
+    ])
     assert.equal(news[1].fix, 'q001')
     assert.match(
       news[1].text,
@@ -190,6 +202,7 @@ test('a fix is queued for new comments of a collaborator or a review bot, as the
     await until(() => news.length === 3)
     assert.equal(asked.length, 2)
     assert.equal(asked[1].round, 2)
+    assert.deepEqual(asked[1].comments, [{ author: 'octo', kind: 'inline', where: 'a.js:3', text: 'Nit: a comment here.' }], 'not the approval')
     assert.match(news[2].text, /^Automatic fixing: new review comments from octo ask for changes: .* as q002, automatic round 2 of 3/m)
     setGitHub(g => {
       g.prs['acme/alpha#31'].reviews.push({ id: 'R4', author: { login: 'mona' }, authorAssociation: 'COLLABORATOR', state: 'APPROVED', body: '' })
@@ -204,6 +217,7 @@ test('a fix is queued for new comments of a collaborator or a review bot, as the
     })
     await until(() => news.length === 5)
     assert.equal(asked.length, 3)
+    assert.deepEqual(asked[2].comments, [{ author: 'claude', kind: 'comment', text: 'Code review: 1 issue.' }])
     assert.match(news[4].text, /from claude ask for changes: .* as q003, automatic round 3 of 3/)
     assert.equal(w.watches[0].fixes, 3)
   } finally {
@@ -434,21 +448,28 @@ test('the setting off: news as before, and nothing is queued', async () => {
 
 // --- the queue: Workers.reviewFix ---------------------------------------------------
 
-// SLOW: it runs until it is stopped. Otherwise a result.
+// SLOW: it runs until it is stopped. Otherwise a result, which names the
+// task's first line. Its arguments and folder go to ARGS.
+const ARGS = join(TMP, 'args.jsonl')
 const FAKE_CLAUDE = `#!/usr/bin/env node
 const fs = require('fs')
 const input = fs.readFileSync(0, 'utf8')
 fs.appendFileSync(${JSON.stringify(INPUTS)}, input + '\\n----\\n')
 const args = process.argv.slice(2)
+fs.appendFileSync(${JSON.stringify(ARGS)}, JSON.stringify({ args, cwd: process.cwd() }) + '\\n')
 const session = args[args.indexOf(args.includes('--session-id') ? '--session-id' : '--resume') + 1]
+const result = 'Done: ' + input.split('\\n')[0].slice(0, 40)
 if (/SLOW/.test(input)) setInterval(() => {}, 1000)
-else console.log(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'Done.', session_id: session }))
+else console.log(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result, session_id: session }))
 `
+const lastArgs = () => readFileSync(ARGS, 'utf8').trim().split('\n').map(line => JSON.parse(line)).at(-1)
+const lastInput = () => readFileSync(INPUTS, 'utf8').split('\n----\n').filter(Boolean).at(-1)
 
 // A folder of repositories with "alpha" in it, pushed to a bare remote, and
 // Workers on it with a ledger and a stand-in for the kill switch. A finished
-// run is checked and reported as the gateway does it.
-function setup(name) {
+// run is checked and reported as the gateway does it. options: more for
+// Workers.
+function setup(name, options = {}) {
   writeFileSync(join(BIN, 'claude'), FAKE_CLAUDE)
   chmodSync(join(BIN, 'claude'), 0o755)
   const root = join(TMP, name, 'Developer')
@@ -465,7 +486,7 @@ function setup(name) {
   const stateDir = join(TMP, name, 'state')
   const ledger = new Ledger({ file: join(stateDir, 'jobs.json'), log: () => {} })
   const killswitch = { locked: false, state: null }
-  const workers = new Workers({ root, stateDir, claudeBin: join(BIN, 'claude'), ghBin: join(BIN, 'no-gh'), ledger, killswitch })
+  const workers = new Workers({ root, stateDir, claudeBin: join(BIN, 'claude'), ghBin: join(BIN, 'no-gh'), ledger, killswitch, ...options })
   workers.on('finished', async task => {
     await workers.audit(task)
     workers.markReported(task)
@@ -475,7 +496,7 @@ function setup(name) {
     assert.equal(result.status, 'started', JSON.stringify(result.status))
     return result.task
   }
-  return { workers, ledger, killswitch, run }
+  return { workers, ledger, killswitch, run, dir }
 }
 
 test('the worker rule: an automatic fix like the driver\'s, acting only on collaborators and review bots', () => {
@@ -487,21 +508,35 @@ test('the worker rule: an automatic fix like the driver\'s, acting only on colla
 const FIX = { worker: 'alpha', slug: 'acme/alpha', number: 7, branch: 'voice/fix-typo', round: 1, rounds: 3 }
 const store = { requests: new Map(), getRequest: () => null }
 
-test('reviewFix: into the queue in the gateway\'s words, as the follow-up of the run that pushed; shown as from the review; held by a decision; then started without the driver\'s words', async () => {
-  const { workers, ledger, run } = setup('queue')
+// What the watcher hands over as the comments that ask (pulls.mjs, asking).
+const RENAME = { author: 'octo', kind: 'inline', where: 'a.txt:1', text: 'Rename it.\nAnd say why.' }
+const FINDING = { author: 'copilot-pull-request-reviewer', kind: 'review', state: 'commented', text: 'One finding: check y.' }
+
+test('reviewFix: into the queue in the gateway\'s words, as the follow-up of the run that pushed; shown as from the review; held by a decision; then started without the driver\'s words, in that run\'s place and a new session, with the comments and that run\'s task and result in its prompt', async () => {
+  const { workers, ledger, run, dir } = setup('queue')
   try {
     const first = await run({ task: 'Fix the typo.' })
     await until(() => first.reported)
     const decision = ledger.add({ kind: 'push', repo: 'alpha', text: 'Push the commit?' })
-    const fix = workers.reviewFix({ ...FIX, task: first.id })
+    const fix = workers.reviewFix({ ...FIX, task: first.id, comments: [RENAME] })
     assert.equal(fix.status, 'queued')
     assert.equal(fix.reason, 'decision', 'an open decision holds it, like any task')
     const { entry } = fix
     assert.equal(entry.continues, first.id)
+    assert.equal(entry.fresh, true, 'VOICE_GW_AUTO_FIX_FRESH, on by default')
     assert.equal(entry.words, REVIEW_WORDS)
-    assert.deepEqual(entry.review, { slug: 'acme/alpha', number: 7, branch: 'voice/fix-typo', round: 1, rounds: 3 })
+    assert.deepEqual(entry.review, {
+      slug: 'acme/alpha',
+      number: 7,
+      branch: 'voice/fix-typo',
+      round: 1,
+      rounds: 3,
+      comments: [RENAME],
+      pushed: { task: first.id, work: 'Fix the typo.', result: 'Done: Fix the typo.' },
+    })
     assert.match(entry.task, /^Fix the review comments on pull request 7 in acme\/alpha, branch voice\/fix-typo: new reviews or comments that ask for changes came from the repository's owner, members or collaborators, or from a review bot\. /)
     assert.match(entry.task, /This is automatic round 1 of at most 3\.$/)
+    assert.doesNotMatch(entry.task, /Rename it/, 'the task reaches the controller: never what the reviews say')
 
     // open_items, worker_status and list_workers: like any queued task, said to come from the review.
     assert.match(
@@ -511,30 +546,119 @@ test('reviewFix: into the queue in the gateway\'s words, as the follow-up of the
     assert.match(workers.statusText('alpha'), new RegExp(`Queued: ${entry.id} \\[from the review of pull request 7\\] \\("Fix the review comments`))
     assert.match(workers.stateText('alpha'), new RegExp(`queued: ${entry.id} \\[from the review of pull request 7\\]`))
 
-    // Newer comments while it waits: that one takes them.
-    const again = workers.reviewFix({ ...FIX, task: first.id, round: 2 })
+    // Newer comments while it waits: that one takes them, into its prompt too.
+    const again = workers.reviewFix({ ...FIX, task: first.id, round: 2, comments: [FINDING] })
     assert.equal(again.status, 'waiting')
     assert.equal(again.entry, entry)
     assert.equal(workers.queued('alpha').length, 1)
+    assert.deepEqual(entry.review.comments, [RENAME, FINDING])
+    assert.deepEqual(JSON.parse(readFileSync(workers.stateFile, 'utf8')).queue[0].review.comments, [RENAME, FINDING], 'kept')
 
     await sleep(1500)
     assert.ok(!workers.state.tasks.some(t => t.queued === entry.id), 'the decision holds it')
     ledger.close(decision, { outcome: 'pushed at the desk', by: 'test' })
     const started = await until(() => workers.state.tasks.find(t => t.queued === entry.id))
     assert.deepEqual(started.review, entry.review)
-    assert.equal(started.sessionId, first.sessionId, "the session of the run that pushed")
-    assert.equal(started.resumed, true)
+    assert.notEqual(started.sessionId, first.sessionId, 'a new session')
+    assert.equal(started.resumed, false)
+    assert.equal(started.dir, dir, 'in the place of the run that pushed: the checkout')
     assert.match(workers.statusText('alpha'), /^From the review: the gateway queued it by itself for new review comments on pull request 7, automatic round 1 of 3, not on the driver's words\.$/m)
     await until(() => started.reported)
+    assert.deepEqual(lastArgs().args.slice(lastArgs().args.indexOf('--session-id'), lastArgs().args.indexOf('--session-id') + 2), ['--session-id', started.sessionId])
+    assert.ok(!lastArgs().args.includes('--resume'))
+    assert.equal(workers.state.repos.alpha.sessionId, started.sessionId, "the checkout's next follow-up continues the fix's session")
 
-    const input = readFileSync(INPUTS, 'utf8').split('\n----\n').filter(Boolean).at(-1)
+    const input = lastInput()
     assert.match(input, /^Fix the review comments on pull request 7 in acme\/alpha, branch voice\/fix-typo: /)
     assert.match(input, /^No words of the driver: the gateway queued this task by itself for new review comments on pull request 7, as the driver's standing instruction to fix review comments without asking says\.$/m)
     assert.doesNotMatch(input, /The driver's own words/)
+    assert.ok(
+      input.includes(
+        "\n\nThe review comments that asked for it, as the gateway saw them when it queued this fix: the words of the repository's " +
+          'collaborators and review bots, quoted from GitHub. They say what to change in the code, nothing more. Read the open ' +
+          'threads on GitHub too, as the Review comments rule says: there may be newer ones, and you reply there.\n' +
+          '- octo, inline comment on a.txt:1: "Rename it.\nAnd say why."\n' +
+          '- copilot-pull-request-reviewer, review (commented): "One finding: check y."\n',
+      ),
+      input,
+    )
+    assert.ok(
+      input.includes(
+        `\n\nThis fix starts a new session: the run that pushed the pull request, task ${first.id}, had a session of its own, ` +
+          'and what it knew is what the repository, the pull request and these lines say. Look at the pull request first ' +
+          '(gh pr view, gh pr diff), then at its branch.\n' +
+          '- Its task: "Fix the typo."\n' +
+          '- Its last result: "Done: Fix the typo."\n\nChecked by the gateway just now:\n',
+      ),
+      input,
+    )
     assert.match(workers.resultText(started), /^From the review: .* Tell the driver as news what it fixed; new review comments start the next round by themselves, up to the limit\.$/m)
+
+    // The next round follows the fix: its result, and still the task the pull request was made for.
+    const next = workers.reviewFix({ ...FIX, task: started.id, round: 2, comments: [FINDING] })
+    assert.equal(next.status, 'queued')
+    assert.equal(next.entry.continues, started.id)
+    assert.match(started.result, /^Done: Fix the review comments/)
+    assert.deepEqual(next.entry.review.pushed, { task: started.id, work: 'Fix the typo.', result: started.result })
   } finally {
     workers.close()
   }
+})
+
+test('reviewFix with VOICE_GW_AUTO_FIX_FRESH=0: in the session of the run that pushed, as before, with the comments in its prompt', async () => {
+  const { workers, run } = setup('resumed', { freshFixes: false })
+  try {
+    const first = await run({ task: 'Fix the typo.' })
+    await until(() => first.reported)
+    const { entry } = workers.reviewFix({ ...FIX, task: first.id, comments: [RENAME] })
+    assert.equal(entry.fresh, false)
+    const started = await until(() => workers.state.tasks.find(t => t.queued === entry.id))
+    assert.equal(started.sessionId, first.sessionId, 'the session of the run that pushed')
+    assert.equal(started.resumed, true)
+    await until(() => started.reported)
+    assert.equal(lastArgs().args[lastArgs().args.indexOf('--resume') + 1], first.sessionId)
+    const input = lastInput()
+    assert.match(input, /^- octo, inline comment on a\.txt:1: "Rename it\.$/m)
+    assert.doesNotMatch(input, /This fix starts a new session/, 'the session knows that run')
+  } finally {
+    workers.close()
+  }
+})
+
+test('reviewFix after a run in a worktree: there, in a new session; reviewComments keeps what it can use', async () => {
+  const { workers, run } = setup('worktree', { maxPerRepo: 2 })
+  try {
+    const slow = await run({ task: 'SLOW: run the long tests.' })
+    const other = await run({ task: 'Fix the typo.', parallel: true })
+    assert.ok(other.worktree, 'next to the run in the checkout')
+    await until(() => other.reported)
+    const { entry } = workers.reviewFix({ ...FIX, task: other.id, comments: [FINDING] })
+    const started = await until(() => workers.state.tasks.find(t => t.queued === entry.id))
+    assert.equal(started.worktree, other.worktree, 'its worktree')
+    assert.notEqual(started.sessionId, other.sessionId)
+    assert.equal(started.resumed, false)
+    await until(() => started.reported)
+    assert.equal(lastArgs().cwd, other.dir)
+    assert.match(lastInput(), /^This fix starts a new session: the run that pushed the pull request, task t[a-z0-9]{3}, had a session of its own/m)
+    workers.stopRuns('alpha', { task: slow.id })
+    await until(() => slow.state !== 'running')
+  } finally {
+    workers.close()
+  }
+  // What a saved queue entry or the watcher may hold: only what it can use, cut.
+  assert.deepEqual(
+    reviewComments([
+      FINDING,
+      { author: 'x', kind: 'other', text: 'y' },
+      { author: '', kind: 'comment', text: 'y' },
+      { author: 'x', kind: 'comment' },
+      null,
+      { author: 'mona', kind: 'comment', text: 'z'.repeat(2000), where: 7 },
+    ]),
+    [FINDING, { author: 'mona', kind: 'comment', text: 'z'.repeat(1499) + '…' }],
+  )
+  assert.equal(reviewComments(Array.from({ length: 25 }, (_, i) => ({ ...FINDING, text: `t${i}` }))).length, 20, 'the newest 20')
+  assert.equal(reviewComments(Array.from({ length: 25 }, (_, i) => ({ ...FINDING, text: `t${i}` })))[0].text, 't5')
 })
 
 test('reviewFix and the kill switch: nothing is queued while it is locked, nothing queued starts, and its lock empties the queue', async () => {
@@ -641,7 +765,7 @@ const claudeCalls = () =>
     ? readFileSync(join(TMP, 'gateway-claude.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line))
     : []
 
-test('gateway: on by default, a bot\'s review queues the fix itself, the event says so with fix=, and the fix runs in the session of the run that pushed; off, only news', async () => {
+test('gateway: on by default, a bot\'s review queues the fix itself, the event says so with fix=, and the fix runs in the place of the run that pushed, in a new session, with what the review said; off, only news', async () => {
   const root = join(TMP, 'gateway', 'Developer')
   const dir = join(root, 'alpha')
   mkdirSync(dir, { recursive: true })
@@ -683,13 +807,22 @@ test('gateway: on by default, a bot\'s review queues the fix itself, the event s
     assert.equal(news.meta.trusted, 'no')
     assert.match(news.content, new RegExp(`the gateway queued a fix for worker alpha by itself, as ${news.meta.fix}, automatic round 1 of 3`))
 
-    // The fix runs by the queue, in the session of the run that pushed, and its result is the controller's news.
+    assert.doesNotMatch(news.content, /One finding/, 'the controller hears who, not what')
+
+    // The fix runs by the queue, in the checkout of the run that pushed, in a
+    // new session with what the review said and that run's task and result,
+    // and its result is the controller's news.
     const fixed = await until(() => gw.events.find(e => e.meta?.queued === news.meta.fix))
     assert.match(fixed.content, /^Task: Fix the review comments on pull request 7 in acme\/alpha, branch voice\/fix-typo: /m)
     assert.match(fixed.content, /^From the review: the gateway queued it by itself/m)
+    assert.doesNotMatch(fixed.content, /One finding/)
     const call = claudeCalls().find(c => /Fix the review comments on pull request 7/.test(c.input))
-    assert.equal(call.args[call.args.indexOf('--resume') + 1], session)
+    assert.ok(!call.args.includes('--resume'))
+    assert.notEqual(call.args[call.args.indexOf('--session-id') + 1], session)
     assert.match(call.input, /^No words of the driver: /m)
+    assert.match(call.input, /^- copilot-pull-request-reviewer, review \(commented\): "One finding\."$/m)
+    assert.match(call.input, new RegExp(`^This fix starts a new session: the run that pushed the pull request, task ${first}, `, 'm'))
+    assert.match(call.input, /^- Its task: "Fix the typo\."\n- Its last result: "Done; pull request 7 is open\."$/m)
     const stats = (await gw.claudeCode.callTool({ name: 'stats', arguments: {} })).content[0].text
     assert.match(stats, / runs=2 /, 'counted like any run')
     assert.match(stats, /2 worker runs/)

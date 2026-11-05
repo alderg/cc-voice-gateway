@@ -59,6 +59,35 @@ export function telegramConfirmOn(value) {
   return text === '' || text === '1'
 }
 
+// The prompt cache of the workers' main conversation
+// (VOICE_GW_WORKER_CACHE_TTL, promptCacheTtl in their --settings): 1h, the
+// default, also on usage credits, where Claude Code's own choice is 5
+// minutes; 5m; auto or 0, Claude Code's own choice (''). null for a value it
+// does not know.
+export const CACHE_TTLS = ['1h', '5m']
+export function cacheTtlValue(value) {
+  const text = String(value ?? '').trim().toLowerCase()
+  if (text === '') return '1h'
+  if (text === 'auto' || text === '0') return ''
+  return CACHE_TTLS.includes(text) ? text : null
+}
+
+// When the workers' sessions are compacted (VOICE_GW_WORKER_AUTOCOMPACT,
+// autoCompactWindow in their --settings), in tokens: 300k, the default; from
+// 100k to 1M, as 400k, 1m or 400000; auto or 0, Claude Code's own window,
+// about the model's whole context (0). null for a value it does not know.
+export const AUTOCOMPACT_RANGE = [100_000, 1_000_000]
+export function autoCompactValue(value) {
+  const text = String(value ?? '').trim().toLowerCase()
+  if (text === '') return 300_000
+  if (text === 'auto' || text === '0') return 0
+  const match = /^(\d+(?:\.\d+)?)(k|m)?$/.exec(text)
+  if (!match) return null
+  const unit = { k: 1000, m: 1_000_000 }[match[2]] ?? 1
+  const tokens = Math.round(Number(match[1]) * unit)
+  return tokens >= AUTOCOMPACT_RANGE[0] && tokens <= AUTOCOMPACT_RANGE[1] ? tokens : null
+}
+
 // Where Claude voice mode calls from: Anthropic's published outbound range.
 export const ANTHROPIC_RANGES = ['160.79.104.0/21']
 
@@ -186,6 +215,14 @@ export const config = {
   // computer and in the container. Empty: Claude Code's defaults.
   workerModel: env.VOICE_GW_WORKER_MODEL || '',
   workerEffort: env.VOICE_GW_WORKER_EFFORT || '',
+  // What their runs cost (cacheTtlValue, autoCompactValue): the prompt cache
+  // of their main conversation, an hour by default, and the size at which
+  // their sessions are compacted, 300k tokens by default. A value it does not
+  // know counts as the default; the gateway says so in its log.
+  workerCacheTtl: cacheTtlValue(env.VOICE_GW_WORKER_CACHE_TTL) ?? '1h',
+  workerCacheTtlSetting: env.VOICE_GW_WORKER_CACHE_TTL ?? '',
+  workerAutoCompact: autoCompactValue(env.VOICE_GW_WORKER_AUTOCOMPACT) ?? 300_000,
+  workerAutoCompactSetting: env.VOICE_GW_WORKER_AUTOCOMPACT ?? '',
   ghBin: env.VOICE_GW_GH_BIN || 'gh',
   // Worker state and the output of every run.
   stateDir: env.VOICE_GW_STATE_DIR || join(ROOT, '.state'),
@@ -228,6 +265,10 @@ export const config = {
   // driver's word.
   autoFixReviews: env.VOICE_GW_AUTO_FIX_REVIEWS !== '0',
   autoFixRounds: Math.floor(num(env.VOICE_GW_AUTO_FIX_ROUNDS, 3)) || 1,
+  // Such a fix runs in that run's place, in a new session of its own, with
+  // the pull request, the comments and that run's task and result in its
+  // prompt, by default; 0 resumes that run's session instead, as before.
+  autoFixFresh: env.VOICE_GW_AUTO_FIX_FRESH !== '0',
   // Routine news about those pull requests in one digest (digest.mjs): checks
   // that passed, reviews and comments a fix was queued for, approvals, fixes
   // that changed nothing. It goes once the news has been quiet this many

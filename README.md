@@ -682,6 +682,32 @@ What applies to every worker run (`src/workers.mjs`):
   review, subagent or skill.
 - **Environment:** the controller session's variables (`CLAUDECODE`, its messaging socket and
   token, the session id) are removed, so a worker cannot reach the controller.
+- **Sessions and what they cost:** a follow-up resumes the session of its place, the checkout's
+  last or its worktree's, so the worker keeps its context; `fresh` starts a new one. What a run
+  costs is mostly that context, read again from the prompt cache on every call, and written again
+  whenever the cache has expired. Two settings in its `--settings` keep that down, the same on this
+  computer and in Docker, and only for the workers, never the controller:
+  - **The prompt cache** of the run's main conversation is kept an hour
+    (`VOICE_GW_WORKER_CACHE_TTL`, `1h`). Claude Code's own choice is an hour on a subscription
+    within its limits, but 5 minutes as soon as a run goes on on usage credits: every wait of more
+    than 5 minutes in a run (a `sleep` while tests or a background subagent run) then wrote the
+    whole context again, and so did most first calls of the next run in that session, even a few
+    minutes later. An hour's cache write costs 1.6 times a 5-minute one,
+    far less than writing it again. Subagents keep Claude Code's 5 minutes: they rarely wait.
+  - **Compaction:** Claude Code summarises a session once it reaches 300k tokens
+    (`VOICE_GW_WORKER_AUTOCOMPACT`), instead of near the model's whole window, about a million
+    tokens on Opus 5.5; long sessions grew that far, and their follow-ups started at a median of
+    about 450k. The run's subagents inherit the window. The summary loses detail of a long build
+    session, and the worker may read files again: keep what matters in the repository (a concept
+    or style guide), or raise the setting.
+  - **What it saves:** replayed on six days of real worker runs (about 28,000 calls, 2026-10-29 to
+    11-04, mostly long builds), about 18 % for the hour's cache, 41 % for compaction at 300k, and
+    46 % for both; estimates, give or take a third. Review fixes in a new session
+    ([automatic fixes](#automatic-fixes-for-review-comments), `VOICE_GW_AUTO_FIX_FRESH`) save
+    some more of the same.
+  - `auto` or `0` leaves either to Claude Code. A `CLAUDE_CODE_PROMPT_CACHE_TTL`,
+    `CLAUDE_CODE_AUTO_COMPACT_WINDOW` or `FORCE_PROMPT_CACHING_5M` in the gateway's environment wins
+    over both, as Claude Code decides; the gateway's log names what the workers get.
 - **Before a run:** the gateway refuses a dispatch without your words from a recent voice request
   ([5.4](#54-approvals-by-voice)) and a checkout with uncommitted changes until you agree. A
   second run in the same repository (more than `VOICE_GW_MAX_WORKERS_PER_REPO`, one by default),
@@ -2392,14 +2418,23 @@ it). The watch above does it, in code (`src/pulls.mjs`, `Workers.reviewFix`):
   list counts only where GitHub does not say it is a person. Anyone else's reviews and comments
   start nothing, as their text is not forwarded either. Approvals without a comment start nothing.
 - **The fix** is a task in the gateway's own words, naming the pull request and its branch, never
-  what the reviews say: the worker reads the threads on GitHub itself, under its rules, and acts
-  only on those of collaborators and review bots. Its prompt says that the gateway queued it, with
-  no words of yours.
+  what the reviews say: that is what the controller sees. Its prompt says that the gateway queued
+  it, with no words of yours, and quotes the comments that asked for it, as the gateway saw them
+  then: those of collaborators and review bots only, as their words from GitHub, at most 20, each
+  cut at 1,500 characters. The worker still reads the open threads on GitHub, for newer ones and to
+  reply there, under its rules, and acts only on those of collaborators and review bots.
 - **Through the queue,** always, as the follow-up of the run that pushed the pull request: in its
-  worktree if it had one, with its session. So it waits like any task: behind a run going there,
-  while an open decision holds the repository, for a free run slot. One that waits already takes
-  newer comments too. While the kill switch is locked nothing is queued, and the lock empties the
-  queue as always.
+  worktree if it had one, otherwise in the checkout. So it waits like any task: behind a run going
+  there, while an open decision holds the repository, for a free run slot. One that waits already
+  takes newer comments too, into its prompt as well. While the kill switch is locked nothing is
+  queued, and the lock empties the queue as always.
+- **In a new session** (`VOICE_GW_AUTO_FIX_FRESH`, on by default): the session of the run that
+  pushed was often several hundred thousand tokens, which every call of the fix read again, for a
+  few small changes. So the fix starts a session of its own in that run's place, and its prompt
+  carries what it needs from that run: its task (in a later round, the task the pull request was
+  made for), its last result, and to look at the pull request and its branch first. The next
+  follow-up there continues the fix's session. `0` resumes the session of the run that pushed, as
+  before.
 - **Rounds.** The fix pushes, the automatic reviews run again, and new comments start the next
   round. At most `VOICE_GW_AUTO_FIX_ROUNDS` (3) per pull request; then the news says they are used
   up, and the controller tells you. A further fix takes your word, and a run you dispatch that
@@ -2525,8 +2560,11 @@ cap), nothing can run until it resets. The gateway waits it out by itself and go
   credits are refused too: `overageStatus: "rejected"` or none, or `errorCode:
   "credits_required"`. A run on credits goes on undisturbed, and nothing waits or is held. The
   gateway notes it once in its log, in `list_workers` (`usage=credits`, `Credits: …`) until the
-  plan's reset, and in the statistics ("partly on usage credits"; Claude Code then keeps the
-  prompt cache 5 minutes instead of an hour). When the credits or their monthly spend limit run
+  plan's reset, and in the statistics ("partly on usage credits"). Claude Code then keeps the
+  prompt cache 5 minutes instead of an hour, except in the workers' main conversation, which the
+  gateway keeps at an hour (`VOICE_GW_WORKER_CACHE_TTL`,
+  [5.5](#55-workers-on-this-computer-or-in-docker)); the statistics say how many runs had the
+  5 minutes. When the credits or their monthly spend limit run
   out, the run fails at once ("You're out of usage credits · resets 3pm", "You've hit your
   monthly spend limit · … · your 5-hour limit resets 3pm"), and that is a wait as below, until
   the plan's reset or the spend limit's (`overageResetsAt`), whichever comes first.
@@ -2646,7 +2684,8 @@ The gateway counts over its running time, and keeps all-time totals across start
 **Not counted:** the controller session's own tokens. They are only in its transcript, whose cost
 line Claude Code writes when the session ends, and the sum of its messages does not match that
 line; neither is cheap and reliable while the session runs. The cost is Claude Code's at API list
-prices; on a subscription it is not what is billed.
+prices; on a subscription it is not what is billed. What makes up the workers' cost, and the
+settings that keep it down: [5.5](#55-workers-on-this-computer-or-in-docker).
 
 **Where you see them:**
 
@@ -2761,6 +2800,8 @@ limits at once.
 | `VOICE_GW_RUN_FOLDER_DAYS` | `7` | Days after its session's last run before a run's [run folder](#55-workers-on-this-computer-or-in-docker) in `.voice-runs` is removed, never while a run of its repository goes or the kill switch is locked; `0`: never |
 | `VOICE_GW_WORKER_MODEL` | Claude Code's default | `--model` for every worker run, host and Docker |
 | `VOICE_GW_WORKER_EFFORT` | Claude Code's default | `--effort`: `low`, `medium`, `high`, `xhigh`, `max` |
+| `VOICE_GW_WORKER_CACHE_TTL` | `1h` | The prompt cache of every worker run's main conversation, host and Docker (`promptCacheTtl` in its `--settings`, [5.5](#55-workers-on-this-computer-or-in-docker)): `1h`, also on usage credits, where Claude Code's own choice is 5 minutes; `5m`; `auto` or `0`: Claude Code's choice. Any other value counts as `1h`, with a log line |
+| `VOICE_GW_WORKER_AUTOCOMPACT` | `300k` | Tokens at which Claude Code compacts a worker's session, its subagents' too (`autoCompactWindow` in its `--settings`): from `100k` to `1m`, as `400k` or `400000`; `auto` or `0`: Claude Code's own window, about the model's whole context. Any other value counts as `300k`, with a log line |
 | `VOICE_GW_CLAUDE_BIN` | `claude` | Claude Code for workers (inside the container in Docker mode) |
 | `VOICE_GW_GH_BIN` | `gh` | GitHub CLI on this computer |
 | `VOICE_GW_PR_DRAFT` | `0` | `1`: workers open their pull requests as drafts; `0`: ready for review |
@@ -2773,6 +2814,7 @@ limits at once.
 | `VOICE_GW_PR_WATCH_HOURS` | `24` | Hours before a watch ends |
 | `VOICE_GW_AUTO_FIX_REVIEWS` | `1` | `1`: new review comments that ask for changes, from collaborators and review bots, get a fix the gateway queues itself ([automatic fixes](#automatic-fixes-for-review-comments)); `0`: only on the driver's word |
 | `VOICE_GW_AUTO_FIX_ROUNDS` | `3` | Automatic fixes per pull request, until the driver dispatches something for it again |
+| `VOICE_GW_AUTO_FIX_FRESH` | `1` | `1`: an automatic fix runs in the place of the run that pushed, in a new session, with that run's task and last result and the comments in its prompt ([automatic fixes](#automatic-fixes-for-review-comments)); `0`: it resumes that run's session, as before |
 | `VOICE_GW_REVIEW_DIGEST` | `10` | Minutes of quiet before routine news about the workers' pull requests goes to the controller as one [digest](#the-digest-of-routine-review-news); `0`: one event each, as before |
 | `VOICE_GW_REVIEW_DIGEST_MAX` | `30` | Minutes after its first item at the latest before the digest goes, however busy the news is |
 | `VOICE_GW_REVIEW_BOTS` | `claude,copilot-pull-request-reviewer,copilot` | Review bots whose reviews and comments start a fix, by GitHub login without `[bot]` |
@@ -2899,6 +2941,7 @@ gateway; do not set them.
 | A decision stays open although it was settled | It closes by itself only through the follow-up dispatch for your answer or the controller's "done" to it. Say what you decided; the controller closes it with `resolve_decision`. `.state/jobs.json` holds them all. |
 | A result says `git="1 commit on no remote"` although the worker pushed | The check counts commits that no remote-tracking branch (`refs/remotes/…`) has. A push to a URL instead of a named remote does not update them; `git fetch` in the checkout does. Without any remote, commits never count. |
 | What did a worker do? | `.state/tasks/<task>.jsonl` holds the whole run. `claude --resume <session>` in the repository opens the session; `.state/workers.json` lists the session ids. |
+| A worker no longer remembers details of an earlier task | Its session was compacted at `VOICE_GW_WORKER_AUTOCOMPACT` (300k tokens), or an automatic review fix ran there in a new session (`VOICE_GW_AUTO_FIX_FRESH`), which the next follow-up continues. Name what it needs in the task, keep it in the repository, or raise the setting ([5.5](#55-workers-on-this-computer-or-in-docker)). |
 | A private repository is handled like a public one | `gh` is not logged in or not on the `PATH`, so the visibility is unknown, and the worker asks before pushing to be safe. |
 | Passed checks or a queued review fix are not told at once | They are routine and wait for the [digest](#the-digest-of-routine-review-news): `VOICE_GW_REVIEW_DIGEST` minutes after the news went quiet, at the latest `VOICE_GW_REVIEW_DIGEST_MAX` after the first. `open_items` says how many wait; the log has `digest: routine news kept …`; `.state/digest.json` holds them. `VOICE_GW_REVIEW_DIGEST=0` brings back one event each. |
 | No news about checks or reviews on a worker's pull request | The log says why: `gh is not logged in`, or `stopped watching pull request … : nothing automatic runs` (often a draft that bot reviewers skip, with `VOICE_GW_PR_DRAFT=1` or `draft`; marking it ready in a later run watches it again), `merged`, `closed` or `time limit`. Only pull requests on `voice/` branches that a run linked to, or pushed to after that, are watched. `.state/pulls.json` lists the watches. |

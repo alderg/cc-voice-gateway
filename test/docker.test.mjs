@@ -236,6 +236,8 @@ before(async () => {
       VOICE_GW_LOG_FILE: '',
       VOICE_GW_WORKER_MODEL: 'opus',
       VOICE_GW_WORKER_EFFORT: 'high',
+      VOICE_GW_WORKER_CACHE_TTL: '5m',
+      VOICE_GW_WORKER_AUTOCOMPACT: '400k',
       VOICE_GW_PR_DRAFT: '', // the default, also where the controller's settings set it
       VOICE_GW_REMOTE_CONTROL: '1', // the controller's only, and not with the container's token
       VOICE_GW_MAX_WORKERS_PER_REPO: '2', // a further run of a repository in a worktree in the container
@@ -518,6 +520,11 @@ test('Docker: runs go through voice-run in the container, with the rules of thei
   assert.equal(arg(call, '--permission-mode'), 'bypassPermissions')
   assert.equal(arg(call, '--model'), 'opus', 'VOICE_GW_WORKER_MODEL reaches the run in the container')
   assert.equal(arg(call, '--effort'), 'high', 'VOICE_GW_WORKER_EFFORT too')
+  // The prompt cache and the compaction window too, on the command line, in
+  // its --settings: nothing for docker exec -e.
+  assert.equal(JSON.parse(arg(call, '--settings')).promptCacheTtl, '5m', 'VOICE_GW_WORKER_CACHE_TTL')
+  assert.equal(JSON.parse(arg(call, '--settings')).autoCompactWindow, 400000, 'VOICE_GW_WORKER_AUTOCOMPACT')
+  assert.match(gw.log, /worker sessions: prompt cache 5m \(VOICE_GW_WORKER_CACHE_TTL\), compacted at 400k tokens \(VOICE_GW_WORKER_AUTOCOMPACT\)/)
   // VOICE_GW_REMOTE_CONTROL=1 is the controller's: a headless run with the
   // token from claude setup-token cannot have it, and the log says why.
   assert.ok(!call.args.includes('--remote-control') && !exec.includes('--remote-control'))

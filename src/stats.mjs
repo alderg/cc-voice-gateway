@@ -75,6 +75,7 @@ export function emptyPeriod(since = 0) {
       stopped: 0,
       limited: 0, // ended by the Claude usage limit, back in the queue to resume after the wait
       credits: 0, // went on past the plan's limit on usage credits, at least in part (limits.mjs)
+      creditsShortCache: 0, // of them, with Claude Code's 5-minute prompt cache there (no VOICE_GW_WORKER_CACHE_TTL=1h)
       followups: 0, // continued the session of an earlier run
       worktrees: 0,
       scratch: 0, // in work folders
@@ -408,6 +409,7 @@ export class Stats {
     runs.ended++
     if (['done', 'failed', 'stopped', 'limited'].includes(task.state)) runs[task.state]++
     if (task.credits) runs.credits++
+    if (task.credits && task.cacheTtl !== '1h') runs.creditsShortCache++
     if (task.resumed) runs.followups++
     if (task.worktree) runs.worktrees++
     if (task.kind === 'scratch') runs.scratch++
@@ -783,8 +785,13 @@ export function detailsLines(p, { allTime = false, total = null } = {}) {
     let line = `Tokens: ${parts.join('; ')}.`
     const cost = costText(tk)
     if (cost) line += ` ${capital(cost)}${tk.costUnknown ? ` (${plural(tk.costUnknown, 'run')} without a cost)` : ''}.`
-    // On usage credits, Claude Code keeps the prompt cache 5 minutes instead of an hour.
-    if (r.credits) line += ` ${capital(creditsText(r))}, with the prompt cache kept 5 minutes instead of an hour.`
+    // On usage credits, Claude Code keeps the prompt cache 5 minutes instead
+    // of an hour, unless the gateway keeps it an hour (VOICE_GW_WORKER_CACHE_TTL).
+    if (r.credits) {
+      const short = r.creditsShortCache
+      const cache = 'the prompt cache kept 5 minutes instead of an hour'
+      line += ` ${capital(creditsText(r))}${!short ? '' : short >= r.credits ? `, with ${cache}` : `, ${short} of them with ${cache}`}.`
+    }
     const count = (n, unit) => (n ? `${amount(n)} ${unit}${n === 1 ? '' : 's'}` : `no ${unit}s`)
     line += ` ${capital(count(tk.turns, 'turn'))}, ${count(tk.tools, 'tool call')}, ${count(tk.subagents, 'subagent')}.`
     lines.push(line)
