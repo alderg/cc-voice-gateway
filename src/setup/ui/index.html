@@ -81,6 +81,14 @@
     </label>
     <p class="guide">The rare approval the controller needs is read out in the car, and with Telegram set up (section 4) it goes to your chat at once too.
       So do those of its helper agents in the background, also the ones it starts with a name, which Claude Code shows only at the terminal: its approval hook hands them over.</p>
+    <label>Approvals for a while
+      <select data-setting="VOICE_GW_APPROVAL_GRANTS"><option value="1">offered for file writes (default)</option><option value="0">off, ask each time</option></select>
+    </label>
+    <p class="guide">An approval for a file write, such as a project's memory file, also offers to allow all such writes of the same helper in the same folder for a while: "once, no, or all such for 20 minutes?" Never the shell, settings, hooks, CLAUDE.md, .git or a merge, which keep asking. "Freigaben zurücknehmen" by voice, or /revoke in Telegram, ends them, and so do the kill switch and a standby.</p>
+    <label>Minutes of such an approval
+      <input data-setting="VOICE_GW_GRANT_MINUTES" inputmode="numeric">
+    </label>
+    <p class="guide">How long one holds when you name no minutes: 20 by default, 5 to 120.</p>
     <label>Remote Control
       <select data-setting="VOICE_GW_REMOTE_CONTROL"><option value="0">off (default)</option><option value="1">on, for the controller</option></select>
     </label>
@@ -212,7 +220,7 @@
     <label>Push, merge, restart, delete and approvals in Telegram
       <select id="telegram-confirm" data-setting="VOICE_GW_TELEGRAM_CONFIRM"><option value="1">on, as by voice (default)</option><option value="0">off, only by voice</option></select>
     </label>
-    <p class="guide">On, an answer or a request there confirms these as the same words spoken do, and an approval request there is answered with yes or no: as a Reply, or as a plain message while it is the only one open; "yes to all" allows every one open. Off, they take your voice: such an answer there is not carried out, and the chat says it must be confirmed by voice.</p>
+    <p class="guide">On, an answer or a request there confirms these as the same words spoken do, and an approval request there is answered with its buttons (Yes, No, and Yes to all while several are open), or typed: yes or no as a Reply, or as a plain message while it is the only one open; "yes to all" allows every one open, and "yes 20" allows one and all such writes for 20 minutes where it offers that. Off, they take your voice: such an answer there is not carried out, the requests come without buttons, and the chat says it must be confirmed by voice.</p>
   </div>
 </section>
 

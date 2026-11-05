@@ -26,15 +26,20 @@ import { adminRequest } from '../src/admin.mjs'
 import { restartTool, spokenByDriver, takesVoice, telegramInstructions } from '../src/channel.mjs'
 import { telegramAnswersMode, telegramConfirmOn, telegramRequestsOn } from '../src/config.mjs'
 import { Ledger } from '../src/ledger.mjs'
-import { Store } from '../src/store.mjs'
+import { Store, pending } from '../src/store.mjs'
 import {
   INPUT_OFF,
+  PRESS,
   Telegram,
   TelegramAnswers,
   TelegramCommands,
   TelegramFallback,
   TelegramInputLog,
+  approvalButtons,
   bareVerdict,
+  grantMinutesOf,
+  outcomeButtons,
+  revokeCommand,
   callBotApi,
   driverId,
   loadTelegram,
@@ -59,7 +64,7 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 
 // updates: null, getUpdates fails as any other call does; a list, it hands
 // out what the test put there, as the driver's messages.
-const api = { messages: [], requests: 0, mode: 'ok', server: null, url: '', updates: null, nextUpdate: 1 }
+const api = { messages: [], requests: 0, mode: 'ok', server: null, url: '', updates: null, nextUpdate: 1, presses: [], edits: [] }
 
 // A message from the driver's chat, a Reply to `replyTo` if given: one of
 // the bot's messages, which Telegram hands along with it.
@@ -76,6 +81,18 @@ function driverSays(text, { replyTo = null, messageId = 1000 + api.nextUpdate } 
   return messageId
 }
 
+// A press of a button under the bot's message `messageId`, by the driver in
+// their chat unless from or chat say otherwise; its answer and the edits of
+// the buttons are in api.presses and api.edits.
+let presses = 0
+function driverPresses(data, messageId, { from = { id: Number(CHAT_ID), is_bot: false, first_name: 'Driver' }, chat = { id: Number(CHAT_ID), type: 'private' } } = {}) {
+  const id = `press-${++presses}`
+  const message = { message_id: messageId, date: Math.floor(Date.now() / 1000), chat, from: { id: 1, is_bot: true }, text: api.messages[messageId - 1]?.text }
+  api.updates.push({ update_id: api.nextUpdate++, callback_query: { id, from, message, chat_instance: 'x', data } })
+  return id
+}
+const pressAnswer = id => api.presses.find(press => press.callback_query_id === id)
+
 before(async () => {
   api.server = createServer((req, res) => {
     let body = ''
@@ -90,6 +107,13 @@ before(async () => {
         return res.end(JSON.stringify({ ok: true, result: (api.updates ?? []).filter(u => u.update_id >= offset) }))
       }
       const message = { path: req.url, ...JSON.parse(body || '{}') }
+      // Presses answered, buttons changed: taken and kept.
+      const other = { answerCallbackQuery: api.presses, editMessageReplyMarkup: api.edits }[req.url.replace(`/bot${TOKEN}/`, '')]
+      if (api.mode === 'ok' && other) {
+        other.push(message)
+        res.writeHead(200, { 'content-type': 'application/json' })
+        return res.end(JSON.stringify({ ok: true, result: true }))
+      }
       const sent = api.mode === 'ok' && req.url === `/bot${TOKEN}/sendMessage`
       if (sent) api.messages.push(message)
       res.writeHead(sent ? 200 : 400, { 'content-type': 'application/json' })
@@ -460,15 +484,26 @@ test("the command loop's pause leaves no abort listener behind, and ends at once
 // requests off, as with VOICE_GW_TELEGRAM_REQUESTS=0, unless asked for.
 // confirm: VOICE_GW_TELEGRAM_CONFIRM, on by default as there; verdicts: the
 // verdicts on approval requests sent to Claude Code (verdict).
-function answering({ mode = 'on', requests = false, confirm = true, held = () => '', push = null, verdict = null } = {}) {
+function answering({ mode = 'on', requests = false, confirm = true, held = () => '', push = null, verdict = null, grants = true } = {}) {
   const store = new Store()
   const ledger = new Ledger({ log: () => {} })
   // As gateway.mjs: the decisions of the question keep the answer.
   store.on('answer', request =>
     ledger.answer(request.answers, { text: request.text.replace(/^\(Answer to [^)]*\)\s*/, ''), answerId: request.id }),
   )
-  const t = { store, ledger, pushed: [], said: [], logged: [], recorded: [], verdicts: [], killswitch: { locked: false }, active: true }
+  const t = { store, ledger, pushed: [], said: [], logged: [], recorded: [], verdicts: [], pressed: [], granted: [], killswitch: { locked: false }, active: true }
+  // Approval grants, as approval-grants.mjs makes them from an approval's offer.
+  const fakeGrants = {
+    fromApproval: (permission, minutes, via) => {
+      if (!permission.offer) return { why: 'this approval offers no grant: only file writes in one folder can be granted' }
+      const grant = { id: `g${t.granted.length + 1}aa`, label: `${permission.offer.text.replace('this subagent', 'the subagent x')}`, until: Date.now() + minutes * 60000 }
+      t.granted.push({ code: permission.code, minutes, via, grant })
+      return { grant }
+    },
+  }
   t.answers = new TelegramAnswers({
+    grants: grants ? fakeGrants : null,
+    pressed: async (id, text) => t.pressed.push([id, text]),
     store,
     ledger,
     mode,
@@ -485,8 +520,8 @@ function answering({ mode = 'on', requests = false, confirm = true, held = () =>
   })
   // An approval request of Claude Code's; with message, the id of the
   // Telegram message that carried it.
-  t.approval = (code, { tool = 'Bash', description = 'gh pr merge 3 --repo driver/alpha --squash', message = null } = {}) => {
-    store.addPermission({ request_id: code, tool_name: tool, description, input_preview: '' })
+  t.approval = (code, { tool = 'Bash', description = 'gh pr merge 3 --repo driver/alpha --squash', message = null, offer = null } = {}) => {
+    store.addPermission({ request_id: code, tool_name: tool, description, input_preview: '' }, { offer })
     if (message !== null) store.getPermission(code).telegramMessage = message
     return store.getPermission(code)
   }
@@ -1309,6 +1344,238 @@ test('"yes to all" allows every approval request open and lists them, "no to all
   assert.equal(await broken.answers.route({ text: 'yes to all', messageId: 51 }), null)
   assert.equal(broken.lastSaid(), 'Not passed on: Not connected.')
   assert.deepEqual(broken.store.openPermissions(), [lost])
+})
+
+// --- approval grants and buttons in Telegram ---------------------------------------
+
+// An approval grant an approval request offers (approval-grants.mjs).
+const OFFER = {
+  scope: { kind: 'memory', folder: '/home/u/.claude/projects/-home-u-Developer-hauswache/memory', name: 'hauswache' },
+  actor: { who: 'controller' },
+  minutes: 20,
+  text: 'writes to the memory files of hauswache by the controller session',
+}
+
+test('"yes 20" and its like allow an approval request and the grant it offers; "revoke" and "Freigaben zurücknehmen" take the grants back, all or one', () => {
+  for (const [text, minutes] of [['yes 20', 20], ['Ja 20', 20], ['yes for 20 minutes', 20], ['ja, 20 Minuten', 20], ['OK 45 min.', 45], ['yes 20min!', 20], ['oui pour 30 minutes', 30], ['ja für 10 Minuten', 10]]) {
+    assert.equal(grantMinutesOf(text), minutes, text)
+  }
+  for (const text of ['yes', 'no 20', 'nein 20', 'yes 20 files', '20', 'yes, merge it in 20 minutes', 'yes 1234', 'yes to all 20']) assert.equal(grantMinutesOf(text), null, text)
+  assert.deepEqual(bareVerdict('Yes 20.'), { behavior: 'allow', all: false, minutes: 20 })
+  assert.deepEqual(bareVerdict('yes'), { behavior: 'allow', all: false })
+  for (const text of ['/revoke', 'revoke', 'Revoke all', 'revoke the grants', 'Freigaben zurücknehmen', 'Alle Freigaben zurücknehmen!', '/revoke all', '/revoke@voice_bot']) {
+    assert.deepEqual(revokeCommand(text), { id: null }, text)
+  }
+  for (const text of ['/revoke g4k2', 'revoke g4k2', 'Freigabe g4k2 zurücknehmen']) assert.deepEqual(revokeCommand(text), { id: 'g4k2' }, text)
+  for (const text of ['please revoke the token', 'Freigaben', 'revoke 12345', 'nein']) assert.equal(revokeCommand(text), null, text)
+})
+
+test('"yes 20" on an approval request that offers a grant: allowed, and the grant made for those minutes, by Reply, with its code or alone; one that offers none is allowed once; with VOICE_GW_TELEGRAM_CONFIRM=0 nothing', async () => {
+  const t = answering()
+  t.approval('hexqp', { tool: 'Edit', description: 'Edit /home/u/.claude/projects/-home-u-Developer-hauswache/memory/MEMORY.md', message: 31, offer: OFFER })
+  await t.answers.route({ text: 'yes 20', replyTo: 31, messageId: 32 })
+  assert.deepEqual(t.verdicts, [['hexqp', 'allow']])
+  assert.deepEqual(t.granted.map(({ code, minutes, via }) => [code, minutes, via]), [['hexqp', 20, 'telegram']])
+  assert.match(
+    t.lastSaid(),
+    /^Allowed: approval request hexqp \(Edit: Edit \/home\/u\/\.claude\/projects\/-home-u-Developer-hauswache\/m…\)\. Claude Code goes on\.\nAnd granted g1aa: all writes to the memory files of hauswache by the controller session, until \d\d:\d\d; they no longer ask until then\. Send "revoke" or "Freigaben zurücknehmen" to end it\.$/,
+  )
+  assert.equal(t.recorded.at(-1).as, 'approval allowed, grant g1aa')
+  // With its code, other minutes.
+  t.approval('mteuh', { offer: OFFER })
+  await t.answers.route({ text: 'mteuh ja, 30 Minuten', messageId: 33 })
+  assert.deepEqual(t.granted.at(-1).minutes, 30)
+  // Alone, while it is the only one open.
+  t.approval('dcura', { offer: OFFER })
+  await t.answers.route({ text: 'Yes for 45 minutes.', messageId: 34 })
+  assert.deepEqual([t.verdicts.at(-1), t.granted.at(-1).minutes], [['dcura', 'allow'], 45])
+  // One that offers none: allowed once, and said.
+  t.approval('frsny', { message: 35 })
+  await t.answers.route({ text: 'yes 20', replyTo: 35, messageId: 36 })
+  assert.deepEqual(t.verdicts.at(-1), ['frsny', 'allow'])
+  assert.equal(t.granted.length, 3)
+  assert.match(t.lastSaid(), /\. Claude Code goes on\.\nNo grant: this approval offers no grant: only file writes in one folder can be granted\.$/)
+  // A no with minutes is no grant, and no answer.
+  t.approval('gtwxy', { message: 37, offer: OFFER })
+  await t.answers.route({ text: 'no 20', replyTo: 37, messageId: 38 })
+  assert.deepEqual(t.verdicts.at(-1), ['gtwxy', 'deny'])
+  // With VOICE_GW_TELEGRAM_CONFIRM=0, approvals take the voice.
+  const off = answering({ confirm: false })
+  off.approval('abcde', { message: 5, offer: OFFER })
+  await off.answers.route({ text: 'yes 20', replyTo: 5, messageId: 6 })
+  assert.deepEqual([off.verdicts, off.granted], [[], []])
+  assert.equal(off.lastSaid(), 'Not passed on: approval request abcde is answered in voice mode or at the computer; Telegram cannot approve.')
+})
+
+test('buttons under an approval request: Yes and No, the grant it offers, Yes to all while several are open; they give way to the outcome once it is answered anywhere, or withdrawn; none where Telegram cannot approve', async () => {
+  const store = new Store()
+  const sent = []
+  const edits = []
+  let approvable = true
+  const fallback = new TelegramFallback(store, {
+    send: async (text, options = {}) => {
+      sent.push({ text, ...options })
+      return { message_id: sent.length }
+    },
+    edit: async (id, markup) => edits.push([id, markup]),
+    approvable: () => approvable,
+    log: () => {},
+  })
+  const labels = markup => markup.inline_keyboard.map(row => row.map(button => `${button.text}=${button.callback_data}`))
+  const editsOf = id => edits.filter(([message]) => message === id).map(([, markup]) => labels(markup))
+  try {
+    store.addPermission({ request_id: 'abcde', tool_name: 'Bash', description: 'gh pr merge 3 --repo driver/alpha --squash', input_preview: '' })
+    await waitFor(() => store.getPermission('abcde').telegramMessage)
+    assert.deepEqual(labels(sent[0].markup), [['✅ Yes=appr:abcde:yes', '❌ No=appr:abcde:no']])
+    // A second, which offers a grant: its own button, and Yes to all on both.
+    store.addPermission({ request_id: 'bcdfg', tool_name: 'Write', description: 'Write MEMORY.md', input_preview: '' }, { offer: OFFER })
+    await waitFor(() => store.getPermission('bcdfg').telegramMessage && editsOf(1).length)
+    assert.deepEqual(labels(sent[1].markup), [['✅ Yes=appr:bcdfg:yes', '⏱ Yes, 20 min=appr:bcdfg:grant', '❌ No=appr:bcdfg:no'], ['✅ Yes to all=appr:bcdfg:all']])
+    assert.deepEqual(editsOf(1), [[['✅ Yes=appr:abcde:yes', '❌ No=appr:abcde:no'], ['✅ Yes to all=appr:abcde:all']]])
+    assert.match(sent[1].text, /\nOr "yes 20" to allow it and all writes to the memory files of hauswache by the controller session for 20 minutes\.$/)
+    // Answered by voice: its outcome, which answers nothing; the other one alone again.
+    store.resolvePermission('abcde', 'allow', 'voice')
+    await waitFor(() => editsOf(1).length === 2 && editsOf(2).length === 1)
+    assert.deepEqual(editsOf(1)[1], [['✅ Allowed by voice=-']])
+    assert.deepEqual(editsOf(2), [[['✅ Yes=appr:bcdfg:yes', '⏱ Yes, 20 min=appr:bcdfg:grant', '❌ No=appr:bcdfg:no']]])
+    // Withdrawn: the subagent stopped waiting.
+    store.withdrawPermission('bcdfg')
+    await waitFor(() => editsOf(2).length === 2)
+    assert.deepEqual(editsOf(2)[1], [['⏹ Not open any more=-']])
+    // The kill switch denies, a grant allows, the driver denies here.
+    for (const [code, by, behavior, grant] of [['cdhjk', 'killswitch', 'deny'], ['dfjkm', 'grant', 'allow', 'g4k2'], ['fhkmn', 'telegram', 'deny']]) {
+      store.addPermission({ request_id: code, tool_name: 'Bash', description: 'ls', input_preview: '' })
+      await waitFor(() => store.getPermission(code).telegramMessage)
+      store.resolvePermission(code, behavior, by, grant)
+    }
+    await waitFor(() => [3, 4, 5].every(id => editsOf(id).at(-1)?.[0]?.[0]?.endsWith('=-')))
+    assert.deepEqual([3, 4, 5].map(id => editsOf(id).at(-1)), [[['⛔ Denied: the kill switch locked=-']], [['✅ Allowed by grant g4k2=-']], [['❌ Denied=-']]])
+    // Nothing changes twice.
+    const count = edits.length
+    store.changed()
+    await sleep(50)
+    assert.equal(edits.length, count)
+    // Where Telegram cannot approve (VOICE_GW_TELEGRAM_CONFIRM=0, answers off): no buttons.
+    approvable = false
+    store.addPermission({ request_id: 'hjkmn', tool_name: 'Bash', description: 'ls', input_preview: '' })
+    await waitFor(() => store.getPermission('hjkmn').telegramMessage)
+    assert.equal(sent.at(-1).markup, undefined)
+    assert.match(sent.at(-1).text, /Telegram cannot approve\.$/)
+  } finally {
+    fallback.close()
+  }
+  // Without a way to change them later, no buttons at all.
+  const plain = []
+  const without = new TelegramFallback(new Store(), { send: async (text, options) => (plain.push(options), { message_id: 1 }), approvable: () => true, log: () => {} })
+  without.store.addPermission({ request_id: 'abcde', tool_name: 'Bash', description: 'ls', input_preview: '' })
+  await waitFor(() => plain.length)
+  assert.equal(plain[0], undefined)
+  without.close()
+  assert.deepEqual(outcomeButtons({ status: 'withdrawn' }), { inline_keyboard: [[{ text: '⏹ Not open any more', callback_data: '-' }]] })
+  assert.equal(approvalButtons({ code: 'abcde' }, { open: 3 }).inline_keyboard.length, 2)
+})
+
+test('a press of a button answers an approval request as a typed answer does: Yes, No, the grant, Yes to all; only by its code, only while it is open; nothing past a locked kill switch, a standby or VOICE_GW_TELEGRAM_CONFIRM=0', async () => {
+  const t = answering()
+  const press = (id, data, messageId = null) => t.answers.press({ id, data, messageId, seen: { from: 4242, chat: 4242, type: 'private', text: `(button ${data})` } })
+  const noticed = id => t.pressed.find(([press]) => press === id)?.[1]
+  t.approval('abcde', { message: 11 })
+  await press('p1', 'appr:abcde:yes', 11)
+  assert.deepEqual(t.verdicts, [['abcde', 'allow']])
+  assert.equal(noticed('p1'), 'Allowed.')
+  assert.deepEqual(t.said.at(-1), { text: 'Allowed: approval request abcde (Bash: gh pr merge 3 --repo driver/alpha --squash). Claude Code goes on.', replyTo: 11 })
+  assert.deepEqual(t.recorded.at(-1), { from: 4242, chat: 4242, type: 'private', text: '(button appr:abcde:yes)', decision: 'accepted', as: 'approval allowed', answers: 'abcde' })
+  // An old button of it: refused by its code, nothing sent again.
+  await press('p2', 'appr:abcde:no', 11)
+  assert.equal(noticed('p2'), 'Not done: approval request abcde is not open any more: it was allowed already here; nothing to do.')
+  assert.equal(t.verdicts.length, 1)
+  assert.equal(t.recorded.at(-1).decision, 'refused')
+  // No.
+  t.approval('bcdfg', { message: 12 })
+  await press('p3', 'appr:bcdfg:no', 12)
+  assert.deepEqual([t.verdicts.at(-1), noticed('p3')], [['bcdfg', 'deny'], 'Denied.'])
+  // The grant it offers.
+  t.approval('cdhjk', { offer: OFFER })
+  await press('p4', 'appr:cdhjk:grant')
+  assert.deepEqual([t.verdicts.at(-1), t.granted.at(-1).minutes, noticed('p4')], [['cdhjk', 'allow'], 20, 'Allowed, and all such for 20 minutes.'])
+  assert.match(t.lastSaid(), /\nAnd granted g1aa: all writes to the memory files of hauswache/)
+  t.approval('dfjkm')
+  await press('p5', 'appr:dfjkm:grant')
+  assert.equal(noticed('p5'), 'Not done: approval request dfjkm offers no grant; press Yes or No.')
+  assert.ok(pending(t.store.getPermission('dfjkm')))
+  // Yes to all: every one open, listed.
+  t.approval('fhkmn')
+  t.approval('hjkmn')
+  await press('p6', 'appr:fhkmn:all')
+  assert.deepEqual(t.verdicts.slice(-3), [['dfjkm', 'allow'], ['fhkmn', 'allow'], ['hjkmn', 'allow']])
+  assert.equal(noticed('p6'), 'Allowed 3 approval requests.')
+  assert.match(t.lastSaid(), /^Allowed 3 approval requests:\n- dfjkm \(Bash: /)
+  // Withdrawn, unknown, and data that is no approval's.
+  t.approval('jkmnp')
+  t.store.withdrawPermission('jkmnp')
+  await press('p7', 'appr:jkmnp:yes')
+  assert.equal(noticed('p7'), 'Not done: approval request jkmnp is not open any more: the subagent that asked stopped waiting for it.')
+  await press('p8', 'appr:zzzzz:yes')
+  assert.equal(noticed('p8'), 'Not done: approval request zzzzz is not open any more.')
+  for (const [id, data] of [['p9', '-'], ['p10', 'appr:kmnpq:yes;rm -rf /'], ['p11', 'appr:KMNPQ:yes'], ['p12', '']]) {
+    await press(id, data)
+    assert.equal(noticed(id), '', data)
+  }
+  assert.equal(t.recorded.at(-1).decision, 'ignored')
+  const verdicts = t.verdicts.length
+  // A locked kill switch, a standby.
+  t.approval('mnpqr')
+  t.killswitch.locked = true
+  await press('p13', 'appr:mnpqr:yes')
+  assert.equal(noticed('p13'), 'Not done: the kill switch is locked. It is unlocked only at the computer.')
+  t.killswitch.locked = false
+  t.active = false
+  await press('p14', 'appr:mnpqr:yes')
+  assert.equal(noticed('p14'), 'Not done: this gateway is inactive, connector disconnected, in standby.')
+  assert.equal(t.verdicts.length, verdicts)
+  assert.ok(pending(t.store.getPermission('mnpqr')))
+  // VOICE_GW_TELEGRAM_CONFIRM=0, and answers off: the voice.
+  for (const options of [{ confirm: false }, { mode: 'off', requests: true }]) {
+    const off = answering(options)
+    off.approval('abcde')
+    await off.answers.press({ id: 'q', data: 'appr:abcde:yes' })
+    assert.deepEqual(off.verdicts, [])
+    assert.deepEqual(off.pressed, [['q', 'Not done: approval request abcde is answered in voice mode or at the computer; Telegram cannot approve.']])
+  }
+  // A verdict that does not reach Claude Code: open again, and said.
+  const failing = answering({ verdict: async () => Promise.reject(new Error('the channel is gone')) })
+  failing.approval('abcde')
+  await failing.answers.press({ id: 'r', data: 'appr:abcde:yes' })
+  assert.deepEqual(failing.pressed, [['r', 'Not done: the channel is gone.']])
+  assert.ok(pending(failing.store.getPermission('abcde')))
+  assert.ok(PRESS.test('appr:abcde:all'))
+})
+
+test("a press of a button counts only from the driver's own account in their private chat with the bot: another sender, another chat, a group, a bot are ignored without a word, each in the input log", () => {
+  const heard = []
+  const recorded = []
+  const commands = new TelegramCommands({ chatId: '4242' }, { answers: true, record: entry => recorded.push(entry), log: () => {} })
+  commands.on('press', event => heard.push(event))
+  const press = ({ from = { id: 4242, is_bot: false }, chat = { id: 4242, type: 'private' }, message = true, data = 'appr:abcde:yes' } = {}) =>
+    commands.handle({ update_id: 1, callback_query: { id: `q${recorded.length + heard.length}`, from, ...(message ? { message: { message_id: 9, chat } } : {}), chat_instance: 'x', data } })
+  press()
+  assert.deepEqual(heard, [{ id: 'q0', data: 'appr:abcde:yes', messageId: 9, seen: { from: 4242, chat: 4242, type: 'private', text: '(button appr:abcde:yes)' } }])
+  press({ from: { id: 999, is_bot: false } })
+  press({ chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false } })
+  press({ chat: { id: -100123, type: 'supergroup' } })
+  press({ from: { id: 4242, is_bot: true } })
+  press({ message: false })
+  assert.equal(heard.length, 1, 'not a word back to a stranger')
+  assert.deepEqual(
+    recorded.map(entry => [entry.decision, entry.why]),
+    [
+      ['ignored', 'a press from another sender'],
+      ['ignored', 'a press from another chat'],
+      ['ignored', 'a press from a supergroup'],
+      ['ignored', 'a press from a bot'],
+      ['ignored', 'a press from a chat of no known type'],
+    ],
+  )
 })
 
 test('a plain yes or no and "yes to all": nothing past a locked kill switch or a standby; with VOICE_GW_TELEGRAM_CONFIRM=0 or answers off, approvals stay with the voice and the chat says so', async () => {
@@ -2648,5 +2915,216 @@ test('a gateway whose port is taken ends with an error, and says so on Telegram'
   } finally {
     child.kill('SIGKILL')
     blocker.close()
+  }
+})
+
+test('gateway: approval requests come with buttons; Yes and No answer them as typed answers do, Yes to all while several are open lists them, the buttons give way to the outcome; a stranger, an old button and a locked kill switch get nothing', async () => {
+  api.mode = 'ok'
+  api.messages.length = 0
+  api.presses.length = 0
+  api.edits.length = 0
+  api.updates = []
+  const gw = await startGateway('buttons', {
+    telegram: true,
+    env: { VOICE_GW_TELEGRAM_POLL: '1', VOICE_GW_TELEGRAM_ANSWERS: '1', VOICE_GW_TELEGRAM_AFTER: '3600' },
+  })
+  const messageWith = text => api.messages.findIndex(m => m.text.includes(text)) + 1
+  const keys = id => api.messages[id - 1].reply_markup?.inline_keyboard.map(row => row.map(button => button.text))
+  const lastEdit = id => api.edits.findLast(edit => edit.message_id === id)?.reply_markup.inline_keyboard.map(row => row.map(button => button.text))
+  const raise = async (code, tool, description) => {
+    await gw.permission(code, tool, description)
+    return waitFor(() => messageWith(`Approval request ${code}`))
+  }
+  try {
+    const merge = await raise('bdozq', 'Bash', 'gh pr merge 3 --repo driver/alpha --squash')
+    assert.deepEqual(api.messages[merge - 1].reply_markup, {
+      inline_keyboard: [[{ text: '✅ Yes', callback_data: 'appr:bdozq:yes' }, { text: '❌ No', callback_data: 'appr:bdozq:no' }]],
+    })
+    const yes = driverPresses('appr:bdozq:yes', merge)
+    await waitFor(() => pressAnswer(yes))
+    assert.equal(pressAnswer(yes).text, 'Allowed.')
+    assert.deepEqual(gw.verdicts, [{ request_id: 'bdozq', behavior: 'allow' }])
+    await waitFor(() => messageWith('Allowed: approval request bdozq'))
+    assert.equal(api.messages[messageWith('Allowed: approval request bdozq') - 1].reply_parameters.message_id, merge, 'as a reply to the request')
+    await waitFor(() => lastEdit(merge))
+    assert.deepEqual(lastEdit(merge), [['✅ Allowed']])
+    // An old button of it: matched by its code, refused.
+    const again = driverPresses('appr:bdozq:no', merge)
+    await waitFor(() => pressAnswer(again))
+    assert.match(pressAnswer(again).text, /^Not done: approval request bdozq is not open any more: it was allowed already here/)
+    assert.equal(gw.verdicts.length, 1)
+
+    // Two open: Yes to all comes under both.
+    const tests = await raise('cdpqr', 'Bash', 'npm test')
+    const fetch = await raise('defrs', 'WebFetch', 'Fetch github.com/jgraph/drawio/discussions/4953')
+    assert.deepEqual(keys(fetch), [['✅ Yes', '❌ No'], ['✅ Yes to all']])
+    await waitFor(() => lastEdit(tests)?.length === 2)
+    // A stranger's presses: nothing, not even an answer.
+    const strangers = [
+      driverPresses('appr:cdpqr:yes', tests, { from: { id: 999, is_bot: false } }),
+      driverPresses('appr:cdpqr:yes', tests, { chat: { id: 999, type: 'private' }, from: { id: 999, is_bot: false } }),
+    ]
+    const no = driverPresses('appr:cdpqr:no', tests)
+    await waitFor(() => pressAnswer(no))
+    assert.equal(pressAnswer(no).text, 'Denied.')
+    assert.deepEqual(gw.verdicts.filter(v => v.request_id === 'cdpqr'), [{ request_id: 'cdpqr', behavior: 'deny' }])
+    for (const id of strangers) assert.equal(pressAnswer(id), undefined)
+    await waitFor(() => lastEdit(tests)?.[0]?.[0] === '❌ Denied' && lastEdit(fetch)?.length === 1)
+    assert.deepEqual(lastEdit(fetch), [['✅ Yes', '❌ No']], 'alone again: no Yes to all')
+
+    // Yes to all, with three open: it lists what it allowed.
+    await raise('efgst', 'Bash', 'ls')
+    const last = await raise('fghtv', 'Bash', 'git status')
+    const all = driverPresses('appr:fghtv:all', last)
+    await waitFor(() => pressAnswer(all))
+    assert.equal(pressAnswer(all).text, 'Allowed 3 approval requests.')
+    await waitFor(() => messageWith('Allowed 3 approval requests:'))
+    assert.match(api.messages[messageWith('Allowed 3 approval requests:') - 1].text, /^Allowed 3 approval requests:\n- defrs \(WebFetch: Fetch github\.com\/jgraph\/drawio\/discussions\/4953\)\n- efgst \(Bash: ls\)\n- fghtv \(Bash: git status\)\nClaude Code goes on\.$/)
+    assert.deepEqual(gw.verdicts.slice(-3).map(v => [v.request_id, v.behavior]), [['defrs', 'allow'], ['efgst', 'allow'], ['fghtv', 'allow']])
+    assert.doesNotMatch(await gw.call('status'), /Pending approvals/)
+
+    // The kill switch denies what is open; its buttons say so, and a press does nothing.
+    const open = await raise('ghjvw', 'Bash', 'rm build.log')
+    await gw.call('emergency_stop', { words: 'Notstopp' })
+    await waitFor(() => lastEdit(open)?.[0]?.[0] === '⛔ Denied: the kill switch locked')
+    const locked = driverPresses('appr:ghjvw:yes', open)
+    await waitFor(() => pressAnswer(locked))
+    assert.match(pressAnswer(locked).text, /^Not done: the kill switch is locked\./)
+    assert.deepEqual(gw.verdicts.at(-1), { request_id: 'ghjvw', behavior: 'deny' })
+    // The input log keeps every press, the strangers' too.
+    const input = readFileSync(join(TMP, 'buttons', 'state', 'telegram-input.log'), 'utf8')
+    assert.match(input, /"text":"\(button appr:bdozq:yes\)","decision":"accepted","as":"approval allowed","answers":"bdozq"/)
+    assert.match(input, /"from":999,.*"decision":"ignored","why":"a press from another sender"/)
+    assert.doesNotMatch(input, new RegExp(TOKEN))
+  } finally {
+    api.updates = null
+    await gw.close()
+  }
+})
+
+test('gateway with VOICE_GW_TELEGRAM_CONFIRM=0 or Telegram input off: approval requests come without buttons, and a press of an old one hears that approvals take the voice', async () => {
+  for (const [name, env, why] of [
+    ['buttons-voice', { VOICE_GW_TELEGRAM_ANSWERS: '1', VOICE_GW_TELEGRAM_CONFIRM: '0' }, /^Not done: approval request kmnpq is answered in voice mode or at the computer; Telegram cannot approve\.$/],
+    ['buttons-off', {}, /^Telegram input is off: here only commands count/],
+  ]) {
+    api.mode = 'ok'
+    api.messages.length = 0
+    api.presses.length = 0
+    api.updates = []
+    const gw = await startGateway(name, { telegram: true, env: { VOICE_GW_TELEGRAM_POLL: '1', VOICE_GW_TELEGRAM_AFTER: '3600', ...env } })
+    try {
+      await gw.permission('kmnpq', 'Bash', 'gh pr merge 3 --repo driver/alpha --squash')
+      const id = await waitFor(() => api.messages.findIndex(m => m.text.includes('Approval request kmnpq')) + 1)
+      assert.equal(api.messages[id - 1].reply_markup, undefined, name)
+      assert.match(api.messages[id - 1].text, /Telegram cannot approve\.$/)
+      const press = driverPresses('appr:kmnpq:yes', id)
+      await waitFor(() => pressAnswer(press))
+      assert.match(pressAnswer(press).text, why, name)
+      assert.deepEqual(gw.verdicts, [], name)
+      assert.match(await gw.call('status'), /Pending approvals: kmnpq \(Bash\)/)
+    } finally {
+      api.updates = null
+      await gw.close()
+    }
+  }
+})
+
+// The controller's PermissionRequest hook, as Claude Code runs it for the
+// main session: next to its dialog and the channel's relay.
+const APPROVAL_HOOK = fileURLToPath(new URL('../controller/.claude/hooks/approval.mjs', import.meta.url))
+function mainHook(secrets, tool_name, tool_input) {
+  const child = spawn(process.execPath, [APPROVAL_HOOK], { env: { ...process.env, VOICE_GW_SECRETS_DIR: secrets }, stdio: ['pipe', 'pipe', 'pipe'] })
+  let stdout = ''
+  child.stdout.on('data', chunk => (stdout += chunk))
+  child.stdin.end(JSON.stringify({ session_id: 's', transcript_path: '', cwd: '/', permission_mode: 'manual', hook_event_name: 'PermissionRequest', tool_name, tool_input }))
+  return new Promise(resolve => child.on('close', () => resolve(stdout ? JSON.parse(stdout).hookSpecificOutput.decision : null)))
+}
+
+test('gateway: approval grants end to end with the real hook: the offer read out and in Telegram, approve with grant_minutes, the next write runs with nothing for the driver, open_items and status list it, "Freigaben zurücknehmen" in Telegram and the emergency stop end it', async () => {
+  api.mode = 'ok'
+  api.messages.length = 0
+  api.presses.length = 0
+  api.edits.length = 0
+  api.updates = []
+  const name = 'grants'
+  const secrets = join(TMP, name)
+  const root = join(secrets, 'no-repositories')
+  // Claude Code's folder of this test, with the hauswache project's memory folder.
+  const claude = join(secrets, 'claude')
+  const memory = join(claude, 'projects', `${root.replace(/[^A-Za-z0-9]/g, '-')}-hauswache`, 'memory')
+  mkdirSync(memory, { recursive: true })
+  const gw = await startGateway(name, {
+    telegram: true,
+    env: { VOICE_GW_TELEGRAM_POLL: '1', VOICE_GW_TELEGRAM_ANSWERS: '1', VOICE_GW_TELEGRAM_AFTER: '3600', CLAUDE_CONFIG_DIR: claude },
+  })
+  const messageWith = text => api.messages.findIndex(m => m.text.includes(text)) + 1
+  const tool = async (tool, args = {}) => (await gw.claudeCode.callTool({ name: tool, arguments: args })).content[0].text
+  // A write of the main session: the channel's copy first, then the hook, as seen on 2026-11-05.
+  const write = async (code, file) => {
+    const file_path = join(memory, file)
+    await gw.claudeCode.notification({
+      method: 'notifications/claude/channel/permission_request',
+      params: { request_id: code, tool_name: 'Write', description: `Write ${file_path}`, input_preview: `{ "file_path": ${JSON.stringify(file_path)}, "content": "x" }` },
+    })
+    return mainHook(secrets, 'Write', { file_path, content: 'x' })
+  }
+  try {
+    assert.match(gw.log, /approval grants on: an approval prompt for a file write offers to allow all such writes of its asker in its folder for 20 minutes \(at most 120, 100 writes\)/)
+    const id = idOf(await gw.call('send', { message: 'Schreib die Standorte in die Memory-Dateien von hauswache.' }))
+    await waitFor(() => gw.events.find(e => e.meta?.request_id === id))
+    // The first write asks, with the offer.
+    assert.equal(await write('hexqp', 'standort-tessin-bedigliora.md'), null, 'the hook decides nothing')
+    const out = await gw.call('get_reply', { id, wait_seconds: 3 })
+    assert.match(out, /Approval needed \(code=hexqp\): Write – Write .*standort-tessin-bedigliora\.md\. Details: .*\. Offer: allow all writes to the memory files of hauswache by the controller session for 20 minutes\n/)
+    assert.match(out, /\nWhere an approval carries an offer, ask: allow once, deny, or allow all such for the minutes offered\? Pass grant_minutes to approve only when the user chose that/)
+    const asked = await waitFor(() => messageWith('Approval request hexqp'))
+    assert.deepEqual(api.messages[asked - 1].reply_markup.inline_keyboard[0].map(button => button.text), ['✅ Yes', '⏱ Yes, 20 min', '❌ No'])
+    assert.match(api.messages[asked - 1].text, /\nOr "yes 20" to allow it and all writes to the memory files of hauswache by the controller session for 20 minutes\.$/)
+    // "Ja, für 20 Minuten alle erlauben."
+    const approved = await gw.call('approve', { code: 'hexqp', decision: 'allow', grant_minutes: 20 })
+    const grant = /grant=(g[a-z0-9]{3}) until=\d\d:\d\d\]/.exec(approved)?.[1]
+    assert.ok(grant, approved)
+    assert.match(approved, new RegExp(`Allowed\\. And granted ${grant} until \\d\\d:\\d\\d: all writes to the memory files of hauswache by the controller session\\. Tell the user`))
+    assert.deepEqual(gw.verdicts, [{ request_id: 'hexqp', behavior: 'allow' }])
+    await waitFor(() => messageWith(`granted ${grant}, by voice: all writes to the memory files of hauswache by the controller session, until`))
+    // The next writes run on the hook's allow; their copies never reach the driver.
+    assert.deepEqual(await write('vcuxs', 'MEMORY.md'), { behavior: 'allow' })
+    assert.deepEqual(await write('tkwgb', 'engelberg.md'), { behavior: 'allow' })
+    await waitFor(() => gw.log.includes(`permission_request allowed by grant, not listed code=tkwgb tool=Write grant=${grant}`))
+    assert.doesNotMatch(await gw.call('status'), /Pending approvals/)
+    assert.ok(!messageWith('Approval request vcuxs') && !messageWith('Approval request tkwgb'))
+    assert.equal(gw.verdicts.length, 1, 'nothing more to the channel')
+    assert.match(await tool('open_items'), new RegExp(`\\n- Grant ${grant}: writes to the memory files of hauswache by the controller session, until \\d\\d:\\d\\d, used 2 times\\.\\n- end_grant ends them`))
+    assert.match(await gw.call('status'), new RegExp(`\\nGrant ${grant}: writes to the memory files`))
+    // A settings write is never covered: it asks, without an offer.
+    const settings = join(secrets, 'proj', '.claude', 'settings.json')
+    await gw.claudeCode.notification({
+      method: 'notifications/claude/channel/permission_request',
+      params: { request_id: 'nvuau', tool_name: 'Write', description: `Write ${settings}`, input_preview: `{ "file_path": ${JSON.stringify(settings)}, "content": "{}" }` },
+    })
+    assert.equal(await mainHook(secrets, 'Write', { file_path: settings, content: '{}' }), null)
+    const nvuau = await waitFor(() => messageWith('Approval request nvuau'))
+    assert.deepEqual(api.messages[nvuau - 1].reply_markup.inline_keyboard[0].map(button => button.text), ['✅ Yes', '❌ No'])
+    assert.match(await gw.call('approve', { code: 'nvuau', decision: 'deny' }), /^\[approval=deny code=nvuau\] Denied\./m)
+    // "Freigaben zurücknehmen" in Telegram: the next write asks again.
+    driverSays('Freigaben zurücknehmen')
+    await waitFor(() => messageWith(`ended the grant ${grant} (writes to the memory files of hauswache by the controller session)`))
+    assert.equal(await write('rrfru', 'zurich.md'), null)
+    const again = await waitFor(() => messageWith('Approval request rrfru'))
+    // Its grant button in Telegram: allowed, and a new grant, by Telegram.
+    const press = driverPresses('appr:rrfru:grant', again)
+    await waitFor(() => pressAnswer(press))
+    assert.equal(pressAnswer(press).text, 'Allowed, and all such for 20 minutes.')
+    const second = /And granted (g[a-z0-9]{3}): all writes/.exec(api.messages[(await waitFor(() => messageWith('Allowed: approval request rrfru'))) - 1].text)?.[1]
+    assert.ok(second && second !== grant)
+    assert.deepEqual(await write('abhez', 'tessin.md'), { behavior: 'allow' })
+    // The emergency stop ends it; then the hook decides nothing, and the channel denies.
+    await gw.call('emergency_stop', { words: 'Notstopp' })
+    await waitFor(() => gw.log.includes(`grant ${second} ended (the kill switch locked (voice))`))
+    assert.equal(await mainHook(secrets, 'Write', { file_path: join(memory, 'nachher.md'), content: 'x' }), null)
+    assert.doesNotMatch(await tool('open_items'), /Grant g/)
+  } finally {
+    api.updates = null
+    await gw.close()
   }
 })

@@ -18,7 +18,9 @@ import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { HookApprovals, describeInput, newCode } from '../src/approvals.mjs'
+import { HOLD_MS, HookApprovals, describeInput, newCode, previewKey, promptKey } from '../src/approvals.mjs'
+import { ApprovalGrants } from '../src/approval-grants.mjs'
+import { GrantLedger } from '../src/grants.mjs'
 import { Store, pending } from '../src/store.mjs'
 import { TelegramAnswers, TelegramFallback } from '../src/telegram.mjs'
 
@@ -117,14 +119,42 @@ async function fakeGateway(p, answer = { behavior: 'allow' }) {
   return { seen, close: () => new Promise(resolve => server.close(resolve)) }
 }
 
-// The gateway's side: a store and the approval socket.
-async function gateway(p, { killswitch = { locked: false }, relay = true } = {}) {
+// The gateway's side: a store and the approval socket; with grants, approval
+// grants over a Claude Code folder of the place's own, with the hauswache
+// project's memory folder (approval-grants.mjs).
+async function gateway(p, { killswitch = { locked: false }, relay = true, grants = false } = {}) {
   const logged = []
+  const log = (...parts) => logged.push(parts.join(' '))
   const store = new Store({ log: () => {} })
-  const approvals = new HookApprovals({ store, killswitch, relay, log: (...parts) => logged.push(parts.join(' ')) })
+  let approvalGrants = null
+  if (grants) {
+    p.claude = join(p.dir, 'claude')
+    // As Claude Code names the project of a folder: its path with "-" for "/" and ".".
+    p.memory = join(p.claude, 'projects', `${join(p.dir, 'Developer').replace(/[^A-Za-z0-9]/g, '-')}-hauswache`, 'memory')
+    mkdirSync(p.memory, { recursive: true })
+    mkdirSync(join(p.dir, 'Developer', 'alpha', '.git'), { recursive: true })
+    approvalGrants = new ApprovalGrants({
+      ledger: new GrantLedger({ log }),
+      home: p.dir,
+      claudeHome: p.claude,
+      root: join(p.dir, 'Developer'),
+      killswitch,
+      pathEnv: '',
+      log,
+    })
+  }
+  const approvals = new HookApprovals({ store, killswitch, relay, grants: approvalGrants, log })
   assert.equal(await approvals.listen(p.socket), true)
-  return { store, approvals, logged, killswitch }
+  return { store, approvals, logged, killswitch, grants: approvalGrants }
 }
+
+// The channel's copy of a Write, as Claude Code 2.1.312 relays it.
+const relayedWrite = (file_path, request_id = 'hexqp') => ({
+  request_id,
+  tool_name: 'Write',
+  description: `Claude requested permissions to edit ${file_path} which is a sensitive file.`,
+  input_preview: `{ "file_path": ${JSON.stringify(file_path)}, "content": "- Standort Tessin" }`,
+})
 
 // --- the hook ------------------------------------------------------------------
 
@@ -146,16 +176,18 @@ test('controller settings: the approval hook sees every prompt, waits a week, an
   assert.equal(SETTINGS.hooks.PreToolUse.length, 1)
 })
 
-test('the hook leaves the main session and ordinary subagents to the channel: no decision, no call to the gateway', async () => {
+test("the hook asks the gateway's check about the main session's and ordinary subagents' prompts: allow on a grant, never a deny, nothing else", async () => {
   const p = place()
-  const fake = await fakeGateway(p)
+  // A check that decides nothing: the channel relays the prompt as before.
+  const nothing = await fakeGateway(p, { behavior: null })
   try {
-    // The main session: no agent_id. The channel relays its prompts.
+    // The main session: no agent_id.
     const main = await runHook(p, hookInput(p)).done
     assert.deepEqual([main.status, main.stdout], [0, ''])
     // An ordinary subagent: its record has no taskKind; after the hook, its
-    // dialog and the channel's relay open (seen with 2.1.312).
-    record(p, 'aa442687c1e1c600b', { agentType: 'general-purpose', isBuiltIn: true, requestShape: 'background', requestNonInteractive: true })
+    // dialog and the channel's relay open (seen with 2.1.312). Its
+    // description names it for the driver.
+    record(p, 'aa442687c1e1c600b', { agentType: 'general-purpose', isBuiltIn: true, description: 'Build daily portfolio report', requestShape: 'background' })
     const ordinary = await runHook(p, hookInput(p, { agent_id: 'aa442687c1e1c600b', agent_type: 'general-purpose' })).done
     assert.deepEqual([ordinary.status, ordinary.stdout], [0, ''])
     // One spawned with a name but without agent teams has the same kind of record.
@@ -163,9 +195,44 @@ test('the hook leaves the main session and ordinary subagents to the channel: no
     assert.equal((await runHook(p, hookInput(p, { agent_id: 'a62cdb0ffa0aed54a', agent_type: 'general-purpose' })).done).stdout, '')
     // An id that would lead out of the folder is no teammate either.
     assert.equal((await runHook(p, hookInput(p, { agent_id: '../../x', agent_type: 'x' })).done).stdout, '')
-    assert.equal(fake.seen.length, 0)
+    assert.deepEqual(nothing.seen.map(seen => seen.url), Array(4).fill('/approval/check'))
+    assert.deepEqual(nothing.seen.map(seen => seen.body.agent_name), [null, 'Build daily portfolio report', 'gateway-stats', null])
+    assert.equal(nothing.seen[0].body.agent_id, undefined, 'the main session')
   } finally {
-    await fake.close()
+    await nothing.close()
+  }
+  // A grant covers it: the hook answers allow, for the main session and a subagent alike.
+  const q = place()
+  const granted = await fakeGateway(q, { behavior: 'allow' })
+  try {
+    assert.deepEqual(decisionOf((await runHook(q, hookInput(q)).done).stdout).decision, { behavior: 'allow' })
+    assert.deepEqual(decisionOf((await runHook(q, hookInput(q, { agent_id: 'aa442687c1e1c600b', agent_type: 'general-purpose' })).done).stdout).decision, { behavior: 'allow' })
+  } finally {
+    await granted.close()
+  }
+  // A deny from the check is never given: only a teammate's prompt is denied, on the gateway's word.
+  const r = place()
+  const denying = await fakeGateway(r, { behavior: 'deny', message: 'no' })
+  try {
+    assert.equal((await runHook(r, hookInput(r)).done).stdout, '')
+  } finally {
+    await denying.close()
+  }
+})
+
+test('the check fails open within two seconds: a gateway that does not answer leaves the prompt to the dialog and the relay', async () => {
+  const p = place()
+  const server = createServer(() => {}) // takes the request, never answers
+  await new Promise(resolve => server.listen(p.socket, resolve))
+  try {
+    const started = Date.now()
+    const out = await runHook(p, hookInput(p)).done
+    assert.deepEqual([out.status, out.stdout], [0, ''])
+    assert.ok(Date.now() - started < 4000, `took ${Date.now() - started} ms`)
+    assert.match(out.stderr, /did not answer within 2000 ms/)
+  } finally {
+    server.closeAllConnections?.()
+    await new Promise(resolve => server.close(resolve))
   }
 })
 
@@ -485,4 +552,131 @@ test('what a prompt is about, from the tool input; codes as Claude Code makes th
     assert.ok(!taken.has(code))
     taken.add(code)
   }
+})
+
+// --- approval grants through the hook (approval-grants.mjs) ------------------------
+
+test("the main session's write into a memory folder: the hook's check gives the channel's copy its offer; with a grant the hook allows it, and the copy never reaches the driver, also when it came first", async () => {
+  const p = place()
+  const gw = await gateway(p, { grants: true })
+  try {
+    const file = join(p.memory, 'standort-tessin-bedigliora.md')
+    const input = hookInput(p, { tool_name: 'Write', tool_input: { file_path: file, content: '- Standort Tessin' } })
+    // No grant yet: the hook decides nothing, the check is kept for the copy.
+    const first = await runHook(p, input).done
+    assert.deepEqual([first.status, first.stdout], [0, ''])
+    const seen = await gw.approvals.relayed(relayedWrite(file))
+    assert.equal(seen.drop, undefined)
+    assert.equal(seen.agent, null, 'the main session')
+    assert.equal(seen.offer.text, 'writes to the memory files of hauswache by the controller session')
+    assert.deepEqual(seen.prompt, { tool: 'Write', input: { file_path: file }, actor: { who: 'controller' } }, 'never the content')
+    // The copy first, as on 2026-11-05 at 09:22 (22 ms before the hook): it waits for the check.
+    const waiting = gw.approvals.relayed(relayedWrite(join(p.memory, 'MEMORY.md'), 'vcuxs'))
+    await sleep(50)
+    await runHook(p, hookInput(p, { tool_name: 'Edit', tool_input: { file_path: join(p.memory, 'MEMORY.md'), old_string: 'a', new_string: 'b' } })).done
+    // An Edit's copy names its file the same way.
+    assert.equal((await waiting).offer?.text, undefined, 'a Write copy does not match an Edit check')
+
+    // The driver allows all such writes for 20 minutes.
+    const { grant } = gw.grants.fromApproval({ code: 'hexqp', offer: seen.offer }, 20, 'voice')
+    const copy = gw.approvals.relayed(relayedWrite(join(p.memory, 'engelberg.md'), 'tkwgb'))
+    const allowed = await runHook(p, hookInput(p, { tool_name: 'Write', tool_input: { file_path: join(p.memory, 'engelberg.md'), content: 'x' } })).done
+    assert.deepEqual(decisionOf(allowed.stdout).decision, { behavior: 'allow' })
+    assert.deepEqual(await copy, { drop: true, grant })
+    assert.equal(grant.uses, 1)
+    assert.ok(gw.logged.some(line => line.startsWith(`permission allowed by grant ${grant.id} tool=Write path=${join(p.memory, 'engelberg.md')} (the controller session, main session; use 1 of 100)`)))
+    // The check first, then the copy: dropped all the same.
+    await runHook(p, hookInput(p, { tool_name: 'Write', tool_input: { file_path: join(p.memory, 'zurich.md'), content: 'x' } })).done
+    assert.equal((await gw.approvals.relayed(relayedWrite(join(p.memory, 'zurich.md'), 'rrfru'))).drop, true)
+
+    // A settings write: never covered, so the hook decides nothing, and its copy is listed after the check, without an offer.
+    const settings = join(p.dir, 'Developer', 'alpha', '.claude', 'settings.json')
+    const settingsCopy = gw.approvals.relayed(relayedWrite(settings, 'nvuau'))
+    const asked = await runHook(p, hookInput(p, { tool_name: 'Write', tool_input: { file_path: settings, content: '{}' } })).done
+    assert.equal(asked.stdout, '')
+    assert.deepEqual(await settingsCopy, { offer: null, agent: null, prompt: { tool: 'Write', input: { file_path: settings }, actor: { who: 'controller' } } })
+    // A copy that no check matches waits HOLD_MS at most, then is listed as before.
+    const started = Date.now()
+    assert.deepEqual(await gw.approvals.relayed(relayedWrite(join(p.memory, 'no-hook.md'), 'frsny')), {})
+    assert.ok(Date.now() - started >= HOLD_MS - 50)
+    // The shell is never held: nothing a grant could decide.
+    const shell = Date.now()
+    assert.deepEqual(await gw.approvals.relayed({ tool_name: 'Bash', input_preview: '{ "command": "sed -i s/a/b/ MEMORY.md" }' }), {})
+    assert.ok(Date.now() - shell < 200)
+  } finally {
+    gw.approvals.close()
+  }
+})
+
+test("an ordinary subagent's prompt: its copy names it and carries the offer; allowed by its grant, it never reaches the channel, and the main session's copy of the same file is not taken for it", async () => {
+  const p = place()
+  const gw = await gateway(p, { grants: true })
+  try {
+    record(p, 'aa442687c1e1c600b', { agentType: 'general-purpose', isBuiltIn: true, description: 'Research the site memories', requestShape: 'background' })
+    const file = join(p.memory, 'a.md')
+    const sub = () => runHook(p, hookInput(p, { agent_id: 'aa442687c1e1c600b', agent_type: 'general-purpose', tool_name: 'Write', tool_input: { file_path: file, content: 'x' } })).done
+    assert.equal((await sub()).stdout, '')
+    // Claude Code waits for a subagent's hook, then relays: the check is there first.
+    const seen = await gw.approvals.relayed(relayedWrite(file))
+    assert.equal(seen.agent, 'Research the site memories')
+    assert.equal(seen.offer.text, 'writes to the memory files of hauswache by this subagent')
+    assert.deepEqual(seen.offer.actor, { who: 'agent', id: 'aa442687c1e1c600b', name: 'Research the site memories' })
+    gw.grants.fromApproval({ code: 'abcde', offer: seen.offer }, 20, 'telegram')
+    assert.deepEqual(decisionOf((await sub()).stdout).decision, { behavior: 'allow' })
+    // The main session writes the same file now: no grant of its own, so its copy is listed, not dropped.
+    await runHook(p, hookInput(p, { tool_name: 'Write', tool_input: { file_path: file, content: 'y' } })).done
+    const main = await gw.approvals.relayed(relayedWrite(file, 'bcdfg'))
+    assert.equal(main.drop, undefined)
+    assert.equal(main.agent, null)
+    assert.equal(main.offer.text, 'writes to the memory files of hauswache by the controller session')
+  } finally {
+    gw.approvals.close()
+  }
+})
+
+test("a teammate's memory write: listed with its offer; with a grant for it, allowed at once and never listed; the kill switch allows nothing", async () => {
+  const p = place()
+  const killswitch = { locked: false }
+  const gw = await gateway(p, { grants: true, killswitch })
+  try {
+    record(p, 'astandorte-drive-3-672684516a8fd7fb', TEAMMATE_META('standorte-drive-3'))
+    const teammate = file => runHook(p, hookInput(p, {
+      agent_id: 'astandorte-drive-3-672684516a8fd7fb',
+      agent_type: 'standorte-drive-3',
+      tool_name: 'Write',
+      tool_input: { file_path: join(p.memory, file), content: 'Möbel' },
+    }))
+    const hook = teammate('engelberg-moebel-raumreolon.md')
+    const [permission] = await waitUntil(() => gw.store.openPermissions().length && gw.store.openPermissions())
+    assert.equal(permission.offer.text, 'writes to the memory files of hauswache by this subagent')
+    assert.deepEqual(permission.offer.actor, { who: 'teammate', name: 'standorte-drive-3', session: 'sess-1' })
+    assert.ok(gw.logged.some(line => line.endsWith('(offers a grant: writes to the memory files of hauswache by this subagent)')))
+    // The driver: "ja, 20 Minuten".
+    gw.store.resolvePermission(permission.code, 'allow', 'voice')
+    await gw.approvals.verdict(permission.code, 'allow')
+    assert.equal(decisionOf((await hook.done).stdout).decision.behavior, 'allow')
+    const { grant } = gw.grants.fromApproval(permission, 20, 'voice')
+    // The next one runs at once, with nothing for the driver.
+    assert.deepEqual(decisionOf((await teammate('standort-tessin-bedigliora.md').done).stdout).decision, { behavior: 'allow' })
+    assert.equal(gw.store.openPermissions().length, 0)
+    assert.equal(grant.uses, 1)
+    // The kill switch: the gateway ends every grant (gateway.mjs); while locked, a teammate is denied whatever.
+    killswitch.locked = true
+    assert.equal(decisionOf((await teammate('x.md').done).stdout).decision.behavior, 'deny')
+  } finally {
+    gw.approvals.close()
+  }
+})
+
+test("the keys that pair a prompt with the channel's copy: the file or the command, as Claude Code's preview writes them; a value it cut matches nothing", () => {
+  assert.equal(promptKey('Write', { file_path: '/a/b.md', content: 'x' }), '/a/b.md')
+  assert.equal(promptKey('NotebookEdit', { notebook_path: '/a/n.ipynb' }), '/a/n.ipynb')
+  assert.equal(promptKey('Bash', { command: 'git  status\n' }), 'git status')
+  assert.equal(promptKey('mcp__x__y', { query: 'q' }), '')
+  assert.equal(previewKey('Write', '{ "file_path": "/a/b.md", "content": "x" }'), '/a/b.md')
+  assert.equal(previewKey('Edit', '{"file_path":"/a/\\"q\\".md","old_string":"a"}'), '/a/"q".md')
+  assert.equal(previewKey('Bash', '{ "command": "git status", "description": "Status" }'), 'git status')
+  assert.equal(previewKey('Write', '{ "file_path": "/a/b\n⋯ 300 code points elided ⋯\nc.md" }'), '')
+  assert.equal(previewKey('Write', '{}'), '')
+  assert.equal(previewKey('Write', 'garbage'), '')
 })

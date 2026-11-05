@@ -19,6 +19,12 @@
 // they carry the name and a standby by the settings, not the live state;
 // status gives that first. While it is inactive, send and ask hand nothing
 // over and say so, so that nothing waits for a controller that is not there.
+//
+// An approval that a grant could cover carries an offer (approval-grants.mjs):
+// its line ends with "Offer: allow all writes to the memory files of hauswache
+// by this subagent for 20 minutes", the voice AI asks for one of three
+// answers, and approve with grant_minutes allows it and makes the grant, only
+// when the user chose the minutes. The result names the grant and its end.
 
 import { createServer } from 'node:http'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
@@ -31,6 +37,7 @@ import { PIN_MINUTES, PIN_TRIES, alarmText, emergencyPhrase, offText } from './k
 import { IpGuard, accessLine } from './ipguard.mjs'
 import { clock } from './limits.mjs'
 import { pending } from './store.mjs'
+import { MIN_GRANT_MINUTES } from './approval-grants.mjs'
 
 // What the voice AI says, asked for in the car: before send and ask, one
 // short line of its own that fits the request, worded freshly each time, and
@@ -143,8 +150,11 @@ const answeredElsewhereLines = store =>
       permission.status === 'withdrawn'
         ? `Approval ${permission.code} is not open any more: the subagent that asked stopped waiting for it. It needs ` +
           'nothing from the user.'
-        : `Approval ${permission.code} was answered ${permission.status === 'elsewhere' ? 'at the computer' : 'in Telegram'} and is ` +
-          'settled; it needs nothing from the user.',
+        : permission.by === 'grant'
+          ? `Approval ${permission.code} was allowed by grant ${permission.grant}, which the user gave since, and is settled; ` +
+            'it needs nothing from the user.'
+          : `Approval ${permission.code} was answered ${permission.status === 'elsewhere' ? 'at the computer' : 'in Telegram'} and is ` +
+            'settled; it needs nothing from the user.',
     )
 
 // While the controller waits for the Claude usage limit (limits.mjs), what is
@@ -164,29 +174,38 @@ function describePermission(permission) {
   const description = String(permission.description).replace(/[\s.]+$/, '')
   // A subagent's, relayed by the hook (approvals.mjs): whose it is.
   const whose = permission.agent ? ` for the subagent ${permission.agent}` : ''
+  // The grant it could get (approval-grants.mjs), which the user may choose.
+  const offer = permission.offer ? `. Offer: allow all ${permission.offer.text} for ${permission.offer.minutes} minutes` : ''
   return (
     `Approval needed (code=${permission.code})${whose}: ${permission.toolName} – ${description}` +
-    (details ? `. Details: ${details}` : '')
+    (details ? `. Details: ${details}` : '') +
+    offer
   )
 }
 
 const ASK_APPROVAL =
   'Read the approval to the user and ask: allow or deny? Call approve with the code only after their explicit yes or no.'
+// With an offer: the third answer, and the one way to give it.
+const ASK_GRANT =
+  'Where an approval carries an offer, ask: allow once, deny, or allow all such for the minutes offered? Pass ' +
+  'grant_minutes to approve only when the user chose that, with the minutes they said; never on your own.'
 
 // The open approvals, in every result that can carry them (report, send,
 // approve), so that the voice AI reads them out with whatever it calls next:
-// heard from now on, their codes for the first line, and a line each.
+// heard from now on, their codes for the first line, and a line each; ask:
+// what to do with them.
 function openApprovals(store) {
   const permissions = store.openPermissions()
   for (const permission of permissions) permission.announced = true
-  return { codes: permissions.map(p => p.code), lines: permissions.map(describePermission) }
+  const ask = permissions.length ? [ASK_APPROVAL, ...(permissions.some(p => p.offer) ? [ASK_GRANT] : [])] : []
+  return { codes: permissions.map(p => p.code), lines: permissions.map(describePermission), ask }
 }
 
 // The lines after the result of send or approve: the open approvals, those
 // answered elsewhere since, and what to do with them.
 function approvalLines(store) {
-  const { codes, lines } = openApprovals(store)
-  return { codes, lines: [...lines, ...answeredElsewhereLines(store), ...(codes.length ? [ASK_APPROVAL] : [])] }
+  const { codes, lines, ask } = openApprovals(store)
+  return { codes, lines: [...lines, ...answeredElsewhereLines(store), ...ask] }
 }
 
 // The last line of every result that ends a request (the answer, a question
@@ -221,7 +240,7 @@ function report(store, request, settings) {
   const news = store.takeNews(request)
   if (news.length) lines.push(...describeNews(news))
 
-  if (permissions.length) lines.push(ASK_APPROVAL)
+  lines.push(...approvals.ask)
   const held = request.state === 'sent' ? heldText(settings) : ''
   if (held) lines.push(held)
 
@@ -358,6 +377,8 @@ function statusText(store, settings, killswitch) {
     lines.push('Pending approvals: ' + permissions.map(p => `${p.code} (${p.toolName})`).join('; '))
   }
   if (settings.night?.text()) lines.push(`Night mode: ${settings.night.text()}.`)
+  // The approval grants that hold (approval-grants.mjs).
+  lines.push(...(settings.approvalGrants?.ledger.lines() ?? []))
   for (const item of settings.limits?.list() ?? []) lines.push(`Waiting: ${item.text}.`)
   lines.push(...answeredElsewhereLines(store))
   const news = store.takeNews()
@@ -375,11 +396,12 @@ function buildVoiceServer(
   store,
   channel,
   config,
-  { killswitch = null, grant = null, presence = null, limits = null, night = null, unlock = null } = {},
+  { killswitch = null, grant = null, presence = null, limits = null, night = null, unlock = null, approvalGrants = null } = {},
 ) {
-  // The waits for the Claude usage limit (limits.mjs) and night mode
-  // (night.mjs) go with the settings into the reports.
-  const settings = limits || night ? { ...config, limits, night } : config
+  // The waits for the Claude usage limit (limits.mjs), night mode
+  // (night.mjs) and the approval grants (approval-grants.mjs) go with the
+  // settings into the reports.
+  const settings = limits || night || approvalGrants ? { ...config, limits, night, approvalGrants } : config
   const askWait = clamp(settings.askWaitSeconds, 1, settings.maxWaitSeconds)
   const replyWait = clamp(settings.defaultWaitSeconds, 1, settings.maxWaitSeconds)
   // Whether Telegram is there for the unlock's PIN.
@@ -652,6 +674,9 @@ function buildVoiceServer(
   )
 
   if (settings.permissionRelay) {
+    // Approval grants (approval-grants.mjs): an approval that offers one may
+    // be allowed with the minutes the user chose.
+    const granting = approvalGrants?.enabled ? approvalGrants : null
     mcp.registerTool(
       'approve',
       {
@@ -660,7 +685,11 @@ function buildVoiceServer(
           'Answer a permission prompt from Claude Code, for example running a shell command or writing a file. ' +
             'Only call this after you read the request to the user and they explicitly said yes (allow) or no ' +
             '(deny) to this specific action. Never approve on your own. Before the call, confirm their decision in ' +
-            'a few words of their language.',
+            'a few words of their language.' +
+            (granting
+              ? ' An approval that carries an offer may also be allowed with all such writes for a while, when the ' +
+                'user explicitly chose that: pass grant_minutes then.'
+              : ''),
         ),
         inputSchema: {
           code: z
@@ -668,10 +697,28 @@ function buildVoiceServer(
             .regex(/^[a-km-z]{5}$/i, 'five letters, as a result listed it')
             .describe('The five-letter approval code, as a result listed it.'),
           decision: z.enum(['allow', 'deny']).describe('allow if the user said yes, deny if they said no.'),
+          ...(granting
+            ? {
+                grant_minutes: z
+                  .number()
+                  .int()
+                  .min(MIN_GRANT_MINUTES)
+                  .max(granting.maxMinutes)
+                  .optional()
+                  .describe(
+                    'Only with allow, on an approval that carries an offer, and only when the user explicitly chose to ' +
+                      `allow all such for a while ("für 20 Minuten", "alle solchen erlauben"): the minutes, ` +
+                      `${granting.defaultMinutes} unless they named others. Leave it out otherwise.`,
+                  ),
+              }
+            : {}),
         },
         annotations: { destructiveHint: true },
       },
-      withLine(withAlarm(async ({ code, decision }) => {
+      withLine(withAlarm(async ({ code, decision, grant_minutes }) => {
+        if (grant_minutes !== undefined && decision !== 'allow') {
+          return text(`[approval=invalid code=${String(code).toLowerCase()}] grant_minutes goes only with allow; nothing was answered. Ask the user once more.`)
+        }
         const known = store.getPermission(code)
         // Answered in the user's Telegram chat (telegram.mjs).
         if (known && !pending(known) && known.by === 'telegram') {
@@ -699,13 +746,23 @@ function buildVoiceServer(
           if (permission.withdrawn) return text(gone)
           throw error
         }
+        // The grant, after the verdict: one that covers other open
+        // approvals allows them too (gateway.mjs), so they leave the lists.
+        const made = grant_minutes !== undefined && granting ? granting.fromApproval(permission, grant_minutes, 'voice') : null
         const approvals = approvalLines(store)
         const more = approvals.codes.length ? ` pending=${approvals.codes.join(',')}` : ''
         const stands = guessed ? ' It looked answered at the computer already; if it was, that answer stands.' : ''
+        const granted = made?.grant
+          ? ` grant=${made.grant.id} until=${clock(made.grant.until)}`
+          : made ? ' grant=none' : ''
+        const grantText = made?.grant
+          ? ` And granted ${made.grant.id} until ${clock(made.grant.until)}: all ${made.grant.label}. Tell the user in a ` +
+            'sentence that such writes no longer ask until then, and that "Freigaben zurücknehmen" ends it.'
+          : made ? ` No grant: ${made.why}. Tell the user in a few words.` : ''
         return text(
           [
             decision === 'allow'
-              ? `[approval=allow code=${permission.code}${more}] Allowed.${stands} Claude Code continues; call get_reply.`
+              ? `[approval=allow code=${permission.code}${granted}${more}] Allowed.${stands}${grantText} Claude Code continues; call get_reply.`
               : `[approval=deny code=${permission.code}${more}] Denied.${stands}`,
             ...approvals.lines,
           ].join('\n'),
@@ -774,6 +831,7 @@ export function startVoiceHttp(
     limits = null,
     night = null,
     unlock = null,
+    approvalGrants = null,
   } = {},
 ) {
   const server = createServer(async (req, res) => {
@@ -842,7 +900,7 @@ export function startVoiceHttp(
       res.on('close', () => store.voiceCallEnded())
     }
 
-    const mcp = buildVoiceServer(store, channel, settings, { killswitch, grant, presence, limits, night, unlock })
+    const mcp = buildVoiceServer(store, channel, settings, { killswitch, grant, presence, limits, night, unlock, approvalGrants })
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
       enableJsonResponse: true,

@@ -418,9 +418,20 @@ test('controller settings: confined tools run without asking, deny rules, no byp
   // Seen in voice mode: an approval for every write is too much while driving.
   // The gateway's tools, by the name of the server in .mcp.json and as the
   // plugin's server (mcp__plugin_<plugin>_<server>__<tool>).
-  const names = ['reply', 'list_workers', 'dispatch', 'worker_status', 'stop_worker', 'order_queue', 'open_items', 'resolve_decision', 'stats', 'restart_controller', 'raise_alarm', 'clone_repo', 'delete_path']
+  // Night mode, standing orders and approval grants check the driver's
+  // words in the gateway, or only narrow: they asked 13 times in 48 hours
+  // (approval-grants report of 2026-11-05).
+  const names = [
+    'reply', 'list_workers', 'dispatch', 'worker_status', 'stop_worker', 'order_queue', 'open_items', 'resolve_decision', 'stats',
+    'restart_controller', 'raise_alarm', 'clone_repo', 'delete_path', 'set_away', 'standing_order', 'end_order', 'grant_approvals', 'end_grant',
+  ]
   const voiceTools = [...names.map(t => `mcp__voice__${t}`), ...names.map(t => `mcp__plugin_voice_voice__${t}`)]
-  assert.deepEqual(permissions.allow, [...voiceTools, 'Bash', 'Write', 'Edit', 'NotebookEdit'])
+  // No rule for a claude.ai connector of one user's: this repository is public, and the names of
+  // a user's connectors belong in their own controller/.claude/settings.local.json.
+  assert.deepEqual(permissions.allow, [...voiceTools, 'Bash', 'Write', 'Edit', 'NotebookEdit', 'Monitor'])
+  assert.ok(!permissions.allow.some(rule => rule.startsWith('mcp__claude_ai_')))
+  // Below unrestricted the start script's deny rules win over Monitor and over connector rules in the local settings.
+  assert.ok(CONTROLLER_DENY.includes('mcp__claude_ai_*') && CONTROLLER_DENY.includes('Monitor'))
   assert.equal(permissions.ask, undefined)
   // Every tool goes through the hook, these and whatever the user's settings
   // allow, too.
@@ -773,10 +784,18 @@ test('confine hook: gh pr merge in one strict form, and always only after an app
 test('confine hook: the gateway\'s tools pass under both names, and a few harmless built-ins', () => {
   allowed('mcp__voice__reply', { request_id: 'abcd', state: 'done', text: 'ok' })
   allowed('mcp__plugin_voice_voice__reply', { request_id: 'abcd', state: 'done', text: 'ok' })
-  // Exactly the tools the settings let run without asking.
-  const voiceTools = SETTINGS.permissions.allow.filter(rule => rule.startsWith('mcp__'))
-  assert.equal(voiceTools.length, 26)
+  // Exactly the gateway's tools the settings let run without asking, night
+  // mode, standing orders and approval grants included: they were blocked
+  // here at confined before, while the settings did not allow them either.
+  const voiceTools = SETTINGS.permissions.allow.filter(rule => /^mcp__(voice|plugin_voice_voice)__/.test(rule))
+  assert.equal(voiceTools.length, 36)
   for (const tool of voiceTools) allowed(tool, {})
+  for (const tool of ['set_away', 'standing_order', 'end_order', 'grant_approvals', 'end_grant']) {
+    allowed(`mcp__voice__${tool}`, {})
+    allowed(`mcp__plugin_voice_voice__${tool}`, {})
+  }
+  // A connector's tool, which a user may allow in their local settings, is no gateway tool: the hook still blocks it at confined.
+  assert.match(blocked('mcp__claude_ai_Calendar__list_events', {}), /not one of the gateway's tools/)
   // ToolSearch loads deferred tools, the gateway's among them; the others
   // are the session's to-do list.
   for (const tool of ['ToolSearch', 'TodoWrite', 'TaskCreate', 'TaskGet', 'TaskList', 'TaskUpdate']) allowed(tool, {})

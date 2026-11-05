@@ -15,7 +15,9 @@
 // open, for checks and reviews, with fixes for review comments queued without
 // asking (VOICE_GW_AUTO_FIX_REVIEWS), and optionally Telegram, for approval
 // requests at once, questions after the voice mode ended, alarms, and the
-// driver's answers, requests and approvals typed there (telegram.mjs). At the
+// driver's answers, requests and approvals typed there or pressed on their
+// buttons (telegram.mjs). Approval grants, which answer a kind of the
+// controller's prompts for a while, through its hook (approval-grants.mjs). At the
 // controller levels clone-delete and unrestricted, also cloning and deleting
 // in the worker root (folders.mjs). Over all of it, the kill switch (killswitch.mjs).
 // And what is open, so that nothing is forgotten: decisions for the driver
@@ -52,6 +54,7 @@ import { SettingsWatcher, othersText } from './live.mjs'
 import { Restarter } from './restart.mjs'
 import { PullWatcher } from './pulls.mjs'
 import {
+  INPUT_OFF,
   TelegramAnswers,
   TelegramCommands,
   TelegramFallback,
@@ -63,10 +66,11 @@ import {
 } from './telegram.mjs'
 import { KillSwitch, PIN_DIGITS, PIN_MINUTES, PIN_TRIES, VoiceUnlock, alarmText, offText } from './killswitch.mjs'
 import { RunGuard } from './guard.mjs'
-import { GRANTS_SETTING, PathGrants } from './grants.mjs'
+import { GRANTS_SETTING, GrantLedger, PathGrants } from './grants.mjs'
+import { ApprovalGrants, actorText, filePathOf } from './approval-grants.mjs'
 import { realpathSync } from 'node:fs'
 import { homedir, hostname } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { DockerRunner, HostRunner } from './runners.mjs'
 import { ACCESS_LEVELS, GitHubAccess } from './access.mjs'
@@ -248,6 +252,12 @@ if (scratch?.runner.container) {
 }
 // The containers the kill switch stops: the workers', and the work folders'.
 const containers = [config.docker ? runner : null, scratch?.runner.container ? scratch.runner : null].filter(Boolean)
+// The grants the driver gives for a while, in one ledger (grants.mjs):
+// approval grants for the controller's prompts now, temporary path grants for
+// workers later. Those for one subagent end with this start, as their agents
+// ended with the session before; the controller's keep their time.
+const grantLedger = new GrantLedger({ file: config.grantsFile })
+grantLedger.endAll('the controller session restarted, and its subagents with it', grant => ['agent', 'teammate'].includes(grant.actor?.who))
 // Folders a repository's workers on this computer may write to as in the
 // repository (grants.mjs), checked strictly; an entry that is no such folder
 // is ignored with a log line. They also change with the settings file while
@@ -258,8 +268,35 @@ const grants = new PathGrants({
   root: config.workerRoot,
   gateway: ROOT,
   guarded: [config.stateDir, config.secretsDir, config.scratchRoot, process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude')],
+  ledger: grantLedger,
   log,
 })
+// Approval grants (approval-grants.mjs): the driver allows a kind of file
+// write by one asker in one folder for a while, and the controller's hook
+// answers such prompts itself. Only with the permission relay.
+const approvalGrants = new ApprovalGrants({
+  ledger: grantLedger,
+  pathGrants: grants,
+  root: config.workerRoot,
+  gateway: ROOT,
+  guarded: [config.stateDir, config.secretsDir, ...(config.logFile ? [dirname(config.logFile)] : [])],
+  killswitch,
+  standby,
+  enabled: config.approvalGrants && config.permissionRelay,
+  defaultMinutes: config.grantMinutes,
+  maxMinutes: config.grantMaxMinutes,
+  maxUses: config.grantMaxUses,
+  log,
+})
+log(
+  approvalGrants.enabled
+    ? `approval grants on: an approval prompt for a file write offers to allow all such writes of its asker in its folder for ` +
+        `${approvalGrants.defaultMinutes} minutes (at most ${approvalGrants.maxMinutes}, ${approvalGrants.maxUses} writes), and the ` +
+        "controller's hook answers them; never the shell, settings, hooks, .git or anything hidden but a project's memory files" +
+        (grantLedger.lines().length ? `; holding: ${grantLedger.active().map(grant => grant.id).join(', ')}` : '')
+    : `approval grants off (${config.permissionRelay ? 'VOICE_GW_APPROVAL_GRANTS=0' : 'the permission relay is off'}): every prompt asks`,
+)
+if (standby.active) grantLedger.endAll('the gateway is in a standby')
 function grantsLog(when) {
   const text = grants.text()
   if (!text && !when) return
@@ -458,7 +495,7 @@ async function selfCheck() {
 // never gets: its PermissionRequest hook hands them over this socket
 // (approvals.mjs). Listed and answered like the channel's, and the verdict
 // goes back to the hook.
-const hookApprovals = new HookApprovals({ store, killswitch, relay: config.permissionRelay })
+const hookApprovals = new HookApprovals({ store, killswitch, relay: config.permissionRelay, grants: approvalGrants })
 if (await hookApprovals.listen(config.approvalSocket)) {
   log(
     config.permissionRelay
@@ -469,6 +506,7 @@ if (await hookApprovals.listen(config.approvalSocket)) {
 
 const channel = await startChannel(store, {
   hookApprovals,
+  approvalGrants,
   permissionRelay: config.permissionRelay,
   workers,
   restarter,
@@ -491,12 +529,44 @@ const channel = await startChannel(store, {
 const capital = text => `${text[0].toUpperCase()}${text.slice(1)}`
 
 // What the gateway waits for or how it works now, for open_items and the
-// start-up summary: night mode, the standing orders, the usage limit waits.
+// start-up summary: night mode, the standing orders, the grants that hold,
+// the usage limit waits.
 function openNotes() {
   const notes = night.text() ? [`${capital(night.text())}.`] : []
   const digested = digest.note() ? [`${capital(digest.note())}.`] : []
-  return [...notes, ...orders.lines(), ...limits.list().map(item => `${capital(item.text)}.`), ...digested]
+  const granted = grantLedger.lines()
+  const endHint = granted.length ? ['end_grant ends them when the driver says "Freigaben zurücknehmen".'] : []
+  return [...notes, ...orders.lines(), ...granted, ...endHint, ...limits.list().map(item => `${capital(item.text)}.`), ...digested]
 }
+
+// A grant the driver just gave also allows the approvals open now that it
+// covers: their yes for all such writes covers those too. Then the chat hears
+// of it, unless they gave it there with "yes 20", whose answer says so.
+approvalGrants.on('made', grant => {
+  for (const permission of store.openPermissions()) {
+    if (!permission.prompt || !approvalGrants.coversPrompt(grant, permission.prompt)) continue
+    if (!store.resolvePermission(permission.code, 'allow', 'grant', grant.id)) continue
+    grantLedger.use(grant)
+    log(
+      `permission allowed by grant ${grant.id}`,
+      `code=${permission.code}`,
+      `tool=${permission.toolName}`,
+      `path=${preview(filePathOf(permission.prompt.input), 160)}`,
+      `(${actorText(permission.prompt.actor)}, open when the grant was made)`,
+    )
+    channel.sendVerdict(permission.code, 'allow').catch(error => log(`verdict of grant ${grant.id} not sent:`, error.message))
+  }
+  if (grant.via === 'telegram' && grant.fromApproval) return
+  try {
+    say(
+      `cc-voice-gateway on ${hostname()}: granted ${grant.id}, ${grant.fromApproval ? 'by voice' : "on your words, asked ahead by the controller"}: ` +
+        `all ${grant.label}, until ${clock(grant.until)}, at most ${grant.maxUses} writes. Such approval prompts no longer ask until then. ` +
+        'Send "revoke" or "Freigaben zurücknehmen" to end it.',
+    )
+  } catch (error) {
+    log(`grant ${grant.id}: not told on Telegram:`, error.message) // made before Telegram was set up
+  }
+})
 
 // When a run ends, the gateway looks at its checkout (Workers.audit), and the
 // result goes to the controller as a channel event, with what the gateway saw
@@ -716,6 +786,10 @@ if (telegram) {
             const wait = limits.active('controller')
             return wait ? `The controller waits for the usage limit until ${clock(wait.until)} and reads it then.` : ''
           },
+          // "yes 20" on an approval request that offers a grant.
+          grants: approvalGrants.enabled ? approvalGrants : null,
+          // The notice over a button the driver pressed.
+          pressed: (id, text) => telegram.answerPress(id, text),
         })
   // A value it does not know counts as off, so that a typo opens nothing.
   const answersSetting = config.telegramAnswersSetting.trim().toLowerCase()
@@ -777,6 +851,8 @@ if (telegram) {
     held: () => standby.active,
     answerable: request => answers?.accepts(request) ?? false,
     approvable: () => answers?.approves() ?? false,
+    // Buttons under approval requests, where they are answered there.
+    edit: (id, markup) => telegram.editButtons(id, markup),
   })
   log(`telegram fallback ready: approval requests at once, questions after ${config.telegramAfterSeconds} s without a voice call`)
   // Inbound, only from the driver in the configured private chat: the kill
@@ -795,6 +871,13 @@ if (telegram) {
     ...(config.telegramRequests ? { asks: id => answers.asks(id) } : {}),
   }).start()
   if (answers) telegramCommands.on('answer', message => answers.route(message))
+  // A button under an approval request; without Telegram input none is
+  // shown, and one pressed on an old message hears why.
+  telegramCommands.on('press', press => {
+    if (answers) return answers.press(press)
+    record({ ...press.seen, decision: 'refused', why: INPUT_OFF })
+    telegram.answerPress(press.id, INPUT_OFF).catch(error => log('telegram press not answered:', error.message))
+  })
   // The driver's own message that does not count, and why.
   telegramCommands.on('refused', ({ why, messageId }) => reply(`Not passed on: ${why}`, messageId))
   telegramCommands.on('stop', ({ text }) => {
@@ -815,6 +898,18 @@ if (telegram) {
     }
   })
   telegramCommands.on('stale', stale => say(staleText(stale)))
+  // /revoke, "revoke" or "Freigaben zurücknehmen": the grants end, all or one,
+  // also while the controller is busy. It only narrows, so it needs no input on.
+  telegramCommands.on('revoke', ({ id }) => {
+    const ended = id ? [grantLedger.end(id, 'taken back in Telegram')].filter(Boolean) : grantLedger.endAll('taken back in Telegram')
+    say(
+      `cc-voice-gateway on ${hostname()}: ` +
+        (ended.length
+          ? `ended ${ended.length === 1 ? 'the grant' : `${ended.length} grants`} ${ended.map(grant => `${grant.id} (${grant.label})`).join('; ')}. ` +
+            'Such approval prompts ask one by one again.'
+          : `${id ? `no grant ${id} holds now` : 'no grant holds now'}; nothing to end.`),
+    )
+  })
   // /stats: this running time in detail; /stats all: all time.
   telegramCommands.on('stats', ({ all }) => say(telegramText(stats.snapshot(), { host: hostname(), allTime: all })))
   // Without the watchdog the gateway itself says that it shuts down, with
@@ -872,8 +967,10 @@ async function lockdown(why) {
     log('kill switch: worker runs stopped, but their state was not saved:', error.message)
   }
   folders?.stopAll()
-  // After an alarm the driver says again what may go on without them.
+  // After an alarm the driver says again what may go on without them, and
+  // which approvals may run without asking.
   orders.endAll(`the kill switch locked (${why})`)
+  grantLedger.endAll(`the kill switch locked (${why})`)
   for (const permission of store.pendingPermissions()) {
     store.resolvePermission(permission.code, 'deny', 'killswitch')
     channel.sendVerdict(permission.code, 'deny').catch(() => {})
@@ -971,7 +1068,7 @@ async function portBusy() {
 }
 
 admin = await startAdmin(auth, config.adminSocket, { killswitch })
-http = startVoiceHttp(store, channel, auth, config, { killswitch, onPortBusy: portBusy, guard: ipGuard, presence, standby, limits, night, unlock })
+http = startVoiceHttp(store, channel, auth, config, { killswitch, onPortBusy: portBusy, guard: ipGuard, presence, standby, limits, night, unlock, approvalGrants })
 
 // Once the session is connected: first one event with everything open, so
 // that a restarted controller knows it without memory files; its answer is
@@ -1128,10 +1225,13 @@ const tell = text =>
   Promise.resolve()
 
 standby.on('enter', async ({ reason }) => {
+  // The driver disconnected: nothing runs on their earlier yes any more.
+  const ended = grantLedger.endAll(`a standby began: ${reason}`)
   await tell(
     `the connector was disconnected (${reason}), I am switching off now. Worker runs stop and nothing new starts; no ` +
-      'reminders and no alerts, at most one summary a day. The queue and the open decisions are kept. A new sign-in ' +
-      'with a pairing code (the setup page, or node scripts/pair.mjs) switches me on again.',
+      'reminders and no alerts, at most one summary a day. The queue and the open decisions are kept' +
+      (ended.length ? `; the approval grants ${ended.map(grant => grant.id).join(', ')} ended` : '') +
+      '. A new sign-in with a pairing code (the setup page, or node scripts/pair.mjs) switches me on again.',
   )
   alerts.pause()
   pulls.paused = true

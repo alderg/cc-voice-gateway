@@ -184,6 +184,8 @@ test('declares the channel and permission capabilities and the reply tool', asyn
     'set_away',
     'standing_order',
     'end_order',
+    'grant_approvals',
+    'end_grant',
   ])
   assert.match(claudeCode.getInstructions(), /request_id/)
   // The controller stays free for new requests: longer work goes out at once.

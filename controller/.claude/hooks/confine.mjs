@@ -60,6 +60,8 @@ const WRITE_TOOLS = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit'])
 // The gateway's own tools, by the name of the server in .mcp.json and as the
 // plugin's server (mcp__plugin_<plugin>_<server>__<tool>). Full names, not a
 // prefix: a server called "voice__x" would also start with mcp__voice__.
+// Night mode, standing orders and approval grants check the driver's words
+// in the gateway, or only narrow.
 const GATEWAY_TOOLS = [
   'reply',
   'list_workers',
@@ -74,6 +76,11 @@ const GATEWAY_TOOLS = [
   'raise_alarm',
   'clone_repo',
   'delete_path',
+  'set_away',
+  'standing_order',
+  'end_order',
+  'grant_approvals',
+  'end_grant',
 ]
 const gatewayNames = name => [`mcp__voice__${name}`, `mcp__plugin_voice_voice__${name}`]
 const VOICE_TOOLS = new Set(GATEWAY_TOOLS.flatMap(gatewayNames))

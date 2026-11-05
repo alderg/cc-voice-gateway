@@ -436,6 +436,11 @@ test('the start: checks, current settings, repositories and the plugin, without 
   assert.equal(data.settings.VOICE_GW_SCRATCH_DOCKER, '', 'and on this computer when turned on')
   assert.equal(data.settings.VOICE_GW_SCRATCH_DAYS, '60')
   assert.equal(data.settings.VOICE_GW_REMOTE_CONTROL, '0', 'Remote Control off, by default')
+  // Approval grants: offered for file writes, 20 minutes, unless turned off.
+  assert.equal(data.settings.VOICE_GW_APPROVAL_GRANTS, '1')
+  assert.equal(data.settings.VOICE_GW_GRANT_MINUTES, '20')
+  assert.match(html, /<select data-setting="VOICE_GW_APPROVAL_GRANTS"><option value="1">offered for file writes \(default\)<\/option><option value="0">off, ask each time<\/option><\/select>/)
+  assert.match(html, /answered with its buttons \(Yes, No, and Yes to all while several are open\)/)
   assert.deepEqual(data.secrets, { telegramToken: null, telegramChatId: null, githubToken: null, claudeToken: null })
   assert.deepEqual(data.git, { name: 'Test Driver', email: 'driver@example.com' })
   assert.equal(data.plugin.mode, 'development')

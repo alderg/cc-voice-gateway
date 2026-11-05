@@ -48,6 +48,7 @@ import { chmodSync, readFileSync, statSync } from 'node:fs'
 import { basename } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { emergencyPhrase } from './killswitch.mjs'
+import { clock } from './limits.mjs'
 import { log as defaultLog, fileLog, preview } from './log.mjs'
 import { pending } from './store.mjs'
 
@@ -131,10 +132,12 @@ export class Telegram {
   // replyTo: the id of a message in the chat that this one answers; sent
   // all the same if that message is gone. quote: false for a message that is
   // never quoted to the controller, the unlock PIN (killswitch.mjs): its id
-  // is not kept, so a Reply to it comes without its text.
-  async send(text, { replyTo = null, quote = true } = {}) {
+  // is not kept, so a Reply to it comes without its text. markup: buttons
+  // under it, { inline_keyboard } (approvalButtons).
+  async send(text, { replyTo = null, quote = true, markup = null } = {}) {
     const body = { chat_id: this.chatId, text: String(text).slice(0, MAX_TEXT) }
     if (replyTo !== null) body.reply_parameters = { message_id: replyTo, allow_sending_without_reply: true }
+    if (markup) body.reply_markup = markup
     const message = await this.call('sendMessage', body)
     if (quote && Number.isInteger(message?.message_id)) {
       this.sentIds.add(message.message_id)
@@ -150,12 +153,25 @@ export class Telegram {
     return this.sentIds.has(id)
   }
 
+  // The buttons under one of its messages, in place of those before:
+  // { inline_keyboard: [] } takes them away.
+  editButtons(messageId, markup) {
+    return this.call('editMessageReplyMarkup', { chat_id: this.chatId, message_id: messageId, reply_markup: markup })
+  }
+
+  // The answer to a press of a button: a short notice over the chat, or
+  // nothing, so that the button stops spinning.
+  answerPress(id, text = '') {
+    return this.call('answerCallbackQuery', { callback_query_id: String(id), ...(text ? { text: preview(String(text), 190) } : {}) })
+  }
+
   // Updates for the bot, waiting up to `timeout` seconds for new ones:
-  // messages, and edits of them, which are refused (TelegramCommands).
+  // messages, edits of them, which are refused, and presses of the buttons
+  // under its messages (TelegramCommands).
   async getUpdates({ offset, timeout = 25, signal } = {}) {
     const result = await this.call(
       'getUpdates',
-      { offset, timeout, allowed_updates: ['message', 'edited_message'] },
+      { offset, timeout, allowed_updates: ['message', 'edited_message', 'callback_query'] },
       { timeoutMs: (timeout + 15) * 1000, signal },
     )
     return Array.isArray(result) ? result : []
@@ -230,6 +246,29 @@ export function statsCommand(text) {
   return match ? { all: Boolean(match[1]) } : null
 }
 
+// The approval grants taken back (approval-grants.mjs): /revoke, "revoke" or
+// "Freigaben zurücknehmen" for all of them, "/revoke g4k2" or "revoke g4k2"
+// for one: { id }, id null for all. null otherwise. It only narrows, so it
+// needs no Telegram input, as /stop does not.
+const REVOKE_WORDS = new Set([
+  'revoke', 'revoke all', 'revoke grants', 'revoke all grants', 'revoke the grants', 'end grants', 'end the grants',
+  'freigaben zurücknehmen', 'freigabe zurücknehmen', 'alle freigaben zurücknehmen', 'die freigaben zurücknehmen',
+  'freigaben zurückziehen', 'freigaben beenden', 'freigaben aufheben',
+])
+export function revokeCommand(text) {
+  const slash = /^\/revoke(?:@\w+)?(?:\s+(all|g[a-z0-9]{3}))?$/i.exec(String(text).trim())
+  if (slash) return { id: slash[1] && slash[1].toLowerCase() !== 'all' ? slash[1].toLowerCase() : null }
+  const words = String(text)
+    .normalize('NFC')
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]+/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (REVOKE_WORDS.has(words)) return { id: null }
+  const one = /^(?:revoke|freigabe) (g[a-z0-9]{3})(?: zurücknehmen)?$/.exec(words)
+  return one ? { id: one[1] } : null
+}
+
 // Waits `ms`, or less if the signal aborts. The timer's abort listener goes
 // away with it, so a long run of backoffs leaves none behind.
 export const pause = (ms, signal) => delay(ms, undefined, { signal }).catch(() => {})
@@ -265,7 +304,7 @@ function notOwn(message, edited) {
 // The answer when Telegram input is off (VOICE_GW_TELEGRAM_ANSWERS and
 // VOICE_GW_TELEGRAM_REQUESTS, off by default).
 export const INPUT_OFF =
-  'Telegram input is off: here only commands count, such as /stop, /funnel, /stats, /night and /back. ' +
+  'Telegram input is off: here only commands count, such as /stop, /funnel, /stats, /night, /back and /revoke. ' +
   'Answer and ask in voice mode, or turn Telegram input on in the setup.'
 
 // Inbound: polls the bot, and takes only the driver's own messages: from
@@ -278,7 +317,8 @@ export const INPUT_OFF =
 // edit, a forwarded message or one written through an inline bot holds no
 // words of theirs and is refused ('refused', { why, messageId }, which the
 // chat hears). Then 'funnel' for a Funnel command, 'away' for night mode on
-// or off and 'stats' for the statistics. With answers (Telegram input on),
+// or off, 'stats' for the statistics and 'revoke' ({ id }) to take the
+// approval grants back, all or one. With answers (Telegram input on),
 // also 'answer' ({ text, replyTo, messageId, quoted, forwarded, seen }) for a
 // Reply to a message that asks something, whatever it says unless it is a
 // slash command, and for any other text that is no command: TelegramAnswers
@@ -384,7 +424,35 @@ export class TelegramCommands extends EventEmitter {
     return null
   }
 
+  // A press of a button under one of the bot's messages (approvalButtons):
+  // only the driver's own, on a message in their private chat with the bot,
+  // as for a message; a stranger's is ignored without a word back. 'press'
+  // ({ id, data, messageId, seen }) for TelegramAnswers, which decides what
+  // it does and answers it.
+  press(query) {
+    const message = query.message ?? {}
+    const seen = {
+      from: query.from?.id ?? null,
+      chat: message.chat?.id ?? null,
+      type: message.chat?.type ?? null,
+      text: `(button ${preview(String(query.data ?? ''), 40)})`,
+    }
+    const stranger = this.stranger({ chat: message.chat ?? {}, from: query.from })
+    if (stranger) {
+      this.warnOnce(`ignored press ${stranger}`, `telegram commands: ignored a press of a button ${stranger}`)
+      this.record({ ...seen, decision: 'ignored', why: `a press ${stranger}` })
+      return
+    }
+    this.emit('press', {
+      id: query.id,
+      data: typeof query.data === 'string' ? query.data : '',
+      messageId: Number.isInteger(message.message_id) ? message.message_id : null,
+      seen,
+    })
+  }
+
   handle(update) {
+    if (update.callback_query) return this.press(update.callback_query)
     const edited = !update.message && Boolean(update.edited_message)
     const message = update.message ?? update.edited_message
     if (!message) return // nothing else is asked for (getUpdates)
@@ -443,7 +511,9 @@ export class TelegramCommands extends EventEmitter {
     if (stats) return accept(stats.all ? 'stats all' : 'stats', 'stats', { all: stats.all, text })
     const away = reply ? null : awayCommand(text)
     if (away) return accept(away === 'away' ? 'night on' : 'night off', 'away', { on: away === 'away', until: awayUntil(text), text })
-    if (slash) return refuse(`"${preview(text, 30)}" is no command here. The commands: /stop, /funnel, /stats, /night and /back.`)
+    const revoke = reply ? null : revokeCommand(text)
+    if (revoke) return accept(revoke.id ? `revoke ${revoke.id}` : 'revoke', 'revoke', { id: revoke.id, text })
+    if (slash) return refuse(`"${preview(text, 30)}" is no command here. The commands: /stop, /funnel, /stats, /night, /back and /revoke.`)
     if (!this.answers) return refuse(INPUT_OFF)
     if (age > this.maxAgeSeconds) return stale()
     // TelegramAnswers records what it makes of it.
@@ -604,7 +674,75 @@ function describePermission(permission, approvable = false) {
           `${elsewhere}.`
       : `Answer ${elsewhere}; Telegram cannot approve.`,
   )
+  // The grant it could get (approval-grants.mjs), with the same answers.
+  const { offer } = permission
+  if (offer) {
+    lines.push(
+      approvable
+        ? `Or "yes ${offer.minutes}" to allow it and all ${offer.text} for ${offer.minutes} minutes.`
+        : `In voice mode it can be allowed with all ${offer.text} for ${offer.minutes} minutes.`,
+    )
+  }
   return lines.join('\n')
+}
+
+// --- buttons under an approval request -----------------------------------------
+//
+// The driver asked: "Könnte man das beim CC-Gateway für die Approval Requests
+// auch so umsetzen, dass man per Knopfdruck Yes, No und, wenn mehrere pendent
+// sind, Yes to all sagen kann?" An approval request in the chat comes with
+// buttons where the driver may answer it there (TelegramAnswers.approves):
+// ✅ Yes and ❌ No, ⏱ Yes, 20 min where it offers an approval grant
+// (approval-grants.mjs), and ✅ Yes to all while more than one is open. A
+// button's data is "appr:<code>:<what>"; only the code says which approval it
+// answers, and that approval must still be open (TelegramAnswers.press). Once
+// it is answered, here or elsewhere, or withdrawn, the buttons give way to
+// one that says what came of it and answers nothing, as hauswache's
+// "✅ Gesehen" does (TelegramFallback.keyboards).
+
+export const PRESS = /^appr:([a-km-z]{5}):(yes|no|grant|all)$/
+
+export function approvalButtons(permission, { open = 1 } = {}) {
+  const { code, offer } = permission
+  const first = [{ text: '✅ Yes', callback_data: `appr:${code}:yes` }]
+  if (offer) first.push({ text: `⏱ Yes, ${offer.minutes} min`, callback_data: `appr:${code}:grant` })
+  first.push({ text: '❌ No', callback_data: `appr:${code}:no` })
+  const rows = [first]
+  if (open > 1) rows.push([{ text: '✅ Yes to all', callback_data: `appr:${code}:all` }])
+  return { inline_keyboard: rows }
+}
+
+// In place of the buttons of one that is answered or withdrawn: what came of it.
+export function outcomeButtons(permission) {
+  const where = { telegram: '', voice: ' by voice', grant: ` by grant ${permission.grant ?? ''}`.trimEnd() }[permission.by] ?? ''
+  const label =
+    permission.status === 'allow'
+      ? `✅ Allowed${where}`
+      : permission.status === 'deny'
+        ? permission.by === 'killswitch'
+          ? '⛔ Denied: the kill switch locked'
+          : `❌ Denied${where}`
+        : '⏹ Not open any more'
+  return { inline_keyboard: [[{ text: label, callback_data: '-' }]] }
+}
+
+// The minutes of an answer that allows an approval request and all such for
+// a while (approval-grants.mjs): "yes 20", "ja 20", "yes for 20 minutes",
+// "ja, 20 Minuten", in any case, with full stops or exclamation marks after
+// it. null for anything else, a plain yes included.
+const GRANT_YES = 'yes|y|yeah|yep|ok|okay|allow|approve|ja|jo|jep|jawohl|oui|si|sì|sí'
+const GRANT_UNITS = "m|min|mins|minute|minutes|minuten|minuti|minutos"
+const GRANT_ANSWER = new RegExp(`^(?:${GRANT_YES})(?: (?:for|für|pour|per|por))? (\\d{1,3}) ?(?:${GRANT_UNITS})?$`, 'u')
+export function grantMinutesOf(text) {
+  const words = String(text)
+    .normalize('NFC')
+    .toLowerCase()
+    .replace(/[,;:]/g, ' ')
+    .replace(/[\s.!…]+$/u, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+  const match = GRANT_ANSWER.exec(words)
+  return match ? Number(match[1]) : null
 }
 
 export class TelegramFallback {
@@ -616,7 +754,9 @@ export class TelegramFallback {
   // default when paused; the gateway holds them only in a standby.
   // answerable(request): whether the driver may answer that request's
   // question here (TelegramAnswers.accepts). approvable(): whether they may
-  // answer approval requests here (TelegramAnswers.approves).
+  // answer approval requests here (TelegramAnswers.approves). edit(id,
+  // markup): changes the buttons under a message sent here; with it, an
+  // approval request the driver may answer here comes with buttons.
   constructor(
     store,
     {
@@ -626,11 +766,13 @@ export class TelegramFallback {
       held = paused,
       answerable = () => false,
       approvable = () => false,
+      edit = null,
       log = defaultLog,
     },
   ) {
     this.store = store
     this.send = send
+    this.edit = edit
     this.afterSeconds = afterSeconds
     this.afterMs = afterSeconds * 1000
     this.paused = paused
@@ -661,6 +803,7 @@ export class TelegramFallback {
       if (!this.held()) {
         this.relay()
         this.approvals()
+        this.keyboards()
       }
       if (this.paused()) return
       const active = this.store.voiceActive(this.afterMs)
@@ -713,11 +856,41 @@ export class TelegramFallback {
   // the next voice call may be long in coming. Only a standby holds it
   // (held); while the kill switch is locked none is open, as the channel
   // denies them (channel.mjs). Its message id, so that a Reply to it finds it.
+  // With buttons where the driver may answer it here (approvalButtons).
   approvals() {
     for (const permission of this.store.openPermissions()) {
       if (permission.telegram) continue
       permission.telegram = true
-      this.deliver(() => describePermission(permission, this.approvable()), { sent: id => (permission.telegramMessage = id) })
+      const markup = () => {
+        if (!this.edit || !this.approvable()) return null
+        const buttons = approvalButtons(permission, { open: this.store.openPermissions().length })
+        permission.buttons = JSON.stringify(buttons) // what the chat shows, for keyboards
+        return buttons
+      }
+      this.deliver(() => describePermission(permission, this.approvable()), { markup, sent: id => (permission.telegramMessage = id) })
+    }
+  }
+
+  // The buttons under the approval requests sent here, as they should be
+  // now: Yes to all comes and goes with the number open, and those of one
+  // answered, here or elsewhere, or withdrawn, give way to its outcome, so
+  // that nothing stale stays to press. Only under those sent with buttons.
+  keyboards() {
+    if (!this.edit) return
+    const open = this.store.openPermissions().length
+    for (const permission of this.store.permissions.values()) {
+      if (!permission.buttons || !Number.isInteger(permission.telegramMessage)) continue
+      const markup = pending(permission)
+        ? this.approvable() ? approvalButtons(permission, { open }) : { inline_keyboard: [] }
+        : outcomeButtons(permission)
+      const key = JSON.stringify(markup)
+      if (key === permission.buttons) continue
+      permission.buttons = key
+      const { code, telegramMessage } = permission
+      this.queue = this.queue
+        .then(() => this.edit(telegramMessage, markup))
+        .then(() => this.log('telegram buttons changed:', `approval ${code}`, preview(markup.inline_keyboard.flat().map(button => button.text).join(', '), 80)))
+        .catch(error => this.log('telegram buttons not changed:', `approval ${code}`, '-', error.message))
     }
   }
 
@@ -755,18 +928,23 @@ export class TelegramFallback {
   // change, and the footer of a question depends on that decision's kind.
   // replyTo: the driver's message this one answers. sent(id): what to do
   // with the id of the message Telegram took; it goes into the saved requests.
-  deliver(message, { replyTo = null, sent = null } = {}) {
+  // markup(): the buttons under it, made when it is its turn, or null.
+  deliver(message, { replyTo = null, sent = null, markup = null } = {}) {
     let title = ''
     this.queue = this.queue
       .then(() => {
         const text = typeof message === 'function' ? message() : message
         title = text.split('\n')[0]
+        const buttons = markup?.() ?? null
+        if (buttons) return this.send(text, replyTo === null ? { markup: buttons } : { replyTo, markup: buttons })
         return replyTo === null ? this.send(text) : this.send(text, { replyTo })
       })
       .then(taken => {
         if (sent && Number.isInteger(taken?.message_id)) {
           sent(taken.message_id)
           this.store.saveSoon?.()
+          // Its buttons may have to change already: another one came meanwhile.
+          this.keyboards()
         }
         this.log('telegram sent:', preview(title, 100))
       })
@@ -853,6 +1031,9 @@ export function bareVerdict(text) {
     .replace(/[\s.!…]+$/u, '')
     .replace(/\s+/g, ' ')
     .trim()
+  // "yes 20": the same, and the grant it offers (grantMinutesOf).
+  const minutes = grantMinutesOf(words)
+  if (minutes !== null) return { behavior: 'allow', all: false, minutes }
   if (BARE_ALLOW.has(words)) return { behavior: 'allow', all: false }
   if (BARE_DENY.has(words)) return { behavior: 'deny', all: false }
   if (ALL_ALLOW.has(words)) return { behavior: 'allow', all: true }
@@ -910,6 +1091,12 @@ export const quoteText = quoted => `(In reply to the gateway's message, quoted a
 // answered in voice mode or at the computer, and a plain yes or no while one
 // is open hears so too.
 //
+// An approval request that offers an approval grant (approval-grants.mjs) is
+// also answered with "yes 20" (grantMinutesOf), as a Reply, with its code, or
+// alone while it is the only one open: allowed, and then the grant made for
+// those minutes, which the chat hears with its end. Every gate above holds
+// for it as for a plain yes.
+//
 // push(request): hands the request to the controller (channel.mjs). say(text,
 // replyTo): a message to the chat, as a reply to the driver's. held(): a
 // sentence when the controller waits for the usage limit, else ''. mode: on,
@@ -919,7 +1106,8 @@ export const quoteText = quoted => `(In reply to the gateway's message, quoted a
 // behavior): sends the driver's verdict on an approval request to Claude
 // Code (channel.mjs); without it, approvals are not answered here.
 // record(entry): what it made of the message, for the input log
-// (TelegramInputLog).
+// (TelegramInputLog). grants: the approval grants, for "yes 20".
+// pressed(id, text): answers a press of a button (press).
 export class TelegramAnswers {
   constructor({
     store,
@@ -934,10 +1122,14 @@ export class TelegramAnswers {
     presence = null,
     held = () => '',
     record = () => {},
+    grants = null,
+    pressed = () => {},
     log = defaultLog,
   }) {
     this.store = store
     this.ledger = ledger
+    this.grants = grants
+    this.pressed = pressed
     this.push = push
     this.say = say
     this.mode = mode
@@ -1038,7 +1230,7 @@ export class TelegramAnswers {
   // which the driver may be answering instead; { why } where Telegram cannot
   // approve. null with none open, where the message is what it was before (a
   // request, say), except that "yes to all" hears that none is open.
-  bare({ behavior, all }) {
+  bare({ behavior, all, minutes = null }) {
     const open = this.store.openPermissions().sort((a, b) => a.createdAt - b.createdAt)
     if (!open.length) return all ? { why: `no approval request is open now, so there is nothing to ${behavior}.` } : null
     if (!this.approves()) {
@@ -1067,7 +1259,7 @@ export class TelegramAnswers {
           `Reply to its message, or write its code with your answer.`,
       }
     }
-    return { permission, behavior }
+    return minutes === null ? { permission, behavior } : { permission, behavior, minutes }
   }
 
   // The open question shown in this chat after the approval request, or
@@ -1140,24 +1332,32 @@ export class TelegramAnswers {
   // { permissions, behavior }, { request: true }, or { why } not, with the
   // whole answer for the chat in text when it is not the usual "Not passed
   // on: <why>".
-  check(text, replyTo, { forwarded = false } = {}) {
+  // Why nothing from the chat counts now, or null: the kill switch is
+  // locked, or the gateway inactive (a standby, no controller).
+  closed() {
     if (this.killswitch?.locked) {
-      return {
-        why: this.killswitch.byVoice
-          ? 'the kill switch is locked. It is unlocked at the computer, or in voice mode with a PIN sent here.'
-          : 'the kill switch is locked. It is unlocked only at the computer.',
-      }
+      return this.killswitch.byVoice
+        ? 'the kill switch is locked. It is unlocked at the computer, or in voice mode with a PIN sent here.'
+        : 'the kill switch is locked. It is unlocked only at the computer.'
     }
     const presence = this.presence?.state() ?? { active: true }
-    if (!presence.active) return { why: `this gateway is inactive, ${presence.why}.` }
+    return presence.active ? null : `this gateway is inactive, ${presence.why}.`
+  }
+
+  check(text, replyTo, { forwarded = false } = {}) {
+    const closed = this.closed()
+    if (closed) return { why: closed }
     if (forwarded) return { why: 'it is forwarded, so its words are not your own. Write what you want in a message of your own.' }
     const target = this.target(text, replyTo)
     if (target.permissions) return target
     if (target.permission) {
+      // "yes 20", with its code or as a Reply: allowed, and the grant it offers.
+      const { code } = target.permission
+      const minutes = target.minutes ?? grantMinutesOf(text.replace(new RegExp(`(^|[^a-z])${code}(?![a-z])`, 'gi'), '$1 '))
+      if (minutes !== null) return { permission: target.permission, behavior: 'allow', minutes }
       // A plain yes or no, as by voice; anything else leaves it open.
       const behavior = target.behavior ?? verdictOf(text)
       if (behavior) return { permission: target.permission, behavior }
-      const { code } = target.permission
       return { why: `approval request ${code} takes a plain yes or no. Reply to it with yes to allow it, or with no to deny it.` }
     }
     if (!target.question) return target
@@ -1187,7 +1387,7 @@ export class TelegramAnswers {
         await this.say(result.text ?? `Not passed on: ${result.why}`, messageId)
         return null
       }
-      if (result.permission) return await this.approve(result.permission, result.behavior, { messageId, record })
+      if (result.permission) return await this.approve(result.permission, result.behavior, { messageId, record, minutes: result.minutes ?? null })
       if (result.permissions) return await this.approveAll(result.permissions, result.behavior, { messageId, record })
       if (result.request) {
         const request = await this.start(said, { messageId, quoted: replyTo === null ? null : quoted })
@@ -1210,6 +1410,62 @@ export class TelegramAnswers {
       record({ decision: 'refused', why: error.message })
       await Promise.resolve(this.say(`Not passed on: ${error.message}.`, messageId)).catch(() => {})
       return null
+    }
+  }
+
+  // A press of a button under an approval request ({ id, data, messageId,
+  // seen }, from TelegramCommands, which let only the driver's own through):
+  // the code in its data names the approval, and nothing else in it counts.
+  // It goes as a typed answer goes: nothing while the kill switch is locked or
+  // the gateway inactive, nothing where approvals take the voice
+  // (VOICE_GW_TELEGRAM_CONFIRM=0, answers off), nothing for one that is not
+  // open any more; the verdict to Claude Code as approve sends it, the same
+  // message in the chat, and "yes to all" lists what it allowed. The press
+  // itself hears a short notice (pressed), and the buttons give way to the
+  // outcome (TelegramFallback.keyboards). Resolves as route does. Never
+  // throws.
+  async press({ id, data, messageId = null, seen = null }) {
+    const record = entry => this.record({ ...(seen ?? { text: `(button ${preview(String(data ?? ''), 40)})` }), ...entry })
+    const notice = text => Promise.resolve(this.pressed(id, text)).catch(error => this.log('telegram press not answered:', error.message))
+    const refuse = async why => {
+      this.log('telegram button not passed on:', why)
+      record({ decision: 'refused', why })
+      await notice(`Not done: ${why}`)
+      return null
+    }
+    const match = PRESS.exec(String(data ?? ''))
+    if (!match) {
+      // An outcome's line, or a button this gateway did not make.
+      record({ decision: 'ignored', why: 'a button that answers nothing' })
+      await notice('')
+      return null
+    }
+    const [, code, what] = match
+    try {
+      const closed = this.closed()
+      if (closed) return await refuse(closed)
+      const permission = this.store.getPermission(code)
+      if (!permission) return await refuse(`approval request ${code} is not open any more.`)
+      const target = this.approving(permission)
+      if (target.why) {
+        // Answered elsewhere: not open any more, and how it went.
+        const why = this.approves() && !permission.withdrawn ? `approval request ${code} is not open any more: ${target.why.replace(/^approval request \w+ /, 'it ')}` : target.why
+        return await refuse(why)
+      }
+      if (what === 'all') {
+        const open = this.store.openPermissions().sort((a, b) => a.createdAt - b.createdAt)
+        const answered = await this.approveAll(open.length ? open : [permission], 'allow', { messageId, record })
+        await notice(`Allowed ${answered.length} approval request${answered.length === 1 ? '' : 's'}.`)
+        return answered
+      }
+      if (what === 'grant' && !permission.offer) return await refuse(`approval request ${code} offers no grant; press Yes or No.`)
+      const behavior = what === 'no' ? 'deny' : 'allow'
+      const minutes = what === 'grant' ? permission.offer.minutes : null
+      const answered = await this.approve(permission, behavior, { messageId, record, minutes })
+      await notice(behavior === 'deny' ? 'Denied.' : minutes ? `Allowed, and all such for ${minutes} minutes.` : 'Allowed.')
+      return answered
+    } catch (error) {
+      return refuse(`${error.message}.`)
     }
   }
 
@@ -1239,7 +1495,9 @@ export class TelegramAnswers {
   // it answered, then sent to Claude Code. One that does not reach Claude
   // Code is open again, to be answered elsewhere. For one the gateway guessed
   // answered at the computer, the chat hears that such an answer stands.
-  async approve(permission, behavior, { messageId = null, record = () => {} } = {}) {
+  // minutes: with "yes 20", the approval grant it offers, made after the
+  // verdict reached Claude Code (approval-grants.mjs).
+  async approve(permission, behavior, { messageId = null, record = () => {}, minutes = null } = {}) {
     const { code, toolName, status, resolvedAt } = permission
     this.store.resolvePermission(code, behavior, 'telegram')
     try {
@@ -1250,11 +1508,20 @@ export class TelegramAnswers {
       throw error
     }
     this.log('telegram approval', `code=${code}`, `behavior=${behavior}`, `tool=${toolName}`)
-    record({ decision: 'accepted', as: behavior === 'allow' ? 'approval allowed' : 'approval denied', answers: code })
+    const made = minutes !== null && behavior === 'allow' ? (this.grants?.fromApproval(permission, minutes, 'telegram') ?? { why: 'approval grants are off' }) : null
+    record({
+      decision: 'accepted',
+      as: behavior === 'allow' ? (made?.grant ? `approval allowed, grant ${made.grant.id}` : 'approval allowed') : 'approval denied',
+      answers: code,
+    })
     const guessed = status === 'elsewhere' ? ' It looked answered at the computer already; if it was, that answer stands.' : ''
+    const grant = made?.grant
+      ? `\nAnd granted ${made.grant.id}: all ${made.grant.label}, until ${clock(made.grant.until)}; they no longer ask until then. ` +
+        'Send "revoke" or "Freigaben zurücknehmen" to end it.'
+      : made ? `\nNo grant: ${made.why}.` : ''
     await this.say(
       behavior === 'allow'
-        ? `Allowed: approval request ${permissionBrief(permission)}. Claude Code goes on.${guessed}`
+        ? `Allowed: approval request ${permissionBrief(permission)}. Claude Code goes on.${guessed}${grant}`
         : `Denied: approval request ${permissionBrief(permission)}. Claude Code does not run it.${guessed}`,
       messageId,
     )

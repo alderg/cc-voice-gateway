@@ -256,7 +256,10 @@ export class Store extends EventEmitter {
   // From the channel's permission relay, or with source 'hook' and the
   // subagent's name in agent from the controller's PermissionRequest hook
   // (approvals.mjs), for a subagent whose prompts the channel never gets.
-  addPermission({ request_id, tool_name, description, input_preview }, { source = 'channel', agent = null } = {}) {
+  // From the relay too with agent, when the hook's check named an ordinary
+  // subagent. offer: the approval grant it could get (approval-grants.mjs);
+  // prompt: its tool, file and asker, for a grant made later that covers it.
+  addPermission({ request_id, tool_name, description, input_preview }, { source = 'channel', agent = null, offer = null, prompt = null } = {}) {
     this.prunePermissions()
     const code = String(request_id).toLowerCase()
     this.permissions.set(code, {
@@ -269,7 +272,10 @@ export class Store extends EventEmitter {
       // | withdrawn (the hook that relayed it stopped waiting)
       status: 'open',
       announced: false, // reported to the voice client at least once
-      ...(source === 'hook' ? { source, agent } : {}),
+      ...(source === 'hook' ? { source } : {}),
+      ...(agent ? { agent } : {}),
+      ...(offer ? { offer } : {}),
+      ...(prompt ? { prompt } : {}),
     })
     this.emit('permission', this.permissions.get(code)) // for the statistics
     this.changed()
@@ -321,15 +327,17 @@ export class Store extends EventEmitter {
   }
 
   // by: where the driver answered, 'voice' (voice.mjs) or 'telegram'
-  // (telegram.mjs); the kill switch denies with 'killswitch'. Also one guessed
-  // answered at the computer: the guess may be wrong, and Claude Code drops a
-  // verdict that comes too late.
-  resolvePermission(code, behavior, by = 'voice') {
+  // (telegram.mjs); the kill switch denies with 'killswitch'; 'grant' for one
+  // a grant the driver made since covers (gateway.mjs), with its id in grant.
+  // Also one guessed answered at the computer: the guess may be wrong, and
+  // Claude Code drops a verdict that comes too late.
+  resolvePermission(code, behavior, by = 'voice', grant = null) {
     const permission = this.permissions.get(String(code).toLowerCase())
     if (!permission || !pending(permission)) return null
     permission.status = behavior
     permission.resolvedAt = Date.now()
     permission.by = by
+    if (grant) permission.grant = grant
     this.emit('permission', permission)
     this.changed()
     return permission
@@ -359,11 +367,11 @@ export class Store extends EventEmitter {
   }
 
   // Approvals the voice client heard that were answered at the computer or
-  // in Telegram since, or withdrawn: each once, so that it stops asking the
-  // driver about them.
+  // in Telegram since, allowed by a grant made since, or withdrawn: each
+  // once, so that it stops asking the driver about them.
   takeAnsweredElsewhere() {
     const elsewhere = p =>
-      p.status === 'elsewhere' || p.status === 'withdrawn' || (p.status !== 'open' && p.by === 'telegram')
+      p.status === 'elsewhere' || p.status === 'withdrawn' || (p.status !== 'open' && ['telegram', 'grant'].includes(p.by))
     const told = [...this.permissions.values()].filter(p => elsewhere(p) && p.announced && !p.toldElsewhere)
     for (const permission of told) permission.toldElsewhere = true
     return told

@@ -592,9 +592,12 @@ and fails closed.
 - **Whoever can call `approve` can approve.** The voice AI is told to approve only after an
   explicit yes; that is an instruction, not enforcement.
 - **Answered in Telegram.** With answers by Telegram on (`VOICE_GW_TELEGRAM_ANSWERS=1`), an
-  approval request in your chat is answered there too: a Reply with a plain yes or no, a message
-  with its code and yes or no, or a plain yes or no alone while it is the only one open; "yes to
-  all" allows every one open ([5.8](#58-the-telegram-fallback)). The verdict goes to Claude Code
+  approval request in your chat is answered there too: with its buttons (Yes, No, Yes to all while
+  several are open), a Reply with a plain yes or no, a message with its code and yes or no, or a
+  plain yes or no alone while it is the only one open; "yes to all" allows every one open
+  ([5.8](#58-the-telegram-fallback)).
+- **For a while:** a file write that a grant could cover offers one, "all such writes for 20
+  minutes" ([approval grants](#approval-grants)). The verdict goes to Claude Code
   as one by voice does; the first answer wins, and the voice AI hears that it was answered in
   Telegram. `VOICE_GW_TELEGRAM_CONFIRM=0` keeps approvals with the voice and the
   terminal.
@@ -631,8 +634,9 @@ without a name, is not affected: its prompts reach the channel like the main ses
   waits for them; a hook's allow or deny decides, and no dialog opens. The controller's hook,
   `controller/.claude/hooks/approval.mjs` (in `controller/.claude/settings.json`, so in plugin mode
   too), hands every teammate prompt to the gateway over `.secrets/approval.sock` and waits for the
-  verdict (`src/approvals.mjs`). The main session's and an ordinary subagent's prompts it leaves to
-  the channel, at once.
+  verdict (`src/approvals.mjs`). The main session's and an ordinary subagent's prompts it only shows
+  the gateway's quick check for [approval grants](#approval-grants) (at most two seconds), and
+  leaves them to the channel unless a grant allows them.
 - **Like the main session's.** The prompt gets a code, is read out with any voice result ("for the
   subagent standorte-drive"), goes to Telegram at once, and is answered by voice or in Telegram as
   above; the verdict goes back to the hook, which gives it to Claude Code. The kill switch denies
@@ -649,6 +653,74 @@ without a name, is not affected: its prompts reach the channel like the main ses
   anything goes wrong, the hook decides nothing, and the dialog opens at the terminal as before.
 - **Who can reach the socket:** like the admin socket, it is mode 0600 in the 0700 secrets folder,
   for processes of your user; a verdict goes back only on the connection that asked.
+
+#### Approval grants
+
+You asked in the car on 2026-11-05: "Dieser Prozess möchte in den nächsten 20 Minuten einige
+Schreibvorgänge machen. Willst du diese grundsätzlich erlauben, oder soll ich dich jedes Mal
+fragen?" An approval grant answers a kind of prompt for a while (`src/approval-grants.mjs`), instead
+of you answering each one. That morning the controller and a teammate wrote the hauswache project's
+memory files in `~/.claude/projects/…/memory` five times, and every write asked: Claude Code takes
+any path with a `.claude` or `.git` segment for a sensitive file, and for such a path, as tested with
+2.1.312, only a `PermissionRequest` hook's allow lifts the prompt, every time. Allow rules, a
+`PreToolUse` allow, `acceptEdits`, added folders and the session rules a hook may return do not.
+
+- **The offer.** At the first prompt a grant could cover, the approval request carries it, read out
+  with any voice result: "Approval needed (code=hexqp) for the subagent standorte-drive-3: Write –
+  … Offer: allow all writes to the memory files of hauswache by this subagent for 20 minutes". The
+  voice AI asks: once, no, or all such for 20 minutes? `approve` with `grant_minutes` allows it and
+  makes the grant, only when you chose that; you may name other minutes. In Telegram, "yes 20" ("ja,
+  20 Minuten", "yes for 45 minutes"), as a Reply, with the code or alone while it is the only one
+  open, or the button "⏱ Yes, 20 min" ([5.8](#58-the-telegram-fallback)). Approvals still open that
+  the new grant covers are allowed with it.
+- **What a grant covers.** One asker: the controller's main session, one subagent (its id is new with
+  every spawn), or one teammate by its name in this session. One class of tools: the file tools
+  (`Write`, `Edit`, `MultiEdit`, `NotebookEdit`); no shell, no browser, no other MCP tool. The
+  tightest folder the prompt shows: the memory folder of one project (only `*.md` files right in
+  it), one repository of the repositories folder (not the gateway's own), or one plain folder,
+  checked as strictly as a [path grant](#path-grants). 20 minutes by default
+  (`VOICE_GW_GRANT_MINUTES`), at most 120 (`VOICE_GW_GRANT_MAX_MINUTES`), and at most 100 writes
+  (`VOICE_GW_GRANT_MAX_USES`).
+- **Never covered:** push, merge, delete and restart (they take the shell or the gateway's own
+  tools, and keep their questions and approvals: a merge still asks twice); anything hidden, which is
+  every Claude Code setting and hook in a `.claude` folder, `.git`, `.github`, `.mcp.json`,
+  `.claude.json`, `.ssh`, `.config` and the shell's rc files; everything in Claude Code's folder but a
+  project's memory files; `CLAUDE.md`, `CLAUDE.local.md` and `AGENTS.md`; the gateway's checkout,
+  state, secrets and logs; the system's folders and the folders on the PATH; a git repository inside
+  a repository. By the path as the kernel resolves it: a link out, a `..` after a link, a link that
+  leads nowhere, a file that is a link and a file with a second hard link are never covered either.
+- **How it acts.** The controller's hook asks the gateway about every prompt now, the main session's
+  too (`POST /approval/check`, answered at once; the hook waits at most two seconds), and answers
+  allow when a grant covers it. For the main session, Claude Code runs the hook next to its dialog and
+  the channel's relay, and the first answer wins. So that you never hear an approval that has run
+  already, the channel's copy of a file write a grant could decide waits up to 1.5 seconds for the
+  hook's check of the same prompt (the same tool and path): allowed by a grant, the copy is dropped,
+  never read out nor sent to Telegram; otherwise it is listed as before, with its offer, and for an
+  ordinary subagent with its name. A teammate's prompt that a grant covers is allowed at once.
+- **Who makes one:** only you. Your yes to an approval that offered it, by voice or in your Telegram
+  chat; or the controller's `grant_approvals` ahead of a batch it plans, such as a subagent that will
+  write a project's memory files, after it asked you and with your words, checked in code as for
+  `standing_order`. Never a worker, a pull request, text with `trusted="no"` or the agent that asks:
+  its prompt only brings the offer, and the scope comes from the prompt as Claude Code gave it. A
+  grant is never extended; a new one takes your new answer.
+- **How it ends:** by its time or its writes; "Freigaben zurücknehmen" or "revoke the grants" (by
+  voice, through the controller's `end_grant`, or in Telegram, `/revoke`, "revoke" or "Freigaben
+  zurücknehmen", which the gateway handles itself, also while the controller is busy); the kill
+  switch and a standby end every grant. A restart of the controller ends those for a subagent, as
+  their agents end with the session; the controller's own keep their time
+  (`.state/grants.json`, shared with the temporary path grants still to come). Night mode changes
+  nothing.
+- **Where you see them:** every grant gets a line in the log ("grant g4k2 made", "permission
+  allowed by grant g4k2", "grant g4k2 ended (…)") and a message in Telegram; `open_items`, the
+  start-up summary and the voice `status` list those that hold.
+- **Off:** `VOICE_GW_APPROVAL_GRANTS=0`, or without the permission relay: every prompt asks, and
+  the hook decides nothing for the main session and ordinary subagents, as before. Without the
+  gateway, the hook fails open: no decision, the prompt asks.
+- **Write files with the file tools.** A memory file written with the shell (`printf >>`, `sed -i`)
+  asks every time: the shell is never covered. The controller's instructions say so.
+- **The temporary `temp-allow` hook** of 2026-11-05 in `~/.claude/hooks` is not needed with this: it
+  covered no memory folder, its `PreToolUse` half lifted no prompt, and its allows for the main
+  session left their copies in the car.
 
 **Dispatch needs your words.** The controller also reads text nobody here wrote: worker results,
 which carry whatever a run read, and news about pull requests. Both arrive with `trusted="no"`,
@@ -1155,8 +1227,10 @@ folder, `.git` included.
   reason in the chat. Commands: the kill switch (`/stop`, `/killswitch`, `/emergencystop` or an
   emergency phrase), the Funnel (`/funnel on`, `/funnel off`, `/funnel`, "keep alive";
   [7.3](#73-publishing-the-endpoint)), the statistics (`/stats`, `/stats all`;
-  [8.5](#85-statistics)) and night mode (`/night`, "good night" on, `/night 09:00` until then;
-  `/back`, "I'm back" off; [night mode](#night-mode)). The kill switch comes first, also in a
+  [8.5](#85-statistics)), night mode (`/night`, "good night" on, `/night 09:00` until then;
+  `/back`, "I'm back" off; [night mode](#night-mode)) and the approval grants (`/revoke`, "revoke"
+  or "Freigaben zurücknehmen" ends them all, `/revoke g4k2` one; [approval
+  grants](#approval-grants)), which needs no Telegram input, as it only narrows. The kill switch comes first, also in a
   forwarded or edited message: a stop can only lock. With Telegram input on, also answers to
   questions and any other message as a request (below); a Reply to a question is its answer,
   whatever it says, and with requests on, a command stays a command as a Reply to any other
@@ -1256,6 +1330,30 @@ folder, `.git` included.
   denies every open approval anyway) or the gateway is inactive. With answers by Telegram off, or
   with `VOICE_GW_TELEGRAM_CONFIRM=0`, approval requests still come to the chat at once, to answer
   by voice or at the terminal; without the permission relay there are none.
+- **Buttons.** You asked: "Könnte man das beim CC-Gateway für die Approval Requests auch so
+  umsetzen, dass man per Knopfdruck Yes, No und, wenn mehrere pendent sind, Yes to all sagen
+  kann?" Where you may answer approvals there, each approval request comes with buttons, as
+  hauswache's messages do: ✅ Yes and ❌ No; ⏱ Yes, 20 min where it offers an [approval
+  grant](#approval-grants); and ✅ Yes to all while more than one is open, which comes and goes under
+  every open one as their number changes. A press counts as the same answer typed: the verdict to
+  Claude Code, the chat's confirmation as a reply to the request, "Yes to all" listing what it
+  allowed, the input log. A short notice over the button says what it did ("Allowed.", "Not done: …").
+  Once a request is answered, here, by voice or by a grant, denied by the kill switch or withdrawn,
+  its buttons give way to one line with the outcome ("✅ Allowed by voice", "⛔ Denied: the kill
+  switch locked", "⏹ Not open any more"), which answers nothing, so that nothing stale stays to
+  press. A button carries only the approval's code and what it does; the code must name an approval
+  that is still open, or the press hears that it is not open any more. Only a press from your own
+  account on a message in your private chat with the bot counts; anyone else's is ignored without a
+  word, and kept in the input log. Nothing while the kill switch is locked or the gateway inactive.
+  With answers off or `VOICE_GW_TELEGRAM_CONFIRM=0` the requests come without buttons, and a press
+  of an old one hears that approvals take the voice.
+- **For a while.** On an approval request that offers an [approval grant](#approval-grants), its
+  last line says so: "Or "yes 20" to allow it and all writes to the memory files of hauswache by
+  this subagent for 20 minutes." "yes 20", "ja, 20 Minuten" or "yes for 45 minutes", as a Reply, with
+  its code or alone while it is the only one open, or the button, allows it and makes the grant; the
+  chat names it with its end ("And granted g4k2: …, until 11:02 … Send "revoke" or "Freigaben
+  zurücknehmen" to end it."). On one that offers none, "yes 20" allows it once and says so. A grant
+  made by voice or asked ahead by the controller is told here too.
 - **Keeping them with your voice** (`VOICE_GW_TELEGRAM_CONFIRM=0`, or any value but `1`, so that a
   typo lets nothing more through). Ordinary requests and answers still come by Telegram; push,
   merge, restart, delete and approvals do not. Their questions on Telegram say "Answer in voice
@@ -1583,7 +1681,7 @@ the same. Otherwise they say: only at the computer.
 | `.secrets/` | Folder for everything below | 0700 |
 | `.secrets/oauth.json` | Clients and grants, hashes only | 0600 |
 | `.secrets/admin.sock` | Admin socket of the running gateway | socket in the 0700 folder |
-| `.secrets/approval.sock` | Where the controller's approval hook hands its teammates' approval prompts to the running gateway and waits for the verdict ([5.4](#54-approvals-by-voice)) | 0600, in the 0700 folder |
+| `.secrets/approval.sock` | Where the controller's approval hook hands its teammates' approval prompts to the running gateway and waits for the verdict, and asks about every other prompt for the [approval grants](#approval-grants) ([5.4](#54-approvals-by-voice)) | 0600, in the 0700 folder |
 | `.secrets/gateway.env` | Settings from the setup assistant | 0600 |
 | `.secrets/telegram_token`, `.secrets/telegram_chat_id` | The Telegram bot, and your chat with it, whose id is your user id | 0600, tightened at every start |
 | `.secrets/killswitch.json` | Kill switch state, present while locked, with the count of wrong PINs in voice mode; never a PIN, which lives only in the gateway's memory | 0600 |
@@ -1596,6 +1694,7 @@ the same. Otherwise they say: only at the computer.
 | `.state/requests.json` | Voice requests and the answers, with what the voice client has read | 0600 |
 | `.state/telegram-input.log`, `.state/telegram-input.log.1` | Every message the bot received, with the decision and why; without the token ([5.8](#58-the-telegram-fallback)); rotated at 1 MB | 0600, folder 0700 |
 | `.state/jobs.json` | Open decisions, with the driver's answers, and the last 100 closed ones for a week | 0600 |
+| `.state/grants.json` | The grants you gave for a while, [approval grants](#approval-grants) now: asker, scope, until when, uses, how you gave them; ended ones for a day | 0600 |
 | `.state/stats.json` | The statistics: this running time and all time, counts, sums and the last 100 durations per figure, repository names; no texts ([8.5](#85-statistics)) | 0600 |
 | `.logs/gateway.log`, `.logs/gateway.log.1` | Log, without tokens; rotated at `VOICE_GW_LOG_MAX_MB` | 0600, folder 0700 when the gateway creates it |
 
@@ -2815,14 +2914,18 @@ limits at once.
 | `VOICE_GW_PORT` | `8787` | Local HTTP port |
 | `VOICE_GW_HOST` | `127.0.0.1` | Bind address; keep loopback |
 | `VOICE_GW_SECRETS_DIR` | `.secrets` | Secrets, settings file, admin socket |
-| `VOICE_GW_STATE_DIR` | `.state` | Worker state and queue, run output, requests, open decisions, pull request watches, usage limit waits, night mode, standing orders |
+| `VOICE_GW_STATE_DIR` | `.state` | Worker state and queue, run output, requests, open decisions, pull request watches, usage limit waits, night mode, standing orders, grants |
 | `VOICE_GW_SELF_CHECKOUT` | This checkout | The checkout whose uncommitted changes and commits on no remote a "done" reply mentions ([5.5](#55-workers-on-this-computer-or-in-docker)); empty: none. Tests use a stand-in |
 | `VOICE_GW_REMIND_MINUTES` | `30` | Minutes before a decision you were never asked about, or a question you have not answered, comes back to the controller as a reminder, at most three times ([8.4](#84-voice-commands)) |
 | `VOICE_GW_LOG_FILE` | `.logs/gateway.log` | Empty: stderr only |
 | `VOICE_GW_LOG_MAX_MB` | `10` | Past this size the log moves to `gateway.log.1`, replacing the one before |
 | `VOICE_GW_OAUTH_HOSTS` | `claude.ai,claude.com` | Hosts allowed in redirect addresses and client ID metadata documents |
 | `VOICE_GW_MCP_ALLOW` | `160.79.104.0/21`, Anthropic's | Ranges (CIDR) or addresses that may call `/mcp` through the tunnel, comma-separated; `any`: no limit, for a tunnel without `X-Forwarded-For` ([5.2](#52-the-voice-endpoint-and-oauth)) |
-| `VOICE_GW_PERMISSION_RELAY` | on | `0`: approvals only at the terminal, the controller's teammates' too (its approval hook then decides nothing) |
+| `VOICE_GW_PERMISSION_RELAY` | on | `0`: approvals only at the terminal, the controller's teammates' too (its approval hook then decides nothing), and no approval grants |
+| `VOICE_GW_APPROVAL_GRANTS` | on | An approval prompt for a file write offers to allow all such writes of its asker in its folder for a while, and the controller's hook answers them ([approval grants](#approval-grants)); `0`: every prompt asks |
+| `VOICE_GW_GRANT_MINUTES` | `20` | Minutes an approval grant holds when you name none |
+| `VOICE_GW_GRANT_MAX_MINUTES` | `120` | The most minutes an approval grant may hold; at least 5 |
+| `VOICE_GW_GRANT_MAX_USES` | `100` | Writes after which an approval grant ends |
 | `VOICE_GW_DEFAULT_WAIT` | `25` | Seconds `get_reply` waits by default |
 | `VOICE_GW_MAX_WAIT` | `40` | Upper limit for `get_reply` and `ask` |
 | `VOICE_GW_ASK_WAIT` | `8` | Seconds `ask` waits for a quick answer before it returns still running; at most `VOICE_GW_MAX_WAIT` |
@@ -3022,6 +3125,9 @@ gateway; do not set them.
 | The Funnel goes off while you still use voice mode | It goes off `VOICE_GW_FUNNEL_IDLE` minutes after the last voice call; a long silence counts. Raise the minutes, or send "keep alive". |
 | No approval by voice | Expected for Bash, Write and Edit: they run without asking. For other tools: the session runs in auto or bypass mode, an allow rule covers the tool, or it is a trust or consent dialog, which is not relayed. Start the session with `scripts/start-controller.sh`. |
 | The terminal shows an approval waiting, the car and Telegram nothing | Every open approval comes with any voice call's result, `send` and `approve` included, and goes to Telegram at once; none drops after a time. Below `unrestricted`, a tool call of the controller after the prompt makes the gateway guess it was answered at the computer and take it off the lists ([5.4](#54-approvals-by-voice)): if one still waits then, answer it at the terminal, or by voice or in Telegram with its code from its Telegram message, which still reaches Claude Code. In a standby nothing goes out until the connector signs in again. A prompt "from the … agent" is a teammate's: the controller's approval hook hands those over ([5.4](#54-approvals-by-voice)); if one shows at the terminal, the hook could not reach the gateway (the log has no `approval socket ready`), the relay is off, or the controller was started before the hook was in `controller/.claude/settings.json`: restart it. |
+| A write still asks although a grant holds for it | Read the grant in `open_items` or `status`: it covers one asker (the main session, one subagent, one teammate), the file tools only and one folder. A write with the shell (`printf >>`, `sed -i`) always asks, and so does another subagent, another project's memory folder or a subfolder of one, anything hidden, `CLAUDE.md` or a settings file ([approval grants](#approval-grants)). The log says `permission allowed by grant …` for each write it covered. `approval grants off` in the log: `VOICE_GW_APPROVAL_GRANTS=0`, or the relay is off. A controller started before the hook asked about every prompt keeps the old hook's behaviour only if `controller/.claude/hooks/approval.mjs` is the old one: the hook file is read at every prompt, no restart needed. |
+| The car or Telegram tells an approval that ran already | A hook's allow for the main session runs next to the channel's relay. The gateway holds the relayed copy of a file write up to 1.5 s for the hook's check and drops it when a grant allowed it; a copy whose preview the gateway cannot pair with the check (a path cut or changed by Claude Code's preview) is listed. Answer it either way: Claude Code drops a late verdict. |
+| An approval request in Telegram has no buttons, or a button only says "Not done" | Buttons come only where approvals are answered there: Telegram input on and `VOICE_GW_TELEGRAM_CONFIRM` not `0`. "Not done: … not open any more": it was answered elsewhere, by voice, by a grant or by the kill switch, or the subagent stopped waiting; the buttons of an answered one give way to its outcome. "Not done: the kill switch is locked" or "inactive": as for typed answers. A press from another account or chat is ignored without an answer (`.state/telegram-input.log`). |
 | A helper agent of the controller waits and nothing asks | A teammate's prompt waits in the approval hook, with no dialog at the terminal, until it is answered by voice or in Telegram: `status` by voice lists it ("for the subagent …"), the gateway's log has `permission_request … subagent=…`. Stopping the agent does not end the wait; deny the prompt. |
 | The controller still starts with the development flag after the admin step | The log line `channel: the development flag, since …` says why. The script reads Claude Code's local copy of the managed settings (`~/.claude/remote-settings.json`), which Claude Code updates when a session starts, so the first start after the admin step still sees the old copy: answer the warning or quit, and start again. `node scripts/channel-mode.mjs` shows what the next start will use; `claude doctor` shows whether the managed settings arrived. |
 | With `VOICE_GW_REMOTE_CONTROL=1`, "Voice controller" is missing in the Claude app | It counts from the next start of the session; the log line `watchdog: remote control: …` shows that it was passed. The controller's terminal (`tmux attach -t voice`) shows why it did not connect, and `claude doctor` which check failed: Claude Code signed in with an API key or a token instead of claude.ai, `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` or `DISABLE_GROWTHBOOK` set, or on Team and Enterprise Remote Control not turned on by an Owner ([7.4](#74-admin-steps-for-team-and-enterprise)). After a restart, take the newest session of that name. |
@@ -3140,6 +3246,17 @@ version changes this, a teammate's prompts open at the terminal again, as before
 a teammate while it waits on a prompt does not end the wait in 2.1.312: a later yes still runs the
 call.
 
+**Approval grants rely on Claude Code's hooks as 2.1.312 runs them.** That a `PermissionRequest`
+hook's allow lifts the prompt for a sensitive path (in a `.claude` folder, say) while allow rules,
+a `PreToolUse` allow and session rules do not; that the hook runs for the main session next to its
+dialog and the channel's relay, the first answer winning; and that it gets `agent_id` for a
+subagent ([approval grants](#approval-grants)). A later version may change any of it, and 2.1.318
+is on disk already: rerun the experiments of the approval-grants analysis before moving to it. If
+the hook's allow no longer counts, every prompt asks again, the safe side; if the main session's
+hook ran before its relay or not at all, the gateway's 1.5 s hold of a copy could come too short or
+in vain, and you would hear a prompt that ran already, or one more time. The Claude in Chrome tools
+and other MCP tools are left out until a live test shows a hook's allow works for them.
+
 ## 9. Repository layout
 
 ```text
@@ -3164,17 +3281,18 @@ src/
   access.mjs         access levels in the container, from the GitHub token
   pulls.mjs          the watch on pull requests that workers open
   digest.mjs         routine news about them, gathered into one event for the controller
-  telegram.mjs       Telegram fallback; /stop, /funnel, answers, approvals and requests from your own chat (off by default), the input log
+  telegram.mjs       Telegram fallback; /stop, /funnel, /revoke, answers, approvals (buttons too) and requests from your own chat (off by default), the input log
   funnel.mjs         the Funnel on and off from Telegram, and off by itself when idle
   killswitch.mjs     the kill switch: state, emergency phrases, alarm, the unlock in voice mode with a PIN
   guard.mjs          the kill switch's rules on the workers' runs
-  grants.mjs         path grants: folders a repository's workers may write to, checked strictly
+  grants.mjs         path grants: folders a repository's workers may write to, checked strictly; the ledger of grants for a while
+  approval-grants.mjs approval grants: a kind of file write by one asker in one folder for a while, the never-list
   restart.mjs        restarting the controller by voice, through the watchdog
   plugin.mjs         the gateway as the MCP server of the plugin voice@cc-voice-gateway
   store.mjs          requests and approvals, persisted across restarts
   folders.mjs        cloning and deleting in the worker root, above the level confined
   admin.mjs          Unix socket for pair.mjs, unlock.mjs, fake-voice and the setup's pairing codes
-  approvals.mjs      Unix socket for the controller's approval hook: its teammates' prompts, the verdicts back
+  approvals.mjs      Unix socket for the controller's approval hook: its teammates' prompts, the verdicts back; the grants' check
   config.mjs         settings from the environment and .secrets/gateway.env
   settings.mjs       reads and writes .secrets/gateway.env
   platform.mjs       what differs on macOS: temporary folders, the autostart's PATH and names
@@ -3183,9 +3301,9 @@ src/
   http.mjs, log.mjs  small HTTP helpers; log to stderr and file, never stdout
 controller/
   .mcp.json          starts the gateway as the server "voice"
-  .claude/settings.json        allow and deny rules, the hooks
+  .claude/settings.json        allow rules (the gateway's tools, Monitor), the hooks; your connectors' in settings.local.json
   .claude/hooks/confine.mjs    the controller's confinement
-  .claude/hooks/approval.mjs   its teammates' approval prompts to the gateway, the verdict back
+  .claude/hooks/approval.mjs   its teammates' approval prompts to the gateway, the verdict back; every prompt to the grants' check
   CLAUDE.md          the controller's instructions
   playground/        the one folder the controller writes to
 .claude-plugin/      this repository as the marketplace cc-voice-gateway, with the plugin voice

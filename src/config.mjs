@@ -136,6 +136,15 @@ export const config = {
   // client so they can be approved by voice. Set VOICE_GW_PERMISSION_RELAY=0
   // to keep approvals in the terminal / Claude app only.
   permissionRelay: env.VOICE_GW_PERMISSION_RELAY !== '0',
+  // Approval grants (approval-grants.mjs): an approval prompt for a file write
+  // that a grant could cover offers the driver to allow all such writes of
+  // that asker in that folder for a while; the controller's hook then answers
+  // them itself. On with the relay; 0 asks each time, as before. How long one
+  // holds by default and at most, in minutes, and how many writes at most.
+  approvalGrants: env.VOICE_GW_APPROVAL_GRANTS !== '0',
+  grantMinutes: num(env.VOICE_GW_GRANT_MINUTES, 20),
+  grantMaxMinutes: num(env.VOICE_GW_GRANT_MAX_MINUTES, 120),
+  grantMaxUses: num(env.VOICE_GW_GRANT_MAX_USES, 100),
 
   // Long-poll limits for get_reply/ask. MCP clients commonly abort a request
   // after 60 s, so a single call must return well before that.
@@ -400,6 +409,8 @@ config.limitsFile = join(config.stateDir, 'limits.json')
 config.nightFile = join(config.stateDir, 'night.json')
 // The driver's standing orders (orders.mjs).
 config.ordersFile = join(config.stateDir, 'orders.json')
+// The grants the driver gives for a while, approval grants first (grants.mjs, approval-grants.mjs).
+config.grantsFile = join(config.stateDir, 'grants.json')
 // The statistics of this running time and of all time (stats.mjs).
 config.statsFile = join(config.stateDir, 'stats.json')
 // The files the kill switch's rule on writes outside moved out of the way,
