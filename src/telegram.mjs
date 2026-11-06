@@ -27,15 +27,15 @@
 // (/stats, /stats all; see stats.mjs) and night mode. And, only when the
 // driver turned Telegram input on (off by default), their answers to its
 // questions (TelegramAnswers, VOICE_GW_TELEGRAM_ANSWERS): a Reply to a
-// question's message, or a message with the question's code, goes to the
-// controller as their answer, like one by voice. Any other message is a
-// request of theirs, as one by voice is (VOICE_GW_TELEGRAM_REQUESTS). The
-// controller's replies to either come back to the chat. Push, merge, restart
-// and delete count here as by voice, and Claude Code's approval requests are
-// answered here with a yes or a no, unless VOICE_GW_TELEGRAM_CONFIRM=0 keeps
-// them with the voice. Nothing here unlocks the kill switch: the PIN for the
-// unlock in voice mode comes to the chat (killswitch.mjs), and typed back
-// here it counts for nothing, masked.
+// question's message, a message with the question's code, or a press of a
+// button under it, goes to the controller as their answer, like one by
+// voice. Any other message is a request of theirs, as one by voice is
+// (VOICE_GW_TELEGRAM_REQUESTS). The controller's replies to either come back
+// to the chat. Push, merge, restart and delete count here as by voice, and
+// Claude Code's approval requests are answered here with a yes or a no,
+// unless VOICE_GW_TELEGRAM_CONFIRM=0 keeps them with the voice. Nothing here
+// unlocks the kill switch: the PIN for the unlock in voice mode comes to the
+// chat (killswitch.mjs), and typed back here it counts for nothing, masked.
 //
 // On only when .secrets/telegram_token and .secrets/telegram_chat_id both
 // exist and are not empty. The token is part of every API address, so it must
@@ -133,7 +133,7 @@ export class Telegram {
   // all the same if that message is gone. quote: false for a message that is
   // never quoted to the controller, the unlock PIN (killswitch.mjs): its id
   // is not kept, so a Reply to it comes without its text. markup: buttons
-  // under it, { inline_keyboard } (approvalButtons).
+  // under it, { inline_keyboard } (approvalButtons, questionButtons).
   async send(text, { replyTo = null, quote = true, markup = null } = {}) {
     const body = { chat_id: this.chatId, text: String(text).slice(0, MAX_TEXT) }
     if (replyTo !== null) body.reply_parameters = { message_id: replyTo, allow_sending_without_reply: true }
@@ -424,11 +424,11 @@ export class TelegramCommands extends EventEmitter {
     return null
   }
 
-  // A press of a button under one of the bot's messages (approvalButtons):
-  // only the driver's own, on a message in their private chat with the bot,
-  // as for a message; a stranger's is ignored without a word back. 'press'
-  // ({ id, data, messageId, seen }) for TelegramAnswers, which decides what
-  // it does and answers it.
+  // A press of a button under one of the bot's messages (approvalButtons,
+  // questionButtons): only the driver's own, on a message in their private
+  // chat with the bot, as for a message; a stranger's is ignored without a
+  // word back. 'press' ({ id, data, messageId, seen }) for TelegramAnswers,
+  // which decides what it does and answers it.
   press(query) {
     const message = query.message ?? {}
     const seen = {
@@ -624,8 +624,9 @@ export function scrubEnv(env, secrets) {
 }
 
 // A question, with its code in the first line and in the last. answerable:
-// whether the driver may answer it here (TelegramAnswers.accepts).
-function describeQuestion(request, update, answerable = false) {
+// whether the driver may answer it here (TelegramAnswers.accepts); buttons:
+// whether it comes with buttons (questionButtons).
+function describeQuestion(request, update, answerable = false, buttons = false) {
   const about = request.worker
     ? `worker ${request.worker.repo}, task ${request.worker.task}`
     : request.via === 'telegram' && request.answers
@@ -637,9 +638,115 @@ function describeQuestion(request, update, answerable = false) {
     update.text,
     '',
     answerable
-      ? `To answer, reply to this message, or write a message that starts with ${request.id}. Or answer in voice mode and mention ${request.id}.`
+      ? `To answer, ${buttons ? 'press a button, ' : ''}reply to this message, or write a message that starts with ${request.id}. ` +
+          `Or answer in voice mode and mention ${request.id}.`
       : `Answer in voice mode and mention ${request.id}.`,
   ].join('\n')
+}
+
+// --- buttons under a question --------------------------------------------------
+//
+// The driver asked: "können wir bei solchen nachfragen auch knöpfe einbauen
+// damit sich das direkt per klick beantworten lässt?" A question in the chat,
+// the first ask and each reminder, comes with buttons where the driver may
+// answer it there (TelegramAnswers.accepts): the answers the controller named
+// with it (reply's options, two to four short labels), or else ✅ Ja and ❌ Nein,
+// in the question's language. A button's data is "ques:<request>:<n>": the
+// label comes from the question the gateway keeps, never from the data, and a
+// press goes as the label typed as a Reply would (TelegramAnswers.press). Once
+// the question is answered anywhere, by voice, typed or pressed, or settled,
+// the buttons of every message of it give way to one line with the outcome
+// that answers nothing (TelegramFallback.keyboards), and never come back.
+
+export const QUESTION_PRESS = /^ques:([a-hjkmnp-z2-9]{4}):([0-3])$/
+export const MIN_OPTIONS = 2
+export const MAX_OPTIONS = 4
+export const MAX_OPTION_LENGTH = 40
+
+// The reply tool's options, as the controller gives them: a list of two to
+// four short labels, or a string of them separated by commas. { options },
+// null for none (an empty list too), or { why } they are none.
+export function optionLabels(value) {
+  if (value === undefined || value === null || value === '') return { options: null }
+  const list = typeof value === 'string' ? value.split(/[,\n|]/) : value
+  if (!Array.isArray(list) || list.some(label => typeof label !== 'string')) return { why: 'options must be a list of short labels.' }
+  const options = list.map(label => label.replace(/\s+/g, ' ').trim()).filter(Boolean)
+  if (!options.length) return { options: null }
+  if (options.length < MIN_OPTIONS || options.length > MAX_OPTIONS) {
+    return { why: `options takes ${MIN_OPTIONS} to ${MAX_OPTIONS} short labels, not ${options.length}.` }
+  }
+  const long = options.find(label => [...label].length > MAX_OPTION_LENGTH)
+  if (long) return { why: `the option "${preview(long, 50)}" is longer than ${MAX_OPTION_LENGTH} characters; name it in a few words.` }
+  if (new Set(options.map(label => label.toLowerCase())).size < options.length) return { why: 'options holds the same label twice.' }
+  return { options }
+}
+
+// Whether a question reads as German, for the default answers: looksGerman's
+// words, and those a question in German has that no English one does.
+const QUESTION_GERMAN = new Set(
+  'ich du sie wir ihr soll sollen sollte willst wollen möchtest kann kannst können darf dürfen wird werden oder dass für auf zu zum zur von vom wie wann wo welche welcher welches schon lieber machen gleich erst heute einen eine ein diesen dieses diese'.split(' '),
+)
+const questionGerman = text =>
+  looksGerman(text) || (String(text).toLowerCase().match(/\p{L}+/gu) ?? []).some(word => QUESTION_GERMAN.has(word))
+
+// The labels of a question's buttons: its options, or yes and no.
+export function questionLabels(update) {
+  if (Array.isArray(update.options) && update.options.length >= MIN_OPTIONS) return update.options.slice(0, MAX_OPTIONS)
+  return questionGerman(update.text) ? ['Ja', 'Nein'] : ['Yes', 'No']
+}
+
+// Two short ones side by side, else one a row, so that a phone shows each whole.
+export function questionButtons(request, update) {
+  const named = Array.isArray(update.options) && update.options.length >= MIN_OPTIONS
+  const labels = questionLabels(update)
+  const buttons = labels.map((label, n) => ({
+    text: named ? label : `${n === 0 ? '✅' : '❌'} ${label}`,
+    callback_data: `ques:${request.id}:${n}`,
+  }))
+  const side = buttons.length === 2 && labels.every(label => [...label].length <= 16)
+  return { inline_keyboard: side ? [buttons] : buttons.map(button => [button]) }
+}
+
+// Whether a question is still open to an answer: its request still waits on
+// it (an answer settles it, store.markAnswered), with update its latest
+// question, as one asked again on the same request takes the place of the
+// one before, and of the decisions asked on it, one is not answered or
+// closed yet. A reminder's question is open no longer once the first ask was
+// answered, and the other way round, as they ask the same decision (ledger.mjs).
+export function questionOpen(request, ledger = null, update = null) {
+  if (!request || request.state !== 'question') return false
+  if (update && update !== request.updates.at(-1)) return false
+  const decisions = ledger?.forRequest(request.id, { closed: true }) ?? []
+  return !decisions.length || decisions.some(d => d.state === 'pending' || d.state === 'asked')
+}
+
+// The driver's answer to a question that is not open any more, to it or to
+// a decision asked on it, as a reminder's, given after the question was
+// asked (since): { by, words }, by ' by voice' or '' for here; null when it
+// was settled without one.
+function questionAnswer(request, { store = null, ledger = null } = {}, since = 0) {
+  const decided = (ledger?.forRequest(request.id, { closed: true }) ?? [])
+    .filter(d => d.answeredBy && d.answeredAt >= since).sort((a, b) => a.answeredAt - b.answeredAt).at(-1)
+  const own = request.answeredBy && !(store?.getRequest(request.answeredBy)?.createdAt < since) ? request.answeredBy : null
+  const answerId = own ?? decided?.answeredBy ?? null
+  if (!answerId) return null
+  const answer = store?.getRequest(answerId)
+  const words = answer ? answer.text.replace(/^\(Answer to [^)]*\)\s*/, '') : (decided?.answer ?? '')
+  return { by: answer && answer.via !== 'telegram' ? ' by voice' : '', words: preview(words, 40) }
+}
+
+// In place of the buttons of a question that is not open any more: what came of it.
+export function questionOutcome(request, known = {}, since = 0) {
+  const answer = questionAnswer(request, known, since)
+  if (!answer) return '⏹ Not open any more'
+  return answer.words ? `✅ Answered${answer.by}: ${answer.words}` : `✅ Answered${answer.by}`
+}
+
+// The same in a sentence, for a press of an old button.
+function questionGone(request, known = {}, since = 0) {
+  const answer = questionAnswer(request, known, since)
+  const how = answer ? `it was answered${answer.by}${answer.words ? ` ("${answer.words}")` : ''}` : 'it was answered or settled'
+  return `question ${request.id} is not open any more: ${how}.`
 }
 
 // The controller's answer or interim status on an answer or a request that
@@ -756,7 +863,9 @@ export class TelegramFallback {
   // question here (TelegramAnswers.accepts). approvable(): whether they may
   // answer approval requests here (TelegramAnswers.approves). edit(id,
   // markup): changes the buttons under a message sent here; with it, an
-  // approval request the driver may answer here comes with buttons.
+  // approval request or a question the driver may answer here comes with
+  // buttons. ledger: the open decisions, which tell when a question's
+  // buttons give way (questionOpen); a closed one changes them too.
   constructor(
     store,
     {
@@ -767,12 +876,14 @@ export class TelegramFallback {
       answerable = () => false,
       approvable = () => false,
       edit = null,
+      ledger = null,
       log = defaultLog,
     },
   ) {
     this.store = store
     this.send = send
     this.edit = edit
+    this.ledger = ledger
     this.afterSeconds = afterSeconds
     this.afterMs = afterSeconds * 1000
     this.paused = paused
@@ -786,6 +897,7 @@ export class TelegramFallback {
     this.check = this.check.bind(this)
     store.on('change', this.check)
     store.on('voice', this.check)
+    ledger?.on('closed', this.check)
     this.check()
   }
 
@@ -793,6 +905,7 @@ export class TelegramFallback {
     clearTimeout(this.timer)
     this.store.off('change', this.check)
     this.store.off('voice', this.check)
+    this.ledger?.off('closed', this.check)
   }
 
   // Runs on every change in the store and when the voice mode may have ended.
@@ -843,11 +956,35 @@ export class TelegramFallback {
         update.telegram = true
         marked = true
         // Its message id, so that a Reply to it finds the question.
-        this.deliver(() => describeQuestion(request, update, this.answerable(request)), { sent: id => (update.telegramMessage = id) })
+        this.question(request, update)
       }
     }
     // The marks go into the saved requests, so a restart sends nothing twice.
     if (marked) this.store.save?.()
+  }
+
+  // A question to the chat, with buttons where the driver may answer it here
+  // (questionButtons), both made when it is its turn. Its message id, so that
+  // a Reply or a press finds it. replyTo: the driver's message it answers.
+  question(request, update, replyTo = null) {
+    const buttons = () => Boolean(this.edit) && this.answerable(request) && questionOpen(request, this.ledger, update)
+    let shown = false
+    this.deliver(
+      () => {
+        shown = buttons()
+        return describeQuestion(request, update, this.answerable(request), shown)
+      },
+      {
+        replyTo,
+        markup: () => {
+          if (!shown) return null
+          const markup = questionButtons(request, update)
+          update.buttons = JSON.stringify(markup) // what the chat shows, for keyboards
+          return markup
+        },
+        sent: id => (update.telegramMessage = id),
+      },
+    )
   }
 
   // Every approval request goes here as soon as Claude Code raises it, once:
@@ -871,10 +1008,11 @@ export class TelegramFallback {
     }
   }
 
-  // The buttons under the approval requests sent here, as they should be
-  // now: Yes to all comes and goes with the number open, and those of one
-  // answered, here or elsewhere, or withdrawn, give way to its outcome, so
-  // that nothing stale stays to press. Only under those sent with buttons.
+  // The buttons under the approval requests and questions sent here, as they
+  // should be now: Yes to all comes and goes with the number open, and those
+  // of one answered, here or elsewhere, or withdrawn or settled, give way to
+  // its outcome, so that nothing stale stays to press. Only under those sent
+  // with buttons.
   keyboards() {
     if (!this.edit) return
     const open = this.store.openPermissions().length
@@ -886,12 +1024,37 @@ export class TelegramFallback {
       const key = JSON.stringify(markup)
       if (key === permission.buttons) continue
       permission.buttons = key
-      const { code, telegramMessage } = permission
-      this.queue = this.queue
-        .then(() => this.edit(telegramMessage, markup))
-        .then(() => this.log('telegram buttons changed:', `approval ${code}`, preview(markup.inline_keyboard.flat().map(button => button.text).join(', '), 80)))
-        .catch(error => this.log('telegram buttons not changed:', `approval ${code}`, '-', error.message))
+      this.editButtons(permission.telegramMessage, markup, `approval ${permission.code}`)
     }
+    // And under the questions: their outcome once they are not open any
+    // more, kept, so that the buttons never come back; none while the driver
+    // may not answer them here.
+    let changed = false
+    for (const request of this.store.requests.values()) {
+      for (const update of request.updates) {
+        if (!update.buttons || !Number.isInteger(update.telegramMessage)) continue
+        if (!update.outcome && !questionOpen(request, this.ledger, update)) {
+          update.outcome = questionOutcome(request, { store: this.store, ledger: this.ledger }, update.at)
+        }
+        const markup = update.outcome
+          ? { inline_keyboard: [[{ text: update.outcome, callback_data: '-' }]] }
+          : this.answerable(request) ? questionButtons(request, update) : { inline_keyboard: [] }
+        const key = JSON.stringify(markup)
+        if (key === update.buttons) continue
+        update.buttons = key
+        changed = true
+        this.editButtons(update.telegramMessage, markup, `question ${request.id}`)
+      }
+    }
+    if (changed) this.store.saveSoon?.()
+  }
+
+  // The buttons under one message, in their turn after what goes out before.
+  editButtons(messageId, markup, what) {
+    this.queue = this.queue
+      .then(() => this.edit(messageId, markup))
+      .then(() => this.log('telegram buttons changed:', what, preview(markup.inline_keyboard.flat().map(button => button.text).join(', '), 80)))
+      .catch(error => this.log('telegram buttons not changed:', what, '-', error.message))
   }
 
   // The controller's replies to an answer or a request the driver gave here
@@ -905,7 +1068,7 @@ export class TelegramFallback {
         update.telegram = true
         const replyTo = request.telegramMessage ?? null
         if (update.state === 'question') {
-          this.deliver(() => describeQuestion(request, update, this.answerable(request)), { replyTo, sent: id => (update.telegramMessage = id) })
+          this.question(request, update, replyTo)
         } else {
           this.deliver(describeReply(request, update), { replyTo })
         }
@@ -1394,17 +1557,7 @@ export class TelegramAnswers {
         record({ decision: 'accepted', as: 'request', request: request.id })
         return request
       }
-      const { question } = result
-      const request = this.store.createRequest(`(Answer to ${question.id}) ${said}`, { answers: question.id, via: 'telegram' })
-      // The meta stays with it, for an event sent again after the usage limit.
-      request.meta = { via: 'telegram' }
-      if (messageId !== null) request.telegramMessage = messageId // the controller's replies answer it
-      this.store.markAnswered(question, request.id)
-      await this.push(request)
-      this.log('telegram answer passed on', `id=${request.id}`, `answers=${question.id}`)
-      record({ decision: 'accepted', as: 'answer', request: request.id, answers: question.id })
-      await this.say(`Passed on to the controller as your answer to ${question.id}.${this.heldText()}`, messageId)
-      return request
+      return await this.answer(result.question, said, { messageId, record })
     } catch (error) {
       this.log('telegram message failed:', error.message)
       record({ decision: 'refused', why: error.message })
@@ -1413,9 +1566,57 @@ export class TelegramAnswers {
     }
   }
 
+  // The driver's answer to a question, typed or pressed: to the controller as
+  // "(Answer to <id>) <text>", a request of theirs with via="telegram", as
+  // one by voice; the question counts as answered, its open decisions keep
+  // the answer (gateway.mjs), and the chat hears it is passed on. messageId:
+  // the message the controller's replies answer, the driver's own, or for a
+  // press the question's. label: what they pressed, for the chat.
+  async answer(question, said, { messageId = null, record = () => {}, label = null } = {}) {
+    const request = this.store.createRequest(`(Answer to ${question.id}) ${said}`, { answers: question.id, via: 'telegram' })
+    // The meta stays with it, for an event sent again after the usage limit.
+    request.meta = { via: 'telegram' }
+    if (messageId !== null) request.telegramMessage = messageId // the controller's replies answer it
+    this.store.markAnswered(question, request.id)
+    await this.push(request)
+    this.log('telegram answer passed on', `id=${request.id}`, `answers=${question.id}`, ...(label === null ? [] : ['(button)']))
+    record({ decision: 'accepted', as: 'answer', request: request.id, answers: question.id })
+    const pressed = label === null ? '' : `: "${label}"`
+    await this.say(`Passed on to the controller as your answer to ${question.id}${pressed}.${this.heldText()}`, messageId)
+    return request
+  }
+
+  // A press of a button under a question (questionButtons; "ques:<id>:<n>"
+  // in data, matched): the question's own label n goes as that label typed
+  // as a Reply to it would, through the same gates: nothing while the kill
+  // switch is locked or the gateway inactive, nothing with answers off or for
+  // a push, merge, restart or delete decision with VOICE_GW_TELEGRAM_CONFIRM=0,
+  // nothing for a question not open any more, or for a message that is not
+  // one of its own. Resolves with the answer's request, or null.
+  async pressQuestion([, id, n], { messageId, record, notice, refuse }) {
+    const closed = this.closed()
+    if (closed) return refuse(closed)
+    const question = this.store.getRequest(id)
+    const update = messageId === null ? null : question?.updates.find(u => u.state === 'question' && u.telegramMessage === messageId)
+    if (!update) return refuse(`question ${id} is not open any more.`)
+    if (update.outcome || !questionOpen(question, this.ledger, update)) {
+      return refuse(questionGone(question, { store: this.store, ledger: this.ledger }, update.at))
+    }
+    const target = this.answering(question)
+    if (target.why) return refuse(target.why)
+    const decision = this.voiceOnly(question)
+    if (decision) return refuse(`${id} is a ${decision.kind} decision, which must be confirmed by voice. Say it in voice mode and mention ${id}.`)
+    const label = questionLabels(update)[Number(n)]
+    if (!label) return refuse(`that button is none of question ${id}'s.`)
+    const request = await this.answer(question, label, { messageId, record: entry => record({ text: `(button ${preview(label, 40)})`, ...entry }), label })
+    await notice(`Passed on as your answer: ${preview(label, 60)}`)
+    return request
+  }
+
   // A press of a button under an approval request ({ id, data, messageId,
   // seen }, from TelegramCommands, which let only the driver's own through):
   // the code in its data names the approval, and nothing else in it counts.
+  // One under a question goes to pressQuestion.
   // It goes as a typed answer goes: nothing while the kill switch is locked or
   // the gateway inactive, nothing where approvals take the voice
   // (VOICE_GW_TELEGRAM_CONFIRM=0, answers off), nothing for one that is not
@@ -1432,6 +1633,14 @@ export class TelegramAnswers {
       record({ decision: 'refused', why })
       await notice(`Not done: ${why}`)
       return null
+    }
+    const asked = QUESTION_PRESS.exec(String(data ?? ''))
+    if (asked) {
+      try {
+        return await this.pressQuestion(asked, { messageId, record, notice, refuse })
+      } catch (error) {
+        return refuse(`${error.message}.`)
+      }
     }
     const match = PRESS.exec(String(data ?? ''))
     if (!match) {

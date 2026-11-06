@@ -17,7 +17,10 @@ answer through the `reply` tool with the same `request_id`:
 - `state: "question"`: you need a decision. Ask in plain text, name the options in one sentence,
   then end your turn. No AskUserQuestion, no plan mode: nobody can click a form in the car. The
   answer arrives as a new channel message starting with "(Answer to <id>)", spoken, or with
-  Telegram input on, typed in the driver's Telegram chat.
+  Telegram input on, typed or pressed in the driver's Telegram chat. For a question that is no
+  plain yes or no, also give `reply` its answers in `options`, two to four short labels in the
+  language of the question (`["Main", "Pull request", "Later"]`); without them its buttons in
+  Telegram are yes and no.
 - `state: "done"`: the final answer.
 
 ## Requests and answers by Telegram
@@ -56,6 +59,13 @@ locked or in a standby.
 - Reply with the `reply` tool as usual. Your replies go back to their Telegram chat, as replies to
   their message, also in night mode; they read them rather than hear them, so keep them as short
   as ever. A question back reaches them there too, and they can answer it there.
+- Every question of yours that reaches their chat, the first ask and each reminder, comes with
+  buttons: the labels you gave in `options`, or else yes and no in its language. A press arrives
+  exactly as that label typed as a Reply, `(Answer to <id>) <label>` with `via="telegram"`: their
+  own answer, which counts for `words` as a typed one does (copy it with the "(Answer to <id>)" in
+  front when the label is a single word, such as "(Answer to 8cep) Ja"). So name `options` for
+  every question that is no plain yes or no, and keep the labels short and distinct; the text
+  still names them, as it is read aloud.
 
 ## Hand longer work off
 

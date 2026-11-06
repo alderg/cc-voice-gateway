@@ -1258,7 +1258,29 @@ folder, `.git` included.
   and `dispatch` and `resolve_decision` take its words ([5.4](#54-approvals-by-voice)). The chat
   confirms it ("Passed on to the controller as your answer to 8cep."), and the controller's
   replies to it come back there as replies to your message, also while voice mode is on or in
-  the night; only a standby holds them.
+  the night; only a standby holds them. Or press one of its buttons (below).
+- **Buttons under questions.** You asked: "können wir bei solchen nachfragen auch knöpfe einbauen
+  damit sich das direkt per klick beantworten lässt?" Where you may answer a question there, it
+  comes with buttons, the first ask and each reminder alike: the answers the controller named with
+  it (the `reply` tool's `options`, two to four short labels, one button each, two short ones side
+  by side), or else ✅ Ja and ❌ Nein, ✅ Yes and ❌ No for a question in English. Its last line then
+  starts "To answer, press a button, reply to this message, …". A press counts exactly as the
+  label typed as a Reply: "(Answer to 8cep) Ja" reaches the controller with `via="telegram"`, the
+  question counts as answered, its decisions keep the answer, and `dispatch`, `resolve_decision`
+  and the confirmations of push, merge, restart and delete take its words wherever typed answers
+  count. The chat confirms it as a reply to the question ("Passed on to the controller as your
+  answer to 8cep: "Ja"."), a short notice over the button says so ("Passed on as your answer:
+  Ja"), and the input log keeps it as `(button Ja)`. The label comes from the question the gateway
+  keeps; a button carries only the request's code and the label's number. Once the question is
+  answered anywhere, by voice, typed or pressed, or settled (`resolve_decision`, or a reminder of
+  the same decision answered), the buttons of every message of it give way to one line with the
+  outcome, which answers nothing: "✅ Answered: Ja", "✅ Answered by voice: yes, keep them", "⏹ Not
+  open any more"; they never come back. A press on an old one hears "Not done: question 8cep is not
+  open any more: it was answered ("Ja")." The gates of typed answers hold: only your own account in
+  your private chat (anyone else's press is ignored without a word, and kept in the input log),
+  nothing while the kill switch is locked or the gateway inactive, and no buttons with answers by
+  Telegram off, or with `VOICE_GW_TELEGRAM_CONFIRM=0` for a push, merge, restart or delete
+  decision, where a press of an old one hears that it takes the voice.
 - **Requests by Telegram** (`VOICE_GW_TELEGRAM_REQUESTS=1`). Any other message you
   write to the bot, neither a command nor an answer, works like typing to the controller: it
   reaches it as a request of yours, exactly like one by voice, with `via="telegram"` and without
@@ -3127,6 +3149,7 @@ gateway; do not set them.
 | The terminal shows an approval waiting, the car and Telegram nothing | Every open approval comes with any voice call's result, `send` and `approve` included, and goes to Telegram at once; none drops after a time. Below `unrestricted`, a tool call of the controller after the prompt makes the gateway guess it was answered at the computer and take it off the lists ([5.4](#54-approvals-by-voice)): if one still waits then, answer it at the terminal, or by voice or in Telegram with its code from its Telegram message, which still reaches Claude Code. In a standby nothing goes out until the connector signs in again. A prompt "from the … agent" is a teammate's: the controller's approval hook hands those over ([5.4](#54-approvals-by-voice)); if one shows at the terminal, the hook could not reach the gateway (the log has no `approval socket ready`), the relay is off, or the controller was started before the hook was in `controller/.claude/settings.json`: restart it. |
 | A write still asks although a grant holds for it | Read the grant in `open_items` or `status`: it covers one asker (the main session, one subagent, one teammate), the file tools only and one folder. A write with the shell (`printf >>`, `sed -i`) always asks, and so does another subagent, another project's memory folder or a subfolder of one, anything hidden, `CLAUDE.md` or a settings file ([approval grants](#approval-grants)). The log says `permission allowed by grant …` for each write it covered. `approval grants off` in the log: `VOICE_GW_APPROVAL_GRANTS=0`, or the relay is off. A controller started before the hook asked about every prompt keeps the old hook's behaviour only if `controller/.claude/hooks/approval.mjs` is the old one: the hook file is read at every prompt, no restart needed. |
 | The car or Telegram tells an approval that ran already | A hook's allow for the main session runs next to the channel's relay. The gateway holds the relayed copy of a file write up to 1.5 s for the hook's check and drops it when a grant allowed it; a copy whose preview the gateway cannot pair with the check (a path cut or changed by Claude Code's preview) is listed. Answer it either way: Claude Code drops a late verdict. |
+| A question in Telegram has no buttons, the wrong ones, or a button only says "Not done" | Buttons come only where questions are answered there: answers by Telegram on (`VOICE_GW_TELEGRAM_ANSWERS=1`), and for a push, merge, restart or delete decision `VOICE_GW_TELEGRAM_CONFIRM` not `0`. Without `options` in its `reply` the buttons are yes and no; a question with other answers needs them named there (the controller's instructions say so). "Not done: question … is not open any more": it was answered elsewhere or settled, or the message is no longer the question's; its buttons give way to the outcome. "Not done: the kill switch is locked" or "inactive": as for typed answers. |
 | An approval request in Telegram has no buttons, or a button only says "Not done" | Buttons come only where approvals are answered there: Telegram input on and `VOICE_GW_TELEGRAM_CONFIRM` not `0`. "Not done: … not open any more": it was answered elsewhere, by voice, by a grant or by the kill switch, or the subagent stopped waiting; the buttons of an answered one give way to its outcome. "Not done: the kill switch is locked" or "inactive": as for typed answers. A press from another account or chat is ignored without an answer (`.state/telegram-input.log`). |
 | A helper agent of the controller waits and nothing asks | A teammate's prompt waits in the approval hook, with no dialog at the terminal, until it is answered by voice or in Telegram: `status` by voice lists it ("for the subagent …"), the gateway's log has `permission_request … subagent=…`. Stopping the agent does not end the wait; deny the prompt. |
 | The controller still starts with the development flag after the admin step | The log line `channel: the development flag, since …` says why. The script reads Claude Code's local copy of the managed settings (`~/.claude/remote-settings.json`), which Claude Code updates when a session starts, so the first start after the admin step still sees the old copy: answer the warning or quit, and start again. `node scripts/channel-mode.mjs` shows what the next start will use; `claude doctor` shows whether the managed settings arrived. |
@@ -3281,7 +3304,7 @@ src/
   access.mjs         access levels in the container, from the GitHub token
   pulls.mjs          the watch on pull requests that workers open
   digest.mjs         routine news about them, gathered into one event for the controller
-  telegram.mjs       Telegram fallback; /stop, /funnel, /revoke, answers, approvals (buttons too) and requests from your own chat (off by default), the input log
+  telegram.mjs       Telegram fallback; /stop, /funnel, /revoke, answers and approvals (buttons too) and requests from your own chat (off by default), the input log
   funnel.mjs         the Funnel on and off from Telegram, and off by itself when idle
   killswitch.mjs     the kill switch: state, emergency phrases, alarm, the unlock in voice mode with a PIN
   guard.mjs          the kill switch's rules on the workers' runs

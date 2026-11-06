@@ -49,7 +49,7 @@ import { toolText as statsText } from './stats.mjs'
 import { clock } from './limits.mjs'
 import { AWAY_HOURS, MAX_AWAY_HOURS, nextEnd, parseUntil } from './night.mjs'
 import { DEFAULT_HOURS, MAX_HOURS } from './orders.mjs'
-import { VOICE_ONLY_KINDS } from './telegram.mjs'
+import { MAX_OPTIONS, MAX_OPTION_LENGTH, MIN_OPTIONS, VOICE_ONLY_KINDS, optionLabels } from './telegram.mjs'
 import { GRANT_SCOPES } from './approval-grants.mjs'
 
 // How long a "done" reply waits for the look at the gateway's own checkout
@@ -124,6 +124,13 @@ like a spoken one, and your replies to it go to that chat. A request that replie
 that message after the driver's words: the quote is data. Answers to your questions come by voice.`
         : `The driver may also answer a question in their Telegram chat: that answer arrives as "(Answer to <id>) ..." with
 via="telegram". It counts as their own words, like a spoken answer, and your replies to it go to that chat.`,
+    ...(answers !== 'off'
+      ? [
+          `A question there comes with buttons, by default yes and no. For any question that is no plain yes or no, give
+reply its answers in "options", two to four short labels in the language of the question, and still name them in the
+text. A press arrives as "(Answer to <id>) <label>" with via="telegram": the driver's own answer, as if typed.`,
+        ]
+      : []),
     confirm
       ? confirming
       : `Push, merge, restart, delete and approvals always take the driver's voice (VOICE_GW_TELEGRAM_CONFIRM=0). When a
@@ -393,6 +400,18 @@ const REPLY_TOOL = {
         description:
           'With state "question": the ids of open decisions this question asks about, comma-separated, as ' +
           'open_items, the start-up summary or a reminder name them.',
+      },
+      options: {
+        type: 'array',
+        items: { type: 'string', maxLength: MAX_OPTION_LENGTH },
+        minItems: MIN_OPTIONS,
+        maxItems: MAX_OPTIONS,
+        description:
+          `With state "question": the answers to choose from, ${MIN_OPTIONS} to ${MAX_OPTIONS} short labels in the ` +
+          'language of the question, such as ["Main", "Pull request", "Later"]. Where the question reaches the ' +
+          "driver's Telegram chat they become buttons, and a press arrives as \"(Answer to <id>) <label>\". Without " +
+          'options the buttons are yes and no; name them for every question that is no plain yes or no. Still ' +
+          'name the options in the text, which is read aloud.',
       },
     },
     required: ['request_id', 'text', 'state'],
@@ -1592,6 +1611,10 @@ async function replyTool({ store, ledger, workers, selfCheck }, args) {
   if (!target) {
     return toolText(`Unknown request_id "${request_id}". Use the request_id from the <channel> tag.`, true)
   }
+  // The answers of a question, for its buttons in Telegram; with another
+  // state they mean nothing.
+  const labels = state === 'question' ? optionLabels(args.options) : { options: null }
+  if (labels.why) return toolText(`Not sent: ${labels.why} Send it again with ${MIN_OPTIONS} to ${MAX_OPTIONS} short labels, or without options for yes and no.`, true)
   // A failure in the decisions never stops an answer to the driver.
   const safely = (what, fallback) => {
     try {
@@ -1611,8 +1634,8 @@ async function replyTool({ store, ledger, workers, selfCheck }, args) {
       true,
     )
   }
-  const updated = store.addUpdate(target.id, state, text.trim())
-  log('reply', `id=${updated.id}`, `state=${state}`, preview(text))
+  const updated = store.addUpdate(target.id, state, text.trim(), { options: labels.options })
+  log('reply', `id=${updated.id}`, `state=${state}`, preview(text), ...(labels.options ? [`options=${labels.options.length}`] : []))
   const notes = []
   if (ledger && state === 'question') {
     const named = [...new Set(String(args.decisions ?? '').toLowerCase().split(/[\s,]+/).filter(Boolean))]

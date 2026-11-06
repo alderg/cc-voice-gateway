@@ -153,7 +153,7 @@ export class Store extends EventEmitter {
       worker, // { repo, task } for a worker result
       state: 'sent',
       createdAt: Date.now(),
-      updates: [], // { at, state, text } from the controller
+      updates: [], // { at, state, text, options } from the controller
       cursor: 0, // index of the first update the voice client has not seen
       closed: false, // the voice client has received state done
     }
@@ -177,10 +177,12 @@ export class Store extends EventEmitter {
 
   // --- answers from the controller ----------------------------------------
 
-  addUpdate(id, state, text) {
+  // options: with a question, the short labels of its answers, for the
+  // buttons under it in Telegram (telegram.mjs, questionButtons).
+  addUpdate(id, state, text, { options = null } = {}) {
     const request = this.getRequest(id)
     if (!request) return null
-    request.updates.push({ at: Date.now(), state, text })
+    request.updates.push({ at: Date.now(), state, text, ...(options?.length ? { options } : {}) })
     request.state = state
     this.controllerLastReplyAt = Date.now()
     this.emit('reply', request, state) // for the statistics

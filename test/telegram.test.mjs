@@ -30,6 +30,7 @@ import { Store, pending } from '../src/store.mjs'
 import {
   INPUT_OFF,
   PRESS,
+  QUESTION_PRESS,
   Telegram,
   TelegramAnswers,
   TelegramCommands,
@@ -38,7 +39,10 @@ import {
   approvalButtons,
   bareVerdict,
   grantMinutesOf,
+  optionLabels,
   outcomeButtons,
+  questionButtons,
+  questionLabels,
   revokeCommand,
   callBotApi,
   driverId,
@@ -526,13 +530,14 @@ function answering({ mode = 'on', requests = false, confirm = true, held = () =>
     return store.getPermission(code)
   }
   // A question of the controller's, as a decision of `kind`; with message,
-  // the id of the Telegram message that carried it.
-  t.question = (text, { kind = 'other', message = null } = {}) => {
+  // the id of the Telegram message that carried it; with options, the
+  // answers it names (reply's options).
+  t.question = (text, { kind = 'other', message = null, options = null } = {}) => {
     const request = store.createRequest('Worker alpha finished task t3cz: done after 2 minutes.', {
       origin: 'worker',
       worker: { repo: 'alpha', task: 't3cz' },
     })
-    store.addUpdate(request.id, 'question', text)
+    store.addUpdate(request.id, 'question', text, { options })
     ledger.ask(request.id, { kind, repo: 'alpha', text })
     if (message !== null) request.updates.at(-1).telegramMessage = message
     return request
@@ -1576,6 +1581,247 @@ test("a press of a button counts only from the driver's own account in their pri
       ['ignored', 'a press from a chat of no known type'],
     ],
   )
+  // A question's button goes the same way: the data as it came, for TelegramAnswers to check.
+  press({ data: 'ques:k8sm:1' })
+  assert.deepEqual(heard.at(-1), { id: heard.at(-1).id, data: 'ques:k8sm:1', messageId: 9, seen: { from: 4242, chat: 4242, type: 'private', text: '(button ques:k8sm:1)' } })
+  press({ from: { id: 999, is_bot: false }, data: 'ques:k8sm:0' })
+  assert.equal(heard.length, 2)
+  assert.deepEqual(recorded.at(-1).why, 'a press from another sender')
+})
+
+test('buttons under a question: yes and no in its language by default, else the two to four answers the controller named, side by side when two are short; the options checked', () => {
+  const request = { id: 'k8sm' }
+  const keys = markup => markup.inline_keyboard.map(row => row.map(button => `${button.text}=${button.callback_data}`))
+  for (const text of ['Soll ich den Fix nach main pushen, ja oder nein?', 'Willst du den Changelog auch?', 'Auch die langsamen Tests?']) {
+    assert.deepEqual(keys(questionButtons(request, { text })), [['✅ Ja=ques:k8sm:0', '❌ Nein=ques:k8sm:1']], text)
+  }
+  assert.deepEqual(keys(questionButtons(request, { text: 'Push the fix to main?' })), [['✅ Yes=ques:k8sm:0', '❌ No=ques:k8sm:1']])
+  assert.deepEqual(questionLabels({ text: 'Merge it now, under the MIT license?' }), ['Yes', 'No'])
+  // Named: as named, two short ones side by side, else one a row.
+  assert.deepEqual(keys(questionButtons(request, { text: 'Main or a pull request?', options: ['Main', 'Pull request'] })), [['Main=ques:k8sm:0', 'Pull request=ques:k8sm:1']])
+  assert.deepEqual(keys(questionButtons(request, { text: 'Where to?', options: ['Main', 'Pull request', 'Later'] })), [['Main=ques:k8sm:0'], ['Pull request=ques:k8sm:1'], ['Later=ques:k8sm:2']])
+  assert.deepEqual(keys(questionButtons(request, { text: 'Which tests?', options: ['Only the fast tests', 'All of them'] })), [['Only the fast tests=ques:k8sm:0'], ['All of them=ques:k8sm:1']])
+  // What reply takes as options.
+  assert.deepEqual(optionLabels(undefined), { options: null })
+  assert.deepEqual(optionLabels([]), { options: null })
+  assert.deepEqual(optionLabels([' ', '']), { options: null })
+  assert.deepEqual(optionLabels([' Main ', 'Pull  request']), { options: ['Main', 'Pull request'] })
+  assert.deepEqual(optionLabels('Main, Pull request, Later'), { options: ['Main', 'Pull request', 'Later'] })
+  assert.equal(optionLabels(['Main']).why, 'options takes 2 to 4 short labels, not 1.')
+  assert.equal(optionLabels(['a', 'b', 'c', 'd', 'e']).why, 'options takes 2 to 4 short labels, not 5.')
+  assert.match(optionLabels(['Main', 'x'.repeat(41)]).why, /is longer than 40 characters; name it in a few words\.$/)
+  assert.equal(optionLabels(['Main', 'main']).why, 'options holds the same label twice.')
+  assert.equal(optionLabels([1, 2]).why, 'options must be a list of short labels.')
+  assert.equal(optionLabels({ a: 'Main' }).why, 'options must be a list of short labels.')
+  // A press's data: the request's id as the gateway makes them, and one of four.
+  assert.ok(QUESTION_PRESS.test('ques:k8sm:3'))
+  for (const data of ['ques:k8sm:4', 'ques:K8SM:0', 'ques:k8sl:0', 'ques:k8sm:0;rm -rf /', 'ques:k8s:0', 'appr:abcde:yes']) assert.ok(!QUESTION_PRESS.test(data), data)
+})
+
+test('the fallback: a question, the first ask and each reminder, comes with buttons where the driver may answer it there; once it is answered anywhere or settled, those of every message of it give way to the outcome, for good', async () => {
+  const store = new Store()
+  const ledger = new Ledger({ log: () => {} })
+  // As gateway.mjs: the decisions of the question keep the answer.
+  store.on('answer', request => ledger.answer(request.answers, { text: request.text.replace(/^\(Answer to [^)]*\)\s*/, ''), answerId: request.id }))
+  const sent = []
+  const edits = []
+  let answerable = true
+  const fallback = new TelegramFallback(store, {
+    afterSeconds: AFTER,
+    send: async (text, options = {}) => {
+      sent.push({ text, ...options })
+      return { message_id: sent.length }
+    },
+    edit: async (id, markup) => edits.push([id, markup]),
+    answerable: () => answerable,
+    ledger,
+    log: () => {},
+  })
+  const labels = markup => markup?.inline_keyboard.map(row => row.map(button => `${button.text}=${button.callback_data}`))
+  const lastEdit = id => labels(edits.findLast(([message]) => message === id)?.[1])
+  const sentFor = request => sent[request.updates.findLast(update => update.state === 'question').telegramMessage - 1]
+  // A question on a worker's result, as reply asks it: the update, then its decision.
+  const ask = (text, { options = null, ids = [], on = null } = {}) => {
+    const request = on ?? store.createRequest('Worker alpha finished task t3cz.', { origin: 'worker', worker: { repo: 'alpha', task: 't3cz' } })
+    store.addUpdate(request.id, 'question', text, { options })
+    ledger.ask(request.id, { ids, kind: 'push', repo: 'alpha', text })
+    return request
+  }
+  const shown = request => waitFor(() => request.updates.findLast(update => update.state === 'question').telegramMessage)
+  try {
+    // No voice call: it goes out at once, with yes and no in its language.
+    const first = ask('Soll ich den Fix nach main pushen, ja oder nein?')
+    const firstMessage = await shown(first)
+    assert.deepEqual(labels(sentFor(first).markup), [[`✅ Ja=ques:${first.id}:0`, `❌ Nein=ques:${first.id}:1`]])
+    assert.match(sentFor(first).text, new RegExp(`\n\nTo answer, press a button, reply to this message, or write a message that starts with ${first.id}\\. `))
+    // A reminder of its decision, asked on the reminder's request: its own buttons.
+    const [decision] = ledger.forRequest(first.id)
+    const reminder = store.createRequest(`Reminder 1 of 3: decision ${decision.id} (push, alpha): the driver has not answered it.`, { origin: 'worker' })
+    ledger.reminded(decision, reminder.id)
+    ask('Noch offen: Soll ich den Fix nach main pushen, ja oder nein?', { ids: [decision.id], on: reminder })
+    const reminderMessage = await shown(reminder)
+    assert.deepEqual(labels(sentFor(reminder).markup), [[`✅ Ja=ques:${reminder.id}:0`, `❌ Nein=ques:${reminder.id}:1`]])
+    assert.equal(edits.length, 0)
+    // Answered by voice on the reminder: the buttons of both give way, as they ask the same decision.
+    const answer = store.createRequest(`(Answer to ${reminder.id}) ja, push ihn`, { answers: reminder.id })
+    store.markAnswered(reminder, answer.id)
+    await waitFor(() => lastEdit(firstMessage) && lastEdit(reminderMessage))
+    assert.deepEqual(lastEdit(reminderMessage), [['✅ Answered by voice: ja, push ihn=-']])
+    assert.deepEqual(lastEdit(firstMessage), [['✅ Answered by voice: ja, push ihn=-']])
+    assert.equal(first.state, 'question', 'its request still says question; its decision tells')
+    // The decision asked again on the answer: the old messages keep their outcome.
+    const count = edits.length
+    ledger.ask(answer.id, { text: 'Auch die Tags?' })
+    store.changed()
+    await sleep(50)
+    assert.equal(edits.length, count, 'never back')
+
+    // The answers the controller named; answered here.
+    const second = ask('Nach main, als Pull Request oder später?', { options: ['Main', 'Pull Request', 'Später'] })
+    const secondMessage = await shown(second)
+    assert.deepEqual(labels(sentFor(second).markup), [[`Main=ques:${second.id}:0`], [`Pull Request=ques:${second.id}:1`], [`Später=ques:${second.id}:2`]])
+    const typed = store.createRequest(`(Answer to ${second.id}) Pull Request`, { answers: second.id, via: 'telegram' })
+    store.markAnswered(second, typed.id)
+    await waitFor(() => lastEdit(secondMessage))
+    assert.deepEqual(lastEdit(secondMessage), [['✅ Answered: Pull Request=-']])
+    // Asked again on the same request: the new message has buttons, the old one keeps its outcome,
+    // and settled without an answer, the new one does not take the old answer for its own.
+    await new Promise(resolve => setTimeout(resolve, 5))
+    store.addUpdate(second.id, 'question', 'Und die Tags auch?')
+    ledger.ask(second.id, { text: 'Und die Tags auch?' })
+    const againMessage = await waitFor(() => second.updates.at(-1).telegramMessage)
+    assert.deepEqual(labels(sent[againMessage - 1].markup), [[`✅ Ja=ques:${second.id}:0`, `❌ Nein=ques:${second.id}:1`]])
+    assert.deepEqual(lastEdit(secondMessage), [['✅ Answered: Pull Request=-']])
+    ledger.close(ledger.forRequest(second.id).at(-1), { outcome: 'no tags', by: 'driver' })
+    await waitFor(() => lastEdit(againMessage))
+    assert.deepEqual(lastEdit(againMessage), [['⏹ Not open any more=-']])
+    assert.deepEqual(lastEdit(secondMessage), [['✅ Answered: Pull Request=-']])
+    // Settled without an answer: resolve_decision closes it, which the ledger alone tells.
+    const third = ask('Delete the old notes?')
+    const thirdMessage = await shown(third)
+    ledger.close(ledger.forRequest(third.id)[0], { outcome: 'kept them', by: 'driver' })
+    await waitFor(() => lastEdit(thirdMessage))
+    assert.deepEqual(lastEdit(thirdMessage), [['⏹ Not open any more=-']])
+    // A question back on a request by Telegram: a reply to the driver's message, with buttons.
+    const typedRequest = store.createRequest('Run the tests in alpha', { via: 'telegram' })
+    typedRequest.telegramMessage = 55
+    store.addUpdate(typedRequest.id, 'question', 'Auch die langsamen?')
+    const typedMessage = await shown(typedRequest)
+    assert.equal(sentFor(typedRequest).replyTo, 55)
+    assert.deepEqual(labels(sentFor(typedRequest).markup), [[`✅ Ja=ques:${typedRequest.id}:0`, `❌ Nein=ques:${typedRequest.id}:1`]])
+    // Where the driver may not answer it there (answers off, a push with VOICE_GW_TELEGRAM_CONFIRM=0): no buttons.
+    answerable = false
+    const fourth = ask('Push it?')
+    await shown(fourth)
+    assert.equal(sentFor(fourth).markup, undefined)
+    assert.match(sentFor(fourth).text, new RegExp(`\n\nAnswer in voice mode and mention ${fourth.id}\\.$`))
+    // And one sent with buttons that is open still: they go, without an outcome.
+    await waitFor(() => lastEdit(typedMessage)?.length === 0)
+    assert.equal(lastEdit(firstMessage)[0][0], '✅ Answered by voice: ja, push ihn=-', 'an outcome stays')
+  } finally {
+    fallback.close()
+  }
+  assert.equal(ledger.listenerCount('closed'), 0, 'closed: no listener left behind')
+  // Without a way to change them later, no buttons at all.
+  const plain = []
+  const without = new TelegramFallback(new Store(), { send: async (text, options) => (plain.push({ text, options }), { message_id: 1 }), answerable: () => true, log: () => {} })
+  const request = without.store.createRequest('Clean up', { origin: 'worker' })
+  without.store.addUpdate(request.id, 'question', 'Delete the old notes?')
+  await waitFor(() => plain.length)
+  assert.equal(plain[0].options, undefined)
+  assert.match(plain[0].text, /\n\nTo answer, reply to this message, or write/)
+  without.close()
+})
+
+test('a press of a button under a question answers it as its label typed as a Reply would: "(Answer to <id>) <label>", via="telegram", its words count, the input log keeps it; only its own labels, only while it is open; nothing past a locked kill switch, a standby, answers off or VOICE_GW_TELEGRAM_CONFIRM=0 for a push', async () => {
+  const t = answering()
+  const press = (id, data, messageId = null) => t.answers.press({ id, data, messageId, seen: { from: 4242, chat: 4242, type: 'private', text: `(button ${data})` } })
+  const noticed = id => t.pressed.find(([press]) => press === id)?.[1]
+  const question = t.question('Soll ich den Changelog auch anpassen, ja oder nein?', { message: 11 })
+  const [decision] = t.ledger.forRequest(question.id)
+
+  const request = await press('p1', `ques:${question.id}:0`, 11)
+  assert.equal(request.text, `(Answer to ${question.id}) Ja`)
+  assert.equal(request.origin, 'voice', "the driver's own request")
+  assert.equal(request.via, 'telegram')
+  assert.deepEqual(request.meta, { via: 'telegram' })
+  assert.equal(request.answers, question.id)
+  assert.equal(request.telegramMessage, 11, "the controller's replies answer the question's message")
+  assert.deepEqual(t.pushed, [request])
+  assert.equal(noticed('p1'), 'Passed on as your answer: Ja')
+  assert.deepEqual(t.said.at(-1), { text: `Passed on to the controller as your answer to ${question.id}: "Ja".`, replyTo: 11 })
+  assert.deepEqual(t.recorded.at(-1), { from: 4242, chat: 4242, type: 'private', text: '(button Ja)', decision: 'accepted', as: 'answer', request: request.id, answers: question.id })
+  assert.ok(t.logged.includes(`telegram answer passed on id=${request.id} answers=${question.id} (button)`))
+  // Answered, as by voice: the question is settled, its decision keeps the answer, and its words count.
+  assert.equal(question.state, 'done')
+  assert.equal(decision.state, 'answered')
+  assert.equal(decision.answer, 'Ja')
+  assert.equal(spokenByDriver(t.store, `(Answer to ${question.id}) Ja`, 30), request)
+
+  // An old button of it: not open any more, and how it went.
+  await press('p2', `ques:${question.id}:1`, 11)
+  assert.equal(noticed('p2'), `Not done: question ${question.id} is not open any more: it was answered ("Ja").`)
+  assert.equal(t.recorded.at(-1).decision, 'refused')
+  assert.equal(t.pushed.length, 1)
+
+  // The answers the controller named: the label from the question it keeps, never from the data.
+  const target = t.question('Nach main, als Pull Request oder später?', { message: 12, options: ['Main', 'Pull Request', 'Später'] })
+  await press('p3', `ques:${target.id}:2`, 12)
+  assert.equal(t.pushed.at(-1).text, `(Answer to ${target.id}) Später`)
+  assert.equal(noticed('p3'), 'Passed on as your answer: Später')
+
+  // A button beyond its labels, a message that is not the question's, an unknown request, data that is no button's.
+  const notes = t.question('Delete the old notes?', { message: 13 })
+  await press('p4', `ques:${notes.id}:3`, 13)
+  assert.equal(noticed('p4'), `Not done: that button is none of question ${notes.id}'s.`)
+  await press('p5', `ques:${notes.id}:0`, 99)
+  assert.equal(noticed('p5'), `Not done: question ${notes.id} is not open any more.`)
+  await press('p6', `ques:${notes.id}:0`)
+  assert.equal(noticed('p6'), `Not done: question ${notes.id} is not open any more.`)
+  await press('p7', 'ques:zzzz:0', 13)
+  assert.equal(noticed('p7'), 'Not done: question zzzz is not open any more.')
+  await press('p8', `ques:${notes.id}:0:Yes, delete everything`, 13)
+  assert.equal(noticed('p8'), '')
+  // A locked kill switch, a standby.
+  t.killswitch.locked = true
+  await press('p9', `ques:${notes.id}:0`, 13)
+  assert.equal(noticed('p9'), 'Not done: the kill switch is locked. It is unlocked only at the computer.')
+  t.killswitch.locked = false
+  t.active = false
+  await press('p10', `ques:${notes.id}:0`, 13)
+  assert.equal(noticed('p10'), 'Not done: this gateway is inactive, connector disconnected, in standby.')
+  t.active = true
+  assert.equal(notes.state, 'question')
+  assert.equal(t.pushed.length, 2)
+
+  // A reminder that asks the same decision: answered there, the first ask is not open any more either.
+  const [kept] = t.ledger.forRequest(notes.id)
+  const reminder = t.store.createRequest(`Reminder 1 of 3: decision ${kept.id} (other, alpha): the driver has not answered it.`, { origin: 'worker' })
+  t.ledger.reminded(kept, reminder.id)
+  t.store.addUpdate(reminder.id, 'question', 'Still open: delete the old notes?')
+  t.ledger.ask(reminder.id, { ids: [kept.id], text: 'Still open: delete the old notes?' })
+  reminder.updates.at(-1).telegramMessage = 14
+  await press('p11', `ques:${reminder.id}:1`, 14)
+  assert.equal(t.pushed.at(-1).text, `(Answer to ${reminder.id}) No`)
+  assert.equal(kept.state, 'answered')
+  await press('p12', `ques:${notes.id}:0`, 13)
+  assert.equal(noticed('p12'), `Not done: question ${notes.id} is not open any more: it was answered ("No").`)
+  assert.equal(t.pushed.length, 3)
+
+  // Answers off (requests only): questions take the voice.
+  const off = answering({ mode: 'off', requests: true })
+  const asked = off.question('Push it?', { message: 11 })
+  await off.answers.press({ id: 'o', data: `ques:${asked.id}:0`, messageId: 11 })
+  assert.deepEqual(off.pressed, [['o', `Not done: ${asked.id} is a question, and questions are answered by voice only (VOICE_GW_TELEGRAM_ANSWERS=0). Answer it in voice mode and mention ${asked.id}.`]])
+  // A push decision with VOICE_GW_TELEGRAM_CONFIRM=0: the voice; other questions as before.
+  const voice = answering({ confirm: false })
+  const push = voice.question('Push it to main?', { kind: 'push', message: 11 })
+  await voice.answers.press({ id: 'v', data: `ques:${push.id}:0`, messageId: 11 })
+  assert.deepEqual(voice.pressed, [['v', `Not done: ${push.id} is a push decision, which must be confirmed by voice. Say it in voice mode and mention ${push.id}.`]])
+  assert.equal(push.state, 'question')
+  const other = voice.question('Keep the old notes?', { message: 12 })
+  await voice.answers.press({ id: 'w', data: `ques:${other.id}:0`, messageId: 12 })
+  assert.equal(voice.pushed.map(request => request.text).join(), `(Answer to ${other.id}) Yes`)
 })
 
 test('a plain yes or no and "yes to all": nothing past a locked kill switch or a standby; with VOICE_GW_TELEGRAM_CONFIRM=0 or answers off, approvals stay with the voice and the chat says so', async () => {
@@ -1973,6 +2219,12 @@ test("the controller's instructions on Telegram: nothing while input is off; wit
         : /Claude Code's approval prompts are answered by voice\.$/,
     )
     assert.doesNotMatch(text, /always take the driver's voice|must be confirmed by voice/)
+    // Buttons under questions, where questions are answered there.
+    if (answers === 'on') {
+      assert.match(text, /\nA question there comes with buttons, by default yes and no\. For any question that is no plain yes or no, give\nreply its answers in "options", two to four short labels/)
+    } else {
+      assert.doesNotMatch(text, /buttons/)
+    }
     const kept = telegramInstructions(answers, requests, false)
     assert.match(kept, first)
     assert.match(
@@ -2302,6 +2554,7 @@ test('gateway with Telegram input off, the default: answers and requests there a
     await gw.reply(first, 'question', 'Keep the old ones?')
     await waitFor(() => messageWith('Keep the old ones?'))
     assert.match(api.messages[messageWith('Keep the old ones?') - 1].text, new RegExp(`\n\nAnswer in voice mode and mention ${first}\\.$`))
+    assert.equal(api.messages[messageWith('Keep the old ones?') - 1].reply_markup, undefined, 'no buttons')
 
     // A Reply to it, and a plain message: refused, and the chat hears why.
     const reply = driverSays('Ja, behalte sie', { replyTo: messageWith('Keep the old ones?') })
@@ -2543,10 +2796,11 @@ test("gateway: a plain message on Telegram is a request of the driver's, as by v
     await waitFor(() => messageWith('Delete the old notes too?'))
     assert.equal(
       sentWith('Delete the old notes too?').text,
-      `Question for request ${secondId} ("Clean up the playground.")\n\nDelete the old notes too?\n\nTo answer, reply to this message, or ` +
-        `write a message that starts with ${secondId}. Or answer in voice mode and mention ${secondId}.`,
+      `Question for request ${secondId} ("Clean up the playground.")\n\nDelete the old notes too?\n\nTo answer, press a button, reply to ` +
+        `this message, or write a message that starts with ${secondId}. Or answer in voice mode and mention ${secondId}.`,
     )
     assert.equal(sentWith('Delete the old notes too?').reply_parameters.message_id, second)
+    assert.deepEqual(sentWith('Delete the old notes too?').reply_markup.inline_keyboard.flat().map(button => button.text), ['✅ Yes', '❌ No'])
     driverSays('Ja, weg damit', { replyTo: messageWith('Delete the old notes too?') })
     const answer = await waitFor(() => gw.events.find(e => e.content === `(Answer to ${secondId}) Ja, weg damit`))
     assert.equal(answer.meta.via, 'telegram')
@@ -2563,7 +2817,7 @@ test("gateway: a plain message on Telegram is a request of the driver's, as by v
     await waitFor(() => messageWith('Push the commits in alpha?'))
     assert.match(
       sentWith('Push the commits in alpha?').text,
-      new RegExp(`\n\nTo answer, reply to this message, or write a message that starts with ${push}\\. Or answer in voice mode and mention ${push}\\.$`),
+      new RegExp(`\n\nTo answer, press a button, reply to this message, or write a message that starts with ${push}\\. Or answer in voice mode and mention ${push}\\.$`),
     )
     driverSays('ja, push', { replyTo: messageWith('Push the commits in alpha?') })
     const pushAnswer = await waitFor(() => gw.events.find(e => e.content === `(Answer to ${push}) ja, push`))
@@ -3026,6 +3280,110 @@ test('gateway with VOICE_GW_TELEGRAM_CONFIRM=0 or Telegram input off: approval r
       api.updates = null
       await gw.close()
     }
+  }
+})
+
+test('gateway: questions come with buttons, yes and no or the answers the controller names; a press answers as the label typed does, its words count, the buttons give way to the outcome; a stranger, an old button, bad options and a locked kill switch get nothing', async () => {
+  api.mode = 'ok'
+  api.messages.length = 0
+  api.presses.length = 0
+  api.edits.length = 0
+  api.updates = []
+  const gw = await startGateway('qbuttons', { telegram: true, env: { VOICE_GW_TELEGRAM_POLL: '1', VOICE_GW_TELEGRAM_ANSWERS: '1' } })
+  const messageWith = text => api.messages.findIndex(m => m.text.includes(text)) + 1
+  const keys = id => api.messages[id - 1].reply_markup?.inline_keyboard.map(row => row.map(button => `${button.text}=${button.callback_data}`))
+  const lastEdit = id => api.edits.findLast(edit => edit.message_id === id)?.reply_markup.inline_keyboard.map(row => row.map(button => button.text))
+  const reply = args => gw.claudeCode.callTool({ name: 'reply', arguments: args })
+  // A voice request, then quiet for the window: its question goes to the chat.
+  const ask = async (message, question, more = {}) => {
+    const id = idOf(await gw.call('send', { message }))
+    await sleep(1300)
+    const asked = await reply({ request_id: id, state: 'question', text: question, ...more })
+    return { id, asked, message: await waitFor(() => messageWith(question)) }
+  }
+  try {
+    assert.match(gw.claudeCode.getInstructions(), /A question there comes with buttons, by default yes and no\./)
+    const { tools } = await gw.claudeCode.listTools()
+    const options = tools.find(tool => tool.name === 'reply').inputSchema.properties.options
+    assert.deepEqual([options.type, options.minItems, options.maxItems], ['array', 2, 4])
+
+    // Yes and no, in the question's language.
+    const first = await ask('Fix the changelog.', 'Soll ich den Changelog auch anpassen, ja oder nein?')
+    const decision = /decision (d[a-z0-9]{3})/.exec(first.asked.content[0].text)[1]
+    assert.deepEqual(keys(first.message), [[`✅ Ja=ques:${first.id}:0`, `❌ Nein=ques:${first.id}:1`]])
+    assert.match(api.messages[first.message - 1].text, new RegExp(`\n\nTo answer, press a button, reply to this message, or write a message that starts with ${first.id}\\.`))
+
+    // A stranger's presses: nothing, not even an answer. Then the driver presses Ja.
+    const strangers = [
+      driverPresses(`ques:${first.id}:1`, first.message, { from: { id: 999, is_bot: false } }),
+      driverPresses(`ques:${first.id}:1`, first.message, { chat: { id: -100555, type: 'supergroup' } }),
+    ]
+    const yes = driverPresses(`ques:${first.id}:0`, first.message)
+    const event = await waitFor(() => gw.events.find(e => e.meta?.via === 'telegram'))
+    assert.equal(event.content, `(Answer to ${first.id}) Ja`)
+    assert.equal(event.meta.trusted, undefined, "the driver's own words")
+    await waitFor(() => pressAnswer(yes))
+    assert.equal(pressAnswer(yes).text, 'Passed on as your answer: Ja')
+    for (const id of strangers) assert.equal(pressAnswer(id), undefined)
+    assert.equal(gw.events.filter(e => e.meta?.via === 'telegram').length, 1)
+    const confirmed = api.messages[(await waitFor(() => messageWith('Passed on to the controller'))) - 1]
+    assert.equal(confirmed.text, `Passed on to the controller as your answer to ${first.id}: "Ja".`)
+    assert.equal(confirmed.reply_parameters.message_id, first.message, 'as a reply to the question')
+    await waitFor(() => lastEdit(first.message))
+    assert.deepEqual(lastEdit(first.message), [['✅ Answered: Ja']])
+    // Its words count, as a typed answer's do.
+    const closed = await gw.claudeCode.callTool({ name: 'resolve_decision', arguments: { id: decision, outcome: 'the changelog too', words: `(Answer to ${first.id}) Ja` } })
+    assert.match(closed.content[0].text, new RegExp(`^\\[decision=closed id=${decision}\\]`))
+    // An old button of it: not open any more.
+    const old = driverPresses(`ques:${first.id}:1`, first.message)
+    await waitFor(() => pressAnswer(old))
+    assert.equal(pressAnswer(old).text, `Not done: question ${first.id} is not open any more: it was answered ("Ja").`)
+
+    // A question back on the answer, with the answers named: a reply to the question's message, one button each.
+    const answer = event.meta.request_id
+    const back = await reply({ request_id: answer, state: 'question', text: 'Main, a pull request, or later?', options: ['Main', 'Pull request', 'Later'] })
+    assert.equal(back.isError, false)
+    const named = await waitFor(() => messageWith('Main, a pull request, or later?'))
+    assert.equal(api.messages[named - 1].reply_parameters.message_id, first.message)
+    assert.deepEqual(keys(named), [[`Main=ques:${answer}:0`], [`Pull request=ques:${answer}:1`], [`Later=ques:${answer}:2`]])
+    driverPresses(`ques:${answer}:1`, named)
+    await waitFor(() => gw.events.find(e => e.content === `(Answer to ${answer}) Pull request`))
+    await waitFor(() => lastEdit(named))
+    assert.deepEqual(lastEdit(named), [['✅ Answered: Pull request']])
+    assert.match(gw.log, /reply id=\w+ state=question Main, a pull request, or later\? options=3/)
+
+    // Options that are none: not sent, and the controller hears why.
+    const sent = api.messages.length
+    const bad = await reply({ request_id: answer, state: 'question', text: 'Which one?', options: ['Only one'] })
+    assert.equal(bad.isError, true)
+    assert.equal(bad.content[0].text, 'Not sent: options takes 2 to 4 short labels, not 1. Send it again with 2 to 4 short labels, or without options for yes and no.')
+    await sleep(200)
+    assert.equal(api.messages.length, sent)
+
+    // Answered by voice: the buttons give way, and say so.
+    const third = await ask('Clean up the notes.', 'Keep the old ones?')
+    assert.deepEqual(keys(third.message), [[`✅ Yes=ques:${third.id}:0`, `❌ No=ques:${third.id}:1`]])
+    await gw.call('send', { message: 'Yes, keep them.', in_reply_to: third.id })
+    await waitFor(() => lastEdit(third.message))
+    assert.deepEqual(lastEdit(third.message), [['✅ Answered by voice: Yes, keep them.']])
+
+    // Locked: a press does nothing.
+    const fourth = await ask('Rename the notes.', 'Rename them to notes-2026?')
+    await gw.call('emergency_stop', { words: 'Notstopp' })
+    const locked = driverPresses(`ques:${fourth.id}:0`, fourth.message)
+    await waitFor(() => pressAnswer(locked))
+    assert.match(pressAnswer(locked).text, /^Not done: the kill switch is locked\./)
+    assert.ok(!gw.events.some(e => e.content.startsWith(`(Answer to ${fourth.id})`)))
+    // The input log keeps every press, the strangers' too.
+    const input = readFileSync(join(TMP, 'qbuttons', 'state', 'telegram-input.log'), 'utf8')
+    assert.match(input, new RegExp(`"text":"\\(button Ja\\)","decision":"accepted","as":"answer","request":"${answer}","answers":"${first.id}"`))
+    assert.match(input, /"from":999,.*"decision":"ignored","why":"a press from another sender"/)
+    assert.match(input, /"decision":"refused","why":"the kill switch is locked/)
+    assert.doesNotMatch(input, new RegExp(TOKEN))
+    assert.ok(!gw.log.includes(TOKEN))
+  } finally {
+    api.updates = null
+    await gw.close()
   }
 })
 

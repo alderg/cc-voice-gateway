@@ -851,8 +851,10 @@ if (telegram) {
     held: () => standby.active,
     answerable: request => answers?.accepts(request) ?? false,
     approvable: () => answers?.approves() ?? false,
-    // Buttons under approval requests, where they are answered there.
+    // Buttons under approval requests and questions, where they are answered
+    // there; a question's give way once its decisions are answered or closed.
     edit: (id, markup) => telegram.editButtons(id, markup),
+    ledger,
   })
   log(`telegram fallback ready: approval requests at once, questions after ${config.telegramAfterSeconds} s without a voice call`)
   // Inbound, only from the driver in the configured private chat: the kill
@@ -871,8 +873,8 @@ if (telegram) {
     ...(config.telegramRequests ? { asks: id => answers.asks(id) } : {}),
   }).start()
   if (answers) telegramCommands.on('answer', message => answers.route(message))
-  // A button under an approval request; without Telegram input none is
-  // shown, and one pressed on an old message hears why.
+  // A button under an approval request or a question; without Telegram
+  // input none is shown, and one pressed on an old message hears why.
   telegramCommands.on('press', press => {
     if (answers) return answers.press(press)
     record({ ...press.seen, decision: 'refused', why: INPUT_OFF })
