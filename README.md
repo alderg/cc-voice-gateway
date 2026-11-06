@@ -2542,11 +2542,23 @@ to fix review comments, which the gateway carries out itself, not the controller
 - **After a push** you hear only that the pull request is out, and which one. The controller never
   offers a review.
 - **The watch.** The gateway takes the pull request URLs in a run's output and checks with `gh`
-  that each is open on a `voice/` branch, comes from the repository itself (not a fork), and was
-  opened by the account `gh` is logged in as. It watches those: every `VOICE_GW_PR_POLL` seconds
-  (60), five times as long after 15 looks. Without a `gh` login it watches nothing. In Docker, a
-  pull request opened with the container's token is watched only if that token belongs to the
-  same account.
+  that each is open, comes from the repository itself (not a fork), was opened by the account
+  `gh` is logged in as, and is the run's, on any branch: a `voice/` branch, one it watched before,
+  one the run's `git push` named (the kill switch's guard notes those on the run's record), one
+  opened while the run went, or, after a `git push` that names no branch, one whose head commit
+  was made while the run went. A pull request the run only names, such as one you opened, is not
+  watched; the log says why (`not watching pull request …: the run … names it, but neither pushed
+  its branch … nor opened it`). It watches the others: every `VOICE_GW_PR_POLL` seconds (60), five
+  times as long after 15 looks. Without a `gh` login it watches nothing. In Docker, a pull request
+  opened with the container's token is watched only if that token belongs to the same account.
+- **Missed ones.** At its start the gateway looks through the records of the runs that ended
+  within `VOICE_GW_PR_WATCH_HOURS` and were reported, and watches the pull requests they pushed or
+  opened that it never watched, by the same checks, with the last such run as the one a fix
+  continues (log: `pull requests picked up from the runs' records`). Until 6 November 2026 only
+  `voice/` branches counted, so tasks that named another branch, such as the Simple Modern
+  batches on `simple-modern-batch-N`, were missed. Such a watch starts at the start: what came
+  before is news once, and its review comments get no automatic fix, as a run may be on them
+  already; the news says so, and the controller tells you.
 - **Later pushes.** A later run that names the pull request watches it anew, from the start, also
   after the watch stopped, so the reviews and checks that run again reach you. One that pushed to
   it or marked it ready without naming it is caught too: when a run ends, the gateway looks again
@@ -2618,7 +2630,8 @@ gathers the routine ones and tells the controller once, in one short summary
   left nothing on no remote or uncommitted, and does not end with a question. With automatic
   fixes off, only passed checks.
 - **Still one by one:** failed checks, comments that ask for changes with no fix queued (the
-  automatic rounds used up, the kill switch locked), a fix that pushed changes, failed, asks or
+  automatic rounds used up, the kill switch locked, or made before a watch the gateway picked up
+  at its start), a fix that pushed changes, failed, asks or
   left something, and every run you or a standing order dispatched. Such an event takes along the
   routine items of its own pull request that were not told yet, so the order stays.
 - **When:** once the news has been quiet for `VOICE_GW_REVIEW_DIGEST` minutes (10), at the latest
@@ -3106,7 +3119,7 @@ gateway; do not set them.
 | A worker no longer remembers details of an earlier task | Its session was compacted at `VOICE_GW_WORKER_AUTOCOMPACT` (300k tokens), or an automatic review fix ran there in a new session (`VOICE_GW_AUTO_FIX_FRESH`), which the next follow-up continues. Name what it needs in the task, keep it in the repository, or raise the setting ([5.5](#55-workers-on-this-computer-or-in-docker)). |
 | A private repository is handled like a public one | `gh` is not logged in or not on the `PATH`, so the visibility is unknown, and the worker asks before pushing to be safe. |
 | Passed checks or a queued review fix are not told at once | They are routine and wait for the [digest](#the-digest-of-routine-review-news): `VOICE_GW_REVIEW_DIGEST` minutes after the news went quiet, at the latest `VOICE_GW_REVIEW_DIGEST_MAX` after the first. `open_items` says how many wait; the log has `digest: routine news kept …`; `.state/digest.json` holds them. `VOICE_GW_REVIEW_DIGEST=0` brings back one event each. |
-| No news about checks or reviews on a worker's pull request | The log says why: `gh is not logged in`, or `stopped watching pull request … : nothing automatic runs` (often a draft that bot reviewers skip, with `VOICE_GW_PR_DRAFT=1` or `draft`; marking it ready in a later run watches it again), `merged`, `closed` or `time limit`. Only pull requests on `voice/` branches that a run linked to, or pushed to after that, are watched. `.state/pulls.json` lists the watches. |
+| No news about checks or reviews on a worker's pull request | The log says why: `gh is not logged in`, or `stopped watching pull request … : nothing automatic runs` (often a draft that bot reviewers skip, with `VOICE_GW_PR_DRAFT=1` or `draft`; marking it ready in a later run watches it again), `merged`, `closed` or `time limit`. Only pull requests that a run linked to and pushed or opened, on any branch, or pushed to after that, are watched; `not watching pull request … neither pushed … nor opened it` names one a run only linked to. The next start picks up those that runs pushed and the gateway missed. `.state/pulls.json` lists the watches. |
 | The controller cannot merge a pull request | A draft must be marked ready first (a task for the worker). Required reviews or checks, conflicts and other branch protection apply; `--admin` is blocked on purpose. With `VOICE_GW_PERMISSION_RELAY=0` the approval only appears at the terminal. |
 | The controller says a `gh` command was blocked | Only the commands in [The controller's confinement](#53-the-controllers-confinement) pass, each with `--repo owner/name` and flags as separate words. If it does not know about `gh` at all, restart the controller so that it reads the current `controller/CLAUDE.md`. |
 | The controller says a tool is blocked | Expected for every tool that is not on the confine hook's list ([confinement](#53-the-controllers-confinement)): MCP tools from your settings or plugins, subagents, skills, web access. Ask for it at the desk, or let a worker do it with `dispatch`. |

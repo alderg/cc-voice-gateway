@@ -18,6 +18,7 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import { z } from 'zod'
 import { adminRequest } from '../src/admin.mjs'
+import { routineNews } from '../src/digest.mjs'
 import { PullWatcher } from '../src/pulls.mjs'
 import { WORKER_RULES } from '../src/workers.mjs'
 
@@ -40,6 +41,8 @@ if (a === 'auth' && b === 'status') state.me ? process.exit(0) : fail('You are n
 if (a === 'api' && b === 'user') state.me ? out({ login: state.me }) : fail('HTTP 401: Bad credentials')
 const inline = a === 'api' && /^repos\\/(.+)\\/pulls\\/(\\d+)\\/comments/.exec(b)
 if (inline) out(state.inline?.[inline[1] + '#' + inline[2]] ?? [])
+const commit = a === 'api' && /^repos\\/(.+)\\/commits\\/(\\w+)$/.exec(b)
+if (commit) state.commits?.[commit[2]] ? out(state.commits[commit[2]]) : fail('HTTP 404: No commit found for SHA: ' + commit[2])
 if (a === 'pr' && b === 'view') {
   const pr = state.prs?.[args[args.indexOf('--repo') + 1] + '#' + c]
   pr ? out(pr) : fail('no pull requests found')
@@ -136,6 +139,123 @@ test("only open pull requests of the run's repository on voice/ branches, as gh 
     assert.deepEqual(w.active().map(entry => entry.key), ['acme/alpha#7'])
     assert.deepEqual(await w.fromRun(task([7], { slug: null })), [], 'no GitHub remote')
     assert.deepEqual(await w.fromRun(task([])), [], 'the run named no pull request')
+  } finally {
+    w.close()
+  }
+})
+
+const ago = minutes => new Date(Date.now() - minutes * 60 * 1000).toISOString()
+
+test('6 November: a run\'s pull request on any branch is watched when the run pushed its branch or opened it, not when it only names it', async () => {
+  // The Simple Modern runs tf73, tmzm and t4t3 pushed simple-modern-* branches
+  // and opened #1154 to #1156 against simple-modern; none was watched, as
+  // only voice/ branches counted.
+  setGitHub(g => {
+    g.prs['acme/alpha#30'] = pr(30, { headRefName: 'simple-modern-batch-25', createdAt: ago(300) })
+    g.prs['acme/alpha#31'] = pr(31, { headRefName: 'simple-modern-tags-simpler', createdAt: ago(30) })
+    g.prs['acme/alpha#32'] = pr(32, { headRefName: 'feature-x', headRefOid: 'ccc333', createdAt: ago(300) })
+    g.prs['acme/alpha#33'] = pr(33, { headRefName: 'driver-branch', createdAt: ago(300) })
+    g.prs['acme/alpha#34'] = pr(34, { headRefName: 'feature-y', headRefOid: 'ddd444', createdAt: ago(300) })
+    g.prs['acme/alpha#35'] = pr(35, { headRefName: 'simple-modern-batch-26', author: { login: 'octo' }, createdAt: ago(30) })
+    g.commits = { ccc333: { sha: 'ccc333', commit: { committer: { date: ago(20) } } }, ddd444: { sha: 'ddd444', commit: { committer: { date: ago(200) } } } }
+  })
+  const window = { startedAt: Date.now() - 60 * 60 * 1000, finishedAt: Date.now() - 60 * 1000 }
+  const { w, logged } = watcher('any-branch')
+  w.paused = true // which ones it takes, not what their polls find
+  try {
+    // Its git push named the branch, as the guard saw it.
+    const pushed = task([30, 33], { ...window, pushedBranches: ['simple-modern', 'simple-modern-batch-25'] })
+    assert.deepEqual((await w.fromRun(pushed)).map(found => found.number), [30])
+    // Opened while the run went: gh pr create, on whatever branch.
+    assert.deepEqual((await w.fromRun(task([31], window))).map(found => found.number), [31])
+    // A push that named no branch: its head commit was made while the run went, or not.
+    assert.deepEqual((await w.fromRun(task([32, 34], { ...window, pushedBranches: ['HEAD'] }))).map(found => found.number), [32])
+    // Someone else's is not the run's, whenever it was opened.
+    assert.deepEqual(await w.fromRun(task([35], window)), [])
+    assert.deepEqual(w.active().map(entry => entry.key), ['acme/alpha#30', 'acme/alpha#31', 'acme/alpha#32'])
+    assert.ok(logged.includes('watching pull request acme/alpha#30 for alpha (the run pushed simple-modern-batch-25)'), logged.join('\n'))
+    assert.ok(logged.includes('watching pull request acme/alpha#31 for alpha (opened during the run)'))
+    assert.ok(logged.includes('watching pull request acme/alpha#32 for alpha (its head commit made during the run)'))
+    assert.ok(logged.includes('not watching pull request acme/alpha#33: the run tabc names it, but neither pushed its branch driver-branch nor opened it'))
+    assert.ok(logged.includes('not watching pull request acme/alpha#34: the run tabc names it, but neither pushed its branch feature-y nor opened it'))
+    assert.ok(logged.includes('not watching pull request acme/alpha#35: opened by octo'))
+
+    // Watched before: a later run that only names it, to request a review, watches it anew.
+    w.stop(w.watches.find(entry => entry.number === 30), 'time limit')
+    const later = { startedAt: Date.now() - 1000, finishedAt: Date.now() }
+    assert.deepEqual((await w.fromRun(task([30, 33], { id: 'tdef', ...later }))).map(found => [found.number, found.opened]), [[30, false]])
+    assert.equal(w.watches.find(entry => entry.number === 30).task, 'tdef')
+    assert.ok(logged.includes('watching pull request acme/alpha#30 for alpha (watched before)'))
+  } finally {
+    w.close()
+  }
+})
+
+test('at the start: pull requests that ended runs pushed or opened and the gateway missed are picked up, newest run first, without a fix for what came before', async () => {
+  const at = minutes => ({ startedAt: Date.now() - (minutes + 30) * 60 * 1000, finishedAt: Date.now() - minutes * 60 * 1000 })
+  const review = (id, minutes, state = 'CHANGES_REQUESTED') => ({
+    id,
+    author: { login: 'octo' },
+    authorAssociation: 'MEMBER',
+    state,
+    body: 'The panel loses its focus ring.',
+    submittedAt: ago(minutes),
+  })
+  setGitHub(g => {
+    g.prs['acme/alpha#40'] = pr(40, { headRefName: 'simple-modern-batch-24', createdAt: ago(50) })
+    // Opened by the older run tmzm, named again by tk7u, which pushed nothing.
+    g.prs['acme/alpha#41'] = pr(41, { headRefName: 'simple-modern-batch-25', isDraft: false, createdAt: ago(45), reviews: [review('R41', 20)] })
+    g.prs['acme/alpha#42'] = pr(42, { headRefName: 'b42', createdAt: ago(5) })
+    g.prs['acme/alpha#43'] = pr(43, { headRefName: 'b43', createdAt: ago(170) })
+    g.prs['acme/alpha#44'] = pr(44, { headRefName: 'b44', createdAt: ago(5) })
+    g.prs['acme/alpha#45'] = pr(45, { headRefName: 'b45', createdAt: ago(600) })
+    g.prs['acme/alpha#46'] = pr(46, { headRefName: 'b46', state: 'MERGED', createdAt: ago(45) })
+  })
+  const queued = []
+  const autoFix = { rounds: 3, queue: async fix => (queued.push(fix), { status: 'queued', entry: { id: `q${queued.length}` } }) }
+  const { w, news, logged } = watcher('pick-up', { autoFix })
+  try {
+    w.watch({ worker: 'alpha', slug: 'acme/alpha', number: 40, title: 'Batch 24' })
+    w.stop(w.watches[0], 'time limit')
+    const records = [
+      { id: 'tmzm', ...at(40), pulls: [40, 41, 46] },
+      { id: 'tk7u', ...at(10), pulls: [41] },
+      { id: 'tunr', ...at(3), pulls: [42], reported: false }, // goes through fromRun again
+      { id: 'told', ...at(150), pulls: [43] }, // beyond the watch time
+      { id: 'trun', ...at(3), pulls: [44], state: 'running', finishedAt: null },
+      { id: 'tnam', ...at(15), pulls: [45] }, // only named it
+    ].map(record => ({ repo: 'alpha', slug: 'acme/alpha', state: 'done', reported: true, ...record }))
+    const before = Date.now()
+    w.paused = true // no poll yet, so that the looks counted below are the pick-up's
+    assert.deepEqual(await w.pickUp(records), ['acme/alpha#41'])
+    const entry = w.watches.find(e => e.number === 41)
+    assert.equal(entry.task, 'tmzm', 'a fix continues the run that pushed it')
+    assert.ok(entry.since >= before, 'watched from now')
+    assert.ok(logged.includes('watching pull request acme/alpha#41 for alpha (opened during the run, picked up from the run tmzm)'), logged.join('\n'))
+    const viewed = ghCalls().filter(call => call[0] === 'pr' && call[1] === 'view').map(call => call[2])
+    for (const number of ['40', '42', '43', '44']) assert.ok(!viewed.includes(number), `#${number} not looked at`)
+    assert.equal(viewed.filter(number => number === '41').length, 1, 'looked at once')
+    assert.equal(w.watches.find(e => e.number === 40).active, false, 'a watch that stopped stays stopped')
+    assert.deepEqual(await w.pickUp(records), [], 'once')
+    w.paused = false
+
+    // Its first look: the review from before is news, with no fix for it, and not routine.
+    await waitUntil(() => news.length === 1)
+    assert.match(news[0].text, /^Review from octo: changes requested, "The panel loses its focus ring\."\.$/m)
+    assert.match(
+      news[0].text,
+      /^The gateway missed this pull request when the run tmzm ended, and picked it up at its start: the review comments from before, from octo, get no automatic fix, as a run may be on them already\. Tell the driver; a fix of them takes their word, like any dispatch\.$/m,
+    )
+    assert.deepEqual([news[0].missed, news[0].asking, news[0].fix, queued.length], [['octo'], [], null, 0])
+    assert.equal(routineNews(news[0]), false)
+
+    // A review after the pick-up gets its fix as usual.
+    setGitHub(g => {
+      g.prs['acme/alpha#41'].reviews.push(review('R42', 0))
+    })
+    await waitUntil(() => news.length === 2)
+    assert.deepEqual([news[1].missed, news[1].fix, queued.length, queued[0].task], [[], 'q1', 1, 'tmzm'])
+    assert.doesNotMatch(news[1].text, /missed this pull request/)
   } finally {
     w.close()
   }
@@ -517,7 +637,7 @@ const arg = name => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] 
 const session_id = arg('--session-id') ?? arg('--resume')
 const out = message => process.stdout.write(JSON.stringify({ ...message, session_id }) + '\\n')
 out({ type: 'system', subtype: 'init' })
-out({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'u1', name: 'Bash', input: { command: 'gh pr create --draft' } }] } })
+out({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'u1', name: 'Bash', input: { command: 'git push -u origin batch-7 && gh pr create --draft' } }] } })
 out({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'u1', content: 'https://github.com/acme/alpha/pull/7\\n' }] } })
 out({ type: 'assistant', message: { content: [{ type: 'text', text: 'Like https://github.com/other/repo/pull/99 did.' }] } })
 out({ type: 'result', subtype: 'success', is_error: false, result: 'Fixed the typo; draft pull request 7 is open.' })
@@ -544,7 +664,8 @@ test("gateway: the run's pull request is named in its result, and its checks fol
   writeFileSync(join(BIN, 'claude'), FAKE_CLAUDE)
   chmodSync(join(BIN, 'claude'), 0o755)
   setGitHub(g => {
-    g.prs['acme/alpha#7'] = pr(7, { statusCheckRollup: [run('test', 'IN_PROGRESS')] })
+    // Not a voice/ branch, and opened before the run as far as gh says: watched as the run's git push named it.
+    g.prs['acme/alpha#7'] = pr(7, { headRefName: 'batch-7', statusCheckRollup: [run('test', 'IN_PROGRESS')] })
   })
 
   const events = []
@@ -620,6 +741,61 @@ test("gateway: the run's pull request is named in its result, and its checks fol
     assert.match(checks.content, /Checks finished on the latest push: 0 passed, 1 failed \(test\)\./)
   } finally {
     await voice.close()
+    await claudeCode.close()
+  }
+})
+
+test("gateway: at its start it picks up the pull request a reported run opened on a branch other than voice/, and the review it missed is news", async () => {
+  const state = join(TMP, 'state-pick-up')
+  const root = join(TMP, 'Developer-pick-up')
+  mkdirSync(state, { recursive: true })
+  mkdirSync(root, { recursive: true })
+  const now = Date.now()
+  const record = { id: 'tq7m', kind: 'repo', repo: 'alpha', slug: 'acme/alpha', task: 'Batch 25.', words: 'go on', state: 'done', reported: true }
+  writeFileSync(join(state, 'workers.json'), JSON.stringify({ tasks: [{ ...record, pulls: [55], startedAt: now - 3600e3, finishedAt: now - 1800e3 }] }))
+  setGitHub(g => {
+    g.prs['acme/alpha#55'] = pr(55, {
+      headRefName: 'simple-modern-batch-25',
+      isDraft: false,
+      createdAt: new Date(now - 2400e3).toISOString(),
+      reviews: [{ id: 'R55', author: { login: 'octo' }, authorAssociation: 'MEMBER', state: 'CHANGES_REQUESTED', body: 'One finding.', submittedAt: new Date(now - 600e3).toISOString() }],
+    })
+  })
+  const events = []
+  const claudeCode = new Client({ name: 'fake-claude-code', version: '0.0.0' })
+  claudeCode.setNotificationHandler(
+    z.object({
+      method: z.literal('notifications/claude/channel'),
+      params: z.object({ content: z.string(), meta: z.record(z.string(), z.string()).optional() }),
+    }),
+    ({ params }) => events.push(params),
+  )
+  await claudeCode.connect(
+    new StdioClientTransport({
+      command: process.execPath,
+      args: [GATEWAY],
+      env: {
+        ...process.env,
+        VOICE_GW_PORT: String(await freePort()),
+        VOICE_GW_SECRETS_DIR: join(TMP, 'secrets-pick-up'),
+        VOICE_GW_STATE_DIR: state,
+        VOICE_GW_WORKER_ROOT: root,
+        VOICE_GW_GH_BIN: GH,
+        VOICE_GW_PR_POLL: '0.2',
+        VOICE_GW_LOG_FILE: '',
+      },
+      stderr: 'ignore',
+    }),
+  )
+  try {
+    const news = await waitUntil(() => events.find(e => e.meta?.pull_request === '55'))
+    assert.equal(news.meta.kind, 'review')
+    assert.equal(news.meta.trusted, 'no')
+    assert.match(news.content, /^Review from octo: changes requested, "One finding\."\.$/m)
+    assert.match(news.content, /^The gateway missed this pull request when the run tq7m ended, and picked it up at its start: the review comments from before, from octo, get no automatic fix/m)
+    const watch = JSON.parse(readFileSync(join(state, 'pulls.json'), 'utf8')).watches.find(w => w.key === 'acme/alpha#55')
+    assert.deepEqual([watch.active, watch.task, watch.fixes, watch.branch], [true, 'tq7m', 0, 'simple-modern-batch-25'])
+  } finally {
     await claudeCode.close()
   }
 })

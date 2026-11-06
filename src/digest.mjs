@@ -17,7 +17,8 @@
 //
 // Everything else goes on one by one, as before: failed checks, comments
 // that ask for changes with no fix queued (the automatic rounds used up, the
-// kill switch locked), a fix that pushed changes, failed, asks or left
+// kill switch locked, or made before a watch picked up at the gateway's
+// start: missed), a fix that pushed changes, failed, asks or left
 // something, and every run the driver or a standing order dispatched. Such
 // an event takes along the routine items of its own pull request that were
 // not told yet (take), so that the controller hears them in their order.
@@ -47,7 +48,7 @@ export const pullKey = (slug, number) => `${String(slug).toLowerCase()}#${number
 // routine. asking: who asks for changes, as the watcher found it with
 // automatic fixing on; null with it off, when only checks can be.
 export function routineNews(news) {
-  if (news.checks?.failed) return false
+  if (news.checks?.failed || news.missed?.length) return false
   if (!Array.isArray(news.asking)) return news.kind === 'checks'
   return news.asking.length === 0 || Boolean(news.fix)
 }

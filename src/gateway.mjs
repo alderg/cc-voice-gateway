@@ -406,6 +406,14 @@ log(
     : "review comments on workers' pull requests: fixed only on the driver's word (VOICE_GW_AUTO_FIX_REVIEWS=0)",
 )
 
+// Pull requests that runs pushed or opened and the gateway never watched,
+// such as those of tasks that named a branch other than voice/ before
+// 2026-11-06: from the runs' records, once at the start (pulls.mjs, pickUp).
+pulls
+  .pickUp(workers.reportedRuns())
+  .then(picked => picked.length && log(`pull requests picked up from the runs' records: ${picked.join(', ')}`))
+  .catch(error => log('pull requests of earlier runs not checked:', error.message))
+
 let http
 let admin
 let funnel = null

@@ -3,10 +3,19 @@
 // tells the controller as news. The driver is not asked anything.
 //
 // Which pull requests: those a run names by URL for its own repository, in
-// its tool output or its result, if gh shows them open on a voice/ branch,
-// opened by the account gh is logged in as, from a branch of the repository
-// itself. A fork can name its branch voice/ too, and anyone can open a pull
-// request on a public repository; those are not watched.
+// its tool output or its result, if gh shows them open, opened by the
+// account gh is logged in as, from a branch of the repository itself, and
+// the run's (whose): on a voice/ branch, the workers' own; watched before;
+// on a branch the run's git push named, on any branch, as the guard saw it
+// (guard.mjs, the run's pushedBranches); opened while the run went; or with
+// a head commit made while it went after a push that named no branch. A
+// pull request the run only names, such as one the driver opened, is not
+// watched. A fork can name its branch voice/ too, and anyone can open a pull
+// request on a public repository; those are not watched either. Until
+// 2026-11-06 only voice/ branches counted, and the pull requests of tasks
+// that named another branch were missed; at its start the gateway picks up
+// those the runs it still has records of pushed and it never watched
+// (pickUp).
 // Whether results will come is not guessed from the repository's settings;
 // the watcher looks: checks on the head commit (GitHub Actions and other CI),
 // requested reviewers (CODEOWNERS, required reviewers, a person the driver
@@ -62,11 +71,12 @@ const SLOW_FACTOR = 5
 const AUTH_CHECK_MS = 10 * 60 * 1000
 const KEEP_STOPPED = 50
 const RECHECK = 3 // earlier watches of a repository looked at again when a run there ends
+const CLOCK_SLACK_MS = 2 * 60 * 1000 // between this computer's clock and GitHub's, for what a run did while it went
 const FOREIGN = 'not opened by the gh account from this repository'
 const ENDED = ['merged', 'closed', FOREIGN] // no later push can matter
 const FIELDS =
-  'number,title,state,isDraft,isCrossRepository,author,headRefName,headRefOid,url,statusCheckRollup,reviewRequests,' +
-  'reviews,comments'
+  'number,title,state,isDraft,isCrossRepository,author,headRefName,headRefOid,url,createdAt,statusCheckRollup,' +
+  'reviewRequests,reviews,comments'
 
 // Whose words reach the controller: gh pr view gives authorAssociation for
 // reviews and comments, the REST API author_association for inline comments.
@@ -224,20 +234,27 @@ export class PullWatcher extends EventEmitter {
     if ((!named.length && !earlier.length) || !(await this.ready())) return []
     const since = task.startedAt ?? Date.now()
     const found = []
-    const add = pr => {
+    const add = (pr, why) => {
       const opened = !this.watches.some(w => w.key === `${task.slug}#${pr.number}`)
       found.push({ number: pr.number, title: pr.title, isDraft: Boolean(pr.isDraft), url: pr.url, opened })
-      this.note(this.watch({ worker: task.repo, slug: task.slug, number: pr.number, title: pr.title, task }), pr)
+      this.note(this.watch({ worker: task.repo, slug: task.slug, number: pr.number, title: pr.title, task, why }), pr)
     }
     for (const number of named) {
       const pr = await this.view(task.slug, number)
-      if (!pr || pr.state !== 'OPEN' || !String(pr.headRefName).startsWith('voice/')) continue
+      if (!pr || pr.state !== 'OPEN') continue
       if (!this.ours(pr)) {
         const why = pr.isCrossRepository !== false ? 'from a fork' : `opened by ${login(pr.author?.login) || 'someone else'}`
         this.log('not watching pull request', `${task.slug}#${pr.number}:`, why)
         continue
       }
-      add(pr)
+      const reason = await this.whose(task, pr)
+      if (!reason) {
+        const branch = pr.headRefName ? `its branch ${pr.headRefName}` : 'it'
+        const why = `the run ${task.id} names it, but neither pushed ${branch} nor opened it`
+        this.log('not watching pull request', `${task.slug}#${pr.number}:`, why)
+        continue
+      }
+      add(pr, reason)
     }
     // A push or "ready for review" the run did not name.
     const views = await Promise.all(earlier.map(entry => this.view(entry.slug, entry.number)))
@@ -247,10 +264,75 @@ export class PullWatcher extends EventEmitter {
       if (pr.state !== 'OPEN') return this.stop(entry, pr.state === 'MERGED' ? 'merged' : 'closed')
       if (!this.ours(pr)) return this.stop(entry, FOREIGN)
       this.note(entry, pr)
-      if (entry.changedAt >= since) add(pr)
+      if (entry.changedAt >= since) add(pr, 'changed during the run')
     })
     if (found.length || earlier.length) this.save()
     return found
+  }
+
+  // Why a pull request the run names, open and the gh account's, is the
+  // run's, or null: on a voice/ branch, the workers' own; watched before, as
+  // a worker's; on a branch the run's git push named (pushedBranches, which
+  // the guard notes on the run's record); opened while the run went; or,
+  // after a push that named no branch (HEAD), with a head commit made while
+  // it went. A little slack on both ends for the clocks.
+  async whose(task, pr) {
+    const branch = String(pr.headRefName ?? '')
+    const pushed = Array.isArray(task.pushedBranches) ? task.pushedBranches : []
+    const during = time => {
+      const at = Date.parse(time ?? '')
+      if (!Number.isFinite(at) || !Number.isFinite(task.startedAt)) return false
+      return at >= task.startedAt - CLOCK_SLACK_MS && at <= (task.finishedAt ?? Date.now()) + CLOCK_SLACK_MS
+    }
+    const key = `${task.slug}#${pr.number}`.toLowerCase()
+    if (branch.startsWith('voice/')) return 'a voice/ branch'
+    if (this.watches.some(w => w.key.toLowerCase() === key && w.stopped !== FOREIGN)) return 'watched before'
+    if (branch && pushed.includes(branch)) return `the run pushed ${branch}`
+    if (during(pr.createdAt)) return 'opened during the run'
+    if (pushed.includes('HEAD') && pr.headRefOid) {
+      const commit = await this.json(['api', `repos/${task.slug}/commits/${pr.headRefOid}`])
+      if (during(commit?.commit?.committer?.date)) return 'its head commit made during the run'
+    }
+    return null
+  }
+
+  // At the start: the pull requests that ended runs pushed or opened and the
+  // gateway never watched, such as those of tasks that named a branch other
+  // than voice/ before 2026-11-06, or of a run whose end it could not check
+  // with gh. From the runs' records (tasks, the workers' state): runs that
+  // ended within the watch time (VOICE_GW_PR_WATCH_HOURS) and were reported,
+  // as an unreported one goes through fromRun again; the same checks as
+  // fromRun, the newest run first, so that a fix continues the last run that
+  // pushed it. Watched from now: what came before is news once, but asks for
+  // no fix, as a run may be on it already (pickedUp, poll). The keys
+  // (owner/name#number) of those it picked up.
+  async pickUp(tasks = []) {
+    const from = Date.now() - this.watchMs
+    const runs = tasks
+      .filter(t => t?.slug && t.pulls?.length && t.state !== 'running' && t.reported && (t.finishedAt ?? 0) >= from)
+      .sort((a, b) => b.finishedAt - a.finishedAt)
+    if (!runs.length || !(await this.ready())) return []
+    const picked = []
+    const seen = new Set(this.watches.map(w => w.key.toLowerCase()))
+    const views = new Map() // several runs may name one
+    for (const task of runs) {
+      for (const number of task.pulls) {
+        const key = `${task.slug}#${number}`.toLowerCase()
+        if (seen.has(key)) continue
+        if (!views.has(key)) views.set(key, await this.view(task.slug, number))
+        const pr = views.get(key)
+        if (!pr || pr.state !== 'OPEN' || !this.ours(pr)) continue
+        const why = await this.whose(task, pr)
+        // A run reported again at the start may have watched it meanwhile (fromRun).
+        if (!why || this.watches.some(w => w.key.toLowerCase() === key)) continue
+        seen.add(key)
+        const entry = this.watch({ worker: task.repo, slug: task.slug, number: pr.number, title: pr.title, task, why, pickedUp: true })
+        this.note(entry, pr)
+        picked.push(entry.key)
+      }
+    }
+    if (picked.length) this.save()
+    return picked
   }
 
   // The last pull requests watched for the run's repository and worker that
@@ -288,14 +370,18 @@ export class PullWatcher extends EventEmitter {
 
   // task: the run that opened or worked on it, which a fix continues. One
   // the driver dispatched gives the automatic fixing its rounds again; a fix
-  // the gateway queued does not (task.review).
-  watch({ worker, slug, number, title, task = null }) {
+  // the gateway queued does not (task.review). why: for the log.
+  // pickedUp: one the gateway missed when the run ended (pickUp), watched
+  // from now on.
+  watch({ worker, slug, number, title, task = null, why = null, pickedUp = false }) {
     const key = `${slug}#${number}`
     let entry = this.watches.find(w => w.key === key)
     if (!entry) {
-      // since: what came before the run that started the watch, that run could see.
-      const from = task?.startedAt ?? Date.now()
+      // since: what came before the run that started the watch, that run
+      // could see; for one picked up, what came before now asks for no fix.
+      const from = pickedUp ? Date.now() : (task?.startedAt ?? Date.now())
       entry = { key, worker, slug, number, reviews: [], comments: [], inline: [], checked: [], fixes: 0, since: from }
+      if (pickedUp) entry.pickedUp = from
       this.watches.push(entry)
     }
     const now = Date.now()
@@ -304,7 +390,8 @@ export class PullWatcher extends EventEmitter {
       entry.task = task.id
       if (!task.review) entry.fixes = 0
     }
-    this.log('watching pull request', key, `for ${worker}`)
+    const how = [why, pickedUp && task ? `picked up from the run ${task.id}` : null].filter(Boolean).join(', ')
+    this.log('watching pull request', key, `for ${worker}${how ? ` (${how})` : ''}`)
     return entry
   }
 
@@ -402,6 +489,25 @@ export class PullWatcher extends EventEmitter {
     const fix = asking.length ? await this.fix(entry, pr, asking, asked) : null
     if (fix) lines.push(fix.line)
     if (fix?.brief) brief.push(fix.brief)
+    // Picked up at the start (pickUp): its first look says so, and who asked
+    // for changes before, which no fix is queued for.
+    let missed = []
+    if (entry.pickedUp) {
+      delete entry.pickedUp
+      const before = this.autoFix ? await this.asking(entry, newReviews, inline, newComments, { before: true }) : []
+      missed = [...new Set(before.map(item => item.author))]
+      if (lines.length) {
+        lines.push(
+          `The gateway missed this pull request when the run ${entry.task ?? 'that pushed it'} ended, and picked it up at its start` +
+            (missed.length
+              ? `: the review comments from before, from ${missed.join(', ')}, get no automatic fix, as a run may be on them ` +
+                'already. Tell the driver; a fix of them takes their word, like any dispatch.'
+              : '.'),
+        )
+        const unfixed = missed.length ? `, no automatic fix for the comments from before (${missed.join(', ')})` : ''
+        brief.push(`picked up at the start${unfixed}`)
+      }
+    }
 
     const expected = checks.length || pr.reviewRequests?.length || reviews.length || comments.length
     if (!expected && ++entry.quiet >= GRACE_POLLS) {
@@ -422,6 +528,8 @@ export class PullWatcher extends EventEmitter {
         // Who asks for changes, with automatic fixing on; null with it off.
         // With brief and title, for the digest of routine news (digest.mjs).
         asking: this.autoFix ? asking : null,
+        // Who asked before a watch picked up at the start: no fix, not routine.
+        missed,
         brief: brief.join('; '),
         title: pr.title,
         text: [
@@ -440,15 +548,17 @@ export class PullWatcher extends EventEmitter {
   // fix's prompt (Workers.reviewComments): the words the worker would act on
   // anyway, of nobody else. gh names the authors of reviews and comments
   // without saying whether they are bots; for a login on the list, the REST
-  // API says it (authors).
-  async asking(entry, reviews, inline, comments) {
+  // API says it (authors). before: those made before that instead, which
+  // ask for nothing (a watch picked up at the start).
+  async asking(entry, reviews, inline, comments, { before = false } = {}) {
     const untyped = item => !collaborator(item.authorAssociation) && this.listed(item.author) && !typed(item.author)
     const rest = {
       reviews: reviews.some(untyped) ? await this.authors(`repos/${entry.slug}/pulls/${entry.number}/reviews?per_page=100`) : new Map(),
       comments: comments.some(untyped) ? await this.authors(`repos/${entry.slug}/issues/${entry.number}/comments?per_page=100`) : new Map(),
     }
     const author = (item, found) => (untyped(item) ? (found.get(item.id) ?? null) : item.author)
-    const counts = (author, association, time) => (collaborator(association) || this.isBot(author)) && since(entry.since, time)
+    const counts = (author, association, time) =>
+      (collaborator(association) || this.isBot(author)) && since(entry.since, time) !== before
     const said = text => String(text ?? '').trim() !== ''
     const items = [
       ...reviews

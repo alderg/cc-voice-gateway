@@ -907,6 +907,12 @@ export class Workers extends EventEmitter {
     return this.state.tasks.find(t => t.id === id) ?? null
   }
 
+  // Finished runs whose result reached the controller, the newest last: for
+  // the pull requests they pushed that the gateway missed (pulls.mjs, pickUp).
+  reportedRuns() {
+    return this.state.tasks.filter(t => t.state !== 'running' && t.reported)
+  }
+
   // Finished runs whose result has not reached the controller yet, for
   // example because the gateway restarted in between.
   unreported() {

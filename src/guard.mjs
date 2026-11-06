@@ -121,6 +121,7 @@ export const TOOL_START = 'voice-gw-tool '
 // docker exec; on this computer they are next to the run's output.
 export const CONTAINER_NOTES = '/tmp/voice-gw'
 const STOP_WAIT_MS = 30 * 1000
+const MAX_PUSHED = 20 // branches a run's git push named, kept on its record
 const HOOK_SCRIPT =
   'const fs=require("fs");let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{' +
   'let i={};try{i=JSON.parse(s)}catch{}' +
@@ -877,7 +878,7 @@ export class RunGuard extends EventEmitter {
   // Returns the folder the call leaves its shell in, null where it cannot
   // tell. call: the tool call, whose writes may go to quarantine (outside).
   // A git push is no rule of its own: the branches it names are for the size
-  // check (commitRefs, reused).
+  // check (commitRefs, reused), and for the pull requests the run pushed.
   shell(run, command, cwd = run.dir, call = null) {
     const outer = []
     const scripts = new Map() // path -> script written from a heredoc in this call
@@ -908,6 +909,12 @@ export class RunGuard extends EventEmitter {
             if (branch !== 'HEAD') this.pushedBy.set(`${run.repo}\0${branch}`, run.id)
           }
           if (push.elsewhere) run.pushedElsewhere = true
+          // On the run's record too, for the pull requests it pushed
+          // (pulls.mjs, PullWatcher.whose): HEAD for a push that names no
+          // branch, such as a bare git push.
+          const names = push.branches.length ? push.branches : ['HEAD']
+          const known = Array.isArray(run.task.pushedBranches) ? run.task.pushedBranches : []
+          run.task.pushedBranches = [...known.filter(b => !names.includes(b)), ...names].slice(-MAX_PUSHED)
         }
         // A cron job runs whatever it says, later: only a listing is no write.
         if (name === 'crontab') {

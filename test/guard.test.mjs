@@ -329,6 +329,21 @@ test("a cd carries over to the next Bash call, as Claude Code keeps the shell's 
   assert.match(tripsAll(['cd "$UNKNOWN"', 'echo x > ../x'])[0], /writes \/work\/x \(/)
 })
 
+test("a git push notes the branches it names on the run's record, HEAD for one that names none, for the pull requests it pushed (pulls.mjs)", () => {
+  // As task tmzm of 6 November pushed batch 25 of Simple Modern.
+  const s = session()
+  s.call('git push -q origin simple-modern 2>&1 | tail -3; git checkout -q -B simple-modern-batch-25 simple-modern')
+  s.call('git commit -q -F msg.txt && git push -u origin simple-modern-batch-25 2>&1 | tail -3')
+  s.call('git -C /work/alpha push origin HEAD:refs/heads/voice/x')
+  s.call("sh -c 'git push --force-with-lease origin +fix-1'")
+  s.call('git push')
+  s.call('git push origin simple-modern-batch-25')
+  s.call('git status && git log --oneline -1')
+  assert.deepEqual(s.task.pushedBranches, ['simple-modern', 'voice/x', 'fix-1', 'HEAD', 'simple-modern-batch-25'])
+  assert.deepEqual(s.tripped, [])
+  s.close()
+})
+
 test("the run's own Claude Code memory folder is allowed, another project's is not", () => {
   const own = `${homedir()}/.claude/projects/-work-alpha/memory`
   assert.deepEqual(trips(`${own}/feedback-pr-ready.md`, 'Write'), [])
