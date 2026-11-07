@@ -507,13 +507,15 @@ test('Docker: runs go through voice-run in the container, with the rules of thei
   // Its run folder in the container's mounted folder of clones, made there
   // through docker exec, and handed to the run inside, not to the docker client.
   const folder = /^- Run folder: (\S+), outside the repository/m.exec(call.input)?.[1]
-  assert.match(folder ?? '', new RegExp(`^${join(REPOS, '.voice-runs', 'readonly')}/\\d{4}-\\d{2}-\\d{2}-[a-z0-9]{4}$`))
-  assert.deepEqual(exec.slice(0, 14), [
+  assert.match(folder ?? '', new RegExp(`^${join(REPOS, '.voice-runs', 'readonly')}/[a-z0-9]{4}$`))
+  assert.deepEqual(exec.slice(0, 18), [
     'exec', '-i', '-w', join(REPOS, 'readonly'), '-e', `TMPDIR=${folder}`, '-e', `VOICE_GW_RUN_FOLDER=${folder}`,
+    '-e', `WRANGLER_LOG_PATH=${folder}/wrangler-logs`, '-e', 'WRANGLER_SEND_METRICS=false',
     '-e', `VOICE_GW_GUARD_NOTES=/tmp/voice-gw/${readonly.id}.notes`, CONTAINER, 'voice-run', readonly.id, join(BIN, 'claude'),
   ])
-  // The guard's hook runs with the container's node (guard.mjs).
-  assert.match(JSON.parse(arg(call, '--settings')).hooks.PreToolUse[0].hooks[0].command, /^'node' -e '/)
+  // The guard's hook runs with the container's node (guard.mjs), with the
+  // fence's module the gateway puts next to the notes there.
+  assert.match(JSON.parse(arg(call, '--settings')).hooks.PreToolUse[0].hooks[0].command, /^'node' -e '[^']+' '\/tmp\/voice-gw\/fence\.mjs'$/)
   assert.deepEqual([call.tmpdir, call.runFolder], [folder, folder])
   assert.ok(existsSync(folder))
   assert.ok(dockerCalls().some(c => c[0] === 'exec' && c.includes('sh') && c.includes(folder) && c.some(a => a.includes('mkdir'))))

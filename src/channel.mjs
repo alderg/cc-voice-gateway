@@ -228,8 +228,9 @@ as screenshots or files for the driver; the worker's prompt names it, and a resu
 so that you can tell the driver where to find it. Never ask a worker to write anywhere else outside its repository,
 not even a folder of your choosing: the kill switch locks on it. Ask for such files "in your run folder". A folder that
 list_workers shows granted to the repository ("may also write in ...", a path grant of the driver's) is the exception.
-A result that says the gateway's guard moved files to quarantine: the run wrote them outside its allowed folders, and
-the third such write of a run locks the kill switch. Tell the driver in a sentence, as a warning; nothing to dispatch.
+A result that says the gateway's guard moved files to quarantine, or refused a call before it ran: the run wrote, or
+tried to write, outside its allowed folders, and the third such write of a run locks the kill switch. Tell the driver in
+a sentence, as a warning; nothing to dispatch, and never ask a worker to clean up or move files outside its folders.
 When the run opened or updated a pull request, the tag also has pull_request="<number>": say only briefly
 that it is out, and which one. Never offer or suggest a review; details only when the driver asks.${DRAFT_INSTRUCTIONS}
 Checks and reviews that run on such a pull request by themselves arrive later as <channel source="${CHANNEL_SOURCE}"

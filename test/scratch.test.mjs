@@ -214,7 +214,7 @@ test('scratch/new: a new empty folder, the run in it with rules of its own; afte
     assert.match(rules, /Your work folder is the current directory/)
     assert.match(rules, /Every file you make goes there, scripts, backups and copies included; only temporary files may also go to\n  \/tmp\. After a cd, give every write an absolute path, and never run commands from an old transcript or log\n  again as they stand/)
     // The quarantine of the rule on writes outside (guard.mjs), and its notes.
-    assert.match(rules, /The first two new files elsewhere it moves to\n  quarantine instead, and tells you in a note that begins "The gateway's guard:", which is the gateway's\n  own; the third stops all work\./)
+    assert.match(rules, /Its guard refuses a command or a file write\n  elsewhere before it runs, moves the first two new files elsewhere that it sees only afterwards to\n  quarantine, and tells you in a message that begins "The gateway's guard", which is the gateway's own\.\n  Each counts as an invalid write; the third stops all work\. Leave caches and logs that tools put in your\n  home folder where they are: never move, remove or tidy up anything outside your folder\./)
     assert.doesNotMatch(rules, /voice\/<short-name>|gh pr create/)
     assert.match(call.input, /^MAKE: sum up the quarter in a report\.\n\nThe driver's own words: "the words"\n/)
     assert.match(call.input, new RegExp(`^- Work folder: ${task.repo}, new and empty$`, 'm'))

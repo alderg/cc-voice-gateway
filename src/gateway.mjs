@@ -1054,6 +1054,20 @@ guard.on('quarantined', (task, entry) => {
     .catch(error => log('quarantine warning not sent by Telegram:', error.message))
 })
 
+// A call the guard's hook refused before it ran, as a write outside
+// (guard.mjs, fence.mjs): nothing happened, the run went on; a warning on
+// Telegram at once, and the controller hears it with the run's result.
+guard.on('refused', (task, entry) => {
+  telegram
+    ?.send(
+      `cc-voice-gateway on ${hostname()}: warning, worker ${task.repo} (task ${task.id}) tried to write outside its ` +
+        `allowed folders, ${preview(entry.paths.join(', '), 200)}, with ${preview(entry.command, 160)}. The guard refused ` +
+        `it before it ran; nothing happened. Invalid write ${entry.n} of the run; the ` +
+        `${entry.n >= 2 ? 'next one' : 'third'} locks the kill switch.`,
+    )
+    .catch(error => log('refusal warning not sent by Telegram:', error.message))
+})
+
 killswitch.on('tripped', async (state, event, first) => {
   const parked = (await lockdown(event.trigger).catch(lockdownFailed)) ?? []
   // Telegram at once; every voice chat hears it with its next call (voice.mjs).
@@ -1179,6 +1193,7 @@ settings.on('change', ({ limits, changed, others, grants: grantsText, accounts: 
   if (grantsText !== undefined) {
     grants.set(grantsText)
     grantsLog('from the settings file, at once')
+    guard.fences() // the guard's hook of every run going sees them too
   }
   if (accountsText !== undefined) accounts.set(accountsText)
   if (plansText !== undefined) accounts.setPlans(plansText)

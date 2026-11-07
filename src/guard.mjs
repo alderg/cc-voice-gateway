@@ -32,17 +32,28 @@
 //                   "Shell cwd was reset to …" in the result; a subagent's
 //                   calls start in the main thread's folder and change it
 //                   never, and neither does a call in the background.
+//                   The guard's hook (guardHooks, fence.mjs) reads each Bash,
+//                   Write, Edit, MultiEdit and NotebookEdit call with the same
+//                   code before it runs, and refuses one that would write
+//                   outside, with a message that names the run's folders: it
+//                   never runs. The rule counts such a call as no write, and
+//                   as an invalid write (refuse); an attempt at something
+//                   severe (severe: keys, settings that run code, a git hook,
+//                   the crontab, a place outside the home and the
+//                   repositories folder) locks at once all the same.
 //                   Quarantine (QUARANTINE_FREE): the first two invalid writes
 //                   of a run that make a new plain file in a place that is not
 //                   sensitive (sensitive) are moved into the quarantine
 //                   folder once the call has ended (decide), logged, kept with
 //                   the task for its result and Telegram, and the worker is
-//                   told by the hook; the third locks. Everything else locks
-//                   at once, as before: changing, appending to, removing or
-//                   moving files, folders and links, hidden files and folders,
-//                   other repositories, the gateway's checkout, places outside
-//                   the home and the repositories folder, and whatever the
-//                   guard cannot pin down.
+//                   told by the hook; the third invalid write, refused or
+//                   moved, locks. Everything else locks at once, as before:
+//                   changing, appending to, removing or moving files, folders
+//                   and links, hidden files and folders (but a new file under
+//                   .voice-runs/<the run's repository> outside every run
+//                   folder), other repositories, the gateway's checkout,
+//                   places outside the home and the repositories folder, and
+//                   whatever the guard cannot pin down.
 //                   Path grants (grants.mjs, VOICE_GW_PATH_GRANTS): folders
 //                   the driver granted to a repository count for its runs on
 //                   this computer as the repository does, apart from what is
@@ -75,22 +86,25 @@
 // goes to the statistics ('measured', stats.mjs): the commits made during
 // the run, the files and lines changed.
 //
-// The rules observe the run; they cannot stop its first step: a write locks
-// once its command shows. What they miss is in the README ("Limits"): targets
-// hidden in variables, scripts or other languages. In the Docker setup, git
-// runs only in the container (runner.git); never on this computer in the
-// mounted folder, and gh only on this computer.
+// The rules observe the run; past the hook, they cannot stop its first
+// step: a write locks once its command shows. What they miss is in the
+// README ("Limits"): targets hidden in variables, scripts or other languages.
+// In the Docker setup, git runs only in the container (runner.git); never on
+// this computer in the mounted folder, and gh only on this computer.
 
 import { execFile } from 'node:child_process'
 import { EventEmitter } from 'node:events'
-import { appendFileSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { appendFileSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join, posix, resolve as resolvePath } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { FENCE_VERSION, FILE_TOOLS, expandPath, gitHook, isDevice, parseShell, refusalTag, walkShell, within } from './fence.mjs'
 import { log as defaultLog, preview } from './log.mjs'
 import { tempFolders } from './platform.mjs'
-import { HELPER_FOLDER, inHelperFolder } from './workspaces.mjs'
+import { HELPER_FOLDER, RUN_FOLDERS, inHelperFolder } from './workspaces.mjs'
 import { WORKTREES, listWorktrees } from './worktrees.mjs'
+
+export { isDevice, parseShell }
 
 // The Claude Code memory folder of a session in the given folder, where its
 // auto memory writes: <config>/projects/<folder with every character but
@@ -104,30 +118,54 @@ export function memoryFolder(config, dir) {
 //
 // In the worker's settings (workers.mjs, --settings with --include-hook-events,
 // which puts every hook's output into the run's stream-json). Before a Bash or
-// Write call, PreToolUse prints the call's id, the folder Claude Code starts
-// it in and when, as one line after TOOL_START; Claude Code shows the model
-// nothing of it. After a call, PostToolUse and PostToolUseFailure hand the
-// model what the guard left for it in the file that GUARD_NOTES_ENV names (a
-// write it moved to quarantine), as additional context, and empty the file.
-// Before the run's turn ends, Stop waits while the guard still decides about
-// a write (the file .wait next to it), and hands over what is left with
+// file tool call, PreToolUse asks the fence (fence.mjs, refusal) whether the
+// call would write outside the run's allowed folders. If not, it prints the
+// call's id, the folder Claude Code starts it in and when, as one line after
+// TOOL_START; Claude Code shows the model nothing of it. If so, it refuses
+// the call, with permissionDecision deny and the fence's message, which
+// Claude Code hands the model as the call's result without running it, and
+// the same line goes to its stderr with refused: true, for the rule. Checked
+// in Claude Code 2.1.312, headless with bypassPermissions as the workers run:
+// a refused Bash or Write asks nothing, does nothing, and the run goes on.
+// It refuses, and never allows: without the fence or its module it only
+// reports, as before. After a call, PostToolUse and PostToolUseFailure hand
+// the model what the guard left for it in the file that GUARD_NOTES_ENV names
+// (a write it moved to quarantine), as additional context, and empty the
+// file. Before the run's turn ends, Stop waits while the guard still decides
+// about a write (the file .wait next to it), and hands over what is left with
 // decision block, so that the worker reads it before it ends. One script for
-// all, run by node: this computer's for a run here, the container's there.
-// It holds no single quote, as it goes into one.
+// all, run by node: this computer's for a run here, the container's there,
+// with the fence's module as its argument. It holds no single quote, as it
+// goes into one.
 
 export const GUARD_NOTES_ENV = 'VOICE_GW_GUARD_NOTES'
 export const TOOL_START = 'voice-gw-tool '
 // The folder of the notes in the container, which the gateway writes with
 // docker exec; on this computer they are next to the run's output.
 export const CONTAINER_NOTES = '/tmp/voice-gw'
+// The fence's module (fence.mjs): on this computer in the gateway's checkout,
+// in the container a copy the gateway puts next to the notes (fence).
+export const FENCE_MODULE = fileURLToPath(new URL('./fence.mjs', import.meta.url))
+export const CONTAINER_FENCE_MODULE = `${CONTAINER_NOTES}/fence.mjs`
+let fenceText = null
+const fenceSource = () => (fenceText ??= readFileSync(FENCE_MODULE, 'utf8'))
+// The version of the hooks a run gets (task.guardHooks): 2 asks the fence
+// and reports the file tools too; true, from before, reports Bash and Write.
+export const GUARD_HOOKS = 2
 const STOP_WAIT_MS = 30 * 1000
 const MAX_PUSHED = 20 // branches a run's git push named, kept on its record
 const HOOK_SCRIPT =
   'const fs=require("fs");let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{' +
   'let i={};try{i=JSON.parse(s)}catch{}' +
   `const e=i.hook_event_name,n=process.env.${GUARD_NOTES_ENV};` +
-  'if(e==="PreToolUse"){process.stdout.write(' +
-  `"${TOOL_START}"+JSON.stringify({id:i.tool_use_id,cwd:i.cwd,agent:i.agent_id||null,at:Date.now()})+"\\n");return}` +
+  'if(e==="PreToolUse"){' +
+  'const r={id:i.tool_use_id,cwd:i.cwd,agent:i.agent_id||null,at:Date.now()},m=process.argv[1];' +
+  'const go=d=>{if(!d)return process.stdout.write(' +
+  `"${TOOL_START}"+JSON.stringify(r)+"\\n");` +
+  `process.stderr.write("${TOOL_START}"+JSON.stringify({...r,refused:true})+"\\n");` +
+  'process.stdout.write(JSON.stringify({hookSpecificOutput:{hookEventName:e,permissionDecision:"deny",permissionDecisionReason:d}}))};' +
+  'if(!m||!n)return go(null);' +
+  'return import(require("url").pathToFileURL(m).href).then(f=>{let d=null;try{d=f.refusal(i,n+".fence")}catch{}go(d)},()=>go(null))}' +
   'if(!n)return;' +
   'const take=()=>{const t=n+".taken"+process.pid;try{fs.renameSync(n,t)}catch{return""}' +
   'try{return fs.readFileSync(t,"utf8").trim()}catch{return""}finally{try{fs.unlinkSync(t)}catch{}}};' +
@@ -138,18 +176,20 @@ const HOOK_SCRIPT =
 
 const shellQuote = text => `'${String(text).replace(/'/g, `'\\''`)}'`
 
-// The hooks for the worker's settings; node: the node that runs the script.
-export function guardHooks(node) {
-  const hook = { type: 'command', command: `${shellQuote(node)} -e ${shellQuote(HOOK_SCRIPT)}` }
+// The hooks for the worker's settings; node: the node that runs the script,
+// fence: the fence's module where that node finds it.
+export function guardHooks(node, fence = FENCE_MODULE) {
+  const hook = { type: 'command', command: `${shellQuote(node)} -e ${shellQuote(HOOK_SCRIPT)} ${shellQuote(fence)}` }
   return {
-    PreToolUse: [{ matcher: 'Bash|Write', hooks: [hook] }],
+    PreToolUse: [{ matcher: ['Bash', ...Object.keys(FILE_TOOLS)].join('|'), hooks: [hook] }],
     PostToolUse: [{ matcher: '*', hooks: [hook] }],
     PostToolUseFailure: [{ matcher: '*', hooks: [hook] }],
     Stop: [{ hooks: [{ ...hook, timeout: STOP_WAIT_MS / 1000 + 30 }] }],
   }
 }
 
-// The calls' reports in a PreToolUse hook's output: [{ id, cwd, agent, at }].
+// The calls' reports in a PreToolUse hook's output, its stdout and, for a
+// call it refused, its stderr: [{ id, cwd, agent, at, refused }].
 export function toolStarts(stdout) {
   const found = []
   for (const line of String(stdout ?? '').split('\n')) {
@@ -164,9 +204,10 @@ export function toolStarts(stdout) {
   return found
 }
 
-const FILE_TOOLS = { Write: 'file_path', Edit: 'file_path', MultiEdit: 'file_path', NotebookEdit: 'notebook_path' }
-// The calls the guard's hook reports before they start (guardHooks).
-const REPORTED = new Set(['Bash', 'Write'])
+// The calls the guard's hook reports before they start (guardHooks): of a
+// run with the hooks from before the fence, Bash and Write only.
+const REPORTED = new Set(['Bash', ...Object.keys(FILE_TOOLS)])
+const REPORTED_BEFORE = new Set(['Bash', 'Write'])
 // How long the rule waits for a call's report before it goes by the folder
 // it followed: the hooks may not run, as with disableAllHooks.
 const REPORT_WAIT_MS = 10 * 1000
@@ -194,26 +235,16 @@ const LOCKING_OPS = {
 const SHELL_FILES = /^\.?(bash_profile|bash_login|bash_logout|bashrc|profile|zshrc|zshenv|zprofile|zlogin|zlogout|kshrc|cshrc|tcshrc|login|logout|inputrc|xprofile|xinitrc|xsessionrc|envrc)$/
 // CI workflow files that live outside a hidden folder.
 const CI_FILES = new Set(['Jenkinsfile', 'azure-pipelines.yml', 'azure-pipelines.yaml', 'bitbucket-pipelines.yml', 'appveyor.yml', 'cloudbuild.yaml', 'cloudbuild.yml', 'buildspec.yml', 'codemagic.yaml'])
+// In the home folder: where keys and credentials live, and the settings that
+// hand them to tools (severe).
+const SECRETS = new Set([
+  '.ssh', '.gnupg', '.aws', '.azure', '.kube', '.docker', '.password-store', '.pki', '.netrc', '.git-credentials',
+  '.gitconfig', '.npmrc', '.pypirc', '.Xauthority', '.config/git', '.config/gh', '.config/gcloud', '.local/share/keyrings',
+])
+// In the home folder: what starts programs by itself (severe).
+const AUTOSTART = ['.config/autostart', '.config/systemd', '.local/share/systemd', '.config/environment.d', 'Library/LaunchAgents', 'Library/LaunchDaemons']
 // The gateway's own checkout.
 const GATEWAY = resolvePath(dirname(fileURLToPath(import.meta.url)), '..')
-// A git hook, in any .git: also the run's own repository's.
-const gitHook = path => /(?:^|\/)\.git\/hooks(?:\/|$)/.test(path)
-const WRAPPERS = new Set(['sudo', 'command', 'exec', 'nohup', 'time', 'env', 'nice'])
-// Words of compound commands before the command itself, or after it.
-const KEYWORDS = new Set(['if', 'then', 'else', 'elif', 'fi', 'do', 'done', 'while', 'until', '!', '{', '}', 'esac'])
-// Commands whose words are not a command: a loop's list, a case's word.
-const CLAUSES = new Set(['for', 'select', 'case', 'function'])
-const SHELLS = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh'])
-
-// Writing to these changes no file: the null device and its kind, the
-// standard streams, terminals, and file descriptors that are open already
-// (opening them for writing was a redirection of its own).
-export function isDevice(path) {
-  return (
-    ['/dev/null', '/dev/zero', '/dev/full', '/dev/stdin', '/dev/stdout', '/dev/stderr', '/dev/tty'].includes(path) ||
-    /^\/(?:dev\/fd|proc\/self\/fd|dev\/pts)\/\d+$/.test(path)
-  )
-}
 
 // The size check's look through the history of the files that the run's
 // own branches changed (versionsBefore): at most this many paths in one git
@@ -235,301 +266,6 @@ function gh(ghBin, args, timeout = 30000) {
     })
   })
 }
-
-// --- shell command lines ------------------------------------------------------
-//
-// What the rules need from a command line, read as a shell reads it: the
-// simple commands in the order they run, each with its words (quotes removed,
-// escapes resolved; an expansion stays as written, $name or ${…}, and a
-// command substitution becomes $(…)) and the targets of its redirections that
-// write. Quoted text, comments, here-strings and heredoc bodies are data, so a
-// > or a ; in a pattern, a message or a script that is written to a file is
-// none. The commands in $(…), `…`, <(…) and >(…), in the body of a heredoc
-// without quotes around its delimiter, and in a heredoc a shell reads, are
-// commands, between { type: 'open' } and { type: 'close' }, as are those of a
-// subshell ( … ): a cd in them stays there. In (( … )), $(( … )) and [[ … ]],
-// < and > compare. Not a whole shell: what it does not see is in the README.
-
-export function parseShell(source) {
-  return new ShellParser(String(source)).parse(0, null).events
-}
-
-const REDIRECT = /^(\d*)(&>>|&>|>>|>\||>&|>|<<<|<<-|<<|<>|<&|<)/
-const WRITES = new Set(['>', '>>', '>|', '&>', '&>>', '<>'])
-
-class ShellParser {
-  constructor(src) {
-    this.src = src
-  }
-
-  // From i to the end, or to the ) that closes what began before i (closer).
-  // Returns { events, end }, end being after the closer. Every step moves on
-  // by at least one character.
-  parse(i, closer) {
-    const src = this.src
-    const events = []
-    const pending = [] // heredocs, whose bodies begin with the next line
-    let command = null
-    let depth = 0 // subshells opened here
-    const current = at => (command ??= { type: 'command', words: [], writes: [], redirects: [], heredocs: [], start: at, end: at })
-    const finish = () => {
-      if (!command) return
-      command.text = src.slice(command.start, command.end).trim()
-      events.push(command)
-      command = null
-    }
-    // In [[ … ]], < > ( ) && || belong to the test.
-    const inTest = () => {
-      const open = command?.words.lastIndexOf('[[') ?? -1
-      return open >= 0 && !command.words.slice(open).includes(']]')
-    }
-    while (i < src.length) {
-      const c = src[i]
-      const next = src[i + 1]
-      const test = '<>()&|'.includes(c) && inTest()
-      if (c === ' ' || c === '\t' || c === '\r') {
-        i++
-      } else if (c === '\\' && next === '\n') {
-        i += 2
-      } else if (c === '\n') {
-        finish()
-        i = this.heredocs(i + 1, pending, events)
-      } else if (c === '#') {
-        while (i < src.length && src[i] !== '\n') i++
-      } else if (test && '<>()'.includes(c)) {
-        current(i).words.push(c)
-        command.end = ++i
-      } else if (test && ((c === '&' && next === '&') || (c === '|' && next === '|'))) {
-        current(i).words.push(c + next)
-        command.end = i += 2
-      } else if (c === ')') {
-        finish()
-        if (depth === 0 && closer === ')') return { events, end: i + 1 }
-        if (depth > 0) {
-          depth--
-          events.push({ type: 'close' })
-        }
-        i++
-      } else if (c === '(' && next === '(' && (!command || command.words.every(w => KEYWORDS.has(w) || w === 'for'))) {
-        current(i).words.push('((…))') // arithmetic
-        command.end = i = this.arithmetic(i + 2)
-      } else if (c === '(') {
-        finish()
-        depth++
-        events.push({ type: 'open' })
-        i++
-      } else if ((c === '<' || c === '>') && next === '(') {
-        // A process substitution: its commands run, it is a word here.
-        current(i)
-        i = this.nested(i + 2, events)
-        command.words.push('$(…)')
-        command.end = i
-      } else if (REDIRECT.test(src.slice(i, i + 12)) && !(c === '&' && next !== '>')) {
-        i = this.redirect(i, current(i), pending, events)
-        command.end = i
-      } else if (c === ';' || c === '&' || c === '|') {
-        finish()
-        i += c === next || (c === '|' && next === '&') || (c === ';' && next === '&') ? 2 : 1
-        if (c === ';' && src[i] === '&') i++ // ;;&
-      } else {
-        const word = this.word(i, events)
-        current(i).words.push(word.text)
-        command.end = i = word.end
-      }
-    }
-    finish()
-    return { events, end: i }
-  }
-
-  // A redirection at i: a write target goes to the command, a heredoc waits
-  // for the next line. Returns the index after it.
-  redirect(i, command, pending, events) {
-    const src = this.src
-    const [all, fd, op] = REDIRECT.exec(src.slice(i, i + 12))
-    i += all.length
-    while (src[i] === ' ' || src[i] === '\t') i++
-    const target = this.word(i, events)
-    if (op === '<<' || op === '<<-') {
-      pending.push({ delimiter: target.text, strip: op === '<<-', quoted: target.quoted, command })
-    } else if (WRITES.has(op) || (op === '>&' && !fd && !/^(\d+-?|-)$/.test(target.text))) {
-      // >&word with a word that is no file descriptor writes to that file
-      if (target.text) {
-        command.writes.push(target.text)
-        command.redirects.push({ target: target.text, op: op.endsWith('>>') ? 'append' : op === '<>' ? 'edit' : 'create' })
-      }
-    }
-    return target.end
-  }
-
-  // A substitution's commands from i to its ), between open and close.
-  nested(i, events) {
-    const inner = this.parse(i, ')')
-    events.push({ type: 'open' }, ...inner.events, { type: 'close' })
-    return inner.end
-  }
-
-  // From inside (( to after the matching )).
-  arithmetic(i) {
-    let depth = 2
-    while (i < this.src.length) {
-      const c = this.src[i++]
-      if (c === '(') depth++
-      else if (c === ')' && --depth === 0) return i
-    }
-    return i
-  }
-
-  // One word from i: { text, quoted, end }.
-  word(i, events) {
-    const src = this.src
-    let text = ''
-    let quoted = false
-    while (i < src.length && !' \t\r\n;&|()<>'.includes(src[i])) {
-      const c = src[i]
-      if (c === '\\') {
-        if (src[i + 1] !== '\n') text += src[i + 1] ?? ''
-        quoted = true
-        i += 2
-      } else if (c === "'") {
-        const end = src.indexOf("'", i + 1)
-        const stop = end < 0 ? src.length : end
-        text += src.slice(i + 1, stop)
-        quoted = true
-        i = stop + 1
-      } else if (c === '$' && src[i + 1] === "'") {
-        // $'…', with backslash escapes
-        i += 2
-        while (i < src.length && src[i] !== "'") {
-          if (src[i] === '\\') {
-            text += src[i + 1] ?? ''
-            i += 2
-          } else {
-            text += src[i++]
-          }
-        }
-        quoted = true
-        i++
-      } else if (c === '"') {
-        quoted = true
-        i++
-        while (i < src.length && src[i] !== '"') {
-          if (src[i] === '\\' && '$`"\\\n'.includes(src[i + 1] ?? '')) {
-            if (src[i + 1] !== '\n') text += src[i + 1]
-            i += 2
-          } else if (src[i] === '$' || src[i] === '`') {
-            const expansion = this.expansion(i, events)
-            text += expansion.text
-            i = expansion.end
-          } else {
-            text += src[i++]
-          }
-        }
-        i++
-      } else if (c === '$' || c === '`') {
-        const expansion = this.expansion(i, events)
-        text += expansion.text
-        i = expansion.end
-      } else {
-        text += c
-        i++
-      }
-    }
-    return { text, quoted, end: i }
-  }
-
-  // An expansion at i ($ or `): { text, end }; the commands of a
-  // substitution go to events.
-  expansion(i, events) {
-    const src = this.src
-    if (src[i] === '`') {
-      // In backticks, \` \\ and \$ stand for the character itself.
-      let j = i + 1
-      let code = ''
-      while (j < src.length && src[j] !== '`') {
-        if (src[j] === '\\' && '`\\$'.includes(src[j + 1] ?? '')) {
-          code += src[j + 1]
-          j += 2
-        } else {
-          code += src[j++]
-        }
-      }
-      const inner = new ShellParser(code).parse(0, null)
-      events.push({ type: 'open' }, ...inner.events, { type: 'close' })
-      return { text: '$(…)', end: j + 1 }
-    }
-    const next = src[i + 1]
-    if (next === '(' && src[i + 2] === '(') return { text: '$((…))', end: this.arithmetic(i + 3) }
-    if (next === '(') return { text: '$(…)', end: this.nested(i + 2, events) }
-    if (next === '{') {
-      // ${…} to its brace; a substitution in it runs
-      let j = i + 2
-      let depth = 1
-      let text = '${'
-      while (j < src.length && depth) {
-        const c = src[j]
-        if (c === '\\') {
-          text += src.slice(j, j + 2)
-          j += 2
-        } else if (c === "'") {
-          const end = src.indexOf("'", j + 1)
-          const stop = end < 0 ? src.length : end + 1
-          text += src.slice(j, stop)
-          j = stop
-        } else if (c === '$' || c === '`') {
-          const expansion = this.expansion(j, events)
-          text += expansion.text
-          j = expansion.end
-        } else {
-          if (c === '{') depth++
-          else if (c === '}') depth--
-          text += c
-          j++
-        }
-      }
-      return { text, end: j }
-    }
-    const name = /^(?:[A-Za-z_][A-Za-z0-9_]*|[0-9@*#?$!-])/.exec(src.slice(i + 1, i + 129))?.[0] ?? ''
-    return { text: `$${name}`, end: i + 1 + name.length }
-  }
-
-  // The bodies of the heredocs opened on the line before, from i on. A body
-  // is data, unless a shell reads it as its script. In one without quotes
-  // around its delimiter, $(…) and `…` run. Returns the index after them.
-  heredocs(i, pending, events) {
-    const src = this.src
-    while (pending.length) {
-      const { delimiter, strip, quoted, command } = pending.shift()
-      let body = ''
-      while (i < src.length) {
-        const end = src.indexOf('\n', i)
-        const stop = end < 0 ? src.length : end
-        const line = src.slice(i, stop)
-        i = stop + 1
-        if ((strip ? line.replace(/^\t+/, '') : line) === delimiter) break
-        body += `${line}\n`
-      }
-      command.heredocs.push(body) // a script it writes to a file may run later (RunGuard.shell)
-      const { name, args } = commandOf(command.words)
-      if (SHELLS.has(basename(name)) && !args.some(arg => /^-[a-zA-Z]*c[a-zA-Z]*$/.test(arg))) {
-        const inner = new ShellParser(body).parse(0, null)
-        events.push({ type: 'open' }, ...inner.events, { type: 'close' })
-      } else if (!quoted) {
-        const inner = new ShellParser(body)
-        for (let j = 0; j < body.length; ) {
-          if (body[j] === '\\') j += 2
-          else if (body[j] === '$' || body[j] === '`') j = inner.expansion(j, events).end
-          else j++
-        }
-      }
-    }
-    return Math.min(i, src.length)
-  }
-}
-
-const basename = name => String(name ?? '').split('/').pop()
-
-// Whether a path is one of the folders, or inside one.
-const within = (path, roots) => roots.some(root => path === root || path.startsWith(root.replace(/\/$/, '') + '/'))
 
 // The folders on this computer's PATH, but / and the home folder itself.
 const pathFolders = home =>
@@ -558,16 +294,23 @@ function quarantineNote(run, entry, granted = []) {
   )
 }
 
-// The command of a simple command's words: past keywords (if, do, …),
-// wrappers (sudo, env, …) and variable assignments. { name, args }.
-function commandOf(words) {
-  let at = 0
-  while (at < words.length && (KEYWORDS.has(words[at]) || WRAPPERS.has(words[at]) || /^[A-Za-z_][A-Za-z0-9_]*\+?=/.test(words[at]))) {
-    at++
-  }
-  const [name = null, ...args] = words.slice(at)
-  return { name, args }
+// What the worker reads, through the guard's hook, after the second invalid
+// write of a run that the hook refused (RunGuard.refuse); the refusal itself
+// said the rest.
+function refusedNote(entry) {
+  const by = entry.command.startsWith('"') ? `the command ${entry.command}` : `the ${entry.command.split(' ')[0]} tool`
+  return (
+    `The gateway's guard: it refused ${by} before it ran, as the second invalid write of this run: the next one ` +
+    'locks the kill switch, which stops all work. Write only in your allowed folders, leave files outside them as ' +
+    'they are, and name them in your result.'
+  )
 }
+
+// crontab's words that only list the table, and so change nothing.
+const cronListing = args =>
+  args.some(arg => /^-[a-zA-Z]*l/.test(arg)) &&
+  !args.some(arg => /^-[a-zA-Z]*[er]/.test(arg)) &&
+  args.filter(arg => !arg.startsWith('-')).length <= (args.includes('-u') ? 1 : 0)
 
 // git [-C dir] [-c key=value] push [options] [remote [refspec...]]: the
 // branches it names as targets, and whether it pushes to a URL or a path
@@ -718,12 +461,17 @@ export class RunGuard extends EventEmitter {
       tripped: new Set(),
       // Its Bash and file tool calls until their results, by Claude Code's id.
       calls: new Map(),
-      // Whether its Claude Code reports each Bash and Write call before it
-      // starts (guardHooks), and whether a report came yet.
+      // Whether its Claude Code reports its Bash and file tool calls before
+      // they start (guardHooks), which of them, and whether a report came yet.
       hooks: Boolean(task.guardHooks),
+      reports: task.guardHooks === GUARD_HOOKS ? REPORTED : REPORTED_BEFORE,
       reported: false,
       notes: typeof task.guardNotes === 'string' && task.guardNotes ? task.guardNotes : null, // for the hook (guardHooks)
-      invalid: 0, // invalid writes that went or go to quarantine
+      claudeConfig,
+      // Invalid writes: those that went or go to quarantine, and the calls
+      // the guard's hook refused.
+      invalid: 0,
+      kinds: [], // of those, which went to quarantine and which were refused, for the reason of the third
       pending: 0, // of those, the ones still to decide
       deciding: new Set(), // the decisions going (decide)
     }
@@ -735,6 +483,52 @@ export class RunGuard extends EventEmitter {
     run.cwd = run.dir // the shell's folder after its last Bash call (see shell)
     this.runs.set(task.id, run)
     run.ready = this.baseline(run)
+    this.fence(run)
+  }
+
+  // --- the fence, for the guard's hook (fence.mjs) ------------------------------
+
+  // What the hook of a run needs to read its calls as the rule does: its
+  // workspace, home and run folder, and the folders it may write in.
+  fenceOf(run) {
+    const granted = this.grantedFolders(run)
+    return {
+      v: FENCE_VERSION,
+      task: run.id,
+      kind: run.scratch ? 'scratch' : run.worktree ? 'worktree' : 'repo',
+      dir: run.dir,
+      home: run.home,
+      runFolder: run.runFolder,
+      allowed: [...new Set([run.dir, ...run.memories, ...run.roots, ...granted])],
+      granted,
+    }
+  }
+
+  // Writes the run's fence next to its notes, whole or not at all: on this
+  // computer at once, in the container through docker exec, with the fence's
+  // module beside it. Again when the grants change (fences). Not for a run
+  // whose hooks do not ask the fence.
+  fence(run) {
+    if (!run.notes || run.task.guardHooks !== GUARD_HOOKS) return Promise.resolve()
+    const file = `${run.notes}.fence`
+    const text = JSON.stringify(this.fenceOf(run))
+    return this.mailbox(run, 'fence for the guard\'s hook not written', () => {
+      if (run.runner.container) {
+        const put = 'mkdir -p "$(dirname "$1")" && printf "%s" "$2" > "$1.$$" && mv -f "$1.$$" "$1"'
+        return run.runner
+          .sh(put, [CONTAINER_FENCE_MODULE, fenceSource()])
+          .then(result => (result?.ok === false ? result : run.runner.sh(put, [file, text])))
+      }
+      mkdirSync(dirname(file), { recursive: true, mode: 0o700 })
+      writeFileSync(`${file}.${process.pid}`, text, { mode: 0o600 })
+      renameSync(`${file}.${process.pid}`, file)
+    })
+  }
+
+  // The fences of every run going, after the folders granted to their
+  // repositories changed (gateway.mjs).
+  fences() {
+    return Promise.all([...this.runs.values()].map(run => this.fence(run)))
   }
 
   // The default branch's name, where the task does not have it, for the size
@@ -755,9 +549,9 @@ export class RunGuard extends EventEmitter {
     const bash = part.name === 'Bash' && typeof part.input?.command === 'string'
     if (!FILE_TOOLS[part.name] && !bash) return
     const id = typeof part.id === 'string' && part.id ? part.id : null // Claude Code's id of the tool call
-    const call = { id, part, parent: typeof parent === 'string' && parent ? parent : null, seenAt: Date.now(), at: null, checked: false, candidates: [] }
+    const call = { id, part, parent: typeof parent === 'string' && parent ? parent : null, seenAt: Date.now(), at: null, checked: false, refused: null, candidates: [] }
     if (id) run.calls.set(id, call)
-    if (run.hooks && id && REPORTED.has(part.name)) {
+    if (run.hooks && id && run.reports.has(part.name)) {
       this.later(REPORT_WAIT_MS, () => this.runs.get(run.id) === run && this.check(run, call))
       return
     }
@@ -765,24 +559,49 @@ export class RunGuard extends EventEmitter {
   }
 
   // A call's report from the guard's hook: the folder Claude Code starts it
-  // in, exactly, and when.
-  toolStart(task, { id, cwd = null, agent = null, at = null } = {}) {
+  // in, exactly, and when. One the hook refused never runs: the rule waits
+  // for its result, which says so for sure (toolResult), and keeps the
+  // folder, which a call that does not run leaves as it was.
+  toolStart(task, { id, cwd = null, agent = null, at = null, refused = false } = {}) {
     const run = this.runs.get(task.id)
     const call = run?.calls.get(id)
     if (!call) return
     run.reported = true
-    this.check(run, call, { cwd: typeof cwd === 'string' && cwd.startsWith('/') ? posix.normalize(cwd) : null, at, agent })
+    const where = typeof cwd === 'string' && cwd.startsWith('/') ? posix.normalize(cwd) : null
+    if (refused === true && !call.checked) {
+      call.refused = { cwd: where, at, agent }
+      if (where && !call.parent && !agent) run.cwd = where
+      return
+    }
+    this.check(run, call, { cwd: where, at, agent })
   }
 
   // A call's result: the folder the main thread's shell is in afterwards, as
   // Claude Code keeps it, and the decision on the writes that may go to
   // quarantine, now that the call has ended. Without a report before, the
   // hooks do not run in this Claude Code: the rule goes by the folder it
-  // followed from then on, without waiting.
+  // followed from then on, without waiting. A call the guard's hook refused
+  // has an error for its result with the refusal's words and the call's own
+  // id, which the call's command cannot know: it goes to refuse. One the
+  // hook reported refused without such a result is checked as one that ran.
   toolResult(task, { id, error = false, text = '' } = {}) {
     const run = this.runs.get(task.id)
     const call = run?.calls.get(id)
     if (!call) return
+    if (!call.checked && error && call.id && String(text).includes(refusalTag(call.id))) {
+      run.reported = true
+      run.calls.delete(id)
+      return this.refuse(run, call, call.refused ?? {})
+    }
+    if (call.refused) {
+      const report = call.refused
+      call.refused = null
+      this.log(
+        `kill switch rule on writes outside: the guard's hook refused the call ${call.id}, but its result does not say so; ` +
+          `the rule checks it as one that ran (worker ${run.repo}, task ${run.id})`,
+      )
+      this.check(run, call, report)
+    }
     if (!call.checked && run.hooks && !run.reported) {
       run.hooks = false
       this.log(`kill switch rule on writes outside: no report of the guard's hook in this run, so the rule follows the shell's folder itself (worker ${run.repo}, task ${run.id})`)
@@ -804,7 +623,7 @@ export class RunGuard extends EventEmitter {
   // What a call writes, checked once: from the folder its report names, or
   // the one the rule followed. A file tool's path is absolute.
   check(run, call, { cwd = null, at = null, agent = null } = {}) {
-    if (call.checked) return
+    if (call.checked || call.refused) return
     call.checked = true
     if (Number.isFinite(at)) call.at = at
     const { part } = call
@@ -857,8 +676,12 @@ export class RunGuard extends EventEmitter {
     if (!run) return
     this.runs.delete(task.id)
     // The calls without a result, such as the one a stop ended: what they
-    // wrote is there now.
+    // wrote is there now. One the guard's hook refused never ran.
     for (const call of run.calls.values()) {
+      if (call.refused) {
+        this.refuse(run, call, call.refused)
+        continue
+      }
       this.check(run, call)
       if (call.candidates.length) this.decide(run, call)
     }
@@ -869,38 +692,27 @@ export class RunGuard extends EventEmitter {
     if (size) this.emit('measured', task, { ...size, pushed: run.pushed.size > 0 })
   }
 
-  // The commands of a Bash call, as a shell runs them (parseShell), with the
-  // folder each runs in: cd changes it for what follows, but not out of a
-  // subshell or a substitution; after a cd whose target a variable hides,
-  // only absolute targets count. sh -c, bash -c and eval run their text, and
-  // a script that cat or tee wrote from a heredoc is checked as shell
-  // commands when the same call runs it, with a shell or by its path.
-  // Returns the folder the call leaves its shell in, null where it cannot
-  // tell. call: the tool call, whose writes may go to quarantine (outside).
-  // A git push is no rule of its own: the branches it names are for the size
-  // check (commitRefs, reused), and for the pull requests the run pushed.
-  shell(run, command, cwd = run.dir, call = null) {
-    const outer = []
-    const scripts = new Map() // path -> script written from a heredoc in this call
-    const events = parseShell(command)
-    for (const event of events) {
-      if (event.type === 'open') {
-        outer.push(cwd)
-        continue
-      }
-      if (event.type === 'close') {
-        if (outer.length) cwd = outer.pop()
-        continue
-      }
-      const shown = `"${preview(event.text, 120)}"`
-      const { name, args } = commandOf(event.words)
-      const ops = [...event.redirects]
-      if (name && !CLAUSES.has(name)) {
-        if (name === 'cd' || name === 'pushd') {
-          const dir = args.find(arg => !arg.startsWith('-') || arg === '-')
-          cwd = dir === undefined ? run.home : dir === '-' ? null : this.resolve(run, cwd, dir)
-        } else if (name === 'popd') {
-          cwd = null
+  // The commands of a Bash call, as a shell runs them (walkShell, fence.mjs,
+  // the same code the guard's hook reads them with), with the folder each
+  // runs in: cd changes it for what follows, but not out of a subshell or a
+  // substitution; after a cd whose target a variable hides, only absolute
+  // targets count. sh -c, bash -c and eval run their text, and a script that
+  // cat or tee wrote from a heredoc is checked as shell commands when the
+  // same call runs it, with a shell or by its path. Returns the folder the
+  // call leaves its shell in, null where it cannot tell. call: the tool call,
+  // whose writes may go to quarantine (outside). A git push is no rule of its
+  // own: the branches it names are for the size check (commitRefs, reused),
+  // and for the pull requests the run pushed. found: for a call that did not
+  // run (refuse), where its writes outside and a change of the crontab go
+  // instead, with nothing else done.
+  shell(run, command, cwd = run.dir, call = null, found = null) {
+    return walkShell(command, cwd, { home: run.home, runFolder: run.runFolder }, {
+      command: (name, args, { shown }) => {
+        // A cron job runs whatever it says, later: only a listing is no write.
+        const crontab = name === 'crontab' && !cronListing(args)
+        if (found) {
+          if (crontab) found.push({ path: 'the crontab', op: 'crontab', detail: `${shown} changes the crontab` })
+          return
         }
         const push = name === 'git' ? pushTargets(args) : null
         if (push) {
@@ -916,87 +728,18 @@ export class RunGuard extends EventEmitter {
           const known = Array.isArray(run.task.pushedBranches) ? run.task.pushedBranches : []
           run.task.pushedBranches = [...known.filter(b => !names.includes(b)), ...names].slice(-MAX_PUSHED)
         }
-        // A cron job runs whatever it says, later: only a listing is no write.
-        if (name === 'crontab') {
-          const listing =
-            args.some(arg => /^-[a-zA-Z]*l/.test(arg)) &&
-            !args.some(arg => /^-[a-zA-Z]*[er]/.test(arg)) &&
-            args.filter(arg => !arg.startsWith('-')).length <= (args.includes('-u') ? 1 : 0)
-          if (!listing) this.violation(run, OUTSIDE, `${shown} changes the crontab, which locks at once`)
-        }
-        ops.push(...this.operations(name, args))
-        const c = SHELLS.has(basename(name)) ? args.findIndex(arg => /^-[a-zA-Z]*c[a-zA-Z]*$/.test(arg)) : -1
-        if (c >= 0 && args[c + 1] !== undefined) this.shell(run, args[c + 1], cwd, call)
-        if (name === 'eval' && args.length) this.shell(run, args.join(' '), cwd, call)
-        if (event.heredocs.length && ['cat', 'tee'].includes(name)) {
-          for (const { target } of ops) {
-            const path = this.resolve(run, cwd, target)
-            if (path) scripts.set(path, event.heredocs.join(''))
-          }
-        }
-        const file = SHELLS.has(basename(name)) || ['source', '.'].includes(name) ? args.find(arg => !arg.startsWith('-')) : name
-        const script = file !== undefined && scripts.get(this.resolve(run, cwd, file))
-        if (script) this.shell(run, script, cwd, call)
-      }
-      for (const { target, op } of ops) {
-        const raw = this.expand(run, cwd, target)
-        const path = raw === null ? null : posix.resolve(raw)
-        if (path && (!this.allowed(run, path, op, raw) || gitHook(path))) {
-          this.outside(run, call, { path, raw, op, detail: `${shown} writes ${path}`, shown })
-        }
-      }
-    }
-    return outer.length ? outer[0] : cwd
+        if (crontab) this.violation(run, OUTSIDE, `${shown} changes the crontab, which locks at once`)
+      },
+      write: ({ path, raw, op, shown }) => {
+        if (!path || (this.allowed(run, path, op, raw) && !gitHook(path))) return
+        const write = { path, raw, op, detail: `${shown} writes ${path}`, shown }
+        if (found) found.push(write)
+        else this.outside(run, call, write)
+      },
+    })
   }
 
   // --- writes -------------------------------------------------------------------
-
-  // What a command writes by its operands, [{ target, op }]: the files and
-  // folders of the commands that make, change or remove them, with what it
-  // does to them (LOCKING_OPS, or create for a new file). mv also removes
-  // what it moves.
-  operations(name, args) {
-    const operands = []
-    const valued = { cp: ['-t', '-S'], mv: ['-t', '-S'], install: ['-t', '-m', '-o', '-g', '-S'], ln: ['-t', '-S'], rsync: [] }[name] ?? []
-    let into = null // -t / --target-directory
-    for (let i = 0; i < args.length; i++) {
-      const arg = args[i]
-      if (arg === '--') {
-        operands.push(...args.slice(i + 1))
-        break
-      }
-      if (['-t', '--target-directory'].includes(arg) && valued.includes('-t')) into = args[++i]
-      else if (arg.startsWith('--target-directory=')) into = arg.slice('--target-directory='.length)
-      else if (valued.includes(arg)) i++
-      else if (!arg.startsWith('-') || arg === '-') operands.push(arg)
-    }
-    const as = (op, targets) => targets.map(target => ({ target, op }))
-    if (name === 'tee') return as(args.some(arg => arg === '--append' || /^-[a-zA-Z]*a/.test(arg)) ? 'append' : 'create', operands)
-    if (['rm', 'rmdir', 'shred', 'unlink'].includes(name)) return as('remove', operands)
-    if (name === 'mkdir') return as('mkdir', operands)
-    if (name === 'touch') return as('create', operands)
-    if (name === 'truncate') return as('truncate', operands)
-    if (['chmod', 'chown', 'chgrp'].includes(name)) return as('mode', operands.slice(1))
-    if (['cp', 'mv', 'install', 'ln', 'rsync'].includes(name)) {
-      const op = { mv: 'move', ln: 'link' }[name] ?? 'create'
-      if (name === 'install' && args.includes('-d') && into === null) return as('mkdir', operands)
-      const [target, sources] = into !== null ? [into, operands] : operands.length > 1 ? [operands.at(-1), operands.slice(0, -1)] : [null, []]
-      if (target === null) return []
-      return [{ target, op }, ...(name === 'mv' ? as('remove', sources) : [])]
-    }
-    if (name === 'sed' && args.some(arg => /^-[a-zA-Z]*i/.test(arg) || arg.startsWith('--in-place'))) {
-      // The script is the first operand, unless -e or -f gave it.
-      const scripts = args.some(arg => /^-[a-zA-Z]*[ef]$/.test(arg) || /^--(expression|file)/.test(arg))
-      const files = []
-      for (let i = 0; i < args.length; i++) {
-        if (/^-[a-zA-Z]*[ef]$/.test(args[i]) || ['--expression', '--file'].includes(args[i])) i++
-        else if (!args[i].startsWith('-')) files.push(args[i])
-      }
-      return as('edit', scripts ? files : files.slice(1))
-    }
-    if (name === 'dd') return as('create', args.filter(arg => arg.startsWith('of=')).map(arg => arg.slice(3)))
-    return []
-  }
 
   // An invalid write: it locks, or goes to quarantine once the call has
   // ended (decide), as the first or second of the run that makes a new plain
@@ -1019,10 +762,54 @@ export class RunGuard extends EventEmitter {
       return
     }
     if (run.invalid >= QUARANTINE_FREE) {
-      return this.violation(run, OUTSIDE, `${detail}: the third invalid write in one run, after ${QUARANTINE_FREE} went to quarantine`)
+      return this.violation(run, OUTSIDE, `${detail}: the third invalid write in one run, ${this.earlier(run)}`)
     }
     run.invalid++
+    run.kinds.push('quarantine')
     call.candidates.push({ path, detail, shown, n: run.invalid })
+  }
+
+  // The invalid writes of a run before its third, in a few words: those
+  // that went to quarantine and those the guard's hook refused.
+  earlier(run) {
+    const moved = run.kinds.filter(kind => kind === 'quarantine').length
+    const refused = run.kinds.length - moved
+    if (run.kinds.length < run.invalid) return `after ${run.invalid} that went to quarantine or that the guard's hook refused`
+    if (moved && refused) return `after ${moved} went to quarantine and the guard's hook refused ${refused}`
+    return refused ? `after the guard's hook refused ${refused}` : `after ${moved} went to quarantine`
+  }
+
+  // The place a path is in: the repositories folder (the run's runner's,
+  // also the work folders'), or the home folder; null for neither.
+  placeOf(run, path) {
+    const sameSide = this.runner !== run.runner && Boolean(this.runner.container) === Boolean(run.runner.container)
+    const places = [run.runner.root, sameSide ? this.runner.root : null, run.home]
+      .filter(root => typeof root === 'string' && root.startsWith('/'))
+      .sort((a, b) => b.length - a.length)
+    return places.find(root => within(path, [root])) ?? null
+  }
+
+  // The run folders the gateway knows (workspaces.mjs, Workers' state), and
+  // those of the runs going.
+  runFolders() {
+    const known = Object.keys(this.workers.state?.runFolders ?? {})
+    const going = [...this.runs.values()].map(run => run.runFolder).filter(Boolean)
+    return [...new Set([...known, ...going])]
+  }
+
+  // The folder that holds the run folders of the run's repository,
+  // <repositories folder>/.voice-runs/<repository>, if the path is under it
+  // and in none of the run folders there; else null. A new file there is a
+  // slip with a run folder's path, such as one with a guessed date (tu46 on
+  // 2026-11-07 wrote .voice-runs/drawio-mcp/2026-11-07-84rf/pr-body.md while
+  // its folder was 2026-11-06-84rf), and may go to quarantine as one in
+  // the home folder may; another run's folder, another repository's, the
+  // worktrees and everything hidden there still lock at once.
+  ownRunTree(run, path) {
+    if (run.scratch || typeof run.runner.root !== 'string') return null
+    const tree = posix.join(run.runner.root, RUN_FOLDERS, run.repo)
+    if (!path.startsWith(`${tree}/`)) return null
+    return within(path, this.runFolders()) ? null : tree
   }
 
   // Why an invalid write locks at once, or null for a new file in a place
@@ -1031,20 +818,21 @@ export class RunGuard extends EventEmitter {
   // folder (shell profiles and rc files, ~/.ssh, ~/.claude, ~/.config with
   // autostart and systemd, .git, .github with the CI workflows), not a shell
   // profile, a hooks folder, a CI file, ~/Library on macOS, the gateway's
-  // own checkout or a folder on the PATH. Whether it is in a git repository
-  // only a look tells (decide).
+  // own checkout or a folder on the PATH. The one hidden folder that may
+  // take one is the run folders' of the run's own repository, outside every
+  // run folder (ownRunTree). Whether it is in a git repository only a look
+  // tells (decide).
   sensitive(run, path, op) {
     if (gitHook(path)) return 'a git hook'
     if (LOCKING_OPS[op]) return LOCKING_OPS[op]
-    const sameSide = this.runner !== run.runner && Boolean(this.runner.container) === Boolean(run.runner.container)
-    const places = [run.runner.root, sameSide ? this.runner.root : null, run.home]
-      .filter(root => typeof root === 'string' && root.startsWith('/'))
-      .sort((a, b) => b.length - a.length)
-    const place = places.find(root => within(path, [root]))
+    const place = this.placeOf(run, path)
     if (!place) return 'outside the home folder and the repositories folder'
     const parts = posix.relative(place, path).split('/')
     const name = parts.at(-1)
-    if (parts.some(part => part.startsWith('.'))) return 'a hidden file or folder, where settings, keys and configuration live'
+    const tree = this.ownRunTree(run, path)
+    if (!tree && place === run.runner.root && parts[0] === RUN_FOLDERS && within(path, this.runFolders())) return "another run's run folder"
+    const hidden = tree ? posix.relative(tree, path).split('/') : parts
+    if (hidden.some(part => part.startsWith('.'))) return 'a hidden file or folder, where settings, keys and configuration live'
     if (SHELL_FILES.test(name)) return 'a shell profile or rc file'
     if (parts.includes('hooks')) return 'a hooks folder'
     if (CI_FILES.has(name)) return 'a CI workflow file'
@@ -1052,6 +840,95 @@ export class RunGuard extends EventEmitter {
     if (!run.runner.container && within(path, [this.gateway])) return "the gateway's own checkout"
     if (!run.runner.container && pathFolders(run.home).includes(posix.dirname(path))) return 'a folder on the PATH'
     return null
+  }
+
+  // Why an attempt at a write outside locks at once even though the guard's
+  // hook refused it before it ran, or null where the attempt only counts as
+  // an invalid write (refuse). A worker that tidies up a tool's cache or log
+  // in the home folder, guesses its run folder's name or makes a folder for a
+  // browser profile is not after these; one that reaches for them is, and
+  // must not get more tries for a way the rule cannot see: a git hook or a
+  // .git folder, a hooks folder, a shell profile, the crontab, keys and
+  // credentials (SECRETS), what starts programs by itself (AUTOSTART), Claude
+  // Code's own folder and the .claude settings of any project, CI workflows,
+  // a folder on the PATH, the gateway's checkout, and every place outside the
+  // home folder and the repositories folder.
+  severe(run, path, op) {
+    if (op === 'crontab') return 'it changes the crontab'
+    if (gitHook(path)) return 'a git hook'
+    const place = this.placeOf(run, path)
+    if (!place) return 'outside the home folder and the repositories folder'
+    const parts = posix.relative(place, path).split('/')
+    const name = parts.at(-1)
+    const under = folders => folders.some(folder => within(parts.join('/'), [folder]))
+    if (parts.includes('.git')) return "a git repository's .git folder"
+    if (SHELL_FILES.test(name)) return 'a shell profile or rc file'
+    if (parts.includes('hooks')) return 'a hooks folder'
+    if (parts.includes('.github') || CI_FILES.has(name)) return 'a CI workflow file'
+    if (parts.includes('.claude') || within(path, [run.claudeConfig])) return "Claude Code's settings, hooks or memory"
+    if (place === run.home && under([...SECRETS])) return 'keys, credentials or the settings that hand them to tools'
+    if (place === run.home && under(AUTOSTART)) return 'what starts programs by itself'
+    if (!run.runner.container && within(path, [this.gateway])) return "the gateway's own checkout"
+    if (!run.runner.container && pathFolders(run.home).includes(posix.dirname(path))) return 'a folder on the PATH'
+    return null
+  }
+
+  // A call the guard's hook refused before it ran (toolResult): nothing of
+  // it ran, so it is no write and no edit, and the shell's folder stays. The
+  // rule reads it all the same, from the folder the hook's report names, for
+  // what it would have written outside. An attempt at something severe
+  // (severe) locks at once; any other counts as an invalid write of the
+  // run, as one that went to quarantine does, and the third locks, as a
+  // worker that keeps pushing against the fence. Kept with the task, for its
+  // result, Telegram and a gateway that takes the run over. One in which the
+  // rule finds nothing outside (a folder granted since, say) counts nothing.
+  refuse(run, call, { cwd = null } = {}) {
+    call.checked = true // never checked as a call that ran, also not by the wait for its report (tool)
+    const { part } = call
+    const found = []
+    if (FILE_TOOLS[part.name]) {
+      const given = part.input?.[FILE_TOOLS[part.name]]
+      const raw = typeof given === 'string' ? this.expand(run, run.dir, given) : null
+      const path = raw === null ? null : posix.resolve(raw)
+      const op = part.name === 'Write' ? 'create' : 'edit'
+      if (path && (!this.allowed(run, path, op, raw) || gitHook(path))) found.push({ path, op, detail: `${part.name} ${path}` })
+    } else if (typeof part.input?.command === 'string') {
+      this.shell(run, part.input.command, cwd ?? run.cwd, null, found)
+    }
+    const shown = FILE_TOOLS[part.name] ? `${part.name} ${found[0]?.path ?? part.input?.[FILE_TOOLS[part.name]]}` : `"${preview(part.input?.command ?? '', 120)}"`
+    const where = `(worker ${run.repo}, task ${run.id})`
+    if (!found.length) {
+      return this.log(`kill switch rule on writes outside: the guard's hook refused ${shown}, in which the rule finds no write outside; it counts nothing ${where}`)
+    }
+    const severe = found.map(write => ({ write, why: this.severe(run, write.path, write.op) })).find(each => each.why)
+    if (severe) {
+      return this.violation(run, OUTSIDE, `${severe.write.detail}: ${severe.why}; the guard's hook refused it before it ran, but an attempt at that locks at once`)
+    }
+    const earlier = call.id && (run.task.refused ?? []).find(entry => entry.tool === call.id)
+    if (earlier) {
+      run.invalid = Math.max(run.invalid, earlier.n)
+      return
+    }
+    const detail = found[0].detail
+    if (run.invalid >= QUARANTINE_FREE) {
+      return this.violation(run, OUTSIDE, `${detail}: the third invalid write in one run, refused by the guard's hook before it ran, ${this.earlier(run)}`)
+    }
+    run.invalid++
+    run.kinds.push('refused')
+    const entry = { n: run.invalid, tool: call.id, paths: [...new Set(found.map(write => write.path))].slice(0, 5), command: shown, at: Date.now() }
+    run.task.refused = [...(run.task.refused ?? []), entry]
+    try {
+      this.workers.save?.()
+    } catch (error) {
+      this.log('worker state not saved:', error.message)
+    }
+    this.log(
+      `kill switch rule on writes outside the allowed folders: the guard's hook refused ${shown} before it ran, which would ` +
+        `have written ${entry.paths.join(', ')}; invalid write ${entry.n} of the run; the ${entry.n >= QUARANTINE_FREE ? 'next' : 'third'} ` +
+        `locks the kill switch ${where}`,
+    )
+    this.emit('refused', run.task, entry)
+    if (entry.n >= QUARANTINE_FREE) this.note(run, refusedNote(entry))
   }
 
   // The invalid writes of a call that may go to quarantine, now that it has
@@ -1095,7 +972,8 @@ export class RunGuard extends EventEmitter {
       .then(() => run.runner.quarantine(path, file))
       .catch(() => false)
     if (!moved) return this.violation(run, OUTSIDE, `${detail}, and the guard could not move it to quarantine`)
-    const entry = { n, tool: call.id, path, file, command: shown, at: Date.now() }
+    const tidied = await this.tidy(run, path, since)
+    const entry = { n, tool: call.id, path, file, command: shown, at: Date.now(), ...(tidied.length ? { folders: tidied } : {}) }
     run.task.quarantined = [...(run.task.quarantined ?? []), entry]
     try {
       this.workers.save?.()
@@ -1109,10 +987,32 @@ export class RunGuard extends EventEmitter {
     }
     this.log(
       `kill switch rule on writes outside the allowed folders: moved ${path} to quarantine (${file}), invalid write ${n} of ` +
-        `the run, by ${shown}; the ${n >= QUARANTINE_FREE ? 'next' : 'third'} locks the kill switch (worker ${run.repo}, task ${run.id})`,
+        `the run, by ${shown}; the ${n >= QUARANTINE_FREE ? 'next' : 'third'} locks the kill switch (worker ${run.repo}, task ${run.id})` +
+        (tidied.length ? `; removed the empty folder${tidied.length === 1 ? '' : 's'} it made, ${tidied.join(', ')}` : ''),
     )
     this.emit('quarantined', run.task, entry)
     await this.note(run, quarantineNote(run, entry, this.grantedFolders(run)))
+  }
+
+  // After a file under the run folders of the run's own repository went to
+  // quarantine (ownRunTree): the folders above it up to there that the call
+  // made, such as the Write tool makes for a path it is given, once they are
+  // empty, so that nothing is left that looks like a run folder. Only
+  // folders born after the call started; never one that holds anything.
+  // Returns the folders removed.
+  async tidy(run, path, since) {
+    const tree = this.ownRunTree(run, path)
+    const removed = []
+    if (!tree || !run.runner.removeEmpty) return removed
+    for (let dir = posix.dirname(path); dir !== tree && dir.startsWith(`${tree}/`); dir = posix.dirname(dir)) {
+      const found = await Promise.resolve()
+        .then(() => run.runner.inspect(dir))
+        .catch(() => null)
+      if (found?.kind !== 'dir' || found.born === null || found.born < since) break
+      if (!(await Promise.resolve().then(() => run.runner.removeEmpty(dir)).catch(() => false))) break
+      removed.push(dir)
+    }
+    return removed
   }
 
   // For the guard's hook, which hands it to the worker with its next tool
@@ -1151,24 +1051,14 @@ export class RunGuard extends EventEmitter {
     return run.mailbox
   }
 
-  // An absolute path, or null where a variable hides it; ~ and $HOME are
-  // the run's home, $TMPDIR and $VOICE_GW_RUN_FOLDER its run folder, which
-  // the gateway set for it (workers.mjs).
-  resolve(run, base, path) {
-    const raw = this.expand(run, base, path)
-    return raw === null ? null : posix.resolve(raw)
-  }
-
-  // The same with its .. and . as written, as the kernel gets it: after a
-  // link, .. goes up from where the link led (grants.mjs, physicalPath).
+  // A path as the run writes it, with its .. and . as written, as the kernel
+  // gets it (after a link, .. goes up from where the link led: grants.mjs,
+  // physicalPath), or null where a variable hides it; ~ and $HOME are the
+  // run's home, $TMPDIR and $VOICE_GW_RUN_FOLDER its run folder, which the
+  // gateway set for it (workers.mjs). As the guard's hook reads it
+  // (fence.mjs, expandPath).
   expand(run, base, path) {
-    let expanded = String(path)
-    if (expanded === '~' || expanded.startsWith('~/')) expanded = run.home + expanded.slice(1)
-    expanded = expanded.replace(/^\$\{?HOME\}?(?=\/|$)/, run.home)
-    if (run.runFolder) expanded = expanded.replace(/^\$(?:\{(TMPDIR|VOICE_GW_RUN_FOLDER)\}|(TMPDIR|VOICE_GW_RUN_FOLDER)\b)(?=\/|$)/, run.runFolder)
-    if (/[$`]/.test(expanded)) return null
-    if (expanded.startsWith('/')) return expanded
-    return base === null ? null : `${base}/${expanded}`
+    return expandPath(path, base, { home: run.home, runFolder: run.runFolder })
   }
 
   // Whether a write may go there without the rule: its workspace, its memory

@@ -327,7 +327,7 @@ test('dispatch runs claude -p in the checkout; the result reaches the controller
   assert.equal(call.socket, null, "no access to the controller's messaging socket")
   // Its run folder, next to the repositories and outside the checkout: TMPDIR,
   // VOICE_GW_RUN_FOLDER and a line of its prompt; the controller knows of it.
-  assert.match(call.runFolder ?? '', new RegExp(`^${join(ROOT, '.voice-runs', 'alpha')}/\\d{4}-\\d{2}-\\d{2}-[a-z0-9]{4}$`))
+  assert.match(call.runFolder ?? '', new RegExp(`^${join(ROOT, '.voice-runs', 'alpha')}/[a-z0-9]{4}$`))
   assert.equal(call.tmpdir, call.runFolder)
   assert.ok(existsSync(call.runFolder))
   assert.ok(call.input.includes(`\n- Run folder: ${call.runFolder}, outside the repository, also $VOICE_GW_RUN_FOLDER and $TMPDIR: new and empty.`))

@@ -52,8 +52,13 @@ export const HELPER_FOLDER = '.voice-scratch'
 export const inHelperFolder = path => String(path).replace(/^"/, '').startsWith(`${HELPER_FOLDER}/`)
 
 // The run folder of a run in a repository: a folder of its own outside every
-// checkout, at <repositories folder>/.voice-runs/<repository>/<date>-<id>,
-// next to the worktrees (worktrees.mjs) and through the runner, so the same on
+// checkout, at <repositories folder>/.voice-runs/<repository>/<id>, four
+// letters and digits and no date, so that a worker has nothing to fill in
+// from the day when it types the path again (tu46 on 2026-11-07, a session
+// that went on past midnight, wrote to …/2026-11-07-84rf while its folder was
+// …/2026-11-06-84rf, and locked the kill switch); folders from before, named
+// <date>-<id>, are kept and used as they are. Next to the worktrees
+// (worktrees.mjs) and through the runner, so the same on
 // this computer and in the worker container, where the repositories folder is
 // the mounted one. For what has no place in the repository at all, such as
 // browser profiles, screenshots for the driver, downloads and temporary
@@ -71,16 +76,31 @@ export const inHelperFolder = path => String(path).replace(/^"/, '').startsWith(
 // makes it again, empty, at the same path when its session goes on.
 export const RUN_FOLDERS = '.voice-runs'
 export const RUN_FOLDER_ENV = 'VOICE_GW_RUN_FOLDER'
-const RUN_FOLDER = /^\d{4}-\d{2}-\d{2}-[a-z0-9]{4}$/
+// A run folder's own name: <id>, or <date>-<id> from before.
+const RUN_FOLDER = /^(?:\d{4}-\d{2}-\d{2}-)?[a-z0-9]{4}$/
 
 // Where a run folder of a repository is, as the runner reaches it; folder:
-// its own name, <date>-<id>.
+// its own name, <id> (or <date>-<id> for one from before).
 export const runFolderDir = (runner, repo, folder) => runner.dir(`${RUN_FOLDERS}/${repo}/${folder}`)
+
+// What a run gets in its environment besides TMPDIR, so that tools which
+// keep logs in the home folder keep them in its run folder: wrangler's debug
+// logs (WRANGLER_LOG_PATH, a folder it makes), and no telemetry of
+// wrangler's. On 2026-11-07 at 09:38 UTC a drawio-mcp run's wrangler whoami
+// left a log and a cache file in ~/.config/.wrangler, and the worker's mv to
+// tidy them up locked the kill switch. Nothing here that other tools read,
+// such as XDG_CONFIG_HOME, which git and gh take their settings and login
+// from, or npm's cache, which would make every npm ci fetch everything anew.
+export const runFolderTools = folder => ({
+  WRANGLER_LOG_PATH: `${folder}/wrangler-logs`,
+  WRANGLER_SEND_METRICS: 'false',
+})
 
 // The saved run folders the gateway can use: { dir: { repo, container,
 // usedAt, removedAt } }, without a prototype; only paths the gateway makes,
-// <root>/.voice-runs/<repository>/<date>-<id>. Anything else, from an older
-// version or edited by hand, is left out: it could point anywhere.
+// <root>/.voice-runs/<repository>/<id>, or <date>-<id> from before. Anything
+// else, from an older version or edited by hand, is left out: it could point
+// anywhere.
 export function runFolderEntries(saved) {
   const entries = Object.create(null)
   for (const [dir, entry] of Object.entries(saved ?? {})) {
@@ -272,9 +292,11 @@ summarise your result for them. Nobody can answer you during the run.
   Every file you make goes there, scripts, backups and copies included; only temporary files may also go to
   /tmp. After a cd, give every write an absolute path, and never run commands from an old transcript or log
   again as they stand, as their folders are not yours. Never write to your home folder or anywhere else:
-  the gateway stops all work when a run writes elsewhere. The first two new files elsewhere it moves to
-  quarantine instead, and tells you in a note that begins "The gateway's guard:", which is the gateway's
-  own; the third stops all work.
+  the gateway stops all work when a run writes elsewhere. Its guard refuses a command or a file write
+  elsewhere before it runs, moves the first two new files elsewhere that it sees only afterwards to
+  quarantine, and tells you in a message that begins "The gateway's guard", which is the gateway's own.
+  Each counts as an invalid write; the third stops all work. Leave caches and logs that tools put in your
+  home folder where they are: never move, remove or tidy up anything outside your folder.
 - There is no repository here. Never push, never open pull requests or issues, and change nothing anywhere
   else: no installing software, no settings, no messages to anyone. Reading the web and running commands
   that only read are fine.

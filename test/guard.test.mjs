@@ -314,6 +314,29 @@ test('the sweep: real writes outside the repository and the temporary folders st
   }
 })
 
+test("the guard's hook reads the sweep as the rule does: it refuses none of the normal commands and every write outside, with its path", async () => {
+  const { fenceWrites } = await import('../src/fence.mjs')
+  const workers = new EventEmitter()
+  const guard = new RunGuard({ workers, runner: { dir: name => `/work/${name}`, git: async () => null }, killswitch: { trip: () => {} }, ghBin: '/bin/false', log: () => {} })
+  workers.emit('started', { id: 'tabc', repo: 'alpha', dir: '/work/alpha', slug: null, defaultBranch: 'main', startedAt: Date.now() })
+  // The fence as the hook reads it from its file.
+  const fence = JSON.parse(JSON.stringify(guard.fenceOf(guard.runs.get('tabc'))))
+  guard.close()
+  const refused = NORMAL.filter(command => fenceWrites(fence, 'Bash', { command }, '/work/alpha').length)
+  assert.deepEqual(refused, [], 'none of them is refused')
+  for (const [command, path] of OUTSIDE) {
+    const found = fenceWrites(fence, 'Bash', { command }, '/work/alpha')
+    assert.ok(found.some(write => write.path.startsWith(path.replace(/^~/, homedir()))), `${command}: ${JSON.stringify(found)}`)
+    assert.equal(trips(command).length, 1, `the rule trips on ${command} too`)
+  }
+  // A git hook, also in the run's own repository; the crontab is the rule's alone.
+  assert.equal(fenceWrites(fence, 'Bash', { command: 'echo "#!/bin/sh" > .git/hooks/pre-commit' }, '/work/alpha')[0].path, '/work/alpha/.git/hooks/pre-commit')
+  assert.deepEqual(fenceWrites(fence, 'Bash', { command: 'crontab -e' }, '/work/alpha'), [])
+  // The folder Claude Code names for the call: a relative target counts from there.
+  assert.deepEqual(fenceWrites(fence, 'Bash', { command: 'echo x > ../report.md' }, '/work/alpha/sub'), [])
+  assert.equal(fenceWrites(fence, 'Bash', { command: 'echo x > ../report.md' }, '/work/alpha')[0].path, '/work/report.md')
+})
+
 test("a cd carries over to the next Bash call, as Claude Code keeps the shell's folder, but only within the workspace", () => {
   // The kill switch of 2026-10-31: the log went to the worktree's own .voice-scratch.
   assert.deepEqual(tripsAll(['cd test/simple-modern', 'timeout 590 node run.js > ../../.voice-scratch/full-format.log 2>&1']), [])

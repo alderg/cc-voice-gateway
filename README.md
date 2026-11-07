@@ -881,11 +881,20 @@ What applies to every worker run (`src/workers.mjs`):
   there counts again at the end of the next run there.
 - **The run folder:** what belongs nowhere in the repository, such as screenshots and other files
   for you, browser profiles, downloads and temporary files, goes to a folder of the run's own
-  outside every checkout, next to the worktrees: `<VOICE_GW_WORKER_ROOT>/.voice-runs/<repository>/<date>-<id>`
+  outside every checkout, next to the worktrees: `<VOICE_GW_WORKER_ROOT>/.voice-runs/<repository>/<id>`
   (in Docker `/repos/.voice-runs/…`, in the mounted folder of clones, so you find it on this
-  computer too). The gateway makes it before the run, for your user only, and hands it over as
-  `TMPDIR` and `VOICE_GW_RUN_FOLDER` (in Docker with `docker exec -e`, inside the container only);
-  the prompt names it, and the rules say to write nowhere else outside the repository, also when a
+  computer too). The name is four letters and digits and nothing else, so that a worker that types
+  the path again has nothing to fill in: until 2026-11-07 it was `<date>-<id>`, and that morning a
+  session that went on past midnight wrote to `…/2026-11-07-84rf` while its folder was
+  `…/2026-11-06-84rf`, which locked the kill switch for 22 minutes. Folders from before keep their
+  dated names; their sessions go on in them, and the cleanup below takes both kinds. The gateway
+  makes it before the run, for your user only, and hands it over as
+  `TMPDIR` and `VOICE_GW_RUN_FOLDER` (in Docker with `docker exec -e`, inside the container only),
+  and as `WRANGLER_LOG_PATH` (`<run folder>/wrangler-logs`) with `WRANGLER_SEND_METRICS=false`, so
+  that wrangler keeps its debug logs there rather than in `~/.config/.wrangler`. Nothing that git,
+  gh or npm read (no `XDG_CONFIG_HOME`, no npm cache: every `npm ci` would fetch everything anew);
+  what tools still leave in the home folder, the rules say to leave there and name in the result.
+  The prompt names it, and the rules say to write nowhere else outside the repository, also when a
   task names another place. It belongs to the worker's Claude session: a follow-up in the same
   session gets the same folder, at the same path, so that what the worker remembers writing there
   it may write again; a run next to it, in a worktree, or a `fresh` session gets one of its own. The
@@ -907,7 +916,8 @@ What applies to every worker run (`src/workers.mjs`):
   clones are what counts.
 - **Rules for the run** (`WORKER_RULES`): branch `voice/<name>`, commit only its own changes, never
   force-push, merge or delete branches, ask before pushing a public repository, scratch output only
-  in the helper folder and the run folder, never end the turn, which ends the run, while tests, a build or a helper
+  in the helper folder and the run folder, never move, remove or tidy up what tools leave in the
+  home folder, never end the turn, which ends the run, while tests, a build or a helper
   agent still run in the background, never end with commits on no remote or uncommitted changes
   without naming them and asking about the push. These are rules, not limits; the check after the
   run is code.
@@ -1600,8 +1610,8 @@ could do small.
 
 ### 5.9 The kill switch
 
-One lock in the gateway's code (`src/killswitch.mjs`, `src/guard.mjs`). It does not depend on the
-controller following instructions.
+One lock in the gateway's code (`src/killswitch.mjs`, `src/guard.mjs`, `src/fence.mjs`). It does not
+depend on the controller following instructions.
 
 ![Kill switch](docs/killswitch.drawio.svg)
 
@@ -1625,7 +1635,7 @@ at every start.
 |---|---|---|
 | Voice | "emergency stop" or "kill switch"; or the tool `emergency_stop`, which the voice AI calls for the same words in any language | In `send` and `ask` before anything reaches the controller: the message starts with the phrase, or has at most six words |
 | Telegram | `/stop` or a phrase | See 5.8 |
-| Rule: outside | Writes outside the repository (for a run in a [worktree](#several-runs-per-repository), outside its worktree), its own [run folder](#55-workers-on-this-computer-or-in-docker) (never another run's, nor `.voice-runs` around it, nor `~/voice-scratch`), `/tmp`, `/var/tmp` (and the system's temp folder on this computer), the run's own Claude Code memory folder (`~/.claude/projects/<repository path with - for every other character>/memory`, where auto memory writes; another project's is outside), `VOICE_GW_KILL_ALLOW_PATHS` and, on this computer, the folders granted to its repository ([path grants](#path-grants)); for a run in a [work folder](#work-folders), writes outside that folder, those temporary folders and its memory folder; writing to `/dev/null`, the standard streams, a terminal or `/dev/fd/N` is none. Also a git hook in any `.git`, the run's own too, and `crontab` other than `-l`. The first two invalid writes of a run that make a new file in a place that is not sensitive go to [quarantine](#quarantine) instead, with a warning; the third locks | The file tools by path. Shell commands by explicit targets: redirections, `tee`, `cp`, `mv` (also what it moves away), `rm`, `mkdir`, `touch`, `ln`, `chmod`, `chown`, `truncate`, `sed -i`, `dd of=`, also after `cd`, from the folder Claude Code names for each call in the gateway's hook, or else the folder the rule follows ([below](#the-folder-a-command-runs-in)); `$HOME` and `~` are expanded, and so are `$TMPDIR` and `$VOICE_GW_RUN_FOLDER` to the run folder. The command line is read as a shell reads it: quoted text, comments, here-strings and heredoc bodies are data, so a `>` or `;` in a pattern, a commit message or a script written to a file is none; the commands in `$(…)`, backticks, `<(…)`, `>(…)`, `sh -c`, `eval` and a heredoc a shell reads are checked like any other, and so is a script written from a heredoc that the same call runs |
+| Rule: outside | Writes outside the repository (for a run in a [worktree](#several-runs-per-repository), outside its worktree), its own [run folder](#55-workers-on-this-computer-or-in-docker) (never another run's, nor `.voice-runs` around it, nor `~/voice-scratch`), `/tmp`, `/var/tmp` (and the system's temp folder on this computer), the run's own Claude Code memory folder (`~/.claude/projects/<repository path with - for every other character>/memory`, where auto memory writes; another project's is outside), `VOICE_GW_KILL_ALLOW_PATHS` and, on this computer, the folders granted to its repository ([path grants](#path-grants)); for a run in a [work folder](#work-folders), writes outside that folder, those temporary folders and its memory folder; writing to `/dev/null`, the standard streams, a terminal or `/dev/fd/N` is none. Also a git hook in any `.git`, the run's own too, and `crontab` other than `-l`. The gateway's hook in the run [refuses such a write before it runs](#the-guards-hook-refuses-first): nothing happens, and it counts as an invalid write, with a warning, unless it reaches for something severe, which locks at once. A new file in a place that is not sensitive that the hook did not stop goes to [quarantine](#quarantine) instead, with a warning, as an invalid write too. The third invalid write of a run locks | The file tools by path. Shell commands by explicit targets: redirections, `tee`, `cp`, `mv` (also what it moves away), `rm`, `mkdir`, `touch`, `ln`, `chmod`, `chown`, `truncate`, `sed -i`, `dd of=`, also after `cd`, from the folder Claude Code names for each call in the gateway's hook, or else the folder the rule follows ([below](#the-folder-a-command-runs-in)); `$HOME` and `~` are expanded, and so are `$TMPDIR` and `$VOICE_GW_RUN_FOLDER` to the run folder. The command line is read as a shell reads it: quoted text, comments, here-strings and heredoc bodies are data, so a `>` or `;` in a pattern, a commit message or a script written to a file is none; the commands in `$(…)`, backticks, `<(…)`, `>(…)`, `sh -c`, `eval` and a heredoc a shell reads are checked like any other, and so is a script written from a heredoc that the same call runs |
 | Rule: many changes | More than 500 file edits in a run; at its end more than 300 files or 30,000 lines changed; in a work folder, more than 300 files in it. Apart from these, the run's [helper folder](#55-workers-on-this-computer-or-in-docker) `.voice-scratch`, for its test reports, screenshots and logs: more than 10,000 file edits there, its run folder and the temporary folders together, or untracked files in the helper folder at the end | Edits as they happen; at the end the commits made during the run, each by its own changes, plus what is not committed, or the files in the work folder. What commits on branches the run made take over from before it counts nothing, on a branch from before the run everything counts (below). What is untracked in the helper folder counts only against its own limit, so the limit for real code stays as strict; what is committed or tracked there counts as any change. What is in the run folder and the temporary folders at the end is no change at all. `VOICE_GW_KILL_MAX_*` |
 | Controller | `raise_alarm` with a reason | One more signal, never the only one |
 
@@ -1670,11 +1680,13 @@ The statistics count what the rule counted.
 
 A relative target such as `../report.md` counts from the folder the shell is in. Each worker run
 gets a hook of the gateway's in its settings (`--settings`, with `--include-hook-events`): before
-every `Bash` and `Write` call, Claude Code's `PreToolUse` hook prints the call's id, the folder
-Claude Code starts it in, and the time into the run's output, and the rule checks the call from
-that folder, a moment after it appeared. The model sees nothing of it. Without that report (a
-Claude Code that runs no hooks, such as with `disableAllHooks`, or a run from before this version),
-the rule follows the shell as Claude Code keeps it, as checked in Claude Code 2.1.312:
+every `Bash`, `Write`, `Edit`, `MultiEdit` and `NotebookEdit` call, Claude Code's `PreToolUse` hook
+prints the call's id, the folder Claude Code starts it in, and the time into the run's output, and
+the rule checks the call from that folder, a moment after it appeared. The model sees nothing of
+it. The same hook refuses a call that would write outside ([next](#the-guards-hook-refuses-first)).
+Without that report (a Claude Code that runs no hooks, such as with `disableAllHooks`, or a run
+from before this version), the rule follows the shell as Claude Code keeps it, as checked in
+Claude Code 2.1.312:
 
 - the main thread's shell keeps its folder from one call to the next, also after a `cd`;
 - after a command that failed it stays where it was: Claude Code takes the new folder only from a
@@ -1692,10 +1704,67 @@ main thread's, went back to the work folder, and read the main thread's
 `cp ws/report.md ../report-2026-10-31-end.md`, which went to `sources/history` in the work folder,
 as a write above it: the switch locked for nothing.
 
+#### The guard's hook refuses first
+
+The rule sees a write once its command shows, so a lock used to come after the fact, also for a
+slip that did no harm. Of 17 locks from 28 October to 7 November, one was a real catch; the others
+cost 28 runs, 20 queued tasks and 9 standing orders. The last of them, on 2026-11-07 at 09:38 UTC,
+stopped all work for six hours while you were away: a drawio-mcp run's `wrangler whoami` had left a
+log and a cache file in `~/.config/.wrangler`, and the worker tidied up with
+`mkdir -p $TMPDIR/wrangler-home && mv ~/.config/.wrangler/cloudflare-skills-repo-cache.json ~/.config/.wrangler/logs/wrangler-….log $TMPDIR/wrangler-home/`:
+moving files away outside locks at once.
+
+So the gateway's hook in each run now reads every `Bash`, `Write`, `Edit`, `MultiEdit` and
+`NotebookEdit` call before it runs, with the rule's own code (`src/fence.mjs`: the same shell
+reading, the same folders), and refuses one that would write outside the allowed folders. Claude
+Code runs nothing of it and hands the worker the refusal as the call's result: what it would touch,
+that it must not, its own folders by name (`your run folder …; write there or in the repository`),
+and to leave files a tool left outside where they are and name them in its result rather than
+clean them up. The run goes on. The rule reads the refused call too, from the hook's report, and
+counts it as no write and no edit, but as an invalid write of the run, as one that went to
+quarantine: Telegram warns at once (`warning, worker drawio-mcp (task thaw) tried to write outside
+its allowed folders, …, with "mkdir -p … && mv …". The guard refused it before it ran; nothing
+happened. Invalid write 1 of the run; the third locks the kill switch.`), the log says so (`the
+guard's hook refused "…" before it ran, which would have written …; invalid write 1 of the run`),
+and the run's result and `worker_status` carry a warning line for the controller.
+
+Two kinds of attempt still lock, although nothing of them ran:
+
+- **The third invalid write of a run**, refused or moved to quarantine: a worker that runs into the
+  fence a third time after two refusals that named its folders is not slipping, it is pushing
+  against the fence, which is what the kill switch is for, and it might find a way the rule cannot
+  see, such as a script in another language.
+- **An attempt at something severe**, the first time: a git hook or a `.git` folder, a `hooks`
+  folder, a shell profile or rc file, the crontab, keys and credentials and the settings that hand
+  them to tools (`~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`, `~/.docker`, `~/.netrc`,
+  `~/.git-credentials`, `~/.gitconfig`, `~/.npmrc`, `~/.config/git`, `~/.config/gh` and the like),
+  what starts programs by itself (`~/.config/autostart`, `~/.config/systemd`, `~/Library/LaunchAgents`),
+  Claude Code's own folder and the `.claude` settings of any project, CI workflows, a folder on the
+  `PATH`, the gateway's checkout, and every place outside the home folder and the repositories
+  folder (`kill switch … : … a shell profile or rc file; the guard's hook refused it before it ran,
+  but an attempt at that locks at once`). Tidying a tool's cache, guessing a run folder's name or
+  making a folder for a browser profile reaches for none of these; a worker steered by planted text
+  does, and must not get more tries for a way the rule cannot see. The one real catch since
+  28 October, an `rmdir` in the live data folder `/srv/wyze-events`, would still lock this way
+  (that folder is now granted to hauswache, so it no longer does).
+
+The hook only ever refuses, never allows: one that cannot read its fence (a small JSON file next to
+the run's notes, `<task>.notes.fence`, with the run's workspace, home, run folder and allowed
+folders, written when the run starts and again when the [path grants](#path-grants) change), cannot
+load its module, or runs in a Claude Code without hooks leaves the call to the rule, as before. In
+Docker the gateway puts a copy of the module next to the notes, at `/tmp/voice-gw/fence.mjs`. The
+rule takes a call for refused only from its result: an error with the refusal's words and the
+call's own id, which no command can know before it runs; a call reported refused whose result does
+not say so is checked as one that ran (`the guard's hook refused the call …, but its result does
+not say so`). Checked in Claude Code 2.1.312, headless and with `bypassPermissions` as the workers
+run: a refused `Bash` and `Write` asked for no approval, did nothing, and the worker read the reason
+and went on; so did a subagent's refused `Bash`.
+
 #### Quarantine
 
-A slip that only adds a file outside does not stop all work at once. The first and the second
-invalid write of a run that make a new plain file in a place that is not sensitive go to
+A slip that only adds a file outside, and that the [hook](#the-guards-hook-refuses-first) did not
+stop, does not stop all work at once. The first and the second invalid write of a run (refused
+calls count too) that make a new plain file in a place that is not sensitive go to
 quarantine: once the call has ended, the gateway looks that the file is there, a plain file born
 after the call started and in no git repository, and moves it into
 `.state/quarantine/<task>/<n>-<name>` on this computer (for a run in Docker out of the container
@@ -1707,7 +1776,18 @@ controller tells you as a warning. The worker reads it in the same run, from the
 with its next tool call, or before it ends its turn, which the hook holds while the gateway still
 decides (`The gateway's guard: the command "…" wrote …, outside your allowed folders. The gateway
 moved the file to quarantine as an invalid write …`); after the second, that the next one locks.
-The third invalid write of the run locks. These lock at once, the first time, as before:
+The third invalid write of the run locks.
+
+The one hidden folder where a new file may go to quarantine is `.voice-runs/<the run's own
+repository>/`, outside every run folder there: a run folder's path with a slip in its name, such
+as the dated name `tu46` guessed on 2026-11-07 (`.voice-runs/drawio-mcp/2026-11-07-84rf/pr-body.md`
+while its folder was `2026-11-06-84rf`). The empty folders the call made for it, as the `Write`
+tool makes a path's folders, go too, so that nothing is left that looks like a run folder (the
+log says `removed the empty folder it made, …`); a folder that holds anything else stays. Another
+run's folder there, another repository's run folders, the worktrees in `.voice-worktrees`, and
+anything hidden, a `hooks` folder or a git repository below `.voice-runs` still lock at once.
+
+These lock at once, the first time, as before:
 
 - changing, appending to, truncating or removing a file outside, moving one there or away (`mv`),
   `mkdir`, `ln`, `chmod`, `sed -i`, an `Edit`, and a file that was there before the call;
@@ -1856,7 +1936,7 @@ the same. Otherwise they say: only at the computer.
 | `.secrets/worker/claude_token`, `.secrets/worker/github_token` | The container's logins, mounted read-only into it; into the work folders' container only `claude_token` | 0600, folder 0700 |
 | `.secrets/accounts/<name>/claude_token` | The tokens of your further Claude accounts for the workers' runs, from `claude setup-token` ([several Claude accounts](#several-claude-accounts)); never mounted into a container, a run gets only its own account's in its environment | 0600, folders 0700; one readable by others is not used |
 | `.state/` | Worker state, run output, open requests and decisions, watched pull requests, the watchdog's lock | 0700 when the gateway creates it |
-| `.state/tasks/`, `.state/workers.json` | Each run's output with every tool input and result, and the kill switch's notes for the run, which its hook hands to the worker (`<task>.notes`; in the container `/tmp/voice-gw/<task>.notes`); the workers' state, with the queue, the worktrees, the limit per repository the queue was planned for, the work folders, and what each run's writes outside went to quarantine | 0600, folder 0700 |
+| `.state/tasks/`, `.state/workers.json` | Each run's output with every tool input and result, and the kill switch's notes for the run, which its hook hands to the worker (`<task>.notes`; in the container `/tmp/voice-gw/<task>.notes`), with the run's fence beside them, which the hook reads to refuse a write outside (`<task>.notes.fence`; in the container also the hook's module, `/tmp/voice-gw/fence.mjs`); the workers' state, with the queue, the worktrees, the limit per repository the queue was planned for, the work folders, and what each run's writes outside went to quarantine | 0600, folder 0700 |
 | `.state/quarantine/<task>/` | The files the rule on writes outside moved out of the way ([quarantine](#quarantine)), as `<n>-<name>`, with `quarantine.jsonl`: where each was, the command, when; never removed by the gateway | The files as they were, `quarantine.jsonl` 0600, folders 0700 |
 | `VOICE_GW_WORKER_ROOT/.voice-worktrees/<repository>/<id>` | The worktrees of further runs of a repository ([several runs per repository](#several-runs-per-repository)), while something is left in them | As git makes them |
 | `~/voice-scratch/<date>-<id>` (`VOICE_GW_SCRATCH_ROOT`) | The work folders, with what their runs made | 0700, and the root too when the gateway or the start script makes it |
@@ -1917,15 +1997,22 @@ is guarded as follows:
   controller at `unrestricted`, or a worker on this computer, could run `scripts/unlock.mjs` as
   you anyway, though no worker runs while the switch is locked. If you do not want it, leave
   Telegram out: without it only the server unlocks.
-- **The rules see a step only after it ran.** They read the commands Claude Code reports; the
-  command that breaks a rule has usually run already.
+- **The rules see a step only after it ran, past the hook.** They read the commands Claude Code
+  reports; the command that breaks a rule has usually run already. The
+  [hook](#the-guards-hook-refuses-first) stops before it runs what the rule on writes outside can
+  read from a call, nothing more: not the many changes, not what the rule misses (below). It only
+  refuses, so a run in a Claude Code without hooks, one whose fence is missing, or in Docker a
+  worker that changes the hook's copy in `/tmp/voice-gw` loses the refusal, not the rule; at worst
+  such a worker gets two writes past it as invalid writes, with a warning each, before the third
+  locks.
 - **Hidden actions are missed.** Not seen:
   - a write inside a script, an alias or another language, such as a Python script that
     writes a file into another repository; of a shell script that `cat` or `tee` writes from a
     heredoc, only what the same Bash call runs is seen;
   - targets in variables other than `$HOME`, and relative targets after a `cd` into one;
-  - writes by programs, such as `npm install` into `~/.npm`, and other ways to run something later
-    than `crontab`, such as `systemctl --user enable` or `git config core.hooksPath`;
+  - writes by programs, such as `npm install` into `~/.npm` or `wrangler` into `~/.config/.wrangler`,
+    and other ways to run something later than `crontab`, such as `systemctl --user enable` or
+    `git config core.hooksPath`;
   - paths behind symlinks, except in a [granted folder](#path-grants).
 - **A path grant opens its folder.** In a granted folder the rule on writes outside watches only
   what is sensitive in itself; what the worker does to the service's data there is up to it, as in
@@ -3310,8 +3397,11 @@ gateway; do not set them.
 | The kill switch locked for no good reason | Read the reason. A rule that misfires: raise its `VOICE_GW_KILL_*` threshold, grant a folder to one repository in `VOICE_GW_PATH_GRANTS` ([path grants](#path-grants)), or add one for all of them to `VOICE_GW_KILL_ALLOW_PATHS`. |
 | The kill switch locked on `many changes` for code that was there already, such as review branches or a rebase | It counts nothing only on branches the run made ([5.9](#59-the-kill-switch), "What a run took over"). Such commits on a branch from before the run count in full, and so does everything after a `git push` to a URL, or when the repository keeps no reflogs (`core.logAllRefUpdates=false`). `kill switch rule on many changes` in the gateway's log names what was left out. |
 | Telegram warns that a worker wrote a file outside its allowed folders and the guard moved it to quarantine | The run went on: the rule on writes outside moves the first two new files a run writes in a place that is not sensitive into `.state/quarantine/<task>/` instead of locking ([quarantine](#quarantine)), and the third locks. `quarantine.jsonl` there names where each was and the command. Put a file back where it was meant to go yourself if you want it; the gateway removes nothing there. If a task needs files in such a place, have the worker use its run folder, or add the folder to `VOICE_GW_KILL_ALLOW_PATHS`. |
+| Telegram warns that a worker tried to write outside its allowed folders and the guard refused it before it ran | Nothing happened, and the run went on: the gateway's hook in the run refused the call and told the worker its folders and to leave files outside as they are ([the guard's hook](#the-guards-hook-refuses-first)). It counts as an invalid write, and the third of a run locks. The run's result carries the warning and what the worker says about files a tool left outside, such as wrangler's in `~/.config/.wrangler`; look at them at the desk. If a task really needs that place, grant it to the repository ([path grants](#path-grants)). |
+| The kill switch locked on `…; the guard's hook refused it before it ran, but an attempt at that locks at once` | Nothing of that call ran, but it reached for something severe: a git hook or a `.git` folder, a shell profile, the crontab, keys and credentials, autostart, Claude Code's settings, CI workflows, a folder on the `PATH`, the gateway's checkout, or a place outside the home folder and the repositories folder ([the guard's hook](#the-guards-hook-refuses-first)). Read the run's output in `.state/tasks/<task>.jsonl` for why it tried; that is what the lock is for. A folder outside that a repository's workers really use goes into `VOICE_GW_PATH_GRANTS`. |
+| The kill switch locked on `the third invalid write in one run, refused by the guard's hook before it ran` | The worker ran into the fence three times in one run, after two refusals that named its folders. Read its output for what it was after; the refusals and quarantined files before it are in the log (`the guard's hook refused …`, `moved … to quarantine`). |
 | The kill switch locked on `write outside the allowed folders` for a relative path such as `../report.md` that went into the workspace | The rule counts it from the folder each call starts in, as Claude Code names it in the gateway's hook ([5.9](#the-folder-a-command-runs-in)). A line `no report of the guard's hook in this run` in `.logs/gateway.log` means the hooks did not run (for example `disableAllHooks` in your Claude Code settings, or managed settings that allow only managed hooks), and the rule followed the shell itself; a run from before this version has no hook either. Before this version a subagent's `cd` counted for the main thread's shell (2026-11-03). |
-| The kill switch locked on `write outside the allowed folders` for screenshots or other helper files, such as in `~/voice-scratch/…` | The worker wrote outside its repository, its run folder and the temporary folders, often because a task named such a place. Its run folder (`.voice-runs/<repository>/…`, also `$TMPDIR`) is the place for them: its prompt and rules say so, and the controller's instructions say to ask for such files there and to name no other folder. A run from before this version has no run folder. A folder outside every repository that workers may really use goes into `VOICE_GW_KILL_ALLOW_PATHS`, never the work folders' root. |
+| The kill switch locked on `write outside the allowed folders` for screenshots or other helper files, such as in `~/voice-scratch/…` | The worker wrote outside its repository, its run folder and the temporary folders, often because a task named such a place. Its run folder (`.voice-runs/<repository>/<id>`, also `$TMPDIR`) is the place for them: its prompt and rules say so, and the controller's instructions say to ask for such files there and to name no other folder. A run from before this version has no run folder, and no [hook](#the-guards-hook-refuses-first) that refuses such a write first. A dated run folder name typed with the wrong day (`…/2026-11-07-84rf` for `…/2026-11-06-84rf`) no longer locks: new run folders have no date in their name, the hook refuses the write, and a new file there that it did not stop goes to [quarantine](#quarantine). A folder outside every repository that workers may really use goes into `VOICE_GW_KILL_ALLOW_PATHS`, never the work folders' root. |
 | The kill switch locked on `write outside the allowed folders` when a worker removed, changed or made files in a folder its repository uses outside the checkout, such as a service's data folder (`rmdir /srv/wyze-events/live/2026-11-04 /srv/wyze-events/live` on 2026-11-04) | Removing, changing or making folders outside locks at once. Grant that folder to the repository: `VOICE_GW_PATH_GRANTS=hauswache=/srv/wyze-events` in `.secrets/gateway.env` applies at once ([path grants](#path-grants)), and `list_workers` then shows it on the repository's line. Only for workers on this computer. If it still locks, read the reason: an entry the log says it ignored (`VOICE_GW_PATH_GRANTS: ignored, …`), or something that locks in a granted folder too, such as a hidden file, a link, a git repository or a path that leads out through a link. |
 | A run folder in `.voice-runs` is gone, with the screenshots in it | It is removed `VOICE_GW_RUN_FOLDER_DAYS` (7) after its session's last run; copy out what you want to keep, or set `0`. `worker_status` names the folder of the last run, and `.state/workers.json` lists them under `runFolders`. |
 | An answer or a request on Telegram is "not passed on" | The reason follows in the chat. "Telegram input is off": turn it on in the setup (section 4), or set `VOICE_GW_TELEGRAM_ANSWERS=1` and `VOICE_GW_TELEGRAM_REQUESTS=1`; it is off by default, also after an update. For an answer, reply to the question's own message, or name its code (the four characters after "Question for request"); a decision's code works too. Only questions still open count: one answered by voice is settled. With `VOICE_GW_TELEGRAM_CONFIRM=0`, a push, merge, restart or delete question, or an approval request, is never answered there ("must be confirmed by voice", "Telegram cannot approve"): say it in voice mode. An approval request takes a plain yes or no, as a Reply to it, with its code, or alone while it is the only one open; with several open, a plain yes gets a list of them and the question which one is meant, and "yes to all" allows them all. A forwarded or edited message, or one without text, is never passed on: write it yourself, as a new message. While the kill switch is locked or the gateway is inactive nothing goes through; try again once it is unlocked or active again. `telegram answers off` in the log: `VOICE_GW_TELEGRAM_ANSWERS` is not `1`; `telegram requests off`: `VOICE_GW_TELEGRAM_REQUESTS` is not `1`. `.state/telegram-input.log` says for every message what became of it. |
@@ -3485,6 +3575,7 @@ src/
   funnel.mjs         the Funnel on and off from Telegram, and off by itself when idle
   killswitch.mjs     the kill switch: state, emergency phrases, alarm, the unlock in voice mode with a PIN
   guard.mjs          the kill switch's rules on the workers' runs
+  fence.mjs          the rules' reading of a command, and the hook's refusal of a write outside before it runs
   grants.mjs         path grants: folders a repository's workers may write to, checked strictly; the ledger of grants for a while
   approval-grants.mjs approval grants: a kind of file write by one asker in one folder for a while, the never-list
   restart.mjs        restarting the controller by voice, through the watchdog

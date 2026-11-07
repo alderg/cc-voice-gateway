@@ -84,7 +84,7 @@ import { log, preview } from './log.mjs'
 import { NIGHT_RULE } from './night.mjs'
 import { orderRule } from './orders.mjs'
 import { SUBAGENT_TOOLS, addResult } from './stats.mjs'
-import { CONTAINER_NOTES, GUARD_NOTES_ENV, guardHooks, toolStarts } from './guard.mjs'
+import { CONTAINER_FENCE_MODULE, CONTAINER_NOTES, FENCE_MODULE, GUARD_HOOKS, GUARD_NOTES_ENV, guardHooks, toolStarts } from './guard.mjs'
 import { DockerRunner, HostRunner, MARK, MAX_FILES, alive, startOf } from './runners.mjs'
 import {
   HELPER_FOLDER,
@@ -100,6 +100,7 @@ import {
   kindOf,
   runFolderDir,
   runFolderEntries,
+  runFolderTools,
   scratchEntries,
   scratchPrompt,
 } from './workspaces.mjs'
@@ -217,8 +218,12 @@ summarise your result for them. Nobody can answer you during the run.
   folder and say so. After a cd, give every write an absolute path; keep backups and copies inside these
   folders too; and never run commands from an old transcript or log again as they stand, as their folders
   are not yours. The gateway counts both folders apart from your changes, and stops all work when a run
-  writes anywhere else: the first two new files elsewhere it moves to quarantine instead, and tells you in a
-  note that begins "The gateway's guard:", which is the gateway's own; the third stops all work.
+  writes anywhere else: its guard refuses a command or a file write elsewhere before it runs, moves the
+  first two new files elsewhere that it sees only afterwards to quarantine, and tells you in a message that
+  begins "The gateway's guard", which is the gateway's own. Each counts as an invalid write; the third stops
+  all work. Tools may leave caches and logs in your home folder, such as npm's or wrangler's: leave them
+  there, never move, remove or tidy up anything outside these folders, and name such files in your result
+  if they matter.
 - Finish the job yourself: once the work is done and tested, commit, push and open the pull request as the
   Publish rule says, without asking first. Whatever you run near the end, a review, a subagent or a skill,
   carry on afterwards: its report is not your result. For a security review, read the diff yourself or give
@@ -875,9 +880,9 @@ export class Workers extends EventEmitter {
       if (old.state === 'running') continue
       rmSync(old.file, { force: true })
       rmSync(old.errFile, { force: true })
-      // The guard's notes for it (guard.mjs), on this computer.
+      // The guard's notes for it (guard.mjs), on this computer, and its fence.
       if (typeof old.guardNotes === 'string' && old.guardNotes.startsWith(this.tasksDir + '/')) {
-        for (const file of [old.guardNotes, `${old.guardNotes}.wait`]) rmSync(file, { force: true })
+        for (const file of [old.guardNotes, `${old.guardNotes}.wait`, `${old.guardNotes}.fence`]) rmSync(file, { force: true })
       }
     }
     this.state.tasks = this.state.tasks.filter((t, i, all) => t.state === 'running' || i >= all.length - KEEP_TASKS)
@@ -1363,9 +1368,10 @@ export class Workers extends EventEmitter {
         await runner.makeFolder(known)
         return use(known)
       }
-      const date = new Date().toISOString().slice(0, 10)
+      // A new one by its id alone (workspaces.mjs): a name with nothing in
+      // it to guess, such as the day.
       for (let tries = 0; tries < 10; tries++) {
-        const dir = runFolderDir(runner, repo, `${date}-${randomId(4)}`)
+        const dir = runFolderDir(runner, repo, randomId(4))
         if (this.state.runFolders[dir] || !(await runner.makeFolder(dir, { fresh: true }))) continue
         return use(dir)
       }
@@ -1631,10 +1637,12 @@ export class Workers extends EventEmitter {
     mkdirSync(this.tasksDir, { recursive: true, mode: 0o700 })
     const out = openSync(record.file, 'a', 0o600)
     const err = openSync(record.errFile, 'a', 0o600)
-    // The kill switch's hooks (guard.mjs, guardHooks): each Bash and Write
-    // call's folder in the output, and the guard's notes for the worker, in
-    // a file next to its output, or in the container.
-    record.guardHooks = true
+    // The kill switch's hooks (guard.mjs, guardHooks): each Bash and file
+    // tool call's folder in the output, the refusal of one that would write
+    // outside the run's fence (fence.mjs), and the guard's notes for the
+    // worker, in a file next to its output, or in the container, with the
+    // fence beside them.
+    record.guardHooks = GUARD_HOOKS
     record.guardNotes = runner.container ? posix.join(CONTAINER_NOTES, `${record.id}.notes`) : join(this.tasksDir, `${record.id}.notes`)
     // What the run costs (config.mjs): the prompt cache of its main
     // conversation, an hour also on usage credits, where Claude Code would
@@ -1645,7 +1653,7 @@ export class Workers extends EventEmitter {
     // settings files, here and in the container alike.
     const settings = {
       permissions: { deny: WORKER_DENY },
-      hooks: guardHooks(runner.container ? 'node' : process.execPath),
+      hooks: runner.container ? guardHooks('node', CONTAINER_FENCE_MODULE) : guardHooks(process.execPath, FENCE_MODULE),
       ...(this.cacheTtl ? { promptCacheTtl: this.cacheTtl } : {}),
       ...(this.autoCompact ? { autoCompactWindow: this.autoCompact } : {}),
     }
@@ -1665,11 +1673,12 @@ export class Workers extends EventEmitter {
       ...(record.resumed ? ['--resume', record.sessionId] : ['--session-id', record.sessionId]),
     ]
     const env = workerEnv({ [MARK.run]: record.mark, [MARK.task]: record.id, [MARK.repo]: record.dir })
-    // Its run folder, for the run itself (workspaces.mjs), and the guard's
-    // notes: in the container through docker exec, not for the docker client
-    // here.
+    // Its run folder, for the run itself (workspaces.mjs), also for the logs
+    // of tools that keep them in the home folder (runFolderTools), and the
+    // guard's notes: in the container through docker exec, not for the
+    // docker client here.
     const runEnv = {
-      ...(record.runFolder ? { TMPDIR: record.runFolder, [RUN_FOLDER_ENV]: record.runFolder } : {}),
+      ...(record.runFolder ? { TMPDIR: record.runFolder, [RUN_FOLDER_ENV]: record.runFolder, ...runFolderTools(record.runFolder) } : {}),
       [GUARD_NOTES_ENV]: record.guardNotes,
     }
     let child
@@ -2548,8 +2557,9 @@ export class Workers extends EventEmitter {
         this.emit('toolResult', task, { id: part.tool_use_id, error: Boolean(part.is_error), text })
       }
     } else if (message.type === 'system' && message.subtype === 'hook_response' && message.hook_event === 'PreToolUse') {
-      // The guard's hook names the folder a call starts in (guardHooks).
-      for (const report of toolStarts(message.stdout)) this.emit('toolStart', task, report)
+      // The guard's hook names the folder a call starts in (guardHooks), on
+      // its stderr for a call it refused, as its stdout holds the refusal.
+      for (const report of toolStarts(`${message.stdout ?? ''}\n${message.stderr ?? ''}`)) this.emit('toolStart', task, report)
     } else if (message.type === 'result') {
       // The end of a turn, not of the run: the process may go on (check).
       task.results = (task.results ?? 0) + 1
@@ -3106,6 +3116,7 @@ export class Workers extends EventEmitter {
     if (task.steps.length) lines.push(`Last steps: ${task.steps.join('; ')}`)
     if (task.audit) lines.push(this.checkText(task))
     if (task.quarantined?.length) lines.push(quarantineLine(task))
+    if (task.refused?.length) lines.push(refusedLine(task))
     if (task.state === 'running' && task.lastText) lines.push(`Last message: ${task.lastText}`)
     if (task.result) lines.push(`Result: ${task.result}`)
     if (task.error && task.error !== task.result) lines.push(`Problem: ${task.error}`)
@@ -3173,6 +3184,7 @@ export class Workers extends EventEmitter {
     }
     if (task.audit) lines.push(this.checkText(task))
     if (task.quarantined?.length) lines.push(quarantineLine(task))
+    if (task.refused?.length) lines.push(refusedLine(task))
     lines.push(...this.worktreeText(task))
     if (task.runFiles?.count) lines.push(runFolderLine(task))
     if (kindOf(task) === 'scratch') {
@@ -3253,6 +3265,19 @@ function quarantineLine(task) {
     `moved ${files.length === 1 ? 'it' : 'them'} to quarantine as invalid writes: ${files.join('; ')}. The third invalid ` +
     'write of a run locks the kill switch. Tell the driver in a sentence, as a warning; the files wait in the quarantine ' +
     'folder at the computer, nothing to dispatch.'
+  )
+}
+
+// The calls the guard's hook refused before they ran, as writes outside the
+// allowed folders (guard.mjs), for worker_status and the result: nothing of
+// them ran. The paths and commands are the run's.
+function refusedLine(task) {
+  const calls = task.refused.map(entry => `${preview(entry.command, 80)} (${preview(entry.paths.join(', '), 120)})`)
+  return (
+    `Warning: the gateway's guard refused ${plural(calls.length, 'call')} of the run before ${calls.length === 1 ? 'it' : 'they'} ` +
+    `ran, as ${calls.length === 1 ? 'a write' : 'writes'} outside its allowed folders: ${calls.join('; ')}. Nothing of ` +
+    `${calls.length === 1 ? 'it' : 'them'} happened. Each counts as an invalid write; the third of a run locks the kill switch. ` +
+    'Tell the driver in a sentence, as a warning, with what the worker says about files left outside; nothing to dispatch.'
   )
 }
 

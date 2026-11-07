@@ -12,7 +12,7 @@
 // clone here as a bundle (scripts/fetch-from-container.sh).
 
 import { execFile, execFileSync, spawn } from 'node:child_process'
-import { constants, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync } from 'node:fs'
+import { constants, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, rmdirSync, statSync } from 'node:fs'
 import { dirname, join, posix } from 'node:path'
 import { ACCOUNT_TOKEN_ENV } from './accounts.mjs'
 import { ROOT, config } from './config.mjs'
@@ -431,6 +431,17 @@ export class HostRunner {
     }
     return true
   }
+
+  // Removes a folder only while it is empty, as rmdir does: false when it
+  // holds anything or is not there.
+  async removeEmpty(dir) {
+    try {
+      rmdirSync(dir)
+      return true
+    } catch {
+      return false
+    }
+  }
 }
 
 // Whether a folder above the path holds .git: the path is in a git
@@ -683,5 +694,10 @@ export class DockerRunner {
     const copied = await run(this.dockerBin, ['cp', `${this.container}:${path}`, dest], 60000)
     if (!copied.ok) return false
     return (await this.exec(['rm', '-f', '--', path])).ok
+  }
+
+  // As HostRunner.removeEmpty, in the container.
+  async removeEmpty(dir) {
+    return (await this.exec(['rmdir', '--', dir])).ok
   }
 }
