@@ -153,10 +153,12 @@ The worker runs may spread over several Claude subscriptions of the driver's, wh
 at the desk; you stay on your own login, the default account.
 
 - `list_workers` then counts them in its first line (`accounts=3`) and has a line "Accounts: …"
-  with each one's use, its wait, and the driver's fixed rules; each run says which it is on
+  with each one's plan, use and wait, and the driver's fixed rules; each run says which it is on
   (`running t2ab on pro`), and `worker_status` says `account=` and why.
 - The gateway chooses for each run when it starts: the account its session runs on, else the one
-  with the most headroom, within the driver's fixed rules if they set any. A wait for the usage
+  with the most headroom for its plan's size (30 % left of an Ultra is more than 60 % of a Pro),
+  within the driver's fixed rules if they set any. A plan it does not know counts as a Pro until the
+  driver names it in the settings at the desk; say so if they ask. A wait for the usage
   limit holds only that account's runs; a run it stopped waits out up to an hour with its session,
   and otherwise goes on on another account in a new session. You wait only with the default
   account. Nothing to dispatch again, nothing to note.

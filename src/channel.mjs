@@ -272,8 +272,8 @@ tell the driver in a sentence when they ask. Events that came while you were at 
 and arrive afterwards, marked resent="yes": answer them as usual. Usage credits are no limit: with them the runs go on
 past the plan's limit and nothing waits; list_workers notes it ("Credits: …"), to mention only when the driver asks.
 Accounts: the worker runs may spread over several Claude accounts of the driver's (list_workers shows "Accounts: …" with
-each one's use). The gateway chooses for each run: the account its session runs on, else the one with the most headroom,
-within the driver's fixed rules if any; a wait for the usage limit holds only the runs of that account, and a run it
+each one's plan and use). The gateway chooses for each run: the account its session runs on, else the one with the most
+headroom for its plan's size, within the driver's fixed rules if any; a wait for the usage limit holds only the runs of that account, and a run it
 stopped waits out up to an hour, else goes on on another account in a new session. Pass account to dispatch only when
 the driver names one; mention accounts only when the driver asks.
 Night mode: when the driver says good night, or that they are away until the morning, call set_away with away=true and

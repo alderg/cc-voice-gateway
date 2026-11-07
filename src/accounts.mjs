@@ -41,14 +41,32 @@
 //    take has room; a shorter wait it waits out. A new session (fresh, a new
 //    worktree, a review fix, which runs fresh by default) chooses freely.
 // 2. The most headroom: of the accounts it may take that do not wait for
-//    the usage limit, the one whose plan is least used, by the latest
-//    rate_limit_event of its runs (Limits.headroom): the fuller of its
-//    windows (5-hour, weekly, …), compared in steps of 5 %. One on usage
-//    credits, or with less than 2 % left, only when none other has room;
+//    the usage limit, the one with the most left of its plan, by the latest
+//    rate_limit_event of its runs (Limits.headroom): what is left of the
+//    fuller of its windows (5-hour, weekly, …), times the plan's size
+//    (PLANS), so that 30 % left of an Ultra (3 Pro plans) beats 60 % left of
+//    a Pro; compared in steps of 5 % of the biggest plan among them, which
+//    for plans of one size is 5 % of the share. One on usage credits, or
+//    with less than 2 % of its own plan left, only when none other has room;
 //    among equals the one with fewer runs going, then the default. An
 //    account without a run for six hours counts as unknown, which ranks as
 //    empty: it is tried, and known again. When all of them wait, the task
 //    waits too (reason usage), until the first of them goes on.
+//
+//    The plan of an account (plan): the driver's VOICE_GW_ACCOUNT_PLANS if
+//    it names one; else for the default on this computer Claude Code's own
+//    record of its login (oauthAccount in .claude.json in CLAUDE_CONFIG_DIR
+//    or the home folder: organizationType and organizationRateLimitTier, as
+//    its profile gave them); else, for a token, what Anthropic's profile
+//    endpoint says to it (VOICE_GW_PLAN_LOOKUP, the one Claude Code asks
+//    after a sign-in), asked once a day per token file and never awaited
+//    longer than a few seconds. Claude Code itself does not know the plan of
+//    a token from claude setup-token (it takes CLAUDE_CODE_SUBSCRIPTION_TYPE
+//    and CLAUDE_CODE_RATE_LIMIT_TIER from the environment, or nothing), and
+//    such a token carries only the scope user:inference, so the profile may
+//    refuse it: then the setting names it. An unknown plan counts as a Pro,
+//    the smallest with Claude Code, so that a guess never takes work from a
+//    plan known to be bigger; said once in the log, and in list_workers.
 // 3. Fixed rules, optional and none by default: VOICE_GW_ACCOUNTS in
 //    .secrets/gateway.env or the environment, repository=account, several
 //    accounts separated by commas, the entries by semicolons, as
@@ -69,12 +87,17 @@
 // one holds only the runs that would take it, and the controller waits only
 // with the default account, its own login (gateway.mjs).
 
-import { lstatSync, readFileSync, readdirSync } from 'node:fs'
+import { lstatSync, readFileSync, readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { clock, limitName } from './limits.mjs'
 import { log as defaultLog } from './log.mjs'
 
 export const ACCOUNTS_SETTING = 'VOICE_GW_ACCOUNTS'
+export const PLANS_SETTING = 'VOICE_GW_ACCOUNT_PLANS'
+export const LOOKUP_SETTING = 'VOICE_GW_PLAN_LOOKUP'
+// Where Claude Code asks for the profile of a login, the plan included
+// (organization.organization_type, rate_limit_tier, plan_display_name).
+export const PROFILE_URL = 'https://api.anthropic.com/api/oauth/profile'
 export const DEFAULT_ACCOUNT = 'default'
 export const TOKEN_FILE = 'claude_token'
 // The variable that hands a run in the container its account's token
@@ -90,6 +113,96 @@ const ROOM = 0.02 // less than this left is no room
 export const SESSION_WAIT_MS = 60 * 60 * 1000
 // A token is one word of printable characters, as claude setup-token prints it.
 const TOKEN = /^[\x21-\x7e]{20,4096}$/
+
+// The plans and their size, relative to Pro, as Anthropic describes them on
+// 7 November 2026 (claude.com/pricing, and the help center's "What is the
+// Ultra plan?" and "What is the Team plan?"): Pro 1; Max, called Max 5x until
+// 30 October 2026, "5x Pro usage every 5 hours and every week"; Ultra, the
+// former Max 20x, "10 times the Pro plan's usage every week", without a
+// 5-hour limit for verified accounts; a Team plan's standard seat 1.25 times
+// and its premium seat 6.25 times "the Pro plan's per-session usage
+// allowance", their weekly limits not compared, so taken as the same. An
+// Enterprise seat has no size of its own (usage-based ones no plan limit at
+// all): the setting gives it as a number.
+export const PLANS = {
+  pro: { name: 'Pro', size: 1 },
+  'team-standard': { name: 'Team standard seat', size: 1.25 },
+  max: { name: 'Max', size: 5 },
+  'team-premium': { name: 'Team premium seat', size: 6.25 },
+  ultra: { name: 'Ultra', size: 10 },
+}
+const PLAN_NAMES = { 'max-5x': 'max', max5x: 'max', 'max-20x': 'ultra', max20x: 'ultra' }
+const UNKNOWN = { id: null, name: 'plan unknown', size: PLANS.pro.size }
+const MAX_SIZE = 100 // a size in the setting, relative to Pro
+const LOOKUP_KEEP_MS = 24 * 60 * 60 * 1000 // an answer of the profile, as Claude Code keeps its own
+const LOOKUP_RETRY_MS = 10 * 60 * 1000 // after a lookup that got no answer
+const LOOKUP_WAIT_MS = 3000 // what a run's start waits for lookups under way
+
+// The plan Claude Code's records name, by its own rules: the type of the
+// organization (claude_max or max, …) and its rate limit tier, a Team seat
+// premium where its tier is that of a Max (isTeamPremiumSubscriber), a Max
+// with the tier of Max 20x an Ultra; the display name only where the tier
+// says nothing. null: unknown, an Enterprise seat among them.
+export function planOf({ type, tier, label } = {}) {
+  const kind = String(type ?? '').replace(/^claude_/, '')
+  if (kind === 'pro') return 'pro'
+  if (kind === 'max') {
+    if (tier === 'default_claude_max_20x') return 'ultra'
+    if (tier === 'default_claude_max_5x') return 'max'
+    return /^ultra$/i.test(String(label ?? '').trim()) ? 'ultra' : 'max' // never the bigger by guess
+  }
+  if (kind === 'team') return tier === 'default_claude_max_5x' ? 'team-premium' : 'team-standard'
+  return null
+}
+
+// The setting's entries: { plans: Map(account -> { id, name, size }),
+// problems }. A plan by its name (pro, max, ultra, team-standard,
+// team-premium, and max-5x, max-20x as they were called) or as a number,
+// its size relative to Pro. A bare "team" says nothing of the seat: left out.
+export function parsePlans(text) {
+  const plans = new Map()
+  const problems = []
+  for (const raw of String(text ?? '').split(';')) {
+    const entry = raw.trim()
+    if (!entry) continue
+    const at = entry.indexOf('=')
+    const name = at < 0 ? '' : entry.slice(0, at).trim().toLowerCase()
+    const value = entry.slice(at + 1).trim().toLowerCase()
+    if (!ACCOUNT_NAME.test(name)) {
+      problems.push(`"${entry}" is no account=plan`)
+      continue
+    }
+    const id = PLAN_NAMES[value] ?? value
+    const size = Number(value)
+    let plan = null
+    if (PLANS[id]) plan = { id, ...PLANS[id] }
+    else if (/^\d+(\.\d+)?$/.test(value) && size > 0 && size <= MAX_SIZE) plan = { id: null, name: `${size} times Pro`, size }
+    if (!plan) {
+      const hint = value === 'team' ? ': say team-standard or team-premium' : `: the plans are ${Object.keys(PLANS).join(', ')}, or a size relative to Pro up to ${MAX_SIZE}`
+      problems.push(`"${value}" for ${name} is no plan${hint}`)
+      continue
+    }
+    if (plans.has(name)) problems.push(`${name} has two entries; the last counts`)
+    plans.set(name, plan)
+  }
+  return { plans, problems }
+}
+
+// Asks the profile endpoint with a token: { status, profile }. Never logs it.
+export function profileLookup(url = PROFILE_URL, { timeoutMs = 10000 } = {}) {
+  return async token => {
+    const response = await fetch(url, {
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', 'User-Agent': 'cc-voice-gateway' },
+      signal: AbortSignal.timeout(timeoutMs),
+    })
+    return { status: response.status, profile: response.ok ? await response.json().catch(() => null) : null }
+  }
+}
+
+// What changes when a file is replaced or written, for answers that belong to
+// one version of it.
+const stampOf = stat => `${stat.ino}:${stat.size}:${stat.mtimeMs}`
+const sizeText = size => `${Number(size.toFixed(2))} times Pro`
 
 // The key of an account for the usage limit (limits.mjs): the default
 // account is the login where the run runs, this computer's or the
@@ -135,22 +248,43 @@ export function parseAccounts(text) {
 
 const percent = used => `${Math.round(used * 100)} %`
 const runsText = n => (n ? `, ${n} run${n === 1 ? '' : 's'} going` : '')
+// An account's plan in a few words: "Ultra, 10 times Pro", "Pro"; a size
+// the setting gives, "8 times Pro"; unknown, "plan unknown, counted as Pro".
+const planText = plan => (plan.id && plan.id !== 'pro' ? `${plan.name}, ${sizeText(plan.size)}` : plan.id || plan.from ? plan.name : `${plan.name}, counted as Pro`)
+// What an account has left, by its plan: "team: Team premium seat, 40 %
+// left, as much as 2.5 Pro plans".
+const roomText = f => {
+  const pros = Number(f.free.toFixed(2))
+  const plan = f.plan.id || f.plan.from ? f.plan.name : 'plan unknown, counted as Pro'
+  return `${f.name}: ${plan}, ${f.left === null ? 'use unknown' : `${percent(f.left)} left`}, as much as ${pros} Pro plan${pros === 1 ? '' : 's'}`
+}
 
 export class Accounts {
   // dir: .secrets/accounts, with a folder per further account; null: only
   // the default. setting: VOICE_GW_ACCOUNTS's text. limits: the waits and
   // the headroom of every account (limits.mjs), whose texts then name the
-  // accounts as label does.
-  constructor({ dir = null, setting = '', limits = null, now = () => Date.now(), log = defaultLog } = {}) {
+  // accounts as label does. The plans (plan): plans, VOICE_GW_ACCOUNT_PLANS's
+  // text; claudeConfig, Claude Code's .claude.json with the record of the
+  // login on this computer; containerToken, the token file of a container's
+  // own login; lookup, token -> { status, profile } (profileLookup). Without
+  // them, every plan the setting does not name is unknown.
+  constructor({ dir = null, setting = '', plans = '', limits = null, claudeConfig = null, containerToken = null, lookup = null, now = () => Date.now(), log = defaultLog } = {}) {
     this.dir = dir
     this.limits = limits
+    this.claudeConfig = claudeConfig
+    this.containerToken = containerToken
+    this.lookup = lookup
     this.now = now
     this.log = log
     this.rules = new Map()
+    this.plans = new Map()
+    this.record = null // the plan in Claude Code's record of its login, by the file's version
+    this.lookups = new Map() // what the profile said to a token: key -> { stamp, at, id, why, pending }
     this.noted = new Map() // what was said about an account or a rule, so that it is said once
     this.usable = null // the further accounts that could take runs at the last look (found)
     if (limits) limits.label = key => this.label(key)
     this.set(setting)
+    this.setPlans(plans)
   }
 
   // Takes the setting's text, in place of the rules before. Returns what it
@@ -163,9 +297,152 @@ export class Accounts {
     return problems
   }
 
+  // Takes VOICE_GW_ACCOUNT_PLANS's text, in place of the plans it named
+  // before. Returns what it ignored; the log names it too.
+  setPlans(text) {
+    const { plans, problems } = parsePlans(text)
+    for (const why of problems) this.log(`${PLANS_SETTING}: ignored, ${why}`)
+    this.plans = plans
+    for (const what of [...this.noted.keys()].filter(what => what.startsWith('plan:'))) this.noted.delete(what)
+    return problems
+  }
+
   // The rules in a few words, for the log: "hauswache: default; *: default, pro".
   text() {
     return [...this.rules].map(([repo, names]) => `${repo}: ${names.join(', ')}`).join('; ')
+  }
+
+  // The plans the setting names, for the log: "team: Team premium seat".
+  plansText() {
+    return [...this.plans].map(([name, plan]) => `${name}: ${plan.name}`).join('; ')
+  }
+
+  // The plan of an account, where its runs run (container: null on this
+  // computer): { id, name, size, from }, from saying where it was found;
+  // unknown, a Pro's size with id null and why. See the head of this file.
+  plan(name, { container = null } = {}) {
+    const set = this.plans.get(name)
+    if (set) return { ...set, from: `set in ${PLANS_SETTING}` }
+    let found
+    if (name === DEFAULT_ACCOUNT && !container) found = this.recorded()
+    else if (name === DEFAULT_ACCOUNT) found = this.looked(`container:${container}`, this.containerToken, () => this.fileToken(this.containerToken))
+    else found = this.problem(name) ? null : this.looked(name, join(this.dir ?? '', name, TOKEN_FILE), () => this.token(name))
+    const known = found?.id ? { id: found.id, ...PLANS[found.id], from: found.from } : null
+    const why = known ? null : (found?.why ?? (found ? 'nothing says it' : `the lookup is off (${LOOKUP_SETTING}=0)`))
+    this.note(
+      `plan:${name}:${container ?? ''}`,
+      known
+        ? `account ${name}: ${planText(known)}, ${known.from}`
+        : found?.pending
+          ? null // asking: said once the answer is there
+          : `account ${name}: plan unknown (${why}), counted as Pro, the smallest; ${PLANS_SETTING} names it (${name}=pro, max, ultra, team-standard, team-premium or a size)`,
+    )
+    return known ?? { ...UNKNOWN, from: null, why }
+  }
+
+  // The plan of the login on this computer, by Claude Code's record of it
+  // (oauthAccount in .claude.json): { id, from } or { why }. Read again when
+  // the file changes; nothing else of it is kept.
+  recorded() {
+    const stat = this.claudeConfig ? statSync(this.claudeConfig, { throwIfNoEntry: false }) : null
+    if (!stat) return { why: this.claudeConfig ? `no ${this.claudeConfig}` : "Claude Code's record not read" }
+    const stamp = stampOf(stat)
+    if (this.record?.stamp !== stamp) {
+      let account = null
+      try {
+        account = JSON.parse(readFileSync(this.claudeConfig, 'utf8'))?.oauthAccount ?? null
+      } catch {
+        // Being written: as if it said nothing, until it changes again.
+      }
+      const id = planOf({ type: account?.organizationType, tier: account?.organizationRateLimitTier ?? account?.userRateLimitTier, label: account?.planDisplayName })
+      const type = account?.organizationType
+      this.record = {
+        stamp,
+        id,
+        from: "by Claude Code's record of its login",
+        why: id ? null : account ? `Claude Code's record of its login names ${type ? `the plan ${type}` : 'no plan'}` : `Claude Code's record names no login`,
+      }
+    }
+    return this.record
+  }
+
+  // What the profile endpoint said to a token: { id, from } or { why },
+  // with pending while it asks; null with the lookup off. key: the
+  // account, or the container for its own login; file: its token file,
+  // whose version an answer belongs to; read: its token. Asks again a day
+  // later, or ten minutes after no answer.
+  looked(key, file, read) {
+    if (!this.lookup) return null
+    const stat = file ? statSync(file, { throwIfNoEntry: false }) : null
+    if (!stat) return { why: 'no token to ask with' }
+    const stamp = stampOf(stat)
+    let entry = this.lookups.get(key)
+    if (entry?.stamp !== stamp) {
+      entry = { stamp, at: 0, id: null, why: null, keep: 0, pending: null }
+      this.lookups.set(key, entry)
+    }
+    if (!entry.pending && this.now() - entry.at >= entry.keep) this.ask(entry, read)
+    return entry
+  }
+
+  ask(entry, read) {
+    const token = read()
+    entry.at = this.now()
+    if (!token) {
+      Object.assign(entry, { id: null, why: 'its token cannot be read', keep: LOOKUP_RETRY_MS })
+      return
+    }
+    entry.pending = Promise.resolve()
+      .then(() => this.lookup(token))
+      .then(({ status, profile }) => {
+        const org = profile?.organization
+        if (status === 200 && org) {
+          const id = planOf({ type: org.organization_type, tier: org.rate_limit_tier, label: org.plan_display_name })
+          const why = id ? null : `its profile names ${org.organization_type ? `the plan ${String(org.organization_type).slice(0, 40)}` : 'no plan'}`
+          return Object.assign(entry, { id, why, from: "by its token's profile", keep: LOOKUP_KEEP_MS })
+        }
+        const refused = status === 401 || status === 403
+        const why = refused
+          ? `its token may not read its profile (HTTP ${status}); a token from claude setup-token may only make model requests`
+          : `the profile gave no answer (HTTP ${status})`
+        return Object.assign(entry, { id: null, why, keep: refused ? LOOKUP_KEEP_MS : LOOKUP_RETRY_MS })
+      })
+      .catch(error => Object.assign(entry, { id: null, why: `the profile gave no answer (${error.name === 'TimeoutError' ? 'no answer in time' : (error.cause?.code ?? error.code ?? 'no connection')})`, keep: LOOKUP_RETRY_MS }))
+      .finally(() => {
+        entry.at = this.now()
+        entry.pending = null
+      })
+  }
+
+  // Looks up the plans of the accounts a run may take where it runs, and
+  // waits a few seconds at most for answers under way (Workers.launch), so
+  // that the first choice after a start or a new token knows them.
+  async detect({ container = null, named = true } = {}) {
+    try {
+      if (!this.configured()) return
+      const names = [DEFAULT_ACCOUNT, ...(named ? this.found().filter(a => !a.problem).map(a => a.name) : [])]
+      for (const name of names) this.plan(name, { container })
+    } catch (error) {
+      this.note('plan:detect', `accounts: their plans could not be looked up (${error.code ?? error.message}); unknown ones count as Pro`)
+      return
+    }
+    const pending = [...this.lookups.values()].map(entry => entry.pending).filter(Boolean)
+    if (!pending.length) return
+    let timer
+    await Promise.race([Promise.allSettled(pending), new Promise(resolve => (timer = setTimeout(resolve, LOOKUP_WAIT_MS)))])
+    clearTimeout(timer)
+  }
+
+  // A plain token file's token, or null (the container's own login).
+  fileToken(file) {
+    try {
+      const stat = lstatSync(file)
+      if (!stat.isFile() || stat.mode & 0o077) return null
+      const text = readFileSync(file, 'utf8').trim()
+      return TOKEN.test(text) ? text : null
+    } catch {
+      return null
+    }
   }
 
   // The further accounts by their folders, each with what is wrong with its
@@ -343,37 +620,48 @@ export class Accounts {
       const to = free.includes(DEFAULT_ACCOUNT) ? DEFAULT_ACCOUNT : this.rank(free, { container, busy })[0]
       return ok(to, `its session's account ${session} is gone, switched off or not allowed; ${to === DEFAULT_ACCOUNT ? 'the default' : 'the most headroom'}`)
     }
-    const [best] = this.rank(free, { container, busy })
+    const ranked = this.ranked(free, { container, busy })
+    // Plans of different sizes: what each has left, so that worker_status says why.
+    const sized = new Set(ranked.map(f => f.plan.size)).size > 1
     const why = fallback
       ? 'the default, as its fixed rule names no account available'
       : names.length === 1
         ? 'the only one allowed'
         : free.length === 1
           ? 'the only one without a wait'
-          : 'the most headroom'
-    return ok(best, moved + why)
+          : sized
+            ? `the most headroom for its plan's size (${ranked.map(roomText).join('; ')})`
+            : 'the most headroom'
+    return ok(ranked[0].name, moved + why)
   }
 
-  // The accounts by their room, the best first (3. at the head of this file).
-  rank(names, { container = null, busy = {} } = {}) {
+  // The accounts by their room, the best first (2. at the head of this file).
+  rank(names, options = {}) {
+    return this.ranked(names, options).map(f => f.name)
+  }
+
+  // The same with what decided it: [{ name, left, plan, free, … }], free
+  // being what is left in Pro plans (left times the plan's size).
+  ranked(names, { container = null, busy = {} } = {}) {
     const facts = names.map(name => {
       const key = accountKey(name, container)
       const left = this.limits?.headroom(key).left ?? null
-      return { name, left, credits: Boolean(this.limits?.paying(key)), busy: busy[name] ?? 0 }
+      // One alone needs no plan, and its lookup no log line.
+      const plan = names.length > 1 ? this.plan(name, { container }) : { ...UNKNOWN }
+      return { name, left, plan, free: (left ?? 1) * plan.size, credits: Boolean(this.limits?.paying(key)), busy: busy[name] ?? 0 }
     })
     const room = f => !f.credits && (f.left === null || f.left >= ROOM)
     const some = facts.some(room)
-    const step = f => Math.floor((f.left ?? 1) / STEP + 1e-9)
-    return facts
-      .sort(
-        (a, b) =>
-          (some ? Number(room(b)) - Number(room(a)) : 0) ||
-          step(b) - step(a) ||
-          a.busy - b.busy ||
-          Number(b.name === DEFAULT_ACCOUNT) - Number(a.name === DEFAULT_ACCOUNT) ||
-          a.name.localeCompare(b.name),
-      )
-      .map(f => f.name)
+    const size = Math.max(...facts.map(f => f.plan.size))
+    const step = f => Math.floor(f.free / (STEP * size) + 1e-9)
+    return facts.sort(
+      (a, b) =>
+        (some ? Number(room(b)) - Number(room(a)) : 0) ||
+        step(b) - step(a) ||
+        a.busy - b.busy ||
+        Number(b.name === DEFAULT_ACCOUNT) - Number(a.name === DEFAULT_ACCOUNT) ||
+        a.name.localeCompare(b.name),
+    )
   }
 
   // Who waits or runs on credits, in a few words, for the texts of limits.mjs:
@@ -389,15 +677,17 @@ export class Accounts {
     return String(key)
   }
 
-  // One account's state in a few words, for list_workers: its use, when its
-  // fullest window resets, its wait or credits, the runs going on it.
+  // One account's state in a few words, for list_workers: its plan, its use,
+  // when its fullest window resets, its wait or credits, the runs going on it.
   describe(name, { container = null, busy = {} } = {}) {
     if (name !== DEFAULT_ACCOUNT) {
       const problem = this.problem(name)
       if (problem) return `${name} unavailable (${problem})`
     }
     const key = accountKey(name, container)
-    const who = name === DEFAULT_ACCOUNT ? `${name} (${container ? `the container ${container}'s login` : "this computer's login, the controller's"})` : name
+    const plan = this.plan(name, { container })
+    const login = name === DEFAULT_ACCOUNT ? `${container ? `the container ${container}'s login` : "this computer's login, the controller's"}; ` : ''
+    const who = `${name} (${login}${planText(plan)}${plan.from?.startsWith('set') ? ', as set' : ''}):`
     const wait = this.limits?.active(key)
     if (wait) return `${who} waits for the usage limit until ${clock(wait.until, this.now())}${runsText(busy[name])}`
     const { windows } = this.limits?.headroom(key) ?? { windows: [] }

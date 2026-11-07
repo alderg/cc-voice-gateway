@@ -15,6 +15,7 @@ import { test, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync, spawnSync } from 'node:child_process'
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { createServer as createHttpServer } from 'node:http'
 import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -25,7 +26,7 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 import { z } from 'zod'
 
 process.env.VOICE_GW_LOG_FILE = ''
-const { ACCOUNT_TOKEN_ENV, Accounts, accountKey, parseAccounts } = await import('../src/accounts.mjs')
+const { ACCOUNT_TOKEN_ENV, Accounts, PLANS, accountKey, parseAccounts, parsePlans, planOf } = await import('../src/accounts.mjs')
 const { HEADROOM_STALE_MS, Limits, windowsOf } = await import('../src/limits.mjs')
 const { Workers } = await import('../src/workers.mjs')
 const { DockerRunner } = await import('../src/runners.mjs')
@@ -130,7 +131,7 @@ function secrets(at, tokens = { pro: PRO, team: TEAM }) {
 let count = 0
 // A folder of repositories without remotes, a secrets folder with pro and
 // team, and workers on them that report as the gateway does.
-function setup({ repos = ['alpha', 'beta', 'gamma'], setting = '', tokens, ...options } = {}) {
+function setup({ repos = ['alpha', 'beta', 'gamma'], setting = '', plans = '', tokens, ...options } = {}) {
   const base = join(TMP, `case${++count}`)
   const root = join(base, 'Developer')
   for (const name of repos) {
@@ -143,7 +144,7 @@ function setup({ repos = ['alpha', 'beta', 'gamma'], setting = '', tokens, ...op
   const lines = []
   const log = (...args) => lines.push(args.join(' '))
   const limits = new Limits({ minWaitMs: 0, log })
-  const accounts = new Accounts({ dir: secrets(base, tokens), setting, limits, log })
+  const accounts = new Accounts({ dir: secrets(base, tokens), setting, plans, limits, log })
   const workers = new Workers({ root, stateDir: join(base, 'state'), claudeBin: join(BIN, 'claude'), ghBin: join(BIN, 'no-gh'), limits, accounts, killAfterMs: 1000, ...options })
   workers.on('finished', async task => {
     if (task.reported) return
@@ -321,6 +322,182 @@ test('the choice: fixed rules pin or allow; a rule without an account available 
   assert.equal(accounts.choose({ repo: 'beta', session: 'ultra' }).status, 'usage', 'pinned to pro, which waits')
   // In a container whose voice-run is older: only its own login.
   assert.deepEqual(accounts.choose({ repo: 'gamma', container: 'voice-workers', named: false }), { status: 'ok', name: 'default', key: 'container:voice-workers', why: 'the only one allowed' })
+})
+
+// --- the plans -----------------------------------------------------------------------
+//
+// The driver in the car: "ja aber bei den abos und der zuteilung nicht nur das
+// freie limit sondern auch das abo berücksichtigen, ein kleineres freies limit
+// kann trotzdem mehr nutzung bedeuten bei einem ultra abo als ein grösseres bei
+// einem pro abo."
+
+test("the plans: Claude Code's records by its own rules; the setting by name or size, a bare team or an unknown name left out", () => {
+  assert.deepEqual(Object.fromEntries(Object.entries(PLANS).map(([id, plan]) => [id, plan.size])), { pro: 1, 'team-standard': 1.25, max: 5, 'team-premium': 6.25, ultra: 10 })
+  // As .claude.json's oauthAccount and the profile name them (organization_type, rate_limit_tier, plan_display_name).
+  assert.equal(planOf({ type: 'claude_max', tier: 'default_claude_max_20x', label: 'Ultra' }), 'ultra')
+  assert.equal(planOf({ type: 'max', tier: 'default_claude_max_5x' }), 'max')
+  assert.equal(planOf({ type: 'claude_max', label: 'Ultra' }), 'ultra', 'by its name where the tier says nothing')
+  assert.equal(planOf({ type: 'claude_max', tier: 'something_new' }), 'max', 'never the bigger by guess')
+  assert.equal(planOf({ type: 'claude_pro', tier: 'default_claude_ai' }), 'pro')
+  assert.equal(planOf({ type: 'claude_team', tier: 'default_claude_max_5x' }), 'team-premium', "a premium seat has a Max's tier, as Claude Code tells it")
+  assert.equal(planOf({ type: 'claude_team', tier: 'default_claude_ai' }), 'team-standard')
+  assert.equal(planOf({ type: 'claude_enterprise', tier: 'default_claude_max_5x' }), null, 'by its seats: unknown')
+  assert.equal(planOf({}), null)
+
+  const { plans, problems } = parsePlans(' default=Ultra; team=team-premium ;old=max-20x;small=max-5x;big=7.5;x=team;y=huge;z=0;Q R=pro;w=200;team=team-standard')
+  assert.deepEqual(Object.fromEntries([...plans].map(([name, plan]) => [name, [plan.id, plan.name, plan.size]])), {
+    default: ['ultra', 'Ultra', 10],
+    team: ['team-standard', 'Team standard seat', 1.25],
+    old: ['ultra', 'Ultra', 10],
+    small: ['max', 'Max', 5],
+    big: [null, '7.5 times Pro', 7.5],
+  })
+  assert.deepEqual(problems, [
+    '"team" for x is no plan: say team-standard or team-premium',
+    '"huge" for y is no plan: the plans are pro, team-standard, max, team-premium, ultra, or a size relative to Pro up to 100',
+    '"0" for z is no plan: the plans are pro, team-standard, max, team-premium, ultra, or a size relative to Pro up to 100',
+    '"Q R=pro" is no account=plan',
+    '"200" for w is no plan: the plans are pro, team-standard, max, team-premium, ultra, or a size relative to Pro up to 100',
+    'team has two entries; the last counts',
+  ])
+})
+
+test("the plans found: the login's from Claude Code's record, a token's from its profile, asked once a day and anew for a new token; refused, off or without an answer, unknown and counted as a Pro; the setting wins; never the token in the log", async () => {
+  const at = join(TMP, 'plans')
+  const dir = secrets(at)
+  const record = join(at, '.claude.json')
+  const write = oauthAccount => writeFileSync(record, JSON.stringify({ numStartups: 3, projects: {}, oauthAccount: { emailAddress: 'driver@example.com', ...oauthAccount } }))
+  write({ organizationType: 'claude_max', organizationRateLimitTier: 'default_claude_max_20x', planDisplayName: 'Ultra' })
+  let now = Date.now()
+  const asked = []
+  const team = { status: 200, profile: { organization: { organization_type: 'claude_team', rate_limit_tier: 'default_claude_max_5x', plan_display_name: 'Team' } } }
+  const answers = new Map([[TEAM, team], [PRO, { status: 403, profile: null }]])
+  const lookup = async token => {
+    asked.push(token)
+    const answer = answers.get(token)
+    if (answer instanceof Error) throw answer
+    return answer ?? { status: 401, profile: null }
+  }
+  const lines = []
+  const accounts = new Accounts({ dir, claudeConfig: record, lookup, now: () => now, log: line => lines.push(line) })
+  await accounts.detect()
+  assert.deepEqual(accounts.plan('default'), { id: 'ultra', name: 'Ultra', size: 10, from: "by Claude Code's record of its login" })
+  assert.deepEqual(accounts.plan('team'), { id: 'team-premium', name: 'Team premium seat', size: 6.25, from: "by its token's profile" })
+  assert.deepEqual(accounts.plan('pro'), {
+    id: null,
+    name: 'plan unknown',
+    size: 1,
+    from: null,
+    why: 'its token may not read its profile (HTTP 403); a token from claude setup-token may only make model requests',
+  })
+  assert.deepEqual(asked.toSorted(), [PRO, TEAM])
+  assert.ok(lines.includes("account default: Ultra, 10 times Pro, by Claude Code's record of its login"))
+  assert.ok(lines.includes("account team: Team premium seat, 6.25 times Pro, by its token's profile"))
+  // Said once.
+  await accounts.detect()
+  accounts.plan('pro')
+  assert.deepEqual(
+    lines.filter(line => line.startsWith('account pro: plan unknown')),
+    [
+      'account pro: plan unknown (its token may not read its profile (HTTP 403); a token from claude setup-token may only make model requests), counted as Pro, the smallest; ' +
+        'VOICE_GW_ACCOUNT_PLANS names it (pro=pro, max, ultra, team-standard, team-premium or a size)',
+    ],
+  )
+  // Asked again a day later, not before.
+  now += 23 * HOUR
+  await accounts.detect()
+  assert.equal(asked.length, 2)
+  now += 2 * HOUR
+  await accounts.detect()
+  assert.equal(asked.length, 4)
+  // A new token in pro's file: asked at once, for that token.
+  answers.set(`${PRO}-new`, { status: 200, profile: { organization: { organization_type: 'claude_pro', rate_limit_tier: 'default_claude_ai' } } })
+  writeFileSync(join(dir, 'pro', 'claude_token'), `${PRO}-new\n`, { mode: 0o600 })
+  await accounts.detect()
+  assert.equal(asked.at(-1), `${PRO}-new`)
+  assert.equal(accounts.plan('pro').id, 'pro')
+  // No answer: unknown, asked again ten minutes later, keeping nothing of the old token's.
+  answers.set(`${TEAM}-new`, new TypeError('fetch failed', { cause: { code: 'ENOTFOUND' } }))
+  writeFileSync(join(dir, 'team', 'claude_token'), `${TEAM}-new\n`, { mode: 0o600 })
+  await accounts.detect()
+  assert.equal(accounts.plan('team').why, 'the profile gave no answer (ENOTFOUND)')
+  const tries = asked.length
+  now += 5 * 60 * 1000
+  await accounts.detect()
+  assert.equal(asked.length, tries)
+  answers.set(`${TEAM}-new`, team)
+  now += 6 * 60 * 1000
+  await accounts.detect()
+  assert.equal(accounts.plan('team').id, 'team-premium')
+  // Claude Code's record changes, after a change of plan at claude.ai: read again.
+  write({ organizationType: 'claude_max', organizationRateLimitTier: 'default_claude_max_5x', planDisplayName: 'Max' })
+  assert.equal(accounts.plan('default').id, 'max')
+  write({ organizationType: 'claude_enterprise', organizationRateLimitTier: 'default_claude_max_5x', seatTier: 'enterprise_usage_based' })
+  assert.equal(accounts.plan('default').why, "Claude Code's record of its login names the plan claude_enterprise")
+  // The setting wins over what was found, at once.
+  assert.deepEqual(accounts.setPlans('team=team-standard;default=8'), [])
+  assert.deepEqual(accounts.plan('team'), { id: 'team-standard', name: 'Team standard seat', size: 1.25, from: 'set in VOICE_GW_ACCOUNT_PLANS' })
+  assert.deepEqual(accounts.plan('default'), { id: null, name: '8 times Pro', size: 8, from: 'set in VOICE_GW_ACCOUNT_PLANS' })
+  assert.equal(accounts.describe('default'), "default (this computer's login, the controller's; 8 times Pro, as set): use unknown, no run seen yet")
+  assert.equal(accounts.describe('pro'), 'pro (Pro): use unknown, no run seen yet')
+  for (const token of [PRO, TEAM]) assert.ok(!lines.join('\n').includes(token), 'never a token in the log')
+
+  // Without a lookup or Claude Code's record: unknown, a Pro's size.
+  const off = new Accounts({ dir, log: () => {} })
+  assert.deepEqual(off.plan('team'), { id: null, name: 'plan unknown', size: 1, from: null, why: 'the lookup is off (VOICE_GW_PLAN_LOOKUP=0)' })
+  assert.equal(off.plan('default').why, "Claude Code's record not read")
+  // In a container: its own login by the token it has.
+  const own = join(at, 'worker-token')
+  writeFileSync(own, `${TEAM}\n`, { mode: 0o600 })
+  const docker = new Accounts({ dir, containerToken: own, claudeConfig: record, lookup, log: () => {} })
+  await docker.detect({ container: 'voice-workers' })
+  assert.equal(docker.plan('default', { container: 'voice-workers' }).id, 'team-premium', "the container's login, not this computer's")
+  assert.equal(docker.plan('default').why, "Claude Code's record of its login names the plan claude_enterprise")
+})
+
+test("the choice by plan size: 30 % left of an Ultra beats 60 % left of a Pro; steps of 5 % of the biggest plan; an unknown plan counts as a Pro; why names each one's room", () => {
+  const at = join(TMP, 'sizes')
+  const limits = new Limits({ log: () => {} })
+  const accounts = new Accounts({ dir: secrets(at), plans: 'default=ultra;pro=pro', limits, log: () => {} })
+  let windows = 0
+  const use = (key, used) => limits.observe(key, { status: 'allowed', unifiedWindows: { seven_day: { utilization: used, resetsAt: Math.floor(Date.now() / 1000) + 86400 + ++windows } } })
+  const choose = (extra = {}) => accounts.choose({ repo: 'alpha', ...extra })
+  use('host', 0.7)
+  use('account:pro', 0.4)
+  use('account:team', 0.95)
+  // As much as 3, 0.6 and 0.05 Pro plans.
+  assert.deepEqual(choose(), {
+    status: 'ok',
+    name: 'default',
+    key: 'host',
+    why:
+      "the most headroom for its plan's size (default: Ultra, 30 % left, as much as 3 Pro plans; pro: Pro, 60 % left, as much as 0.6 Pro plans; " +
+      'team: plan unknown, counted as Pro, 5 % left, as much as 0.05 Pro plans)',
+  })
+  // Without the plans, as before: the emptier one, and why says nothing of sizes.
+  assert.deepEqual(new Accounts({ dir: secrets(at), limits, log: () => {} }).choose({ repo: 'alpha' }), { status: 'ok', name: 'pro', key: 'account:pro', why: 'the most headroom' })
+  // Steps of 5 % of the biggest plan, half a Pro here: within one, fewer runs, then the default.
+  use('host', 0.94) // 0.6
+  use('account:pro', 0.45) // 0.55
+  assert.equal(choose().name, 'default', 'the same step: the default')
+  assert.equal(choose({ busy: { default: 1 } }).name, 'pro', 'the same step: fewer runs going')
+  use('host', 0.96) // 0.4: a step less
+  assert.equal(choose({ busy: { pro: 2 } }).name, 'pro')
+  // Room is each plan's own: less than 2 % of the Ultra left is none, though as much as 0.15 Pro plans.
+  use('host', 0.985)
+  use('account:pro', 0.9)
+  assert.equal(choose().name, 'pro', '10 % of a Pro left, as much as 0.1 Pro plans')
+
+  // An unknown plan counts as a Pro: an empty one goes first only once the Ultra has less than a Pro's worth left.
+  const two = new Accounts({ dir: secrets(at), setting: '*=default,team', plans: 'default=ultra', limits, log: () => {} })
+  use('account:team', 0)
+  use('host', 0.85) // 1.5
+  assert.equal(two.choose({ repo: 'alpha' }).name, 'default')
+  use('host', 0.92) // 0.8
+  assert.equal(two.choose({ repo: 'alpha' }).name, 'team')
+  // Unknown use ranks as empty, at its plan's size.
+  const fresh = new Accounts({ dir: secrets(at), setting: '*=default,team', plans: 'default=ultra;team=team-premium', limits: new Limits({ log: () => {} }), log: () => {} })
+  assert.equal(fresh.choose({ repo: 'alpha' }).name, 'default', '10 against 6.25')
 })
 
 test("dispatch's account: refused where it does not exist, is unavailable, a rule allows another, or the session goes on elsewhere; else taken, also while it waits", () => {
@@ -503,8 +680,8 @@ test("dispatch's account: refused with the reason, nothing started; taken, also 
   }
 })
 
-test('list_workers and worker_status: the accounts with their use and rules, and the account of each run; nothing about them with the default alone', async () => {
-  const { workers, dispatch } = setup({ setting: 'beta=pro' })
+test('list_workers and worker_status: the accounts with their plans, use and rules, and the account of each run, why by plan size; nothing about them with the default alone', async () => {
+  const { workers, dispatch } = setup({ setting: 'beta=pro', plans: 'default=ultra;team=team-premium' })
   try {
     const h = hold()
     const run = await dispatch('beta', `USE:12 HOLD:${h} working`)
@@ -514,14 +691,26 @@ test('list_workers and worker_status: the accounts with their use and rules, and
     assert.match(list, /^\[workers=3 running=1 max=2 accounts=3\]$/m)
     assert.match(
       list,
-      /^Accounts: default \(this computer's login, the controller's\) use unknown, no run seen yet; pro 12 % of the weekly limit \(resets \d\d:\d\d on \d+ \w+\) used, 1 run going; team use unknown, no run seen yet\. Fixed rules \(VOICE_GW_ACCOUNTS\): beta: pro; the rest by headroom\.$/m,
+      /^Accounts: default \(this computer's login, the controller's; Ultra, 10 times Pro, as set\): use unknown, no run seen yet; pro \(plan unknown, counted as Pro\): 12 % of the weekly limit \(resets \d\d:\d\d on \d+ \w+\) used, 1 run going; team \(Team premium seat, 6\.25 times Pro, as set\): use unknown, no run seen yet\. Fixed rules \(VOICE_GW_ACCOUNTS\): beta: pro; the rest by headroom\.$/m,
     )
     assert.match(list, new RegExp(`^beta: no remote, branch main, clean, running ${run.task.id} on pro for `, 'm'))
     const status = workers.statusText('beta')
     assert.match(status, new RegExp(`^\\[worker=beta state=running task=${run.task.id} account=pro elapsed=\\d+s\\]$`, 'm'))
     assert.match(status, /^Account: pro \(the only one allowed\)\.$/m)
+    // Chosen among plans of different sizes: why, with each one's room.
+    const alpha = await dispatch('alpha', 'USE:70 next')
+    assert.equal(alpha.task.account, 'default')
+    assert.match(
+      workers.statusText('alpha'),
+      /^Account: default \(the most headroom for its plan's size \(default: Ultra, use unknown, as much as 10 Pro plans; team: Team premium seat, use unknown, as much as 6\.25 Pro plans; pro: plan unknown, counted as Pro, 88 % left, as much as 0\.88 Pro plans\)\)\.$/m,
+    )
     release(h)
     await ended(run.task)
+    await ended(alpha.task)
+    // 30 % of the Ultra left: as much as 3 Pro plans, less than the Team seat's 6.25.
+    const gamma = await dispatch('gamma', 'then')
+    assert.equal(gamma.task.account, 'team')
+    await ended(gamma.task)
   } finally {
     workers.close()
   }
@@ -549,7 +738,7 @@ test('adding and removing an account at the desk: a token file, or its folder de
     // Added: a new folder with a token, no restart.
     secrets(base, { extra: PRO })
     assert.match(await workers.listText(), /accounts=3\]/)
-    assert.match(await workers.listText(), /; extra use unknown, no run seen yet; team /)
+    assert.match(await workers.listText(), /; extra \(plan unknown, counted as Pro\): use unknown, no run seen yet; team /)
     // Switched off: the folder named with a dot. Its session goes on on the default, anew.
     renameSync(join(dir, 'team'), join(dir, '.team'))
     assert.doesNotMatch(await workers.listText(), /team/)
@@ -648,7 +837,7 @@ test('docker/voice-run: the account\'s token over the container\'s, the variable
 
 // --- the settings file --------------------------------------------------------------
 
-test('the settings file while the gateway runs: a changed VOICE_GW_ACCOUNTS comes at once; the environment wins', () => {
+test('the settings file while the gateway runs: a changed VOICE_GW_ACCOUNTS or VOICE_GW_ACCOUNT_PLANS comes at once; the environment wins', () => {
   const file = join(TMP, 'live.env')
   writeFileSync(file, 'VOICE_GW_PORT=8787\n')
   const lines = []
@@ -658,8 +847,14 @@ test('the settings file while the gateway runs: a changed VOICE_GW_ACCOUNTS come
   const added = watcher.reload()
   assert.equal(added.accounts, 'beta=pro')
   assert.deepEqual(added.others, [], 'no restart needed')
+  assert.equal('plans' in added, false, 'unchanged')
+  writeFileSync(file, 'VOICE_GW_PORT=8787\nVOICE_GW_ACCOUNTS=beta=pro\nVOICE_GW_ACCOUNT_PLANS=team=team-premium\n')
+  const plans = watcher.reload()
+  assert.equal(plans.plans, 'team=team-premium')
+  assert.deepEqual(plans.others, [], 'no restart needed')
+  assert.equal('accounts' in plans, false, 'unchanged')
   writeFileSync(file, 'VOICE_GW_PORT=8787\n')
-  assert.equal(watcher.reload().accounts, '', 'taken out: none')
+  assert.deepEqual([watcher.reload()].map(r => [r.accounts, r.plans]), [['', '']], 'taken out: none')
   watcher.close()
   writeFileSync(file, 'VOICE_GW_ACCOUNTS=beta=pro\n')
   const pinned = new SettingsWatcher({ file, env: { VOICE_GW_ACCOUNTS: 'beta=team' }, limits, log: line => lines.push(line) })
@@ -667,10 +862,14 @@ test('the settings file while the gateway runs: a changed VOICE_GW_ACCOUNTS come
   assert.equal(pinned.reload(), null)
   assert.ok(lines.some(line => /VOICE_GW_ACCOUNTS changed in the settings file, but the environment sets it, which wins: the accounts' rules stay as they are/.test(line)))
   pinned.close()
-  // Applied, the rules count for the next run that starts.
-  const accounts = new Accounts({ setting: 'beta=pro', log: () => {} })
+  // Applied, the rules count for the next run that starts, and so do the plans.
+  const accounts = new Accounts({ setting: 'beta=pro', plans: 'team=pro', log: () => {} })
   assert.deepEqual(accounts.set('beta=team;x y=pro'), ['"x y=pro" is no repository=account'])
   assert.equal(accounts.text(), 'beta: team')
+  assert.deepEqual(accounts.setPlans('team=team-premium;pro=huge'), [
+    '"huge" for pro is no plan: the plans are pro, team-standard, max, team-premium, ultra, or a size relative to Pro up to 100',
+  ])
+  assert.equal(accounts.plansText(), 'team: Team premium seat')
 })
 
 // --- the gateway as a whole ------------------------------------------------------------
@@ -687,7 +886,7 @@ function freePort() {
   })
 }
 
-test('the gateway: list_workers names the accounts, dispatch takes one or says why not, a wait on one holds neither the others nor the controller, and stats count by account', async () => {
+test('the gateway: list_workers names the accounts and their plans, dispatch takes one or says why not, a wait on one holds neither the others nor the controller, and stats count by account', async () => {
   const base = join(TMP, 'gw')
   const root = join(base, 'Developer')
   for (const name of ['alpha', 'beta', 'gamma']) {
@@ -698,6 +897,19 @@ test('the gateway: list_workers names the accounts, dispatch takes one or says w
     git(join(root, name), 'commit', '-q', '-m', 'init')
   }
   secrets(base)
+  // Claude Code's record of the login here, and a stand-in for the profile endpoint: team's token a premium seat, pro's refused.
+  const claudeConfig = join(base, 'claude-config')
+  mkdirSync(claudeConfig, { recursive: true })
+  writeFileSync(join(claudeConfig, '.claude.json'), JSON.stringify({ oauthAccount: { organizationType: 'claude_max', organizationRateLimitTier: 'default_claude_max_20x', planDisplayName: 'Ultra' } }))
+  const asked = []
+  const profiles = createHttpServer((request, response) => {
+    asked.push([request.url, request.headers.authorization])
+    const team = request.headers.authorization === `Bearer ${TEAM}`
+    response.writeHead(team ? 200 : 403, { 'content-type': 'application/json' })
+    response.end(JSON.stringify(team ? { organization: { organization_type: 'claude_team', rate_limit_tier: 'default_claude_max_5x' } } : { error: { type: 'permission_error' } }))
+  })
+  await new Promise(resolve => profiles.listen(0, '127.0.0.1', resolve))
+  after(() => profiles.close())
   const port = await freePort()
   const events = []
   let stderr = ''
@@ -721,6 +933,8 @@ test('the gateway: list_workers names the accounts, dispatch takes one or says w
       VOICE_GW_LOG_FILE: '',
       VOICE_GW_MAX_WORKERS: '3',
       VOICE_GW_ACCOUNTS: 'beta=pro;gamma=team',
+      VOICE_GW_PLAN_LOOKUP: `http://127.0.0.1:${profiles.address().port}/api/oauth/profile`,
+      CLAUDE_CONFIG_DIR: claudeConfig,
     },
     stderr: 'pipe',
   })
@@ -746,10 +960,21 @@ test('the gateway: list_workers names the accounts, dispatch takes one or says w
     const idOf = text => /task=(t[a-z0-9]{3})/.exec(text)?.[1]
     const result = id => until(() => events.find(e => e.meta?.task === id))
 
-    assert.match(stderr, /accounts for the workers' runs: default \(the login\), pro, team; fixed rules \(VOICE_GW_ACCOUNTS\): beta: pro; gamma: team; the rest by headroom/)
+    assert.match(
+      stderr,
+      /accounts for the workers' runs: default \(the login\), pro, team; fixed rules \(VOICE_GW_ACCOUNTS\): beta: pro; gamma: team; the rest by headroom for each plan's size, a session on its own account; plans named \(VOICE_GW_ACCOUNT_PLANS\): none, the others by Claude Code's record and the tokens' profiles/,
+    )
     const list = await tool('list_workers')
     assert.match(list, /^\[workers=3 running=0 max=3 accounts=3\]$/m)
-    assert.match(list, /^Accounts: default \(this computer's login, the controller's\) use unknown, no run seen yet; pro use unknown, no run seen yet; team use unknown, no run seen yet\. Fixed rules \(VOICE_GW_ACCOUNTS\): beta: pro; gamma: team; the rest by headroom\.$/m)
+    assert.match(
+      list,
+      /^Accounts: default \(this computer's login, the controller's; Ultra, 10 times Pro\): use unknown, no run seen yet; pro \(plan unknown, counted as Pro\): use unknown, no run seen yet; team \(Team premium seat, 6\.25 times Pro\): use unknown, no run seen yet\. Fixed rules \(VOICE_GW_ACCOUNTS\): beta: pro; gamma: team; the rest by headroom\.$/m,
+    )
+    assert.match(stderr, /account default: Ultra, 10 times Pro, by Claude Code's record of its login/)
+    assert.match(stderr, /account team: Team premium seat, 6\.25 times Pro, by its token's profile/)
+    assert.match(stderr, /account pro: plan unknown \(its token may not read its profile \(HTTP 403\); a token from claude setup-token may only make model requests\), counted as Pro/)
+    assert.deepEqual(asked.map(([url]) => url), ['/api/oauth/profile', '/api/oauth/profile'], 'once each, at the start')
+    assert.deepEqual(asked.map(([, auth]) => auth).toSorted(), [`Bearer ${PRO}`, `Bearer ${TEAM}`])
 
     const refused = await dispatch('beta', 'Please fix the beta tests.', { account: 'team' })
     assert.match(refused, /^\[dispatch=refused worker=beta account=team\] Nothing started: a fixed rule of the driver's \(VOICE_GW_ACCOUNTS\) keeps beta on pro\. Tell the driver/)

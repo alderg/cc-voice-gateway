@@ -227,6 +227,12 @@ export const config = {
   // semicolons, *= for the rest. Also changes while the gateway runs, with
   // the settings file (live.mjs).
   accounts: env.VOICE_GW_ACCOUNTS ?? '',
+  // Their plans, whose size weighs their headroom: account=plan, entries
+  // separated by semicolons, for those the gateway cannot find or finds
+  // wrong; also changes while the gateway runs. And where it asks a token
+  // for its plan: Anthropic's profile endpoint by default, 0 nowhere.
+  accountPlans: env.VOICE_GW_ACCOUNT_PLANS ?? '',
+  planLookup: env.VOICE_GW_PLAN_LOOKUP?.trim() ?? '',
   // Model and effort of the workers' runs (claude --model, --effort), on this
   // computer and in the container. Empty: Claude Code's defaults.
   workerModel: env.VOICE_GW_WORKER_MODEL || '',

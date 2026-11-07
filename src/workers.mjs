@@ -1297,7 +1297,8 @@ export class Workers extends EventEmitter {
     if (this.workspace(worker)?.kind === 'scratch') return this.launchScratch({ worker, task, words, fresh, answers, order, account }, entry)
     this.starting.add(worker)
     try {
-      const facts = await this.inspect(worker)
+      // The accounts' plans next to the checks, for its choice (accounts.mjs).
+      const [facts] = await Promise.all([this.inspect(worker), this.accounts.detect(this.accountPlace(worker))])
       // The checks take a while (git, gh, the GitHub API), and the kill switch
       // stops only runs that are already going.
       if (this.killswitch?.locked) return { status: 'locked', state: this.killswitch.state }
@@ -1419,7 +1420,7 @@ export class Workers extends EventEmitter {
       }
       const name = made?.name ?? worker
       const dir = made?.dir ?? this.dirOf(name)
-      const files = made ? [] : await this.scratch.runner.files(dir)
+      const [files] = await Promise.all([made ? [] : this.scratch.runner.files(dir), this.accounts.detect(this.accountPlace(worker))])
       if (!files) return { status: 'gone', why: 'its folder cannot be read; it may have been removed at the desk' }
       if (this.stopStrays({ dir, why: 'found before a new run there' }).length) return { status: 'busy', strays: true }
       const facts = { kind: 'scratch', name, dir, hostDir: this.scratch.hostDir(name), files, made: Boolean(made), where: this.scratch.where() }
@@ -2994,7 +2995,8 @@ export class Workers extends EventEmitter {
 
   async listText() {
     const names = await this.repos()
-    const facts = await Promise.all(names.map(name => this.inspect(name)))
+    // The accounts' plans for their line, next to the checks (accounts.mjs).
+    const [facts] = await Promise.all([Promise.all(names.map(name => this.inspect(name))), this.accounts.detect(this.accountPlace(names[0] ?? ''))])
     const container = this.runner.container
     const queued = this.queued().length
     const perRepo = this.maxPerRepo > 1 ? ` per_repo=${this.maxPerRepo}` : ''

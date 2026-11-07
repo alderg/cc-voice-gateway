@@ -83,7 +83,7 @@ import { Stats, shutdownText, telegramText } from './stats.mjs'
 import { Standby } from './standby.mjs'
 import { Presence } from './presence.mjs'
 import { Limits, TranscriptWatch, clock } from './limits.mjs'
-import { ACCOUNTS_SETTING, Accounts, SESSION_WAIT_MS } from './accounts.mjs'
+import { ACCOUNTS_SETTING, Accounts, LOOKUP_SETTING, PLANS_SETTING, PROFILE_URL, SESSION_WAIT_MS, TOKEN_FILE, profileLookup } from './accounts.mjs'
 import { Night, morningText, parseUntil } from './night.mjs'
 import { Orders } from './orders.mjs'
 
@@ -309,19 +309,39 @@ function grantsLog(when) {
 grantsLog()
 // The Claude accounts the workers' runs spread over (accounts.mjs): the
 // login, and one per token in .secrets/accounts; the fixed rules from
-// VOICE_GW_ACCOUNTS, which also change with the settings file (below). The
-// usage limit's texts name the accounts from now on.
-const accounts = new Accounts({ dir: config.accountsDir, setting: config.accounts, limits, log })
+// VOICE_GW_ACCOUNTS and the plans from VOICE_GW_ACCOUNT_PLANS, which also
+// change with the settings file (below). The other plans from Claude Code's
+// record of the login here, and for a token from the profile endpoint
+// (VOICE_GW_PLAN_LOOKUP; 0: never asked). The usage limit's texts name the
+// accounts from now on.
+const lookupUrl = /^https?:\/\//.test(config.planLookup) ? config.planLookup : PROFILE_URL
+const planLookup = /^(0|off|no|false)$/i.test(config.planLookup) ? null : profileLookup(lookupUrl)
+if (planLookup && config.planLookup && lookupUrl === PROFILE_URL && config.planLookup !== PROFILE_URL) {
+  log(`${LOOKUP_SETTING}: ignored, "${config.planLookup.slice(0, 80)}" is neither 0 nor a URL; the plans are asked at ${PROFILE_URL}`)
+}
+const accounts = new Accounts({
+  dir: config.accountsDir,
+  setting: config.accounts,
+  plans: config.accountPlans,
+  limits,
+  claudeConfig: join(process.env.CLAUDE_CONFIG_DIR || homedir(), '.claude.json'),
+  containerToken: join(config.workerSecretsDir, TOKEN_FILE),
+  lookup: planLookup,
+  log,
+})
 function accountsLog(when) {
   const found = accounts.found()
   if (!found.length && !accounts.rules.size && !when) return
   const each = found.map(a => (a.problem ? `${a.name} (unavailable: ${a.problem})` : a.name))
   log(
     `accounts for the workers' runs${when ? `, ${when}` : ''}: default (the login)${each.length ? `, ${each.join(', ')}` : ''}; ` +
-      `fixed rules (${ACCOUNTS_SETTING}): ${accounts.text() || 'none'}; the rest by headroom, a session on its own account`,
+      `fixed rules (${ACCOUNTS_SETTING}): ${accounts.text() || 'none'}; the rest by headroom for each plan's size, a session on its own account; ` +
+      `plans named (${PLANS_SETTING}): ${accounts.plansText() || 'none'}, the others ${planLookup ? "by Claude Code's record and the tokens' profiles" : `by Claude Code's record (${LOOKUP_SETTING}=0)`}`,
   )
 }
 accountsLog()
+// Their plans, before the first run asks; a log line for each.
+accounts.detect({ container: config.docker || null })
 // A container's voice-run takes an account's token only since the accounts
 // (docker/voice-run): until its image is rebuilt, runs there take its own login.
 for (const each of [runner, scratch?.runner].filter(r => r?.container)) {
@@ -1155,14 +1175,16 @@ if (process.env[FROM_FILE] === undefined && Object.keys(WORKER_LIMITS).some(name
       "scripts/settings.sh); a worker limit there counts as the file's while it equals the file's value at the start",
   )
 }
-settings.on('change', ({ limits, changed, others, grants: grantsText, accounts: accountsText }) => {
+settings.on('change', ({ limits, changed, others, grants: grantsText, accounts: accountsText, plans: plansText }) => {
   if (grantsText !== undefined) {
     grants.set(grantsText)
     grantsLog('from the settings file, at once')
   }
-  if (accountsText !== undefined) {
-    accounts.set(accountsText)
+  if (accountsText !== undefined) accounts.set(accountsText)
+  if (plansText !== undefined) accounts.setPlans(plansText)
+  if (accountsText !== undefined || plansText !== undefined) {
     accountsLog('from the settings file, at once')
+    accounts.detect({ container: config.docker || null })
   }
   if (!Object.keys(changed).length) return
   const { was, plan } = workers.setLimits({

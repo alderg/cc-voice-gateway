@@ -1,10 +1,12 @@
 // Settings that apply while the gateway runs: the worker limits,
 // VOICE_GW_MAX_WORKERS and VOICE_GW_MAX_WORKERS_PER_REPO (config.mjs), the
 // path grants, VOICE_GW_PATH_GRANTS (grants.mjs), and the accounts' fixed
-// rules, VOICE_GW_ACCOUNTS (accounts.mjs). The gateway watches its settings
-// file, .secrets/gateway.env (settings.mjs), which the setup assistant
-// writes; once a change has settled, it reads the file again and applies
-// them (gateway.mjs, Workers.setLimits, PathGrants.set, Accounts.set). Every other
+// rules and plans, VOICE_GW_ACCOUNTS and VOICE_GW_ACCOUNT_PLANS
+// (accounts.mjs). The gateway watches its settings file,
+// .secrets/gateway.env (settings.mjs), which the setup assistant writes; once
+// a change has settled, it reads the file again and applies them
+// (gateway.mjs, Workers.setLimits, PathGrants.set, Accounts.set and
+// Accounts.setPlans). Every other
 // setting counts from the next start of the controller, and the log says so.
 // As at the start, a value set in the environment from outside (for example
 // in controller/.mcp.json) wins over the file; one the watchdog's start
@@ -14,13 +16,13 @@
 // written (a last line without its end) keeps the limits and the grants as
 // they are; a value that is no whole number from 1 to MAX_LIMIT is ignored,
 // with a log line; a line taken out means the default again, as at a start,
-// for the grants and the rules none. Their own entries are checked where they
-// apply (PathGrants.set, Accounts.set).
+// for the grants, the rules and the plans none. Their own entries are checked
+// where they apply (PathGrants.set, Accounts.set, Accounts.setPlans).
 
 import { EventEmitter } from 'node:events'
 import { readFileSync, unwatchFile, watchFile } from 'node:fs'
 import { MAX_LIMIT, WORKER_LIMITS, limitValue } from './config.mjs'
-import { ACCOUNTS_SETTING } from './accounts.mjs'
+import { ACCOUNTS_SETTING, PLANS_SETTING } from './accounts.mjs'
 import { GRANTS_SETTING } from './grants.mjs'
 import { log as defaultLog } from './log.mjs'
 import { environmentWins, parseSettings } from './settings.mjs'
@@ -81,11 +83,11 @@ export class SettingsWatcher extends EventEmitter {
   }
 
   // Reads the file and applies what changed. Emits 'change' with { limits,
-  // changed, others, grants, accounts }: the limits now, those that changed,
-  // the names of other settings that changed, which count from the next
-  // start, and the new text of the path grants and of the accounts' rules
-  // where it changed (missing otherwise). Returns the same, or null when
-  // nothing was applied.
+  // changed, others, grants, accounts, plans }: the limits now, those that
+  // changed, the names of other settings that changed, which count from the
+  // next start, and the new text of the path grants, of the accounts' rules
+  // and of their plans where it changed (missing otherwise). Returns the
+  // same, or null when nothing was applied.
   reload() {
     const read = this.read()
     if (read.problem) {
@@ -94,7 +96,7 @@ export class SettingsWatcher extends EventEmitter {
         this.unfinished = read.text
         this.changed()
       }
-      this.log(`settings file ${this.file} changed, but ${read.problem}: the worker limits, the path grants and the accounts' rules stay as they are`)
+      this.log(`settings file ${this.file} changed, but ${read.problem}: the worker limits, the path grants and the accounts' rules and plans stay as they are`)
       return null
     }
     this.unfinished = null
@@ -125,15 +127,16 @@ export class SettingsWatcher extends EventEmitter {
     }
     const grants = text(GRANTS_SETTING, 'the path grants')
     const accounts = text(ACCOUNTS_SETTING, "the accounts' rules")
+    const plans = text(PLANS_SETTING, "the accounts' plans")
     const names = new Set([...Object.keys(this.last), ...Object.keys(settings)])
     const others = [...names]
-      .filter(name => !(name in WORKER_LIMITS) && ![GRANTS_SETTING, ACCOUNTS_SETTING].includes(name) && this.last[name] !== settings[name])
+      .filter(name => !(name in WORKER_LIMITS) && ![GRANTS_SETTING, ACCOUNTS_SETTING, PLANS_SETTING].includes(name) && this.last[name] !== settings[name])
       .sort()
     this.last = settings
     if (others.length) {
       this.log(`settings file changed: ${others.join(', ')} take effect at the next start of the controller`)
     }
-    if (!Object.keys(changed).length && !others.length && grants === undefined && accounts === undefined) return null
+    if (!Object.keys(changed).length && !others.length && grants === undefined && accounts === undefined && plans === undefined) return null
     Object.assign(this.limits, changed)
     const result = {
       limits: { ...this.limits },
@@ -141,6 +144,7 @@ export class SettingsWatcher extends EventEmitter {
       others,
       ...(grants === undefined ? {} : { grants }),
       ...(accounts === undefined ? {} : { accounts }),
+      ...(plans === undefined ? {} : { plans }),
     }
     this.emit('change', result)
     return result

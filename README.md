@@ -1127,15 +1127,19 @@ steers them all; only the workers' runs move, and only their plan pays.
      gone or switched off (then the default takes it), or waits for the usage limit for more than an
      hour while another account has room; a shorter wait the session waits out. A new session
      (`fresh`, a new worktree, an automatic review fix, which runs fresh by default) chooses freely.
-  2. **The most headroom:** of the accounts that do not wait, the one whose plan is least used, by
-     the latest `rate_limit_event` of a run on it. Claude Code writes one into every run's
-     stream-json with each window's use (`unifiedWindows`: the 5-hour and the weekly limit,
-     `utilization` as a fraction, `resetsAt`); the gateway keeps the latest per account and window in
-     `.state/limits.json`. The fuller window counts, compared in steps of 5 %. An account on usage
-     credits, or with less than 2 % left, only when none other has room; among equals the one with
-     fewer runs going, then the default. Without a run on an account for six hours its use counts as
-     unknown, which ranks as empty: it is tried, and known again. A window whose reset has passed
-     counts as unused.
+  2. **The most headroom, by the plan's size:** of the accounts that do not wait, the one with the
+     most left of its plan, by the latest `rate_limit_event` of a run on it. Claude Code writes one
+     into every run's stream-json with each window's use (`unifiedWindows`: the 5-hour and the weekly
+     limit, `utilization` as a fraction, `resetsAt`); the gateway keeps the latest per account and
+     window in `.state/limits.json`. What is left of the fuller window counts, times the plan's size
+     ([plans](#the-plans-of-the-accounts)): 30 % left of an Ultra is as much as 3 Pro plans and beats
+     60 % left of a Pro, 0.6. It is compared in steps of 5 % of the biggest plan among them (half a
+     Pro next to an Ultra), so that small differences do not flip it; for plans of one size that is
+     5 % of the share, as before. An account on usage credits, or with less than 2 % of its own plan
+     left, only when none other has room; among equals the one with fewer runs going, then the
+     default. Without a run on an account for six hours its use counts as unknown, which ranks as
+     empty, at its plan's size: it is tried, and known again. A window whose reset has passed counts
+     as unused.
   3. **Fixed rules, optional** and none by default, in `VOICE_GW_ACCOUNTS`, only where you want a
      repository on certain accounts: `repository=account`, several accounts separated by commas, the
      entries by `;`, and `*=…` for every repository without an entry and for the work folders; one
@@ -1153,16 +1157,20 @@ steers them all; only the workers' runs move, and only their plan pays.
   a new session; a task whose accounts all wait waits (`reason=usage`) until the first of them goes
   on. The controller session waits only with the default account, its own login, never with another.
 - **What shows it:** `list_workers` counts them in its first line (`accounts=2`) and has a line
-  `Accounts: default (this computer's login, the controller's) 37 % of the weekly limit (resets 09:00
-  on 12 Nov) used, 1 run going; team 12 % of the weekly limit … used. No fixed rules: every run by
-  headroom.`, and each run `running t2ab on team for …`. `worker_status` has `account=team` and why
-  (`Account: team (the most headroom).`), `dispatch` answers `account=team`, and the waits name the
-  account ("the workers on the account team wait for the Claude usage limit until …"). The
-  statistics count runs, time and cost by account ([8.5](#85-statistics)). The gateway's log names
-  the accounts and rules at its start, each run's account and why (`worker start … on account team
-  (the most headroom)`), and every session that goes on anew on another account (`worker account
-  alpha its session was on team; a new session on default (…)`). Nothing of it shows while the
-  default is the only account and no rule is set.
+  `Accounts: default (this computer's login, the controller's; Ultra, 10 times Pro): 37 % of the
+  weekly limit (resets 09:00 on 12 Nov) used, 1 run going; team (Team premium seat, 6.25 times
+  Pro): 12 % of the weekly limit … used. No fixed rules: every run by headroom.`, and each run
+  `running t2ab on team for …`. `worker_status` has `account=default` and why (`Account: default
+  (the most headroom for its plan's size (default: Ultra, 63 % left, as much as 6.3 Pro plans; team:
+  Team premium seat, 88 % left, as much as 5.5 Pro plans)).`, or `(the most headroom)` among plans
+  of one size), `dispatch` answers `account=default`, and the waits name the account ("the workers
+  on the account team wait for the Claude usage limit until …"). The statistics count runs, time and cost by account
+  ([8.5](#85-statistics)). The gateway's log names the accounts, rules and named plans at its
+  start, each account's plan once it is known (`account team: Team premium seat, 6.25 times Pro, by
+  its token's profile`) or why not, each run's account and why (`worker start … on account team (the
+  most headroom …)`), and every session that goes on anew on another account (`worker account alpha
+  its session was on team; a new session on default (…)`). Nothing of it shows while the default is
+  the only account and no rule is set.
 - **In Docker,** a run on another account than the container's own gets its token through `docker
   exec -e VOICE_GW_ACCOUNT_TOKEN`, by name only, with the value from the docker client's environment;
   `voice-run` makes it the run's `CLAUDE_CODE_OAUTH_TOKEN` in place of the container's. Only a
@@ -1175,6 +1183,48 @@ steers them all; only the workers' runs move, and only their plan pays.
 - **What it does not change:** a worker on this computer could always read your login and
   `.secrets/`; it can read its account's token in its environment as well. The controller session,
   Remote Control and voice mode stay on your own login.
+
+#### The plans of the accounts
+
+The headroom weighs each account by the size of its plan, relative to Pro, as Anthropic describes
+the plans on claude.com/pricing and in its help center ("What is the Ultra plan?", "What is the Team
+plan?") in November 2026 (`PLANS` in `src/accounts.mjs`):
+
+| Plan | In `VOICE_GW_ACCOUNT_PLANS` | Size |
+|---|---|---|
+| Pro | `pro` | 1 |
+| Team, standard seat | `team-standard` | 1.25 (Anthropic gives it per session; the weekly limit is not compared, so taken as the same) |
+| Max, called Max 5x until 30 October 2026 | `max`, or `max-5x` | 5, every 5 hours and every week |
+| Team, premium seat | `team-premium` | 6.25 (per session, as for the standard seat) |
+| Ultra, the former Max 20x | `ultra`, or `max-20x` | 10, every week; verified accounts have no 5-hour limit |
+| Enterprise, or anything else | a number, such as `8` | the number |
+
+Where the gateway finds the plan, without asking you:
+
+- **The default account on this computer:** Claude Code's own record of its login, `oauthAccount`
+  in `.claude.json` (in `CLAUDE_CONFIG_DIR`, else your home folder): the organization's type and
+  rate limit tier, as Claude Code read them from your profile. A Max with the tier of Max 20x is an
+  Ultra; a Team seat is a premium one where its tier is that of a Max, as Claude Code itself tells
+  them apart. Read again whenever the file changes, so a change of plan counts once Claude Code has
+  seen it.
+- **An account with a token**, and in Docker the container's own login: Anthropic's profile
+  endpoint, the one Claude Code asks after a sign-in (`VOICE_GW_PLAN_LOOKUP`), asked with the token
+  once a day and at once for a new token file; a run's start waits at most three seconds for it.
+  The answer is kept in memory with the token file's version; the token itself goes only into that
+  request's header, as into every model request, and never into the log or the state. A token from
+  `claude setup-token` carries only the scope `user:inference`, and Claude Code itself does not
+  know the plan of such a token (it takes `CLAUDE_CODE_SUBSCRIPTION_TYPE` and
+  `CLAUDE_CODE_RATE_LIMIT_TIER` from the environment, or nothing): the endpoint may refuse it. The
+  log then says so once (`account team: plan unknown (its token may not read its profile (HTTP 403)
+  …)`), and so does `list_workers`.
+- **`VOICE_GW_ACCOUNT_PLANS`** names it, over anything found: `account=plan`, entries separated by
+  `;`, the plan by its name from the table or as its size, such as
+  `VOICE_GW_ACCOUNT_PLANS=team=team-premium`. A bare `team` says nothing of the seat and is left out
+  with a log line, as is a name it does not know; the plans of the others are still found. It
+  applies at once when `.secrets/gateway.env` changes, for the next run that starts.
+- **Unknown** counts as a Pro, the smallest plan with Claude Code, so that a guess never takes work
+  from a plan known to be bigger: such an account goes first only once the others have less than a
+  Pro's worth left. `list_workers` says `plan unknown, counted as Pro`; name it in the setting then.
 
 ### 5.6 Access levels and their detection
 
@@ -3032,8 +3082,9 @@ setting with where it came from.
 start: raised per repository, the controller hears which queued tasks could now run next to
 others; lowered, runs going run to the end and nothing new starts above the limit. So does
 `VOICE_GW_PATH_GRANTS` ([path grants](#path-grants)), for the next write of every run, with a log
-line that names the grants now and one for each entry it ignored, and `VOICE_GW_ACCOUNTS`
-([several Claude accounts](#several-claude-accounts)), for the next run that starts. Every other
+line that names the grants now and one for each entry it ignored, and `VOICE_GW_ACCOUNTS` and
+`VOICE_GW_ACCOUNT_PLANS` ([several Claude accounts](#several-claude-accounts), [the plans of the
+accounts](#the-plans-of-the-accounts)), for the next run that starts. Every other
 changed setting is logged as counting from the next start. A value set in the environment from
 outside still wins over the file, and the log says so; one the watchdog's start script exported
 from the file does not, as it lists those names in `VOICE_GW_SETTINGS_FROM_FILE`
@@ -3079,6 +3130,8 @@ limits at once.
 | `VOICE_GW_WORKER_CACHE_TTL` | `1h` | The prompt cache of every worker run's main conversation, host and Docker (`promptCacheTtl` in its `--settings`, [5.5](#55-workers-on-this-computer-or-in-docker)): `1h`, also on usage credits, where Claude Code's own choice is 5 minutes; `5m`; `auto` or `0`: Claude Code's choice. Any other value counts as `1h`, with a log line |
 | `VOICE_GW_WORKER_AUTOCOMPACT` | `300k` | Tokens at which Claude Code compacts a worker's session, its subagents' too (`autoCompactWindow` in its `--settings`): from `100k` to `1m`, as `400k` or `400000`; `auto` or `0`: Claude Code's own window, about the model's whole context. Any other value counts as `300k`, with a log line |
 | `VOICE_GW_ACCOUNTS` | empty | Optional fixed rules for the Claude accounts the worker runs spread over ([several Claude accounts](#several-claude-accounts)); not needed to use them: `repository=account`, several accounts by `,`, entries by `;`, `*=…` for the rest and the work folders, such as `hauswache=default;*=default,team`; one account pins, several allow. Without an entry: every available account, by headroom. The accounts are `default`, the login, and one per `.secrets/accounts/<name>/claude_token`. A name that is no account name is left out of its entry, with a log line. Applies at once when the settings file changes |
+| `VOICE_GW_ACCOUNT_PLANS` | empty | The plans of the Claude accounts, where the gateway cannot find them or finds them wrong ([the plans of the accounts](#the-plans-of-the-accounts)); they weigh each account's headroom by its size: `account=plan`, entries by `;`, the plan `pro`, `max`, `ultra`, `team-standard`, `team-premium` (also `max-5x`, `max-20x`) or a size relative to Pro, such as `team=team-premium;default=ultra`. Over what was found. A bare `team` or an unknown name is left out, with a log line. Unknown plans count as Pro. Applies at once when the settings file changes |
+| `VOICE_GW_PLAN_LOOKUP` | Anthropic's profile endpoint | Where the gateway asks a token of a further account, or the container's own, for its plan, once a day per token file ([the plans of the accounts](#the-plans-of-the-accounts)); `0`: nowhere, so that a token goes only into the runs, and plans not named in `VOICE_GW_ACCOUNT_PLANS` count as Pro, the default's on this computer still from Claude Code's record |
 | `VOICE_GW_CLAUDE_BIN` | `claude` | Claude Code for workers (inside the container in Docker mode) |
 | `VOICE_GW_GH_BIN` | `gh` | GitHub CLI on this computer |
 | `VOICE_GW_PR_DRAFT` | `0` | `1`: workers open their pull requests as drafts; `0`: ready for review |
@@ -3242,7 +3295,8 @@ gateway; do not set them.
 | `worker container …: /repos is a volume, not a host folder` or `… it runs as …` | The container was started without `-v <folder>:/repos` or without `--user "$(id -u):$(id -g)"`. Remove it (`docker rm -f voice-workers`) and start it with `scripts/start-workers-container.sh`. |
 | `fetch-from-container: the container could not bundle …` | The branch does not exist in the container's repository, or the container is not running. The worker names its branch at the end of each run. |
 | A worker in Docker fails at once | Claude Code is not logged in: `.secrets/worker/claude_token` is missing or expired; run `claude setup-token` again. Otherwise read `.state/tasks/<task>.err`. |
-| `list_workers` says `team unavailable (…)`, or a further account never gets a run | The reason follows in the brackets and once in the log (`account team unavailable: …`): no `claude_token` in `.secrets/accounts/team/`, an empty one, one readable by others (`chmod 600` it), a folder name with capitals or spaces, or a folder named `default`, which is the login. Fix it at the desk; the next run's start reads it again ([several Claude accounts](#several-claude-accounts)). A fixed rule in `VOICE_GW_ACCOUNTS` may also leave it out for that repository, and a folder whose name starts with a dot is switched off. While the default has much more headroom, it simply ranks first. |
+| `list_workers` says `team unavailable (…)`, or a further account never gets a run | The reason follows in the brackets and once in the log (`account team unavailable: …`): no `claude_token` in `.secrets/accounts/team/`, an empty one, one readable by others (`chmod 600` it), a folder name with capitals or spaces, or a folder named `default`, which is the login. Fix it at the desk; the next run's start reads it again ([several Claude accounts](#several-claude-accounts)). A fixed rule in `VOICE_GW_ACCOUNTS` may also leave it out for that repository, and a folder whose name starts with a dot is switched off. While the default has much more headroom for its plan's size, it simply ranks first; and an account whose plan is unknown counts as a Pro (see the next row). |
+| `list_workers` says `plan unknown, counted as Pro`, or names a plan that is not the account's | The log says why once (`account team: plan unknown (…)`): for a token, most often that Anthropic's profile endpoint refused it (`HTTP 403`; a token from `claude setup-token` may only make model requests), gave no answer (asked again ten minutes later), or `VOICE_GW_PLAN_LOOKUP=0`; for the default, that Claude Code's `.claude.json` names no plan the gateway knows, such as an Enterprise seat. Name it in `VOICE_GW_ACCOUNT_PLANS` (`team=team-premium`, `default=ultra`, or a size such as `8`); it applies at once and wins over what was found ([the plans of the accounts](#the-plans-of-the-accounts)). |
 | A run on a further account fails at once with a login or authentication error | Its token expired (about a year) or was revoked: `claude setup-token` again, signed in to that account, into the same file. `worker_status` names the run's account (`account=…`). |
 | `VOICE_GW_ACCOUNTS: the entry … names no account available …; … runs on the default account` in the log | Every account the entry names is unavailable (see the row above) or does not exist: its runs take the default rather than not run. A misspelt name in the setting is left out with its own log line (`ignored, …`). |
 | `dispatch=refused … account=…` | The account named for the task cannot be taken: a fixed rule allows another for that repository, the session it continues runs on another account (with `fresh` a new session may start elsewhere), or it does not exist or is unavailable. The answer says which. |
@@ -3414,7 +3468,7 @@ src/
   presence.mjs       which gateway answers the connector, and whether it is active
   standby.mjs        the standby when the connector is disconnected, until a new sign-in
   limits.mjs         the Claude usage limit, in runs and the controller's transcript, waited out; credits noted; each account's use
-  accounts.mjs       the Claude accounts the runs spread over: token files, fixed rules, the choice by session and headroom
+  accounts.mjs       the Claude accounts the runs spread over: token files, fixed rules, their plans, the choice by session and headroom for each plan's size
   night.mjs          night mode: the quiet hours, good night and I'm back, the morning summary
   orders.mjs         standing orders: what the controller may dispatch without fresh words, at night
   workers.mjs        workers: repositories, claude -p runs, the queue, the check after a run, results
