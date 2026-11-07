@@ -220,6 +220,13 @@ export const config = {
   // never.
   runFolderDays: env.VOICE_GW_RUN_FOLDER_DAYS?.trim() === '0' ? 0 : num(env.VOICE_GW_RUN_FOLDER_DAYS, 7),
   claudeBin: env.VOICE_GW_CLAUDE_BIN || 'claude',
+  // The Claude accounts the workers' runs spread over by headroom
+  // (accounts.mjs): the login, and one per folder with a token in
+  // .secrets/accounts. Optional fixed rules per repository, none by default:
+  // repository=account or several by commas, entries separated by
+  // semicolons, *= for the rest. Also changes while the gateway runs, with
+  // the settings file (live.mjs).
+  accounts: env.VOICE_GW_ACCOUNTS ?? '',
   // Model and effort of the workers' runs (claude --model, --effort), on this
   // computer and in the container. Empty: Claude Code's defaults.
   workerModel: env.VOICE_GW_WORKER_MODEL || '',
@@ -423,6 +430,9 @@ config.telegramChatIdFile = join(config.secretsDir, 'telegram_chat_id')
 config.telegramInputLog = join(config.stateDir, 'telegram-input.log')
 // The kill switch's state: outside controller/, and not in .secrets/worker.
 config.killSwitchFile = join(config.secretsDir, 'killswitch.json')
+// The tokens of the Claude accounts other than the login, one folder each
+// (accounts.mjs): <name>/claude_token, from claude setup-token.
+config.accountsDir = join(config.secretsDir, 'accounts')
 // The worker container's secrets, mounted read-only into it.
 config.workerSecretsDir = join(config.secretsDir, 'worker')
 config.githubTokenFile = join(config.workerSecretsDir, 'github_token')

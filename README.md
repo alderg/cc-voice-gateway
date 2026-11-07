@@ -14,7 +14,7 @@ This README is the technical documentation. What it is for, in a two-minute vide
 |---|---|---|
 | **Voice control** | Claude's voice mode, through a custom MCP connector, as the front end of Claude Code: in the car with CarPlay or Android Auto, on the phone, or at the desk next to mouse and keyboard. Answers are written to be heard; approvals by voice | [Overview](#1-overview), [voice commands](#84-voice-commands) |
 | **Three layers of AI** | The voice AI (Claude voice mode) hands each request to the controller, a Claude Code session on your computer reached through a channel. The controller keeps the context, dispatches workers (headless `claude -p` runs) and sums up their results. The gateway in between has no AI of its own | [Overview](#1-overview), [architecture](#41-architecture) |
-| **Parallel workers** | Several repositories at once, several runs per repository in git worktrees of their own, a queue that survives restarts, work folders for tasks without a repository; on this computer or in Docker | [Workers](#55-workers-on-this-computer-or-in-docker), [several runs](#several-runs-per-repository), [work folders](#work-folders) |
+| **Parallel workers** | Several repositories at once, several runs per repository in git worktrees of their own, a queue that survives restarts, work folders for tasks without a repository; on this computer or in Docker, spread over several Claude accounts of yours by headroom | [Workers](#55-workers-on-this-computer-or-in-docker), [several runs](#several-runs-per-repository), [work folders](#work-folders), [accounts](#several-claude-accounts) |
 | **It comes back to you** | Results as spoken news; approval requests on Telegram at once, questions once the call has ended, and if you turn it on, questions and approvals answered there by Reply and requests written there as to the controller itself, with its replies in the chat; pull requests watched, review comments fixed automatically; open items and reminders; the controller in the Claude app with Remote Control | [Telegram](#58-the-telegram-fallback), [open items](#84-voice-commands), [review fixes](#automatic-fixes-for-review-comments), [Remote Control](#remote-control-from-the-claude-app) |
 | **Safe by design** | Pull requests on `voice/` branches; a merge after your yes and an approval; workers only on your own words; Docker access levels set by the GitHub token; a confined controller; a kill switch in code; sign-in with a pairing code, `/mcp` only from Anthropic's addresses | [Security design](#5-security-design) |
 
@@ -941,9 +941,10 @@ What applies to every worker run (`src/workers.mjs`):
 - **Mounts:** the folder of clones at `/repos`, read-write, or read-only while the kill switch is
   locked; the volume `voice-home` at `/home/worker`; `.secrets/worker` at `/run/secrets/voice`,
   read-only.
-- **Tokens:** `voice-run` reads them for each run (`CLAUDE_CODE_OAUTH_TOKEN`, `GH_TOKEN`). git
-  gets the GitHub token from the credential helper `git-credential-voice`. They are never part of
-  the container's configuration.
+- **Tokens:** `voice-run` reads them for each run (`CLAUDE_CODE_OAUTH_TOKEN`, `GH_TOKEN`); a run
+  on another Claude account gets that account's from the gateway instead
+  ([several Claude accounts](#several-claude-accounts)). git gets the GitHub token from the
+  credential helper `git-credential-voice`. They are never part of the container's configuration.
 - **Docker itself:** whoever controls the gateway can control Docker, which on Linux is as good as
   root.
 
@@ -1079,6 +1080,101 @@ environment, their runs run in a container from the worker image instead of on t
 | Reaches | Everything your user can | The work folders, Claude Code's token, the network |
 | GitHub | Your `gh` login, which its rules forbid it to use for anything but reading | Nothing beyond what anyone can read |
 | Isolation | None; the rules only observe | The container |
+
+#### Several Claude accounts
+
+The worker runs can spread over several Claude subscriptions of yours, such as a personal Max and a
+Team seat, so that no single plan carries the week (`src/accounts.mjs`). The one controller session
+steers them all; only the workers' runs move, and only their plan pays.
+
+- **The default account** is the login the workers have anyway: Claude Code's own on this
+  computer, which is the controller session's, and in a container the container's token. Without
+  anything else, every run takes it, as before.
+- **Adding an account** is one token file: made at the desk with `claude setup-token` while signed
+  in to that account (it prints a token valid for about a year, which can only make model requests,
+  all a worker run needs), in `.secrets/accounts/<name>/claude_token`, the file 0600 and the folders
+  0700. `<name>`, lower case letters, digits, `-` and `_`, is how `list_workers`, the controller and
+  the optional rules name it. Do not make one for the controller's own account: that is the
+  default. The files are read again at every run's start, so a new or renewed token counts at once,
+  without a restart or a setting; a file that is missing, empty, no plain file or readable by others
+  makes its account unavailable, with a log line and a note in `list_workers`.
+
+  ```bash
+  # once per account, signed in to that account (the Team seat, …) when it asks:
+  claude setup-token
+  mkdir -p -m 700 .secrets/accounts .secrets/accounts/team
+  # paste the token it printed; printf is built into the shell, so it stays off every command line (ps)
+  (umask 077; read -rsp 'Claude token of team: ' t; printf '%s' "$t" > .secrets/accounts/team/claude_token)
+  ```
+
+- **Removing an account** is deleting its folder, or switching it off by giving the folder a name
+  that starts with a dot (`mv .secrets/accounts/team .secrets/accounts/.team`, and back to switch it
+  on), which the gateway passes over. That too counts at the next run's start. The sessions that were
+  on it go on on the default account, in a new session, with a log line.
+- **The token** goes into a run's environment only, as `CLAUDE_CODE_OAUTH_TOKEN` (and no
+  `ANTHROPIC_API_KEY`, which Claude Code would take first), never onto a command line, into the log
+  or the state. Claude Code's folder stays the same for every account (`CLAUDE_CONFIG_DIR`
+  unchanged), so memory folders, `CLAUDE.md` and your settings are shared; only the plan that pays
+  differs.
+- **Which account a run takes** is decided when it starts, a dispatch or a queued task alike, and
+  kept with the run and its session, so that a later change of the files or the setting never moves
+  what ran:
+  1. **A session stays on its account:** a follow-up, your answer to a result, and a run that a
+     restart or the usage limit interrupted go on in their session on the account it was made on,
+     where its context and prompt cache are. A session never changes account: a run that takes
+     another one starts a new session there, and its prompt says to look at what the earlier runs
+     left first (the files, git, the pull request). That happens only when the session's account is
+     gone or switched off (then the default takes it), or waits for the usage limit for more than an
+     hour while another account has room; a shorter wait the session waits out. A new session
+     (`fresh`, a new worktree, an automatic review fix, which runs fresh by default) chooses freely.
+  2. **The most headroom:** of the accounts that do not wait, the one whose plan is least used, by
+     the latest `rate_limit_event` of a run on it. Claude Code writes one into every run's
+     stream-json with each window's use (`unifiedWindows`: the 5-hour and the weekly limit,
+     `utilization` as a fraction, `resetsAt`); the gateway keeps the latest per account and window in
+     `.state/limits.json`. The fuller window counts, compared in steps of 5 %. An account on usage
+     credits, or with less than 2 % left, only when none other has room; among equals the one with
+     fewer runs going, then the default. Without a run on an account for six hours its use counts as
+     unknown, which ranks as empty: it is tried, and known again. A window whose reset has passed
+     counts as unused.
+  3. **Fixed rules, optional** and none by default, in `VOICE_GW_ACCOUNTS`, only where you want a
+     repository on certain accounts: `repository=account`, several accounts separated by commas, the
+     entries by `;`, and `*=…` for every repository without an entry and for the work folders; one
+     account pins the repository to it, several allow only those, among which 2. chooses. For example
+     `VOICE_GW_ACCOUNTS=hauswache=default;*=default,team`. An entry whose accounts are all
+     unavailable counts as none: its runs take the default, with a log line, rather than not run. A
+     pinned repository waits for its account. It applies at once when `.secrets/gateway.env`
+     changes, for the next run that starts.
+  4. **`dispatch` with `account`** names one for that start, when you ask for one. Refused, with the
+     reason, where a fixed rule allows another or the session it continues runs on another account
+     that does not wait; with `fresh` a new session may start there.
+- **The usage limit is per account** ([the usage limit](#the-claude-usage-limit)): a wait holds
+  only the runs that would take that account. A run it stopped goes back to the queue, waits out a
+  wait of up to an hour with its session, and otherwise goes on on another account that has room, in
+  a new session; a task whose accounts all wait waits (`reason=usage`) until the first of them goes
+  on. The controller session waits only with the default account, its own login, never with another.
+- **What shows it:** `list_workers` counts them in its first line (`accounts=2`) and has a line
+  `Accounts: default (this computer's login, the controller's) 37 % of the weekly limit (resets 09:00
+  on 12 Nov) used, 1 run going; team 12 % of the weekly limit … used. No fixed rules: every run by
+  headroom.`, and each run `running t2ab on team for …`. `worker_status` has `account=team` and why
+  (`Account: team (the most headroom).`), `dispatch` answers `account=team`, and the waits name the
+  account ("the workers on the account team wait for the Claude usage limit until …"). The
+  statistics count runs, time and cost by account ([8.5](#85-statistics)). The gateway's log names
+  the accounts and rules at its start, each run's account and why (`worker start … on account team
+  (the most headroom)`), and every session that goes on anew on another account (`worker account
+  alpha its session was on team; a new session on default (…)`). Nothing of it shows while the
+  default is the only account and no rule is set.
+- **In Docker,** a run on another account than the container's own gets its token through `docker
+  exec -e VOICE_GW_ACCOUNT_TOKEN`, by name only, with the value from the docker client's environment;
+  `voice-run` makes it the run's `CLAUDE_CODE_OAUTH_TOKEN` in place of the container's. Only a
+  `voice-run` that knows it does that, so after an update rebuild the image (`docker build …
+  docker/`, [5.5](#55-workers-on-this-computer-or-in-docker)) and start the container again with
+  `scripts/start-workers-container.sh`; until then the gateway finds the old `voice-run`, logs it,
+  and runs there take only the container's own login, so that none runs on another account than its
+  record says. The same subscription in the container and on this computer is one account for the
+  usage limit and the headroom.
+- **What it does not change:** a worker on this computer could always read your login and
+  `.secrets/`; it can read its account's token in its environment as well. The controller session,
+  Remote Control and voice mode stay on your own login.
 
 ### 5.6 Access levels and their detection
 
@@ -1708,6 +1804,7 @@ the same. Otherwise they say: only at the computer.
 | `.secrets/telegram_token`, `.secrets/telegram_chat_id` | The Telegram bot, and your chat with it, whose id is your user id | 0600, tightened at every start |
 | `.secrets/killswitch.json` | Kill switch state, present while locked, with the count of wrong PINs in voice mode; never a PIN, which lives only in the gateway's memory | 0600 |
 | `.secrets/worker/claude_token`, `.secrets/worker/github_token` | The container's logins, mounted read-only into it; into the work folders' container only `claude_token` | 0600, folder 0700 |
+| `.secrets/accounts/<name>/claude_token` | The tokens of your further Claude accounts for the workers' runs, from `claude setup-token` ([several Claude accounts](#several-claude-accounts)); never mounted into a container, a run gets only its own account's in its environment | 0600, folders 0700; one readable by others is not used |
 | `.state/` | Worker state, run output, open requests and decisions, watched pull requests, the watchdog's lock | 0700 when the gateway creates it |
 | `.state/tasks/`, `.state/workers.json` | Each run's output with every tool input and result, and the kill switch's notes for the run, which its hook hands to the worker (`<task>.notes`; in the container `/tmp/voice-gw/<task>.notes`); the workers' state, with the queue, the worktrees, the limit per repository the queue was planned for, the work folders, and what each run's writes outside went to quarantine | 0600, folder 0700 |
 | `.state/quarantine/<task>/` | The files the rule on writes outside moved out of the way ([quarantine](#quarantine)), as `<n>-<name>`, with `quarantine.jsonl`: where each was, the command, when; never removed by the gateway | The files as they were, `quarantine.jsonl` 0600, folders 0700 |
@@ -2747,17 +2844,20 @@ cap), nothing can run until it resets. The gateway waits it out by itself and go
   worktree may have. It resumes with a line that says so, once the wait is over.
 - **The wait:** until the reset time Claude Code gives (from `resetsAt`, else from the text, in the
   computer's time), at least a minute; without one, 15, then 30, then 60 minutes, until a run gets
-  through again. Per account: the workers on this computer, those in a container (its own login),
-  and the controller session. Nothing new starts on an account that waits; `dispatch` answers
-  `queued` with `reason=usage`, and the queue goes on by itself afterwards. Kept across a restart
-  (`.state/limits.json`).
+  through again. Per account: the workers on this computer's login, those in a container (its own
+  login), those on each further account of yours ([several Claude accounts](#several-claude-accounts)),
+  and the controller session. Nothing new starts on an account that waits; with further accounts a
+  run it stopped waits out up to an hour with its session, and otherwise goes on, like the queue, on
+  another account that has room, in a new session there. A task whose
+  accounts all wait gets `queued` from `dispatch`, with `reason=usage`, and the queue goes on by
+  itself afterwards. Kept across a restart (`.state/limits.json`).
 - **What says so:** one Telegram message when the wait starts, one when it ends; `list_workers`
   (`usage=waiting`), `worker_status`, `status` (`Waiting: …`), `open_items` and the start-up summary
   ("The gateway now: …"), and the first line of every connector answer:
   `Gateway sky (Mac): active; the workers on this computer wait for the Claude usage limit until
   03:00, when it resets`. The gateway stays active.
-- **The controller session:** the workers on this computer use its login, so it counts as waiting
-  with them. The gateway also follows its own transcript (`CLAUDE_CODE_SESSION_ID`, which Claude
+- **The controller session:** the workers on this computer's login, the default account, use its
+  login, so it counts as waiting with them; not with a further account's. The gateway also follows its own transcript (`CLAUDE_CODE_SESSION_ID`, which Claude
   Code gives the gateway, in `<CLAUDE_CONFIG_DIR>/projects/*/<id>.jsonl`, every
   `VOICE_GW_TRANSCRIPT_POLL` seconds). Before, an event that came while the controller was at the
   limit started a turn that failed at once, and was never answered. Now, while it waits, events for
@@ -2844,7 +2944,7 @@ The gateway counts over its running time, and keeps all-time totals across start
 | Running time, starts, and what each start came after (a crash, a restart by voice, of the service) | The gateway's start, and the watchdog's note `restarted` |
 | Voice requests, in conversations (a new one after 10 minutes without a request); questions to you, answered, and how long you took (typical and longest); approvals by voice | The requests, the controller's replies with state "question", the answers "(Answer to …)" (`store.mjs`) |
 | Decisions raised, by kind and whether the gateway raised them itself; closed, by whom, and how long they were open | `ledger.mjs` |
-| Worker runs by outcome (done, failed, stopped), follow-ups, in worktrees, in work folders, interrupted and queued again; by repository (top three, with time and cost); worker time, typical and longest run | The runs as they end (`workers.mjs`); every work folder counts under "work folders" |
+| Worker runs by outcome (done, failed, stopped), follow-ups, in worktrees, in work folders, interrupted and queued again; by repository (top three, with time and cost); by Claude account, with time and cost, once another than the default took some ([several Claude accounts](#several-claude-accounts)); worker time, typical and longest run | The runs as they end (`workers.mjs`); every work folder counts under "work folders"; a run from before the accounts under the default |
 | The most runs at once, and the time with two or more; the same in one repository | The runs' starts and ends |
 | Queue: tasks that waited, typical and longest wait; tasks that could not start; dropped | The queue |
 | Tokens in (with cache reads and writes) and out (with thinking), cost at API list prices, turns, tool calls, subagents | Each run's output, which the gateway follows anyway: per result `model_usage_since_last_result` (the usage since the result before, with the cost; `total_cost_usd` adds up the whole session, earlier runs included), the tool calls, and the `Agent` (or `Task`) calls for subagents |
@@ -2891,7 +2991,7 @@ settings that keep it down: [5.5](#55-workers-on-this-computer-or-in-docker).
 **The file** `.state/stats.json` (0600): this running time and all time, written atomically a few
 seconds after a change, every five minutes, and as the gateway ends; a crash loses only those
 seconds. It holds counts, sums, maxima and the last 100 durations per figure for the typical
-values (medians), repository names and the process id of the controller session it belongs to:
+values (medians), repository and account names and the process id of the controller session it belongs to:
 no texts, prompts or secrets. A start takes the totals from it and counts its own running time
 from zero; a file that cannot be read starts the totals again, with a line in the log.
 
@@ -2932,7 +3032,8 @@ setting with where it came from.
 start: raised per repository, the controller hears which queued tasks could now run next to
 others; lowered, runs going run to the end and nothing new starts above the limit. So does
 `VOICE_GW_PATH_GRANTS` ([path grants](#path-grants)), for the next write of every run, with a log
-line that names the grants now and one for each entry it ignored. Every other
+line that names the grants now and one for each entry it ignored, and `VOICE_GW_ACCOUNTS`
+([several Claude accounts](#several-claude-accounts)), for the next run that starts. Every other
 changed setting is logged as counting from the next start. A value set in the environment from
 outside still wins over the file, and the log says so; one the watchdog's start script exported
 from the file does not, as it lists those names in `VOICE_GW_SETTINGS_FROM_FILE`
@@ -2949,7 +3050,7 @@ limits at once.
 | `VOICE_GW_PORT` | `8787` | Local HTTP port |
 | `VOICE_GW_HOST` | `127.0.0.1` | Bind address; keep loopback |
 | `VOICE_GW_SECRETS_DIR` | `.secrets` | Secrets, settings file, admin socket |
-| `VOICE_GW_STATE_DIR` | `.state` | Worker state and queue, run output, requests, open decisions, pull request watches, usage limit waits, night mode, standing orders, grants |
+| `VOICE_GW_STATE_DIR` | `.state` | Worker state and queue, run output, requests, open decisions, pull request watches, usage limit waits and each account's use, night mode, standing orders, grants |
 | `VOICE_GW_SELF_CHECKOUT` | This checkout | The checkout whose uncommitted changes and commits on no remote a "done" reply mentions ([5.5](#55-workers-on-this-computer-or-in-docker)); empty: none. Tests use a stand-in |
 | `VOICE_GW_REMIND_MINUTES` | `30` | Minutes before a decision you were never asked about, or a question you have not answered, comes back to the controller as a reminder, at most three times ([8.4](#84-voice-commands)) |
 | `VOICE_GW_LOG_FILE` | `.logs/gateway.log` | Empty: stderr only |
@@ -2977,6 +3078,7 @@ limits at once.
 | `VOICE_GW_WORKER_EFFORT` | Claude Code's default | `--effort`: `low`, `medium`, `high`, `xhigh`, `max` |
 | `VOICE_GW_WORKER_CACHE_TTL` | `1h` | The prompt cache of every worker run's main conversation, host and Docker (`promptCacheTtl` in its `--settings`, [5.5](#55-workers-on-this-computer-or-in-docker)): `1h`, also on usage credits, where Claude Code's own choice is 5 minutes; `5m`; `auto` or `0`: Claude Code's choice. Any other value counts as `1h`, with a log line |
 | `VOICE_GW_WORKER_AUTOCOMPACT` | `300k` | Tokens at which Claude Code compacts a worker's session, its subagents' too (`autoCompactWindow` in its `--settings`): from `100k` to `1m`, as `400k` or `400000`; `auto` or `0`: Claude Code's own window, about the model's whole context. Any other value counts as `300k`, with a log line |
+| `VOICE_GW_ACCOUNTS` | empty | Optional fixed rules for the Claude accounts the worker runs spread over ([several Claude accounts](#several-claude-accounts)); not needed to use them: `repository=account`, several accounts by `,`, entries by `;`, `*=…` for the rest and the work folders, such as `hauswache=default;*=default,team`; one account pins, several allow. Without an entry: every available account, by headroom. The accounts are `default`, the login, and one per `.secrets/accounts/<name>/claude_token`. A name that is no account name is left out of its entry, with a log line. Applies at once when the settings file changes |
 | `VOICE_GW_CLAUDE_BIN` | `claude` | Claude Code for workers (inside the container in Docker mode) |
 | `VOICE_GW_GH_BIN` | `gh` | GitHub CLI on this computer |
 | `VOICE_GW_PR_DRAFT` | `0` | `1`: workers open their pull requests as drafts; `0`: ready for review |
@@ -3140,6 +3242,13 @@ gateway; do not set them.
 | `worker container …: /repos is a volume, not a host folder` or `… it runs as …` | The container was started without `-v <folder>:/repos` or without `--user "$(id -u):$(id -g)"`. Remove it (`docker rm -f voice-workers`) and start it with `scripts/start-workers-container.sh`. |
 | `fetch-from-container: the container could not bundle …` | The branch does not exist in the container's repository, or the container is not running. The worker names its branch at the end of each run. |
 | A worker in Docker fails at once | Claude Code is not logged in: `.secrets/worker/claude_token` is missing or expired; run `claude setup-token` again. Otherwise read `.state/tasks/<task>.err`. |
+| `list_workers` says `team unavailable (…)`, or a further account never gets a run | The reason follows in the brackets and once in the log (`account team unavailable: …`): no `claude_token` in `.secrets/accounts/team/`, an empty one, one readable by others (`chmod 600` it), a folder name with capitals or spaces, or a folder named `default`, which is the login. Fix it at the desk; the next run's start reads it again ([several Claude accounts](#several-claude-accounts)). A fixed rule in `VOICE_GW_ACCOUNTS` may also leave it out for that repository, and a folder whose name starts with a dot is switched off. While the default has much more headroom, it simply ranks first. |
+| A run on a further account fails at once with a login or authentication error | Its token expired (about a year) or was revoked: `claude setup-token` again, signed in to that account, into the same file. `worker_status` names the run's account (`account=…`). |
+| `VOICE_GW_ACCOUNTS: the entry … names no account available …; … runs on the default account` in the log | Every account the entry names is unavailable (see the row above) or does not exist: its runs take the default rather than not run. A misspelt name in the setting is left out with its own log line (`ignored, …`). |
+| `dispatch=refused … account=…` | The account named for the task cannot be taken: a fixed rule allows another for that repository, the session it continues runs on another account (with `fresh` a new session may start elsewhere), or it does not exist or is unavailable. The answer says which. |
+| A follow-up waits for the usage limit although another account has room | Its session's account waits an hour or less: the session waits that out, with its context and cache; or its repository is pinned to one account by `VOICE_GW_ACCOUNTS`, or every account its rule allows waits. `worker_status` says which waits until when. For a new session elsewhere at once, dispatch it with `fresh`. |
+| A follow-up does not remember the earlier run | Its session's account was removed, switched off or waited longer than an hour, so it went on on another account in a new session; a session never changes account. Its prompt says so, and to read what the earlier runs left; the log has `worker account … its session was on …`. |
+| `container …: its voice-run is older than the accounts` in the log | The worker image is from before the accounts: runs in the container take only its own login. Rebuild the image (`docker build … docker/`) and start the container again with `scripts/start-workers-container.sh`, then restart the controller. |
 | `dispatch=locked`, `[state=locked]` or an `[ALARM]` line | The kill switch is locked; the alarm names the trigger. `node scripts/unlock.mjs --status` shows it, `node scripts/unlock.mjs` at the server unlocks it. In the car, with Telegram set up: say "unlock the kill switch", then the PIN that comes to Telegram ([5.9](#59-the-kill-switch)). |
 | `[unlock=blocked]` | Three wrong PINs for this lock, or a kill switch file that cannot be read: only `node scripts/unlock.mjs` at the server unlocks it now. |
 | `[unlock=no-telegram]` or no PIN arrives | The unlock in voice mode needs Telegram, with your private chat with the bot as the configured chat. `[unlock=unsent]` names Telegram's error; `[unlock=standby]`: not in a standby. A PIN is valid five minutes (`[unlock=expired]`); ask for a new one. |
@@ -3304,13 +3413,14 @@ src/
   ipguard.mjs        the door: access log, /mcp only from Anthropic's addresses, alerts on Telegram
   presence.mjs       which gateway answers the connector, and whether it is active
   standby.mjs        the standby when the connector is disconnected, until a new sign-in
-  limits.mjs         the Claude usage limit, in runs and the controller's transcript, waited out; credits noted
+  limits.mjs         the Claude usage limit, in runs and the controller's transcript, waited out; credits noted; each account's use
+  accounts.mjs       the Claude accounts the runs spread over: token files, fixed rules, the choice by session and headroom
   night.mjs          night mode: the quiet hours, good night and I'm back, the morning summary
   orders.mjs         standing orders: what the controller may dispatch without fresh words, at night
   workers.mjs        workers: repositories, claude -p runs, the queue, the check after a run, results
   workspaces.mjs     where a run works: a repository, or a work folder, with its rules and check; run folders
   worktrees.mjs      the worktrees of further runs of a repository: made, with submodules, removed
-  live.mjs           the worker limits and path grants from the settings file while the gateway runs
+  live.mjs           the worker limits, path grants and accounts' rules from the settings file while the gateway runs
   ledger.mjs         open decisions for the driver, and the open items
   stats.mjs          the statistics: this running time and all time, the texts
   runners.mjs        where workers run: this computer, or the Docker container; a run's processes

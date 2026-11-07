@@ -61,6 +61,12 @@
 // workspaces.mjs), its TMPDIR, made before the run and removed some days
 // after its session's last run (runFolderDays).
 //
+// A run takes one of the driver's Claude accounts (accounts.mjs): chosen when
+// it starts, by the fixed rules, its session's account and the headroom of
+// each, and kept with the run and its session (account), so that the usage
+// limit, the statistics and a follow-up know where it ran. Only the token of
+// an account other than the default goes into its environment.
+//
 // The run output holds every tool input and result, so .state/tasks and
 // .state/workers.json are for this user only (folders 0700, files 0600).
 // While following it, the gateway also counts what a run used, for the
@@ -72,6 +78,7 @@ import { randomInt, randomUUID } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { chmodSync, closeSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join, posix, relative } from 'node:path'
+import { ACCOUNT_NAME, Accounts, DEFAULT_ACCOUNT, accountKey } from './accounts.mjs'
 import { Limits, creditsOf, track, waitText } from './limits.mjs'
 import { log, preview } from './log.mjs'
 import { NIGHT_RULE } from './night.mjs'
@@ -546,6 +553,8 @@ function queueEntry(entry) {
   if (!out.baseline) delete out.baseline
   out.review = reviewOf(entry.review)
   if (!out.review) delete out.review
+  // The account dispatch named for it (accounts.mjs).
+  if (typeof entry.account !== 'string' || !ACCOUNT_NAME.test(entry.account)) delete out.account
   return out
 }
 
@@ -581,6 +590,8 @@ function worktreeEntries(saved, runFolders = Object.create(null)) {
       createdAt: Number.isFinite(wt.createdAt) ? wt.createdAt : Date.now(),
       removedAt: Number.isFinite(wt.removedAt) ? wt.removedAt : null,
       runFolder: typeof wt.runFolder === 'string' && runFolders[wt.runFolder]?.repo === wt.repo ? wt.runFolder : null,
+      // The account its session was made on (accounts.mjs); none: the default.
+      account: typeof wt.account === 'string' && ACCOUNT_NAME.test(wt.account) ? wt.account : null,
     }
   }
   return entries
@@ -726,12 +737,14 @@ export class Workers extends EventEmitter {
     timeoutMinutes = 360, // 0: no time limit
     runFolderDays = 7, // run folders removed this long after their last run; 0: never
     grants = null, // the path grants (grants.mjs): for list_workers and the prompts of runs on this computer
+    accounts = null, // the Claude accounts runs may take (accounts.mjs); null: only the default, the login
     resultGraceMs = RESULT_GRACE_MS,
     killAfterMs = KILL_AFTER_MS,
   }) {
     super()
     this.runFolderDays = runFolderDays
     this.grants = grants
+    this.accounts = accounts ?? new Accounts({ limits, log: () => {} })
     this.runner = runner // the repositories'
     // The kinds of workspace, by name (workspaces.mjs); work folders only
     // when they are on.
@@ -963,16 +976,61 @@ export class Workers extends EventEmitter {
     return [...new Set(Object.values(this.kinds).map(kind => kind.runner))]
   }
 
-  // The Claude account a run uses, for the usage limit (limits.mjs): the
-  // login on this computer, or a container's own.
+  // The Claude account a run uses, as the key of its usage limit
+  // (limits.mjs, accounts.mjs): the one its record names, on this computer or
+  // in its container; a run from before the accounts, the default, the login
+  // where it runs.
   accountOf(task) {
-    const container = this.runnerOf(task)?.container
-    return container ? `container:${container}` : 'host'
+    return accountKey(task?.account ?? DEFAULT_ACCOUNT, this.runnerOf(task)?.container ?? null)
   }
 
-  // The account a queued task, or a dispatch, would run on.
-  accountOfEntry(entry) {
-    return this.accountOf({ kind: this.workspace(entry.worker)?.kind ?? 'repo' })
+  // Where a workspace's runs run, for the choice of an account: { container,
+  // named }, named being whether accounts with a token can run there (a
+  // container whose voice-run is older cannot, runners.mjs).
+  accountPlace(worker) {
+    const runner = this.runnerOf({ kind: this.workspace(worker)?.kind ?? 'repo' })
+    const container = runner?.container ?? null
+    return { container, named: !container || runner.accountTokens === true }
+  }
+
+  // The runs going per account, for the choice among equals.
+  busyAccounts() {
+    const busy = {}
+    for (const task of this.running()) busy[task.account ?? DEFAULT_ACCOUNT] = (busy[task.account ?? DEFAULT_ACCOUNT] ?? 0) + 1
+    return busy
+  }
+
+  // The account of the session a task would go on with when it starts
+  // (start), or null for a new one: its checkout's, its worktree's or its
+  // work folder's, as launch picks the place (with one run per repository
+  // always the checkout, once it is free); a session from before the
+  // accounts ran on the default.
+  sessionAccount(entry) {
+    if (entry.fresh) return null
+    const name = entry.worker
+    const of = holder => (holder?.sessionId ? (holder.account ?? DEFAULT_ACCOUNT) : null)
+    if (this.workspace(name)?.kind === 'scratch') return name === SCRATCH_NEW ? null : of(this.state.repos[name])
+    let place = this.placeOf(entry)
+    if (place === 'any') place = this.maxPerRepo > 1 && this.checkoutTaken(name) ? { worktree: null } : 'main'
+    if (place === 'main') return of(this.state.repos[name])
+    const wt = place.worktree ? this.state.worktrees[place.worktree] : null
+    return wt?.resumable ? of(wt) : null
+  }
+
+  // The account a task would take if it started now (Accounts.choose): a
+  // dispatch, a queued task, or the next of a repository for worker_status.
+  // session: the account of the session it goes on with, if known already.
+  choice(entry, { session = this.sessionAccount(entry) } = {}) {
+    return this.accounts.choose({ repo: entry.worker, ...this.accountPlace(entry.worker), session, account: entry.account ?? null, busy: this.busyAccounts() })
+  }
+
+  // The waits a task waits for (choice's keys), in a sentence.
+  waitsText(keys) {
+    return keys
+      .map(key => [key, this.limits?.active(key)])
+      .filter(([, wait]) => wait)
+      .map(([key, wait]) => waitText(key, wait, Date.now(), this.limits.label(key)))
+      .join('; ')
   }
 
   // The usage limit waits of the workers' accounts (limits.mjs), as sentences.
@@ -1083,6 +1141,9 @@ export class Workers extends EventEmitter {
   // has now. continues: the task (t…) whose place and session it continues,
   // its worktree if it ran in one; answered: the task whose result the
   // driver's answer is about, which it continues unless continues names one.
+  // account: the Claude account to run on (accounts.mjs), refused where a
+  // fixed rule or the session's account says otherwise; without it the
+  // gateway chooses when the task starts.
   async dispatch({
     worker,
     task,
@@ -1098,6 +1159,7 @@ export class Workers extends EventEmitter {
     continues = null,
     answered = null,
     order = null,
+    account = null,
   }) {
     if (this.killswitch?.locked) return { status: 'locked', state: this.killswitch.state }
     if (this.standby?.active) return { status: 'standby', why: this.standby.state.reason }
@@ -1110,6 +1172,13 @@ export class Workers extends EventEmitter {
       if (order.problems.length) return { status: 'order', problems: order.problems }
       const fromAnswer = !continues && answered && this.taskById(answered)?.repo === worker ? answered : null
       Object.assign(job, { parallel: Boolean(parallel), after: order.after.length ? order.after : null, continues: order.continues ?? fromAnswer })
+    }
+    if (account) {
+      // Checked now, and again when it starts: a queued task keeps it.
+      const name = String(account).trim().toLowerCase()
+      const why = this.accounts.refusal({ repo: worker, ...this.accountPlace(worker), account: name, session: this.sessionAccount(job) })
+      if (why) return { status: 'account', account: name, why }
+      job.account = name
     }
     const first = this.follows(worker, answers).length > 0
     const why = this.blocked(job, { first })
@@ -1224,8 +1293,8 @@ export class Workers extends EventEmitter {
   // checkout's uncommitted files are a question only for a run there; a
   // worktree is the task's own.
   async launch(job, entry = null) {
-    const { worker, task, words, fresh = false, allowDirty = false, direct = false, draft = false, answers = null, order = null } = job
-    if (this.workspace(worker)?.kind === 'scratch') return this.launchScratch({ worker, task, words, fresh, answers, order }, entry)
+    const { worker, task, words, fresh = false, allowDirty = false, direct = false, draft = false, answers = null, order = null, account = null } = job
+    if (this.workspace(worker)?.kind === 'scratch') return this.launchScratch({ worker, task, words, fresh, answers, order, account }, entry)
     this.starting.add(worker)
     try {
       const facts = await this.inspect(worker)
@@ -1248,7 +1317,7 @@ export class Workers extends EventEmitter {
         facts.decided = [...decided]
         const dir = place.worktree ? this.worktreeOf(place.worktree, worker) : null
         if (dir && this.stopStrays({ dir, why: 'found before a new run there' }).length) return { status: 'busy', strays: true }
-        return this.start(facts, { task, words, fresh, direct, draft, answers, order }, entry, place)
+        return this.start(facts, { task, words, fresh, direct, draft, answers, order, account }, entry, place)
       }
       facts.followed = facts.dirty.filter(file => decided.has(file))
       const foreign = facts.dirty.filter(file => !decided.has(file))
@@ -1258,10 +1327,16 @@ export class Workers extends EventEmitter {
       // one of a run nobody follows is ended, and the task waits for it.
       if (this.stopStrays({ dir: facts.dir, why: 'found before a new run there' }).length) return { status: 'busy', strays: true }
       // The run folder of the session it starts or goes on with, as start
-      // decides it: the checkout's session, unless it starts a new one.
+      // decides it: the checkout's session, unless it starts a new one, also
+      // because it leaves the session's account (accounts.mjs), which is
+      // chosen here for that (moved).
       const holder = this.state.repos[worker]
-      facts.runFolder = await this.runFolder(worker, { holder, resumed: !fresh && Boolean(holder?.sessionId) })
-      return this.start(facts, { task, words, fresh, direct, draft, answers, order }, entry)
+      const session = !fresh && holder?.sessionId ? (holder.account ?? DEFAULT_ACCOUNT) : null
+      const chosen = session ? this.choice(job, { session }) : null
+      const moved = chosen?.status === 'ok' && chosen.name !== session ? { ...chosen, from: session } : null
+      const renew = fresh || Boolean(moved)
+      facts.runFolder = await this.runFolder(worker, { holder, resumed: !renew && Boolean(holder?.sessionId) })
+      return this.start(facts, { task, words, fresh: renew, direct, draft, answers, order, account, moved }, entry)
     } finally {
       this.starting.delete(worker)
     }
@@ -1330,7 +1405,7 @@ export class Workers extends EventEmitter {
   // are kept, so that the look after the run tells what it made. Any number
   // of new ones may start at once, within the run slots: each is a starting
   // of its own. A new folder whose run did not start goes again.
-  async launchScratch({ worker, task, words, fresh = false, answers = null, order = null }, entry = null) {
+  async launchScratch({ worker, task, words, fresh = false, answers = null, order = null, account = null }, entry = null) {
     const isNew = worker === SCRATCH_NEW
     const key = isNew ? Symbol(worker) : worker
     this.starting.add(key)
@@ -1348,7 +1423,7 @@ export class Workers extends EventEmitter {
       if (!files) return { status: 'gone', why: 'its folder cannot be read; it may have been removed at the desk' }
       if (this.stopStrays({ dir, why: 'found before a new run there' }).length) return { status: 'busy', strays: true }
       const facts = { kind: 'scratch', name, dir, hostDir: this.scratch.hostDir(name), files, made: Boolean(made), where: this.scratch.where() }
-      const result = this.start(facts, { task, words, fresh, answers, order }, entry)
+      const result = this.start(facts, { task, words, fresh, answers, order, account }, entry)
       if (result.status === 'started') made = null
       return result
     } finally {
@@ -1387,12 +1462,11 @@ export class Workers extends EventEmitter {
   // worktree starts at once as a record, and its worktree is made (or found
   // again) before claude starts in it (prepare); until then it is
   // "preparing", and counts as running.
-  start(facts, { task, words, fresh, direct = false, draft = false, answers = null, order = null }, entry = null, place = 'main') {
+  start(facts, { task, words, fresh, direct = false, draft = false, answers = null, order = null, account = null, moved = null }, entry = null, place = 'main') {
     if (this.killswitch?.locked) return { status: 'locked', state: this.killswitch.state }
     if (this.standby?.active) return { status: 'standby', why: this.standby.state.reason }
     if (entry && !this.state.queue.some(waiting => waiting.id === entry.id)) return { status: 'dropped' }
     const kind = kindOf(facts)
-    if (this.limits?.active(this.accountOf({ kind }))) return { status: 'usage' }
     const id = this.newTaskId()
     const scratch = kind === 'scratch'
     if (scratch) direct = draft = false // nothing to push in a work folder
@@ -1400,7 +1474,31 @@ export class Workers extends EventEmitter {
     // A worktree has a session of its own, as does the repository's checkout.
     const wid = place === 'main' || scratch ? null : (place.worktree ?? id)
     const wt = wid ? this.state.worktrees[wid] : null
-    const previous = fresh ? null : wid ? (wt?.resumable ? wt.sessionId : null) : this.state.repos[facts.name]?.sessionId
+    const holder = wid ? wt : this.state.repos[facts.name]
+    let previous = fresh ? null : wid ? (wt?.resumable ? wt.sessionId : null) : holder?.sessionId
+    // Its Claude account (accounts.mjs): its session's, unless that one is
+    // gone or waits long for the usage limit; else the one with the most
+    // headroom; nothing starts while every one it may take waits. launch
+    // chose already for a run in the checkout (moved).
+    const session = previous ? (holder?.account ?? DEFAULT_ACCOUNT) : null
+    const chosen = moved ?? this.choice({ worker: facts.name, account }, { session })
+    if (chosen.status === 'usage') return { status: 'usage' }
+    if (chosen.status === 'refused') return { status: 'account', account, why: chosen.why }
+    let { name: accountName, why: accountWhy } = chosen
+    const token = this.accounts.token(accountName)
+    if (accountName !== DEFAULT_ACCOUNT && !token) {
+      // Its token file went between the choice and here: the login, as its record says.
+      log('worker account', accountName, 'has no token it can read; the run takes the default account')
+      accountName = DEFAULT_ACCOUNT
+      accountWhy = `the token of ${chosen.name} could not be read`
+    }
+    // A session never changes account: on another one, a new session, which
+    // its prompt names (runLines).
+    const leaves = moved ? moved.from : session && accountName !== session ? session : null
+    if (leaves) {
+      log('worker account', facts.name, `its session was on ${leaves}; a new session on ${accountName} (${accountWhy})`)
+      previous = null
+    }
     const sessionId = previous || randomUUID()
     const dir = wid ? (wt?.dir ?? worktreeDir(runner, facts.name, wid)) : facts.dir
     const record = {
@@ -1408,6 +1506,8 @@ export class Workers extends EventEmitter {
       kind, // of its workspace (workspaces.mjs)
       repo: facts.name, // the workspace's name
       container: runner.container ?? null, // where it runs: the container, or null for this computer
+      account: accountName, // the Claude account it runs on (accounts.mjs)
+      accountWhy, // why that one, in a few words
       task,
       words,
       state: 'running', // until every process of the run has ended (check)
@@ -1454,6 +1554,7 @@ export class Workers extends EventEmitter {
     if (entry) Object.assign(record, { queued: entry.id, queuedAt: entry.queuedAt }) // it waited in the queue as this, since then
     if (entry?.requeued) Object.assign(record, { resumes: entry.resumes ?? 1, requeued: entry.requeued })
     if (entry?.review) record.review = entry.review // a fix the gateway queued for review comments (reviewFix)
+    if (leaves) record.leftAccount = leaves // its place's session was on that account: a new one here (runLines)
     if (scratch) {
       // For the look at the end: the files as the run found them.
       record.hostDir = facts.hostDir ?? null // the folder on this computer
@@ -1479,9 +1580,12 @@ export class Workers extends EventEmitter {
       record.follows = closed.map(d => d.id)
       record.carried = { commits: closed.flatMap(d => d.details?.commits ?? []), files: closed.flatMap(d => d.details?.files ?? []) }
     }
-    const job = { task, words, direct, draft }
+    // The account's token goes with the job, in memory only, to the run's
+    // environment (spawnRun); never into the record or the state.
+    const job = { task, words, direct, draft, token: accountName === DEFAULT_ACCOUNT ? null : token }
     if (!wid) this.spawnRun(record, facts, job) // before the record is kept: a run that cannot start is no run
     this.state.tasks.push(record)
+    // The place's session, with the account it is on now: a follow-up goes on there.
     if (wid) {
       const now = record.startedAt
       this.state.worktrees[wid] = {
@@ -1490,19 +1594,21 @@ export class Workers extends EventEmitter {
         sessionId,
         resumable: Boolean(previous),
         task: id,
+        account: accountName,
       }
     } else if (scratch) {
-      this.state.repos[facts.name] = { sessionId }
+      this.state.repos[facts.name] = { sessionId, account: accountName }
     } else {
       // The session's run folder: this run's, or the one the session had.
       const runFolder = record.runFolder ?? (previous ? this.state.repos[facts.name]?.runFolder : null) ?? null
-      this.state.repos[facts.name] = { sessionId, runFolder }
+      this.state.repos[facts.name] = { sessionId, runFolder, account: accountName }
     }
     if (entry) this.state.queue = this.state.queue.filter(waiting => waiting.id !== entry.id)
     this.save()
     const queued = entry ? [`queued as ${entry.id}`] : []
     const where = wid ? [wt ? `in its worktree ${wid}` : 'in a new worktree'] : []
-    log('worker start', facts.name, id, previous ? 'resumed session' : 'new session', ...where, ...queued, preview(task, 60))
+    const on = this.accounts.configured() ? [`on account ${accountName} (${accountWhy})`] : []
+    log('worker start', facts.name, id, previous ? 'resumed session' : 'new session', ...where, ...on, ...queued, preview(task, 60))
     if (wid) {
       this.preparing.add(id)
       this.prepare(record, facts, job, entry).finally(() => this.preparing.delete(id))
@@ -1510,11 +1616,12 @@ export class Workers extends EventEmitter {
       this.emit('started', record)
     }
     const others = this.runsOf(facts.name).filter(t => t !== record)
-    return { status: 'started', task: record, facts, closed: closed.map(d => d.id), others }
+    return { status: 'started', task: record, facts, closed: closed.map(d => d.id), others, accounts: this.accounts.configured() }
   }
 
-  // Starts claude for a run whose record is made, in its folder.
-  spawnRun(record, facts, { task, words, direct = false, draft = false }) {
+  // Starts claude for a run whose record is made, in its folder. token: its
+  // account's, for any but the default (accounts.mjs).
+  spawnRun(record, facts, { task, words, direct = false, draft = false, token = null }) {
     const scratch = kindOf(record) === 'scratch'
     const runner = this.runnerOf(record)
     const rules = scratch
@@ -1566,7 +1673,7 @@ export class Workers extends EventEmitter {
     }
     let child
     try {
-      child = runner.spawn(record.id, this.claudeBin, args, { cwd: record.dir, stdio: ['pipe', out, err], env, runEnv })
+      child = runner.spawn(record.id, this.claudeBin, args, { cwd: record.dir, stdio: ['pipe', out, err], env, runEnv, token })
     } finally {
       closeSync(out)
       closeSync(err)
@@ -1813,11 +1920,14 @@ export class Workers extends EventEmitter {
   // it waits for goes; queue: a task queued before it goes first; after: a
   // task it waits for (after) has not ended; limit: its repository has as
   // many runs as it may; decision: an open decision holds it; full: every
-  // run slot is taken; usage: its account waits for the usage limit.
+  // run slot is taken; usage: every account it may take waits for the usage
+  // limit.
   blocked(entry, { first = false } = {}) {
-    // Its account waits for the Claude usage limit (limits.mjs): nothing
-    // starts there until the wait is over, then the queue goes on by itself.
-    if (this.limits?.active(this.accountOfEntry(entry))) return 'usage'
+    // Every Claude account it may take waits for the usage limit (limits.mjs,
+    // accounts.mjs): nothing starts there until a wait is over, then the
+    // queue goes on by itself. One that waits while another may take it
+    // starts there.
+    if (this.choice(entry).status === 'usage') return 'usage'
     const repo = entry.worker
     const mine = this.queued(repo)
     const inQueue = mine.includes(entry)
@@ -1921,13 +2031,12 @@ export class Workers extends EventEmitter {
       throw error
     }
     log('worker queued', job.worker, entry.id, reason, ...(queueMarks(entry) ? [queueMarks(entry)] : []), preview(job.task, 60))
-    const account = this.accountOfEntry(entry)
-    const wait = this.limits?.active(account)
+    const choice = this.choice(entry)
     return {
       status: 'queued',
       entry,
       reason, // busy, decision, queue (others before it), after, limit, full (no run slot), usage (the usage limit)
-      wait: wait ? waitText(account, wait) : null, // the account's wait for the usage limit, in a sentence
+      wait: choice.status === 'usage' ? this.waitsText(choice.keys) || null : null, // the accounts' waits for the usage limit, in a sentence
       position: this.queued(job.worker).indexOf(entry) + 1,
       task: this.running().find(t => t.repo === job.worker) ?? null,
       strays: this.strays.has(this.dirOf(job.worker)), // worker processes of a run nobody followed, being ended
@@ -1994,6 +2103,7 @@ export class Workers extends EventEmitter {
       refused: 'a direct push needs access level full, and the repository is not at full',
       dirty: `the checkout has ${plural(result.files?.length ?? 0, 'uncommitted file')}`,
       gone: result.why,
+      account: `the account ${result.account} named for it can no longer be taken: ${result.why}`,
     }[result.status]
     this.park(entry, why ?? `it could not start (${result.status})`, result.status)
   }
@@ -2386,8 +2496,14 @@ export class Workers extends EventEmitter {
     const wt = task.worktree ? this.state.worktrees[task.worktree] : null
     if (message.session_id && message.session_id !== task.sessionId) {
       task.sessionId = message.session_id
-      // The run folder goes on with it (workspaces.mjs).
-      if (!wt) this.state.repos[task.repo] = { sessionId: message.session_id, ...(task.runFolder ? { runFolder: task.runFolder } : {}) }
+      // The run folder goes on with it (workspaces.mjs), and the account.
+      if (!wt) {
+        this.state.repos[task.repo] = {
+          sessionId: message.session_id,
+          ...(task.runFolder ? { runFolder: task.runFolder } : {}),
+          ...(task.account ? { account: task.account } : {}),
+        }
+      }
     }
     if (wt && message.session_id && wt.task === task.id) Object.assign(wt, { sessionId: message.session_id, resumable: true })
     // For the end of a run that gave its result (check): when it last wrote,
@@ -2406,6 +2522,9 @@ export class Workers extends EventEmitter {
       task.credits = true
       this.limits?.credits(this.accountOf(task), credits)
     }
+    // How much of its account's plan is used, for the choice of an account
+    // for the next runs (accounts.mjs): every such event says it.
+    if (message.type === 'rate_limit_event') this.limits?.observe(this.accountOf(task), message.rate_limit_info)
     if (message.type === 'assistant') {
       for (const part of message.message?.content ?? []) {
         if (part.type === 'tool_use') {
@@ -2882,11 +3001,15 @@ export class Workers extends EventEmitter {
     const waits = this.waitLines()
     const credits = this.creditLines()
     const usage = waits.length ? ' usage=waiting' : credits.length ? ' usage=credits' : ''
+    // The Claude accounts (accounts.mjs), once there is more than the default.
+    const several = this.accounts.configured()
+    const accounts = several ? ` accounts=${1 + this.accounts.found().filter(a => !a.problem).length}` : ''
     const lines = [
       `[workers=${names.length} running=${this.running().length}${queued ? ` queued=${queued}` : ''} max=${this.maxRuns}${perRepo}` +
-        `${container ? ` docker=${container}` : ''}${this.scratch ? ' scratch=on' : ''}${usage}]`,
+        `${container ? ` docker=${container}` : ''}${this.scratch ? ' scratch=on' : ''}${accounts}${usage}]`,
       ...waits.map(line => `Waiting: ${line}; nothing new starts there until then, and the queue goes on by itself.`),
       ...credits.map(line => `Credits: ${line}.`),
+      ...(several ? [this.accounts.line({ ...this.accountPlace(names[0] ?? ''), busy: this.busyAccounts() })] : []),
     ]
     for (const f of facts) {
       const where = f.moved
@@ -2916,10 +3039,11 @@ export class Workers extends EventEmitter {
   }
 
   // A run as list_workers and open_items say it: running, ending, or
-  // preparing its worktree.
+  // preparing its worktree; with further accounts, on which.
   runText(task, length = 50) {
     const what = task.stopping ? 'ending' : task.preparing ? 'preparing' : 'running'
-    return `${what} ${task.id}${task.worktree ? ' in a worktree' : ''} for ${duration(Date.now() - task.startedAt)} ("${preview(task.task, length)}")`
+    const on = this.accounts.configured() ? ` on ${task.account ?? DEFAULT_ACCOUNT}` : ''
+    return `${what} ${task.id}${task.worktree ? ' in a worktree' : ''}${on} for ${duration(Date.now() - task.startedAt)} ("${preview(task.task, length)}")`
   }
 
   // The worktrees kept after their runs, in a few words each.
@@ -2961,16 +3085,20 @@ export class Workers extends EventEmitter {
   taskLines(repo, task) {
     const lines = []
     const worktree = task.worktree ? ` worktree=${task.worktree}` : ''
+    // With further accounts (accounts.mjs): the one it runs on, and why.
+    const several = this.accounts.configured()
+    const account = several ? ` account=${task.account ?? DEFAULT_ACCOUNT}` : ''
     if (task.state === 'running') {
       // Ending: stopped, or done, while processes of it are still there.
       const state = task.stopping ? 'ending' : task.preparing ? 'preparing' : 'running'
-      lines.push(`[worker=${repo} state=${state} task=${task.id}${worktree} elapsed=${Math.round((Date.now() - task.startedAt) / 1000)}s]`)
+      lines.push(`[worker=${repo} state=${state} task=${task.id}${worktree}${account} elapsed=${Math.round((Date.now() - task.startedAt) / 1000)}s]`)
       if (task.stopping) lines.push(`Ending: ${task.stopping.reason ?? 'it gave its result, and the gateway ends what is left of it'}; nothing else starts here until all its processes are gone.`)
       if (task.preparing) lines.push(`Preparing: the gateway makes its worktree (${task.dir}); then claude starts there.`)
     } else {
-      lines.push(`[worker=${repo} state=${task.state} task=${task.id}${worktree} took=${duration(task.finishedAt - task.startedAt)}]`)
+      lines.push(`[worker=${repo} state=${task.state} task=${task.id}${worktree}${account} took=${duration(task.finishedAt - task.startedAt)}]`)
     }
     lines.push(`Task: ${preview(task.task, 200)}`)
+    if (several) lines.push(`Account: ${task.account ?? DEFAULT_ACCOUNT}${task.accountWhy ? ` (${task.accountWhy})` : ''}.`)
     if (task.review) lines.push(reviewLine(task.review))
     if (task.runFolder) lines.push(runFolderLine(task))
     if (task.steps.length) lines.push(`Last steps: ${task.steps.join('; ')}`)
@@ -2988,9 +3116,9 @@ export class Workers extends EventEmitter {
     const task = this.lastTask(repo)
     const runs = this.runsOf(repo)
     const queued = this.queued(repo)
-    const account = this.accountOfEntry({ worker: repo })
-    const wait = this.limits?.active(account)
-    const waiting = wait ? `Waiting: ${waitText(account, wait)}; its queued tasks start by themselves then.` : ''
+    // Every account its next task may take waits (accounts.mjs).
+    const next = this.choice(queued[0] ?? { worker: repo })
+    const waiting = next.status === 'usage' ? `Waiting: ${this.waitsText(next.keys)}; its queued tasks start by themselves then.` : ''
     if (!task) return `[worker=${repo} state=idle] No task yet.${queued.length ? ` Queued: ${queueList(queued)}.` : ''}${waiting ? `\n${waiting}` : ''}`
     const blocks = (runs.length ? runs : [task]).map(t => this.taskLines(repo, t).join('\n'))
     const lines = [blocks.join('\n\n')]
@@ -3140,8 +3268,10 @@ const ACCESS_TEXT = {
 
 // What every run reads after its prompt, in a repository or a work folder:
 // that it resumes a run the usage limit ended, in the checkout or the work
-// folder (a worktree's lines say so themselves, worktrees.mjs); and in night
-// mode, how to work without the driver (night.mjs).
+// folder (a worktree's lines say so themselves, worktrees.mjs); that it
+// starts a new session, as the one of its place was on another Claude
+// account (accounts.mjs); and in night mode, how to work without the driver
+// (night.mjs).
 export function runLines(record) {
   const lines = []
   if (record.requeued?.limit && !record.worktree) {
@@ -3149,6 +3279,13 @@ export function runLines(record) {
       `- Resumed: this task was interrupted (${record.requeued.why}) and continues here` +
         `${record.resumed ? ', in the same session' : ''}. Look at what is done already first (git status and git log in ` +
         'a repository, the files in a work folder), then finish it.',
+    )
+  }
+  if (record.leftAccount) {
+    lines.push(
+      '- New session: the earlier runs here worked in a session on another Claude account, which this run cannot go ' +
+        'on with. What they did is in the files, in git (status, log, branches) and in a pull request, if one is out: ' +
+        'look there first, then do the task.',
     )
   }
   if (record.order) lines.push(orderRule(record.order))

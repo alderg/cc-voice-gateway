@@ -14,6 +14,7 @@
 import { execFile, execFileSync, spawn } from 'node:child_process'
 import { constants, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync } from 'node:fs'
 import { dirname, join, posix } from 'node:path'
+import { ACCOUNT_TOKEN_ENV } from './accounts.mjs'
 import { ROOT, config } from './config.mjs'
 import { log } from './log.mjs'
 
@@ -31,6 +32,10 @@ function run(command, args, timeout, env = undefined) {
 
 // git never asks for a password: a run's git, or the gateway's, would wait.
 const GIT_QUIET = { GIT_TERMINAL_PROMPT: '0' }
+
+// What Claude Code would take as its login before an account's token
+// (accounts.mjs): a run on such an account gets none of them.
+const OTHER_LOGINS = ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN']
 
 // Whether a process still exists; EPERM means it does, as someone else's.
 export function alive(pid) {
@@ -290,9 +295,16 @@ export class HostRunner {
   // Detached: its own process group, so stopping it reaches the commands it
   // started, and a controller restart does not end it. env carries the
   // run's marks (MARK); runEnv what only the run itself gets, its run folder
-  // as TMPDIR (workspaces.mjs).
-  spawn(taskId, command, args, { cwd, stdio, env, runEnv = {} }) {
-    return spawn(command, args, { cwd, detached: true, stdio, env: { ...env, ...runEnv } })
+  // as TMPDIR (workspaces.mjs); token: the token of the account it runs on,
+  // if not this computer's login (accounts.mjs), as Claude Code's, in its
+  // environment only.
+  spawn(taskId, command, args, { cwd, stdio, env, runEnv = {}, token = null }) {
+    const own = { ...env, ...runEnv }
+    if (token) {
+      for (const name of OTHER_LOGINS) delete own[name]
+      own.CLAUDE_CODE_OAUTH_TOKEN = token
+    }
+    return spawn(command, args, { cwd, detached: true, stdio, env: own })
   }
 
   // The kill switch stops the runs; there is no container here.
@@ -450,6 +462,7 @@ export class DockerRunner {
     this.container = container
     this.root = root
     this.dockerBin = dockerBin
+    this.accountTokens = false // whether its voice-run takes an account's token (takesAccounts)
   }
 
   dir(name) {
@@ -544,14 +557,30 @@ export class DockerRunner {
   // it, and it carries the run's marks on this side; it lives as long as the
   // run's own process in the container (voice-run waits for it). runEnv goes
   // into the container with docker exec -e, not to the docker client here: a
-  // TMPDIR of the container's is no folder on this computer.
-  spawn(taskId, command, args, { cwd, stdio, env, runEnv = {} }) {
+  // TMPDIR of the container's is no folder on this computer. token: the
+  // token of the account it runs on, if not the container's own
+  // (accounts.mjs): docker exec -e names it only and takes its value from
+  // the docker client's environment, so that no command line shows it;
+  // voice-run makes it the run's CLAUDE_CODE_OAUTH_TOKEN, in place of the
+  // container's.
+  spawn(taskId, command, args, { cwd, stdio, env, runEnv = {}, token = null }) {
     const vars = Object.entries(runEnv).flatMap(([name, value]) => ['-e', `${name}=${value}`])
+    const account = token ? ['-e', ACCOUNT_TOKEN_ENV] : []
     return spawn(
       this.dockerBin,
-      ['exec', '-i', '-w', cwd, ...vars, this.container, 'voice-run', taskId, command, ...args],
-      { detached: true, stdio, env },
+      ['exec', '-i', '-w', cwd, ...vars, ...account, this.container, 'voice-run', taskId, command, ...args],
+      { detached: true, stdio, env: token ? { ...env, [ACCOUNT_TOKEN_ENV]: token } : env },
     )
+  }
+
+  // Whether the container's voice-run hands a run an account's token
+  // (docker/voice-run, since the accounts): until it does, runs there take
+  // only the container's own login, so that none runs on another account
+  // than its record says. Kept in accountTokens; false until known.
+  async takesAccounts() {
+    const { ok } = await this.exec(['sh', '-c', `grep -qs ${ACCOUNT_TOKEN_ENV} "$(command -v voice-run)"`])
+    this.accountTokens = ok
+    return ok
   }
 
   // The docker client of the run.

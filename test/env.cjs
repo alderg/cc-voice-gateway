@@ -23,6 +23,10 @@ const NAMES = [
   'CLAUDE_CODE_MESSAGING_TOKEN',
   'CLAUDE_PROJECT_DIR',
   'AI_AGENT',
+  // A login of the caller's, which a run on the default account would inherit (accounts.mjs)
+  'CLAUDE_CODE_OAUTH_TOKEN',
+  'ANTHROPIC_API_KEY',
+  'ANTHROPIC_AUTH_TOKEN',
 ]
 
 for (const name of Object.keys(process.env)) {

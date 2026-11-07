@@ -271,6 +271,11 @@ Telegram. open_items says what waits, under "The gateway now". Nothing to dispat
 tell the driver in a sentence when they ask. Events that came while you were at the limit yourself wait in the gateway
 and arrive afterwards, marked resent="yes": answer them as usual. Usage credits are no limit: with them the runs go on
 past the plan's limit and nothing waits; list_workers notes it ("Credits: …"), to mention only when the driver asks.
+Accounts: the worker runs may spread over several Claude accounts of the driver's (list_workers shows "Accounts: …" with
+each one's use). The gateway chooses for each run: the account its session runs on, else the one with the most headroom,
+within the driver's fixed rules if any; a wait for the usage limit holds only the runs of that account, and a run it
+stopped waits out up to an hour, else goes on on another account in a new session. Pass account to dispatch only when
+the driver names one; mention accounts only when the driver asks.
 Night mode: when the driver says good night, or that they are away until the morning, call set_away with away=true and
 their words, and with until when they name an end ("until tomorrow at 9"), also to extend it; when they say they are
 back, away=false. It also comes on by itself in the quiet hours. An event with
@@ -591,6 +596,14 @@ function workerTools(scratch = null) {
               'The id of a standing order of the driver (o…, from standing_order or open_items) that covers this task, ' +
               'for when there are no fresh words of theirs, at night say: only while it holds, only for its repository, ' +
               'only within its scope. Then "words" may be left empty.',
+          },
+          account: {
+            type: 'string',
+            description:
+              'The Claude account to run it on, by its name in list_workers ("Accounts: …"), only when the driver ' +
+              'names one. Without it the gateway chooses: the account its session runs on, else the one with the most ' +
+              "headroom, within the driver's fixed rules. Refused where a fixed rule allows another, or where the " +
+              'session it continues runs on another account; with fresh=true a new session may start elsewhere.',
           },
         },
         required: ['worker', 'task'],
@@ -981,7 +994,8 @@ function dispatchText(worker, result, killswitch = null) {
         // The work folder's own name from now on, also for scratch/new.
         const name = result.task.repo
         return toolText(
-          `[dispatch=started worker=${name} task=${result.task.id} session=${result.task.resumed ? 'continued' : 'new'}] ` +
+          `[dispatch=started worker=${name} task=${result.task.id} session=${result.task.resumed ? 'continued' : 'new'}` +
+            `${result.accounts ? ` account=${result.task.account}` : ''}] ` +
             `Started in ${result.facts.made ? 'a new work folder' : 'the work folder'}, ${name}.${closed} Tell the ` +
             `driver it is on its way. When it ends, a channel event with worker="${name}" arrives; follow-ups and ` +
             'answers go to that name.',
@@ -1004,6 +1018,7 @@ function dispatchText(worker, result, killswitch = null) {
         : ''
       return toolText(
         `[dispatch=started worker=${worker} task=${task.id} session=${task.resumed ? 'continued' : 'new'}` +
+          `${result.accounts ? ` account=${task.account}` : ''}` +
           `${task.worktree ? ` worktree=${task.worktree}` : ''}` +
           `${access ? ` access=${access.level}` : ''}${result.facts.pushDirect ? ' push=direct' : ''}` +
           `${task.draft && !ignored ? ' draft=yes' : ''}] ` +
@@ -1071,6 +1086,12 @@ function dispatchText(worker, result, killswitch = null) {
     }
     case 'gone':
       return toolText(`[dispatch=gone worker=${worker}] Nothing started: ${result.why}. Tell the driver.`, true)
+    case 'account':
+      return toolText(
+        `[dispatch=refused worker=${worker} account=${result.account}] Nothing started: ${result.why}. Tell the driver ` +
+          'in a sentence; without account the gateway chooses one itself.',
+        true,
+      )
     case 'dirty': {
       const shown = result.files.slice(0, 5).join(', ') + (result.files.length > 5 ? ', …' : '')
       return toolText(
@@ -1097,7 +1118,7 @@ function dispatchText(worker, result, killswitch = null) {
         after: `it waits for ${(entry.after ?? []).join(', ')}`,
         limit: `${worker} has as many runs as one repository may have (${result.perRepo}): ${runList(runs)}`,
         full: `every run slot is taken (${result.running.map(t => t.repo).join(', ')})`,
-        usage: result.wait ?? 'the workers wait for the Claude usage limit',
+        usage: result.wait ?? 'the workers wait for the Claude usage limit, on every account it may take',
       }[reason]
       const ask =
         reason === 'decision'
@@ -1373,6 +1394,7 @@ async function workerTool(workers, name, args, spoken, taskOf = () => null, orde
     // The run whose result the driver answers: its follow-up goes there.
     answered: said?.answers ? taskOf(said.answers) : null,
     order,
+    account: typeof args.account === 'string' && args.account.trim() ? args.account.trim().toLowerCase() : null,
   })
   const answer = dispatchText(worker, result, workers.killswitch)
   if (order && ['started', 'queued'].includes(result.status)) {

@@ -20,7 +20,7 @@
 //
 // What is kept: counts, sums, maxima, and the last SAMPLES durations for the
 // typical values (medians); no texts, prompts or secrets, of names only the
-// repositories'. In .state/stats.json, atomically, mode 0600: this running
+// repositories' and those of the Claude accounts the runs took (accounts.mjs). In .state/stats.json, atomically, mode 0600: this running
 // time (current) and the totals of all time including it (total), saved a few
 // seconds after a change and every few minutes, so that a crash loses little,
 // and a last time when the gateway ends (close), with endedAt. A start takes
@@ -55,6 +55,7 @@ const UNSAFE_KEYS = new Set(['__proto__', 'constructor', 'prototype'])
 
 const map = () => Object.create(null) // counts by name, without inherited keys
 const repoEntry = () => ({ runs: 0, ms: 0, costUsd: 0, maxAtOnce: 0, twoPlusMs: 0 })
+const accountEntry = () => ({ runs: 0, ms: 0, costUsd: 0 })
 
 // One period: this running time, or all time. Names that start with "max"
 // are maxima, "longest" is the longest run with its repository, "since" the
@@ -85,6 +86,7 @@ export function emptyPeriod(since = 0) {
       longest: { ms: 0, repo: '' },
     },
     repos: map(), // name -> repoEntry()
+    accounts: map(), // the Claude account a run took (accounts.mjs) -> accountEntry()
     parallel: { maxAtOnce: 0, twoPlusMs: 0 },
     queue: { started: 0, waitMs: [], maxWaitMs: 0, parked: 0, dropped: 0 },
     tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, thinking: 0, costUsd: 0, costUnknown: 0, turns: 0, tools: 0, subagents: 0 },
@@ -94,7 +96,7 @@ export function emptyPeriod(since = 0) {
   }
 }
 
-const MAPS = { kinds: () => 0, closedBy: () => 0, triggers: () => 0, repos: repoEntry }
+const MAPS = { kinds: () => 0, closedBy: () => 0, triggers: () => 0, repos: repoEntry, accounts: accountEntry }
 
 // A saved period as the gateway can use it: the known shape, numbers only,
 // whatever the file holds.
@@ -430,6 +432,12 @@ export class Stats {
     repo.runs++
     repo.ms += ms
     repo.costUsd += finite(usage?.costUsd)
+    // By account: one from before the accounts ran on the default.
+    const named = String(task.account ?? 'default').slice(0, 40)
+    const account = (this.current.accounts[UNSAFE_KEYS.has(named) ? 'default' : named] ??= accountEntry())
+    account.runs++
+    account.ms += ms
+    account.costUsd += finite(usage?.costUsd)
     this.changed()
   }
 
@@ -674,6 +682,17 @@ export function totalLine(t) {
   return `${head}: ${parts.join(', ')}.`
 }
 
+// The runs by Claude account (accounts.mjs), once another than the default
+// took some: " By account: default 12 (3 h, $40), pro 3 (40 min, $6)."
+function accountsText(accounts = {}) {
+  const used = Object.entries(accounts)
+    .filter(([, entry]) => entry.runs)
+    .sort((a, b) => b[1].runs - a[1].runs || b[1].ms - a[1].ms)
+  if (!used.length || (used.length === 1 && used[0][0] === 'default')) return ''
+  const each = used.map(([name, entry]) => `${name} ${entry.runs} (${span(entry.ms)}${entry.costUsd >= 0.995 ? `, ${dollars(entry.costUsd)}` : ''})`)
+  return ` By account: ${each.join(', ')}.`
+}
+
 const DECISION_KINDS = { other: 'other' }
 const CLOSED_BY = { driver: 'by the driver', dispatch: 'by a follow-up', reply: 'with an answer', gateway: 'by the gateway' }
 const TRIGGERS = { voice: 'by voice', telegram: 'on Telegram', rule: 'by a rule', controller: 'by the controller' }
@@ -739,7 +758,7 @@ export function detailsLines(p, { allTime = false, total = null } = {}) {
     if (repos.length > 3) top.push(`${repos.length - 3} more`)
     lines.push(
       `Worker runs: ${r.ended} ended, ${outcomes.join(', ')}${kinds.length ? `; ${kinds.join(', ')}` : ''}. ` +
-        `By repository: ${top.join(', ')}.`,
+        `By repository: ${top.join(', ')}.${accountsText(p.accounts)}`,
     )
     const typical = median(r.runMs)
     lines.push(

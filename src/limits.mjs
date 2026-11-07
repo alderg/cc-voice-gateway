@@ -28,17 +28,27 @@
 // waits as for the plan's limit, until the earlier of the plan's reset and
 // the credits' (overageResetsAt), when Claude Code gives them.
 //
-// A wait belongs to an account: the workers on this computer ("host"), those
-// in a container ("container:<name>", which has its own login), and the
-// controller session ("controller"). Until it ends, no run starts on that
-// account (workers.mjs), and while the controller waits, the gateway holds
-// the events for it, which would only end as failed turns, and sends them
-// once it answers again (gateway.mjs). The end: the reset time when Claude
-// Code gives one, otherwise a backoff of 15, 30, then 60 minutes, counted
-// from the last wait on that account that ended without a run getting
-// through. Kept in .state/limits.json, so that a restart keeps waiting.
-// Runs on usage credits are only noted, once in the log and in list_workers
-// (Limits.credits), in memory.
+// A wait belongs to an account: the workers on this computer's login
+// ("host"), those in a container on its own login ("container:<name>"), those
+// on a further account of the driver's, with a token of its own
+// ("account:<name>", accounts.mjs), and the controller session
+// ("controller"). Until it ends, no run starts on that account (workers.mjs),
+// and while the controller waits, the gateway holds the events for it, which
+// would only end as failed turns, and sends them once it answers again
+// (gateway.mjs). The end: the reset time when Claude Code gives one,
+// otherwise a backoff of 15, 30, then 60 minutes, counted from the last wait
+// on that account that ended without a run getting through. Kept in
+// .state/limits.json, so that a restart keeps waiting. Runs on usage credits
+// are only noted, once in the log and in list_workers (Limits.credits), in
+// memory.
+//
+// The headroom of each account, for the choice of an account for a run
+// (accounts.mjs): every rate_limit_event of a run says how much of each of
+// the plan's windows is used (unifiedWindows: five_hour, seven_day, … with
+// utilization as a fraction and resetsAt), whatever its status. The latest
+// per account and window is kept with the waits (Limits.observe,
+// Limits.headroom); one older than HEADROOM_STALE_MS counts as unknown, one
+// whose window has reset since as nothing used.
 
 import { EventEmitter } from 'node:events'
 import { closeSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, statSync, writeFileSync } from 'node:fs'
@@ -50,6 +60,9 @@ export const BACKOFF_MINUTES = [15, 30, 60]
 const MIN_WAIT_MS = 60 * 1000 // a reset that is due already still waits this long
 const MAX_WAIT_MS = 8 * 24 * 60 * 60 * 1000 // a weekly limit at most, and a little
 const CREDITS_MS = 5 * 60 * 60 * 1000 // runs on usage credits are noted this long without a reset time
+// What a run said about an account's use counts this long; later, as nothing
+// ran there meanwhile, it is unknown again: others may have used it.
+export const HEADROOM_STALE_MS = 6 * 60 * 60 * 1000
 const MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec']
 
 // The texts Claude Code ends a turn with at the account's limit, the plan's
@@ -194,6 +207,28 @@ export function creditsOf(message) {
   return { limit: info.rateLimitType ?? null, resetsAt: Number.isFinite(info.resetsAt) ? seconds(info.resetsAt) : null }
 }
 
+// How much of each of the plan's windows a rate_limit_info says is used:
+// { five_hour: { used, resetsAt (ms) or null }, seven_day: … }, used as a
+// fraction (Claude Code gives 0.35 for 35 %; a value above 2 is taken as
+// percent). From unifiedWindows, else from the window the info names; a
+// window it refuses counts as used up. Not the credits' own window
+// ("overage"), which is no part of the plan.
+export function windowsOf(info) {
+  const out = {}
+  if (!info || typeof info !== 'object') return out
+  const put = (name, used, resetsAt) => {
+    if (typeof name !== 'string' || !/^[a-z0-9_]{1,40}$/.test(name) || name === 'overage') return
+    if (!Number.isFinite(used) || used < 0) return
+    out[name] = { used: used > 2 ? used / 100 : used, resetsAt: Number.isFinite(resetsAt) ? seconds(resetsAt) : null }
+  }
+  const windows = info.unifiedWindows && typeof info.unifiedWindows === 'object' ? info.unifiedWindows : {}
+  for (const [name, window] of Object.entries(windows)) put(name, window?.utilization, window?.resetsAt)
+  if (!(info.rateLimitType in out)) {
+    put(info.rateLimitType, info.status === 'rejected' && !Number.isFinite(info.utilization) ? 1 : info.utilization, info.resetsAt)
+  }
+  return out
+}
+
 // Two findings of one run as one: a usage limit over a throttle; the exact
 // reset time over one read from a text, a later one over an earlier; the
 // words over the generic text.
@@ -227,22 +262,27 @@ export function accountName(account) {
   if (account === 'controller') return 'the controller session'
   if (account === 'host') return 'the workers on this computer'
   if (String(account).startsWith('container:')) return `the workers in the container ${account.slice('container:'.length)}`
+  if (String(account).startsWith('account:')) return `the workers on the account ${account.slice('account:'.length)}`
   return String(account)
 }
 
 export class Limits extends EventEmitter {
   // file: where the waits are kept; null keeps them in memory (tests).
   // minWaitMs: how long a wait lasts at least, also for a reset due already.
-  constructor({ file = null, backoffMinutes = BACKOFF_MINUTES, minWaitMs = MIN_WAIT_MS, now = () => Date.now(), log = defaultLog } = {}) {
+  // label: who waits, in a few words, for the texts (accountName; with
+  // further accounts, Accounts.label says which login waits).
+  constructor({ file = null, backoffMinutes = BACKOFF_MINUTES, minWaitMs = MIN_WAIT_MS, now = () => Date.now(), log = defaultLog, label = accountName } = {}) {
     super()
     this.file = file
     this.minWaitMs = minWaitMs
     this.backoff = backoffMinutes.map(minutes => minutes * 60 * 1000)
     this.now = now
     this.log = log
+    this.label = label
     this.waits = {} // account -> { kind, limit, text, since, until, reset, source, tasks }
     this.strikes = {} // account -> waits without a reset time in a row, for the backoff
     this.credited = {} // account -> { since, until, limit, reset }: usage credits pay for its runs (credits)
+    this.seen = {} // account -> { at, windows: { name -> { used, resetsAt, at } } }: its use, as its runs said (observe)
     this.timer = null
     this.load()
   }
@@ -264,6 +304,14 @@ export class Limits extends EventEmitter {
       for (const [account, count] of Object.entries(saved.strikes ?? {})) {
         if (Number.isInteger(count) && count > 0) this.strikes[account] = count
       }
+      for (const [account, entry] of Object.entries(saved.usage ?? {})) {
+        const windows = {}
+        for (const [name, window] of Object.entries(entry?.windows ?? {})) {
+          if (!/^[a-z0-9_]{1,40}$/.test(name) || !Number.isFinite(window?.used) || !Number.isFinite(window?.at)) continue
+          windows[name] = { used: window.used, resetsAt: Number.isFinite(window.resetsAt) ? window.resetsAt : null, at: window.at }
+        }
+        if (Object.keys(windows).length && Number.isFinite(entry.at)) this.seen[account] = { at: entry.at, windows }
+      }
     } catch (error) {
       if (error.code !== 'ENOENT') this.log('usage limits file unreadable, starting without waits:', error.message)
     }
@@ -274,7 +322,8 @@ export class Limits extends EventEmitter {
     try {
       mkdirSync(dirname(this.file), { recursive: true, mode: 0o700 })
       const tmp = `${this.file}.${process.pid}.tmp`
-      writeFileSync(tmp, JSON.stringify({ waits: this.waits, strikes: this.strikes }, null, 2) + '\n', { mode: 0o600 })
+      const data = { waits: this.waits, strikes: this.strikes, usage: this.seen }
+      writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n', { mode: 0o600 })
       renameSync(tmp, this.file)
     } catch (error) {
       this.log('usage limits not saved:', error.message)
@@ -317,7 +366,7 @@ export class Limits extends EventEmitter {
     this.waits[account] = wait
     this.save()
     this.schedule()
-    this.log(`usage limit: ${accountName(account)} wait until ${new Date(until).toISOString()} (${kind}${limit ? `, ${limit}` : ''}): ${preview(text, 100)}`)
+    this.log(`usage limit: ${this.label(account)} wait until ${new Date(until).toISOString()} (${kind}${limit ? `, ${limit}` : ''}): ${preview(text, 100)}`)
     this.emit('wait', account, wait, true)
     return wait
   }
@@ -350,7 +399,7 @@ export class Limits extends EventEmitter {
     delete this.waits[account]
     this.save()
     this.schedule()
-    this.log(`usage limit: ${accountName(account)} go on, ${why}`)
+    this.log(`usage limit: ${this.label(account)} go on, ${why}`)
     this.emit('resume', account, wait, why)
     return true
   }
@@ -376,7 +425,46 @@ export class Limits extends EventEmitter {
     return Object.keys(this.waits)
       .map(account => ({ account, wait: this.active(account) }))
       .filter(item => item.wait)
-      .map(({ account, wait }) => ({ account, wait, text: waitText(account, wait, this.now()) }))
+      .map(({ account, wait }) => ({ account, wait, text: waitText(account, wait, this.now(), this.label(account)) }))
+  }
+
+  // What a run's rate_limit_event says about its account's use (windowsOf),
+  // for the choice of an account (accounts.mjs): the latest per window, with
+  // when it was seen. Within a window the use only grows until its reset, so
+  // a lower figure for the same reset, as from a run's output read again
+  // after a restart, keeps the higher one and its time. Saved only when a
+  // figure changed by a percent or a window reset, not with every event.
+  observe(account, info) {
+    const windows = windowsOf(info)
+    if (!Object.keys(windows).length) return
+    const now = this.now()
+    const entry = (this.seen[account] ??= { at: now, windows: {} })
+    let changed = false
+    for (const [name, window] of Object.entries(windows)) {
+      const was = entry.windows[name]
+      if (was && was.resetsAt === window.resetsAt && window.used < was.used) continue
+      if (!was || was.resetsAt !== window.resetsAt || Math.round(was.used * 100) !== Math.round(window.used * 100)) changed = true
+      entry.windows[name] = { ...window, at: now }
+    }
+    entry.at = now
+    if (changed) this.save()
+  }
+
+  // How much room an account's plan has, by what its runs said (observe):
+  // { left, windows }. left: the share of the fullest window still free,
+  // 0 to 1, or null when nothing is known; windows: [{ name, used, resetsAt,
+  // at, stale }], used null where it is stale (HEADROOM_STALE_MS without a
+  // run there: others may have used it since), 0 where the window has reset
+  // since.
+  headroom(account, { staleMs = HEADROOM_STALE_MS } = {}) {
+    const now = this.now()
+    const windows = Object.entries(this.seen[account]?.windows ?? {}).map(([name, window]) => {
+      const reset = window.resetsAt !== null && now >= window.resetsAt
+      const stale = !reset && now - window.at > staleMs
+      return { name, used: reset ? 0 : stale ? null : window.used, resetsAt: reset ? null : window.resetsAt, at: window.at, stale }
+    })
+    const known = windows.filter(window => window.used !== null).map(window => window.used)
+    return { left: known.length ? Math.max(0, 1 - Math.max(...known)) : null, windows }
   }
 
   // Usage credits pay for an account's runs (creditsOf): its plan's limit is
@@ -397,7 +485,7 @@ export class Limits extends EventEmitter {
     }
     const entry = { since: now, until, limit, reset }
     this.credited[account] = entry
-    this.log(`usage credits: ${creditsText(account, entry, now)}`)
+    this.log(`usage credits: ${creditsText(account, entry, now, this.label(account))}`)
     return entry
   }
 
@@ -417,22 +505,22 @@ export class Limits extends EventEmitter {
     return Object.keys(this.credited)
       .map(account => ({ account, entry: this.paying(account) }))
       .filter(item => item.entry)
-      .map(({ account, entry }) => ({ account, entry, text: creditsText(account, entry, this.now()) }))
+      .map(({ account, entry }) => ({ account, entry, text: creditsText(account, entry, this.now(), this.label(account)) }))
   }
 }
 
 // An account on usage credits in a sentence.
-export function creditsText(account, entry, now = Date.now()) {
+export function creditsText(account, entry, now = Date.now(), name = accountName(account)) {
   const plan = PLAN_LIMITS.has(entry.limit) ? `the ${limitName(entry.limit)}` : "the plan's limit"
   const until = entry.reset ? ` until it resets at ${clock(entry.until, now)}` : ''
-  return `${accountName(account)} run on usage credits since ${clock(entry.since, now)}, as ${plan} is reached${until}; nothing waits`
+  return `${name} run on usage credits since ${clock(entry.since, now)}, as ${plan} is reached${until}; nothing waits`
 }
 
 // One wait in a sentence.
-export function waitText(account, wait, now = Date.now()) {
+export function waitText(account, wait, now = Date.now(), name = accountName(account)) {
   const what = wait.kind === 'usage' ? `the Claude usage limit${wait.limit ? ` (${limitName(wait.limit)})` : ''}` : 'the Claude API, which was overloaded,'
   const until = wait.reset ? `until ${clock(wait.until, now)}, when it resets` : `until ${clock(wait.until, now)}, then they try again`
-  return `${accountName(account)} wait for ${what} ${until}`
+  return `${name} wait for ${what} ${until}`
 }
 
 const LIMIT_NAMES = {
@@ -443,7 +531,7 @@ const LIMIT_NAMES = {
   seven_day_overage_included: 'Fable limit',
   overage: 'usage credits',
 }
-const limitName = limit => LIMIT_NAMES[limit] ?? String(limit).replace(/_/g, ' ')
+export const limitName = limit => LIMIT_NAMES[limit] ?? String(limit).replace(/_/g, ' ')
 // The plan's own limits, which usage credits go past.
 const PLAN_LIMITS = new Set(Object.keys(LIMIT_NAMES).filter(limit => limit !== 'overage'))
 

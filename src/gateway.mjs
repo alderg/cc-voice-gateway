@@ -82,7 +82,8 @@ import { RUN_FOLDERS, ScratchFolders, scratchProblem } from './workspaces.mjs'
 import { Stats, shutdownText, telegramText } from './stats.mjs'
 import { Standby } from './standby.mjs'
 import { Presence } from './presence.mjs'
-import { Limits, TranscriptWatch, accountName, clock } from './limits.mjs'
+import { Limits, TranscriptWatch, clock } from './limits.mjs'
+import { ACCOUNTS_SETTING, Accounts, SESSION_WAIT_MS } from './accounts.mjs'
 import { Night, morningText, parseUntil } from './night.mjs'
 import { Orders } from './orders.mjs'
 
@@ -306,6 +307,30 @@ function grantsLog(when) {
   )
 }
 grantsLog()
+// The Claude accounts the workers' runs spread over (accounts.mjs): the
+// login, and one per token in .secrets/accounts; the fixed rules from
+// VOICE_GW_ACCOUNTS, which also change with the settings file (below). The
+// usage limit's texts name the accounts from now on.
+const accounts = new Accounts({ dir: config.accountsDir, setting: config.accounts, limits, log })
+function accountsLog(when) {
+  const found = accounts.found()
+  if (!found.length && !accounts.rules.size && !when) return
+  const each = found.map(a => (a.problem ? `${a.name} (unavailable: ${a.problem})` : a.name))
+  log(
+    `accounts for the workers' runs${when ? `, ${when}` : ''}: default (the login)${each.length ? `, ${each.join(', ')}` : ''}; ` +
+      `fixed rules (${ACCOUNTS_SETTING}): ${accounts.text() || 'none'}; the rest by headroom, a session on its own account`,
+  )
+}
+accountsLog()
+// A container's voice-run takes an account's token only since the accounts
+// (docker/voice-run): until its image is rebuilt, runs there take its own login.
+for (const each of [runner, scratch?.runner].filter(r => r?.container)) {
+  each.takesAccounts().then(ok => {
+    if (!ok && accounts.found().some(a => !a.problem)) {
+      log(`container ${each.container}: its voice-run is older than the accounts; runs there take its own login until its image is rebuilt (docker build, then scripts/start-workers-container.sh)`)
+    }
+  })
+}
 const workers = new Workers({
   runner,
   scratch,
@@ -332,6 +357,7 @@ const workers = new Workers({
   timeoutMinutes: config.workerTimeoutMinutes,
   runFolderDays: config.runFolderDays,
   grants,
+  accounts,
 })
 log(
   `run folders of the workers' runs: in ${RUN_FOLDERS} in the repositories folder${config.docker ? ` of the container ${config.docker}` : ''}, ` +
@@ -1114,9 +1140,10 @@ async function deliverPlan(why, note) {
   }
 }
 
-// The worker limits and the path grants while the gateway runs (live.mjs): a
-// change in the settings file applies at once. Runs going always run to the
-// end; the grants count for their next write.
+// The worker limits, the path grants and the accounts' rules while the
+// gateway runs (live.mjs): a change in the settings file applies at once.
+// Runs going always run to the end, on the account they took; the grants
+// count for their next write, the rules for the next run that starts.
 settings = new SettingsWatcher({
   file: config.settingsFile,
   limits: { VOICE_GW_MAX_WORKERS: workers.maxRuns, VOICE_GW_MAX_WORKERS_PER_REPO: workers.maxPerRepo },
@@ -1128,10 +1155,14 @@ if (process.env[FROM_FILE] === undefined && Object.keys(WORKER_LIMITS).some(name
       "scripts/settings.sh); a worker limit there counts as the file's while it equals the file's value at the start",
   )
 }
-settings.on('change', ({ limits, changed, others, grants: grantsText }) => {
+settings.on('change', ({ limits, changed, others, grants: grantsText, accounts: accountsText }) => {
   if (grantsText !== undefined) {
     grants.set(grantsText)
     grantsLog('from the settings file, at once')
+  }
+  if (accountsText !== undefined) {
+    accounts.set(accountsText)
+    accountsLog('from the settings file, at once')
   }
   if (!Object.keys(changed).length) return
   const { was, plan } = workers.setLimits({
@@ -1290,12 +1321,16 @@ standby.on('leave', async ({ why }) => {
 //
 // A worker run that meets it goes back to the queue (Workers.limited), and
 // its account waits: one Telegram message when the wait starts, one when it
-// ends, and the queue goes on by itself. The workers on this computer share
-// the controller session's login, so the controller counts as waiting too:
-// its events are held (channel.mjs) instead of ending as failed turns. Its
-// own transcript says when it meets the limit itself; then the events it
-// got since its last answer go again too. A tool call of it ends its wait,
-// and so does the reset; then the held events go to it.
+// ends, and the queue goes on by itself. With further accounts
+// (accounts.mjs), the queue goes on on another account that has room, and so
+// does the run, in a new session, when the wait is longer than an hour;
+// a shorter one it waits out with its session. The workers on the default account share
+// the controller session's login, so the controller counts as waiting too
+// when that one waits, and only then: its events are held (channel.mjs)
+// instead of ending as failed turns. Its own transcript says when it meets
+// the limit itself; then the events it got since its last answer go again
+// too. A tool call of it ends its wait, and so does the reset; then the held
+// events go to it.
 limits.on('wait', (account, wait, first) => {
   if (!first) return
   const until = wait.reset ? `at ${clock(wait.until)}, when it resets` : `at ${clock(wait.until)}`
@@ -1305,9 +1340,15 @@ limits.on('wait', (account, wait, first) => {
     }
     return
   }
-  const tasks = wait.tasks.length ? `${wait.tasks.join(', ')} went back to the queue and resume${wait.tasks.length === 1 ? 's' : ''} ` : 'The queue goes on '
+  const several = accounts.configured()
+  const long = wait.until - Date.now() > SESSION_WAIT_MS
+  const resume = several && long ? ' at once on another account with room, in a new session, if there is one, else ' : ' '
+  const tasks = wait.tasks.length
+    ? `${wait.tasks.join(', ')} went back to the queue and resume${wait.tasks.length === 1 ? 's' : ''}${resume}`
+    : 'The queue goes on '
   const what = wait.kind === 'usage' ? `reached the Claude usage limit (${wait.text})` : `met an overloaded Claude API (${wait.text})`
-  tell(`${accountName(account)} ${what}. ${tasks}${until}; nothing new starts there until then, and I go on by myself.`)
+  tell(`${limits.label(account)} ${what}. ${tasks}${until}; nothing new starts there until then, and I go on by myself.`)
+  // Only the default account on this computer is the controller's own login.
   if (account === 'host') limits.hit('controller', { kind: wait.kind, resetsAt: wait.until, limit: wait.limit, text: wait.text, source: 'account' })
 })
 
@@ -1317,7 +1358,7 @@ limits.on('resume', (account, wait, why) => {
     resendHeld()
     return
   }
-  tell(`the usage limit wait is over for ${accountName(account)} (${why}): the queue goes on.`)
+  tell(`the usage limit wait is over for ${limits.label(account)} (${why}): the queue goes on.`)
 })
 
 // The controller met the limit itself: it waits, and what it got since its
@@ -1338,8 +1379,8 @@ function controllerLimited(hit) {
 
 transcript = new TranscriptWatch({ onLimit: hit => controllerLimited(hit), pollMs: config.transcriptPollSeconds * 1000 }).start()
 // The night's summary names the waits too.
-limits.on('wait', (account, wait, first) => first && account !== 'controller' && night.note(`${accountName(account)} began to wait for the usage limit`))
-limits.on('resume', account => account !== 'controller' && night.note(`${accountName(account)} went on after the usage limit`))
+limits.on('wait', (account, wait, first) => first && account !== 'controller' && night.note(`${limits.label(account)} began to wait for the usage limit`))
+limits.on('resume', account => account !== 'controller' && night.note(`${limits.label(account)} went on after the usage limit`))
 limits.start()
 
 // --- night mode (night.mjs) ---------------------------------------------------------

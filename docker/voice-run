@@ -7,14 +7,26 @@
 # goes to /tmp/voice-runs/<task> so that voice-stop ends the whole run. The
 # mark VOICE_GW_TASK, which everything the run starts inherits, lets
 # voice-stop find processes that left the group too.
+#
+# A run on another Claude account than the container's own gets that
+# account's token from the gateway as VOICE_GW_ACCOUNT_TOKEN, through docker
+# exec -e by name only (src/accounts.mjs): it becomes the run's
+# CLAUDE_CODE_OAUTH_TOKEN in place of the container's, and the variable
+# itself goes. The gateway looks for VOICE_GW_ACCOUNT_TOKEN in this file to
+# know that it may.
 set -eu
 task="$1"
 shift
 secrets="${VOICE_SECRETS:-/run/secrets/voice}"
-if [ -s "$secrets/claude_token" ]; then
+if [ -n "${VOICE_GW_ACCOUNT_TOKEN:-}" ]; then
+  CLAUDE_CODE_OAUTH_TOKEN="$VOICE_GW_ACCOUNT_TOKEN"
+  export CLAUDE_CODE_OAUTH_TOKEN
+  unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
+elif [ -s "$secrets/claude_token" ]; then
   CLAUDE_CODE_OAUTH_TOKEN="$(cat "$secrets/claude_token")"
   export CLAUDE_CODE_OAUTH_TOKEN
 fi
+unset VOICE_GW_ACCOUNT_TOKEN
 if [ -s "$secrets/github_token" ]; then
   GH_TOKEN="$(cat "$secrets/github_token")"
   export GH_TOKEN
